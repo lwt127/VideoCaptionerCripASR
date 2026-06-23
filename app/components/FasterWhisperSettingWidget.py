@@ -994,22 +994,45 @@ class FasterWhisperSettingWidget(QWidget):
         )
 
         # 检查未下载的模型并从下拉框中移除
-        for i in range(self.model_card.comboBox.count() - 1, -1, -1):
-            model_text = self.model_card.comboBox.itemText(i).lower()
+        # 注意：移除项会触发 currentIndexChanged，可能把配置覆盖成其它模型；
+        # 因此过滤期间屏蔽信号，过滤后再恢复用户已保存的选择。
+        combo = self.model_card.comboBox
+        saved_value = cfg.faster_whisper_model.value.value  # 例如 "kotoba-whisper-v2.2-faster"
+        combo.blockSignals(True)
+        for i in range(combo.count() - 1, -1, -1):
+            item_value = combo.itemText(i)  # 下拉项文本即 enum.value
             model_config = next(
                 (
-                    model
-                    for model in FASTER_WHISPER_MODELS
-                    if model["label"].lower() == model_text
+                    m
+                    for m in FASTER_WHISPER_MODELS
+                    if m["label"].lower() == item_value.lower()
+                    or m["value"].lower() == item_value.lower()
+                    or m["value"].lower() == f"faster-whisper-{item_value.lower()}"
                 ),
                 None,
             )
             if model_config:
-                model_path = Path(MODEL_PATH) / model_config["value"]
-                model_bin_path = model_path / "model.bin"
-                if model_bin_path.exists():
+                folder = model_config["value"]
+                # 兼容两种本地目录命名：<value> 和 faster-whisper-<value>
+                candidates = [
+                    Path(MODEL_PATH) / folder / "model.bin",
+                    Path(MODEL_PATH) / f"faster-whisper-{folder}" / "model.bin",
+                ]
+                if any(c.exists() for c in candidates):
                     continue
-            self.model_card.comboBox.removeItem(i)
+            combo.removeItem(i)
+        combo.blockSignals(False)
+
+        # 过滤后恢复用户已保存的选择（若仍可用）；否则选第一项并写回配置
+        idx = combo.findData(cfg.faster_whisper_model.value)
+        if idx < 0:
+            # 用 enum.value 文本再找一次（findData 比较 enum 对象）
+            idx = combo.findText(saved_value)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        elif combo.count() > 0:
+            combo.setCurrentIndex(0)
+            cfg.set(cfg.faster_whisper_model, combo.itemData(0))
 
         # 创建管理模型卡片
         self.manage_model_card = HyperlinkCard(
