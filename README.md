@@ -80,21 +80,33 @@ python main.py
 
 ## Transcription backends
 
-VideoCaptioner can transcribe locally using several backends. Pick the one you need:
+VideoCaptioner can transcribe locally using several backends.
 
-### CrispASR (integrated)
+### CrispASR (integrated, zero-setup ✨)
 
-- **Windows:** prebuilt binaries are included in `resource/bin/CrispASR/`
-  (`crispasr.exe`, `crispasr.dll`, `whisper.dll`, `ggml*.dll`) — ready to use.
-- **Other platforms / rebuild:** build from source:
-  ```bash
-  cd _build/CrispASR
-  # See _build/CrispASR/README.md for full options.
-  # Windows:
-  ./build-windows.bat
-  # CUDA build / CMake presets are also available (CMakePresets.json).
-  ```
-  Then copy the resulting `crispasr` binary + libraries into `resource/bin/CrispASR/`.
+CrispASR works **out of the box** — no manual installation. In the **语音转录
+(Transcription)** tab choose **CrispASR**, pick a backend engine + model, then start
+the task. On first use:
+
+- If the **CrispASR engine** binary is missing, it is **automatically downloaded**
+  from the official GitHub Releases (`CrispStrobe/CrispASR`) into
+  `resource/bin/CrispASR/`.
+- The selected **model** is **automatically downloaded** by CrispASR on first run
+  (cached under `~/.cache/crispasr/`).
+
+So users only need to *select* a backend/model and press start — everything else is
+fetched automatically.
+
+> Windows ships a self-contained prebuilt `crispasr.exe` (auto-downloaded if absent).
+> To build manually for other platforms, see `_build/CrispASR/` (`build-windows.bat`,
+> CMake presets) and copy the binary into `resource/bin/CrispASR/`.
+
+**Available CrispASR backends** (all auto-downloadable): Whisper, Parakeet (TDT/RNNT/CTC
+variants), FastConformer-CTC, Canary, Voxtral Mini 3B / 4B Realtime, Granite Speech,
+Qwen3-ASR, Mega-ASR, Fun-ASR Nano, SenseVoice, Paraformer-zh, Cohere, wav2vec2 /
+HuBERT / data2vec, omniASR (1600+ languages), FireRedASR2, GLM-ASR, Kyutai STT,
+Gemma4-E2B, MiMo-ASR, MOSS-Audio, VibeVoice, KugelAudio, Moonshine — plus selectable
+VAD methods (Silero / FireRedVAD / MarbleNet / Whisper-VAD).
 
 ### Faster-Whisper (optional)
 
@@ -104,9 +116,8 @@ Download it and point the app to it via Settings, or place it under
 
 ### Models
 
-ASR models are downloaded into `AppData/models/` (or a path you configure in the
-app). They are not committed to this repo — download them on first use via the
-in-app downloader, or place them in the configured model directory.
+CrispASR models download automatically (see above). WhisperCpp / Faster-Whisper
+models can be downloaded via the in-app model manager into `AppData/models/`.
 
 ---
 

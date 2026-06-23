@@ -156,9 +156,9 @@ class CrispASRSettingWidget(QWidget):
         # 引擎状态 / 项目主页
         engine_ok = CRISP_ASR_BIN.exists()
         engine_desc = (
-            self.tr("已检测到 crispasr 引擎")
+            self.tr("已检测到 crispasr 引擎，模型将在首次使用时自动下载")
             if engine_ok
-            else self.tr("未检测到 crispasr，请将其放入 resource/bin/CrispASR/ 目录")
+            else self.tr("引擎与模型将在开始转录时自动下载，无需手动安装")
         )
         self.engine_card = HyperlinkCard(
             CRISP_ASR_PROJECT_URL,

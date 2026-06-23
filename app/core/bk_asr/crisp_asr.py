@@ -53,41 +53,74 @@ class CrispASR(BaseASR):
         self.vad_method = vad_method or "silero"
 
         # 解析模型参数：
-        #  - "auto" 或非 ggml 文件名 → 交由 CrispASR 自动下载/解析
-        #  - "ggml-*.bin" → 在本地 models 目录查找（whisper 后端，与 WhisperCpp 共用）
+        #  - "auto" → 交由 CrispASR 自动下载该后端默认模型（缓存到 ~/.cache/crispasr）
+        #  - "ggml-*.bin"（whisper 后端）→ 优先用本地 models 目录的文件；
+        #    若本地不存在，则回退为 "auto"，让 CrispASR 自动下载默认 whisper 模型。
         if model and model != "auto" and "ggml" in model.lower():
             models_dir = Path(MODEL_PATH)
             candidate = models_dir / model
             if candidate.exists():
                 self.model_arg = str(candidate)
+                logger.info(f"使用本地模型文件: {self.model_arg}")
             else:
                 matches = list(models_dir.glob(f"*{Path(model).stem}*.bin"))
                 if matches:
                     self.model_arg = str(matches[0])
+                    logger.info(f"使用本地模型文件: {self.model_arg}")
                 else:
-                    raise ValueError(
-                        f"在 {models_dir} 目录下未找到模型 '{model}'。"
-                        f"请在「转录」设置中下载该模型，或选择「自动下载」的模型。"
+                    # 本地没有该 ggml 模型 → 交给 CrispASR 自动下载
+                    self.model_arg = "auto"
+                    logger.info(
+                        f"本地未找到模型 '{model}'，改用自动下载 (backend={self.backend})"
                     )
-            logger.info(f"使用本地模型文件: {self.model_arg}")
         else:
             # 自动下载（CrispASR 会缓存到 ~/.cache/crispasr）
             self.model_arg = model or "auto"
-            logger.info(f"使用自动下载模型: backend={self.backend}, model={self.model_arg}")
-
-        # 定位 crispasr 可执行文件
-        self.crisp_asr_path = Path(crisp_asr_path) if crisp_asr_path else CRISP_ASR_BIN
-        if not self.crisp_asr_path.exists():
-            raise FileNotFoundError(
-                f"未找到 CrispASR 可执行文件: {self.crisp_asr_path}。"
-                f"请将 crispasr 放入 resource/bin/CrispASR/ 目录。"
+            logger.info(
+                f"使用自动下载模型: backend={self.backend}, model={self.model_arg}"
             )
+
+        # 定位 crispasr 可执行文件（缺失时在 _run 阶段自动下载，不在此处抛错）
+        self.crisp_asr_path = Path(crisp_asr_path) if crisp_asr_path else CRISP_ASR_BIN
 
         self.language = language
         self.use_gpu = use_gpu
         self.use_vad = use_vad
         self.need_word_time_stamp = need_word_time_stamp
         self.process = None
+
+    def _ensure_engine(self, callback) -> None:
+        """确保 crispasr 引擎二进制存在；缺失则从 GitHub Releases 自动下载。
+
+        在转录线程内同步执行，进度通过 callback 反馈，不阻塞 UI 线程。
+        """
+        if self.crisp_asr_path.exists():
+            return
+
+        logger.info("未检测到 CrispASR 引擎，开始自动下载…")
+        callback(0, "正在下载 CrispASR 引擎…")
+
+        try:
+            from app.thread.crisp_asr_download_thread import (
+                download_crisp_asr_engine_sync,
+            )
+        except Exception as e:  # pragma: no cover
+            raise FileNotFoundError(
+                f"未找到 CrispASR 引擎，且无法加载下载模块: {e}"
+            )
+
+        target_dir = self.crisp_asr_path.parent
+
+        def _dl_progress(pct: int, msg: str):
+            # 引擎下载占进度前 30%，避免与转录进度冲突
+            callback(min(int(pct * 0.3), 30), msg)
+
+        exe = download_crisp_asr_engine_sync(
+            target_dir, prefer_gpu=self.use_gpu, progress=_dl_progress
+        )
+        self.crisp_asr_path = Path(exe)
+        logger.info("CrispASR 引擎已就绪: %s", self.crisp_asr_path)
+        callback(30, "引擎就绪，开始转录…")
 
     def _make_segments(self, resp_data: str) -> list[ASRDataSeg]:
         asr_data = ASRData.from_srt(resp_data)
@@ -147,6 +180,9 @@ class CrispASR(BaseASR):
     def _run(self, callback=None) -> str:
         if callback is None:
             callback = lambda x, y: None
+
+        # 确保引擎可用：缺失则自动下载（模型则由 CrispASR 自身按需自动下载）
+        self._ensure_engine(callback)
 
         temp_root = Path(tempfile.gettempdir()) / "bk_asr"
         temp_root.mkdir(parents=True, exist_ok=True)
