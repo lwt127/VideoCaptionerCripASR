@@ -1,6 +1,7 @@
 from typing import Optional
 
 from app.core.bk_asr.bcut import BcutASR
+from app.core.bk_asr.crisp_asr import CrispASR
 from app.core.bk_asr.faster_whisper import FasterWhisperASR
 from app.core.bk_asr.jianying import JianYingASR
 from app.core.bk_asr.kuaishou import KuaiShouASR
@@ -31,6 +32,7 @@ def transcribe(audio_path: str, config: TranscribeConfig, callback=None) -> ASRD
         # TranscribeModelEnum.KUAISHOU: KuaiShouASR,
         TranscribeModelEnum.BIJIAN: BcutASR,
         TranscribeModelEnum.WHISPER_CPP: WhisperCppASR,
+        TranscribeModelEnum.CRISP_ASR: CrispASR,
         TranscribeModelEnum.WHISPER_API: WhisperAPI,
         TranscribeModelEnum.FASTER_WHISPER: FasterWhisperASR,
     }
@@ -51,6 +53,15 @@ def transcribe(audio_path: str, config: TranscribeConfig, callback=None) -> ASRD
             {
                 "language": config.transcribe_language,
                 "whisper_model": config.whisper_model,
+            }
+        )
+    elif config.transcribe_model == TranscribeModelEnum.CRISP_ASR:
+        asr_args.update(
+            {
+                "language": config.transcribe_language,
+                "whisper_model": config.crisp_asr_model,
+                "use_gpu": config.crisp_asr_use_gpu,
+                "use_vad": config.crisp_asr_use_vad,
             }
         )
     elif config.transcribe_model == TranscribeModelEnum.WHISPER_API:

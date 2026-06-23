@@ -185,6 +185,7 @@ class VideoInfoCard(CardWidget):
         if self.task and not self.task.need_next_task:
             need_language_settings = cfg.transcribe_model.value in [
                 TranscribeModelEnum.WHISPER_CPP,
+                TranscribeModelEnum.CRISP_ASR,
                 TranscribeModelEnum.WHISPER_API,
                 TranscribeModelEnum.FASTER_WHISPER,
             ]

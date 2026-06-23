@@ -93,6 +93,7 @@ class TranscribeModelEnum(Enum):
     JIANYING = "J 接口"
     FASTER_WHISPER = "FasterWhisper ✨"
     WHISPER_CPP = "WhisperCpp"
+    CRISP_ASR = "CrispASR ✨"
     WHISPER_API = "Whisper [API]"
 
 
@@ -508,6 +509,10 @@ class TranscribeConfig:
     need_word_time_stamp: bool = True
     # Whisper Cpp 配置
     whisper_model: Optional[WhisperModelEnum] = None
+    # CrispASR 配置 (whisper.cpp 兼容, 复用 ggml 模型)
+    crisp_asr_model: Optional[WhisperModelEnum] = None
+    crisp_asr_use_gpu: bool = False
+    crisp_asr_use_vad: bool = True
     # Whisper API 配置
     whisper_api_key: Optional[str] = None
     whisper_api_base: Optional[str] = None

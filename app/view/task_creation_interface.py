@@ -365,6 +365,7 @@ class TaskCreationInterface(QWidget):
         # 检查是否需要显示语言设置对话框
         need_language_settings = cfg.transcribe_model.value in [
             TranscribeModelEnum.WHISPER_CPP,
+            TranscribeModelEnum.CRISP_ASR,
             TranscribeModelEnum.WHISPER_API,
             TranscribeModelEnum.FASTER_WHISPER,
         ]

@@ -26,6 +26,7 @@ from ..core.entities import (
     VadMethodEnum,
     WhisperModelEnum,
 )
+from .CrispASRSettingWidget import CrispASRSettingWidget
 from .EditComboBoxSettingCard import EditComboBoxSettingCard
 from .FasterWhisperSettingWidget import FasterWhisperSettingWidget
 from .LineEditSettingCard import LineEditSettingCard
@@ -48,11 +49,13 @@ class TranscriptionSettingCard(QWidget):
         # 添加各个设置界面
         self.empty_widget = QWidget(self)  # 添加空白页面作为默认显示
         self.whisper_cpp_widget = WhisperCppSettingWidget(self)
+        self.crisp_asr_widget = CrispASRSettingWidget(self)
         self.whisper_api_widget = WhisperAPISettingWidget(self)
         self.faster_whisper_widget = FasterWhisperSettingWidget(self)
 
         self.stacked_widget.addWidget(self.empty_widget)  # 添加空白页面
         self.stacked_widget.addWidget(self.whisper_cpp_widget)
+        self.stacked_widget.addWidget(self.crisp_asr_widget)
         self.stacked_widget.addWidget(self.whisper_api_widget)
         self.stacked_widget.addWidget(self.faster_whisper_widget)
 
@@ -62,6 +65,8 @@ class TranscriptionSettingCard(QWidget):
         # 切换对应的设置界面
         if value == TranscribeModelEnum.WHISPER_CPP.value:
             self.stacked_widget.setCurrentWidget(self.whisper_cpp_widget)
+        elif value == TranscribeModelEnum.CRISP_ASR.value:
+            self.stacked_widget.setCurrentWidget(self.crisp_asr_widget)
         elif value == TranscribeModelEnum.WHISPER_API.value:
             self.stacked_widget.setCurrentWidget(self.whisper_api_widget)
         elif value == TranscribeModelEnum.FASTER_WHISPER.value:
