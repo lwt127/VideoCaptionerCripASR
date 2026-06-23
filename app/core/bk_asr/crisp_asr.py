@@ -286,6 +286,11 @@ class CrispASR(BaseASR):
 
                     full_output.append(line)
 
+                    # 实时输出 CrispASR 日志（去掉行尾换行）
+                    stripped = line.rstrip("\r\n")
+                    if stripped:
+                        logger.info("[CrispASR] %s", stripped)
+
                     # 解析进度（whisper.cpp 兼容输出: [HH:MM:SS.mmm --> ...]）
                     if " --> " in line and "[" in line:
                         try:
@@ -302,10 +307,6 @@ class CrispASR(BaseASR):
                             continue
 
                 self.process.wait()
-
-                # 完整输出写入日志，便于诊断崩溃
-                full_text = "".join(full_output)
-                logger.info("CrispASR 输出:\n%s", full_text[-4000:])
 
                 if self.process.returncode != 0:
                     code = self.process.returncode
