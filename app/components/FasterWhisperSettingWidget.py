@@ -277,70 +277,129 @@ class HuggingFaceDownloadThread(QThread):
         try:
             os.makedirs(self.save_dir, exist_ok=True)
 
+            aria2c = _find_aria2c()
+
             for i, filename in enumerate(self.files):
                 file_url = f"{self.repo_url}/resolve/main/{filename}"
                 save_path = os.path.join(self.save_dir, filename)
 
                 self.progress.emit(
                     int(i / len(self.files) * 100),
-                    f"正在下载 {filename}..."
+                    f"正在下载 {filename}...",
                 )
 
-                cmd = [
-                    "aria2c",
-                    "--show-console-readout=false",
-                    "--summary-interval=1",
-                    "-x4",
-                    "-s4",
-                    "--connect-timeout=10",
-                    "--timeout=30",
-                    "--max-tries=3",
-                    "--retry-wait=2",
-                    "--continue=true",
-                    "--auto-file-renaming=false",
-                    "--allow-overwrite=true",
-                    "--check-certificate=false",
-                    f"--dir={self.save_dir}",
-                    f"--out={filename}",
-                    file_url,
-                ]
-
-                subprocess_args = {
-                    "stdout": subprocess.PIPE,
-                    "stderr": subprocess.PIPE,
-                    "universal_newlines": True,
-                    "encoding": "utf-8",
-                }
-                if sys.platform == "win32":
-                    subprocess_args["creationflags"] = subprocess.CREATE_NO_WINDOW
-
-                self.process = subprocess.Popen(cmd, **subprocess_args)
-
-                while True:
-                    if self.process.poll() is not None:
-                        break
-                    line = self.process.stdout.readline()
-                    if "[#" in line and "]" in line:
-                        try:
-                            import re
-                            pct_match = re.search(r"\((\d+)%\)", line)
-                            if pct_match:
-                                file_pct = int(pct_match.group(1))
-                                overall = int((i / len(self.files) + file_pct / 100 / len(self.files)) * 100)
-                                self.progress.emit(overall, f"正在下载 {filename}: {file_pct}%")
-                        except Exception:
-                            pass
-
-                if self.process.returncode != 0:
-                    stderr = self.process.stderr.read()
-                    raise RuntimeError(f"下载 {filename} 失败: {stderr}")
+                if aria2c:
+                    self._download_with_aria2c(aria2c, file_url, filename, i)
+                else:
+                    self._download_file_urllib(file_url, save_path, filename, i)
 
             self.progress.emit(100, "下载完成")
             self.finished.emit()
         except Exception as e:
             self.error.emit(str(e))
 
+    def _download_with_aria2c(self, aria2c, file_url, filename, i):
+        cmd = [
+            aria2c,
+            "--show-console-readout=false",
+            "--summary-interval=1",
+            "-x4",
+            "-s4",
+            "--connect-timeout=10",
+            "--timeout=30",
+            "--max-tries=3",
+            "--retry-wait=2",
+            "--continue=true",
+            "--auto-file-renaming=false",
+            "--allow-overwrite=true",
+            "--check-certificate=false",
+            f"--dir={self.save_dir}",
+            f"--out={filename}",
+            file_url,
+        ]
+
+        subprocess_args = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "universal_newlines": True,
+            "encoding": "utf-8",
+        }
+        if sys.platform == "win32":
+            subprocess_args["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+        self.process = subprocess.Popen(cmd, **subprocess_args)
+
+        while True:
+            if self.process.poll() is not None:
+                break
+            line = self.process.stdout.readline()
+            if "[#" in line and "]" in line:
+                try:
+                    import re
+
+                    pct_match = re.search(r"\((\d+)%\)", line)
+                    if pct_match:
+                        file_pct = int(pct_match.group(1))
+                        overall = int(
+                            (i / len(self.files) + file_pct / 100 / len(self.files))
+                            * 100
+                        )
+                        self.progress.emit(
+                            overall, f"正在下载 {filename}: {file_pct}%"
+                        )
+                except Exception:
+                    pass
+
+        if self.process.returncode != 0:
+            stderr = self.process.stderr.read()
+            raise RuntimeError(f"下载 {filename} 失败: {stderr}")
+
+    def _download_file_urllib(self, file_url, save_path, filename, i):
+        """无 aria2c 时的纯 Python 下载（支持断点续传）。"""
+        import ssl
+        import urllib.request
+
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        resume_from = os.path.getsize(save_path) if os.path.exists(save_path) else 0
+        headers = {"User-Agent": "Mozilla/5.0 (VideoCaptioner)"}
+        if resume_from > 0:
+            headers["Range"] = f"bytes={resume_from}-"
+
+        req = urllib.request.Request(file_url, headers=headers)
+        resp = urllib.request.urlopen(req, timeout=30, context=ctx)
+
+        if resume_from > 0 and resp.status != 206:
+            resume_from = 0  # 服务器不支持续传，重新下载
+
+        content_len = int(resp.headers.get("Content-Length", 0))
+        total = content_len + resume_from if content_len else 0
+        mode = "ab" if resume_from > 0 else "wb"
+        downloaded = resume_from
+        n = len(self.files)
+
+        with resp, open(save_path, mode) as f:
+            while True:
+                if getattr(self, "_stop", False):
+                    return
+                chunk = resp.read(1024 * 512)
+                if not chunk:
+                    break
+                f.write(chunk)
+                downloaded += len(chunk)
+                if total > 0:
+                    file_pct = downloaded / total
+                    overall = int((i / n + file_pct / n) * 100)
+                    self.progress.emit(
+                        overall,
+                        f"正在下载 {filename}: {downloaded/1024/1024:.1f}/"
+                        f"{total/1024/1024:.1f} MB",
+                    )
+
     def terminate(self):
+        self._stop = True
         if self.process and self.process.poll() is None:
             self.process.kill()
         super().terminate()
