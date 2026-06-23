@@ -91,11 +91,14 @@ the task. On first use:
 - If the **CrispASR engine** binary is missing, it is **automatically downloaded**
   from the official GitHub Releases (`CrispStrobe/CrispASR`) into
   `resource/bin/CrispASR/`.
+- **GPU acceleration:** if an NVIDIA GPU (CUDA) is detected, the app automatically
+  downloads/uses the **CUDA build** of the engine for much faster transcription;
+  otherwise it uses the CPU build.
 - The selected **model** is **automatically downloaded** by CrispASR on first run
   (cached under `~/.cache/crispasr/`).
 
-So users only need to *select* a backend/model and press start — everything else is
-fetched automatically.
+So users only need to *select* a backend/model and press start — everything else
+(engine, GPU build, model) is fetched automatically.
 
 > Windows ships a self-contained prebuilt `crispasr.exe` (auto-downloaded if absent).
 > To build manually for other platforms, see `_build/CrispASR/` (`build-windows.bat`,

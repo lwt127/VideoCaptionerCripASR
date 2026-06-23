@@ -34,6 +34,31 @@ def _auto(label: str, backend: str, value: str = "auto") -> dict:
 # 其余每个后端单独成项，模型项默认“自动下载”。
 CRISP_ASR_BACKENDS = [
     {
+        # 推荐：非自回归, 快且稳定, 适合长音频 (CPU 也流畅), 50+ 语言含日语
+        "label": "SenseVoice (✨推荐✨, 50+ 语言, 快, 稳定)",
+        "backend": "sensevoice",
+        "models": [
+            _auto("SenseVoice Small (自动下载)", "sensevoice"),
+            {
+                "label": "SenseVoice Small Q8",
+                "value": "sensevoice-small-q8_0.gguf",
+                "backend": "sensevoice",
+            },
+        ],
+    },
+    {
+        "label": "Paraformer-zh (中英, 非自回归, 稳定)",
+        "backend": "paraformer",
+        "models": [
+            _auto("Paraformer-zh (自动下载)", "paraformer"),
+            {
+                "label": "Paraformer-zh Q8",
+                "value": "paraformer-zh-q8_0.gguf",
+                "backend": "paraformer",
+            },
+        ],
+    },
+    {
         "label": "Whisper (通用, 99 语言, ggml)",
         "backend": "whisper",
         "models": [
@@ -113,30 +138,6 @@ CRISP_ASR_BACKENDS = [
         "models": [
             _auto("Fun-ASR Nano (自动下载)", "funasr"),
             _auto("Fun-ASR MLT Nano (31 语言)", "fun-asr-mlt-nano"),
-        ],
-    },
-    {
-        "label": "SenseVoice (50+ 语言, 含情感)",
-        "backend": "sensevoice",
-        "models": [
-            _auto("SenseVoice Small (自动下载)", "sensevoice"),
-            {
-                "label": "SenseVoice Small Q8",
-                "value": "sensevoice-small-q8_0.gguf",
-                "backend": "sensevoice",
-            },
-        ],
-    },
-    {
-        "label": "Paraformer-zh (中英, 非自回归)",
-        "backend": "paraformer",
-        "models": [
-            _auto("Paraformer-zh (自动下载)", "paraformer"),
-            {
-                "label": "Paraformer-zh Q8",
-                "value": "paraformer-zh-q8_0.gguf",
-                "backend": "paraformer",
-            },
         ],
     },
     {

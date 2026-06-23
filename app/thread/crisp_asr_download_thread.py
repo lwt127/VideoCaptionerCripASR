@@ -53,14 +53,36 @@ def get_release_asset_url(prefer_gpu: bool = False) -> str:
         data = json.loads(resp.read().decode("utf-8"))
 
     assets = data.get("assets", [])
-    # 优先精确匹配，否则回退到任意 windows 的 cpu 包
-    for a in assets:
-        if a.get("name") == asset_name:
-            return a["browser_download_url"]
-    for a in assets:
-        name = a.get("name", "")
-        if "windows" in name and "cpu" in name and name.endswith(".zip"):
-            return a["browser_download_url"]
+
+    def _find(pred):
+        for a in assets:
+            name = a.get("name", "")
+            if name.startswith("crispasr-") and name.endswith(".zip") and pred(name):
+                return a["browser_download_url"]
+        return None
+
+    # 1) 精确匹配
+    url = _find(lambda n: n == asset_name)
+    if url:
+        return url
+
+    # 2) GPU 优先：cuda → vulkan；否则 cpu
+    if prefer_gpu:
+        url = _find(lambda n: "windows" in n and "cuda" in n)
+        if url:
+            return url
+        url = _find(lambda n: "windows" in n and "vulkan" in n)
+        if url:
+            return url
+
+    # 3) 回退到 windows cpu（非 legacy 优先）
+    url = _find(lambda n: "windows" in n and "cpu" in n and "legacy" not in n)
+    if url:
+        return url
+    url = _find(lambda n: "windows" in n and "cpu" in n)
+    if url:
+        return url
+
     raise RuntimeError(
         f"在最新 Release 中未找到 Windows 资产（期望: {asset_name}）"
     )
@@ -148,13 +170,16 @@ def _find_exe(root: Path):
     return None
 
 
-def download_crisp_asr_engine_sync(target_bin_dir, prefer_gpu: bool = False, progress=None):
+def download_crisp_asr_engine_sync(
+    target_bin_dir, prefer_gpu: bool = False, progress=None, force: bool = False
+):
     """同步下载并解压 CrispASR 引擎（供转录线程内调用，不创建 QThread）。
 
     Args:
         target_bin_dir: 解压目标目录（resource/bin/CrispASR）
         prefer_gpu: 是否优先下载 GPU(CUDA) 版本
         progress: 可选回调 progress(pct:int, msg:str)
+        force: 为 True 时即使已存在也重新下载（用于 CPU→CUDA 升级）
 
     Returns:
         str: crispasr 可执行文件路径
@@ -165,10 +190,11 @@ def download_crisp_asr_engine_sync(target_bin_dir, prefer_gpu: bool = False, pro
     target_bin_dir = Path(target_bin_dir)
     target_bin_dir.mkdir(parents=True, exist_ok=True)
 
-    # 已存在则直接返回
-    existing = _find_exe(target_bin_dir)
-    if existing:
-        return str(existing)
+    # 已存在且非强制时直接返回
+    if not force:
+        existing = _find_exe(target_bin_dir)
+        if existing:
+            return str(existing)
 
     progress(0, "正在查询 CrispASR 最新版本…")
     url = get_release_asset_url(prefer_gpu)

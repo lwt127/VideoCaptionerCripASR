@@ -16,6 +16,46 @@ logger = setup_logger("crisp_asr")
 CRISP_ASR_BIN = Path(BIN_PATH) / "CrispASR" / "crispasr.exe"
 
 
+def cuda_available() -> bool:
+    """检测系统是否有可用的 NVIDIA GPU（通过 nvidia-smi）。"""
+    if shutil.which("nvidia-smi") is None:
+        return False
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        return r.returncode == 0 and bool(r.stdout.strip())
+    except Exception:
+        return False
+
+
+def engine_supports_cuda(exe_path) -> bool:
+    """运行 crispasr --version，判断该二进制的 ggml 后端是否包含 cuda/vulkan(GPU)。"""
+    try:
+        r = subprocess.run(
+            [str(exe_path), "--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        out = (r.stdout or "") + (r.stderr or "")
+        # 形如 "ggml backends : cpu" 或 "... cuda ..."
+        for line in out.splitlines():
+            if "backends" in line.lower():
+                low = line.lower()
+                return "cuda" in low or "vulkan" in low
+        return False
+    except Exception:
+        return False
+
+
 class CrispASR(BaseASR):
     """CrispASR 本地转录后端（多后端 ASR 引擎）。
 
@@ -93,13 +133,29 @@ class CrispASR(BaseASR):
         """确保 crispasr 引擎二进制存在；缺失则从 GitHub Releases 自动下载。
 
         在转录线程内同步执行，进度通过 callback 反馈，不阻塞 UI 线程。
+
+        若开启 GPU 且检测到 NVIDIA 显卡，但当前引擎为 CPU-only 构建，
+        则自动下载 CUDA 构建以启用 GPU 加速。
         """
+        want_cuda = self.use_gpu and cuda_available()
+
+        # 已存在引擎时：若需要 CUDA 但当前为 CPU-only，则升级为 CUDA 构建
         if self.crisp_asr_path.exists():
+            if want_cuda and not engine_supports_cuda(self.crisp_asr_path):
+                logger.info("检测到 NVIDIA GPU，但当前 CrispASR 为 CPU 构建，升级为 CUDA 构建…")
+                callback(0, "检测到显卡，正在下载 CUDA 版 CrispASR 引擎…")
+                self._download_engine(callback, prefer_gpu=True)
+            else:
+                if want_cuda:
+                    logger.info("CrispASR 引擎已支持 CUDA，使用 GPU 加速")
             return
 
         logger.info("未检测到 CrispASR 引擎，开始自动下载…")
         callback(0, "正在下载 CrispASR 引擎…")
+        self._download_engine(callback, prefer_gpu=want_cuda)
 
+    def _download_engine(self, callback, prefer_gpu: bool):
+        """下载并安装 CrispASR 引擎（CPU 或 CUDA 构建）。"""
         try:
             from app.thread.crisp_asr_download_thread import (
                 download_crisp_asr_engine_sync,
@@ -109,17 +165,20 @@ class CrispASR(BaseASR):
                 f"未找到 CrispASR 引擎，且无法加载下载模块: {e}"
             )
 
-        target_dir = self.crisp_asr_path.parent
+        target_dir = Path(CRISP_ASR_BIN).parent
 
         def _dl_progress(pct: int, msg: str):
             # 引擎下载占进度前 30%，避免与转录进度冲突
             callback(min(int(pct * 0.3), 30), msg)
 
         exe = download_crisp_asr_engine_sync(
-            target_dir, prefer_gpu=self.use_gpu, progress=_dl_progress
+            target_dir,
+            prefer_gpu=prefer_gpu,
+            progress=_dl_progress,
+            force=True,  # 允许覆盖已有（CPU→CUDA 升级）
         )
         self.crisp_asr_path = Path(exe)
-        logger.info("CrispASR 引擎已就绪: %s", self.crisp_asr_path)
+        logger.info("CrispASR 引擎已就绪: %s (GPU=%s)", self.crisp_asr_path, prefer_gpu)
         callback(30, "引擎就绪，开始转录…")
 
     def _make_segments(self, resp_data: str) -> list[ASRDataSeg]:
@@ -243,9 +302,23 @@ class CrispASR(BaseASR):
                             continue
 
                 self.process.wait()
+
+                # 完整输出写入日志，便于诊断崩溃
+                full_text = "".join(full_output)
+                logger.info("CrispASR 输出:\n%s", full_text[-4000:])
+
                 if self.process.returncode != 0:
+                    code = self.process.returncode
+                    # 0xFFFFFFFF / -1 等通常为后端崩溃（如长音频 + 实验性后端不稳定）
+                    hint = ""
+                    if code in (4294967295, -1, 3221225477, -1073741819):
+                        hint = (
+                            "（该后端在当前音频上崩溃，建议改用更稳定的后端"
+                            "如 SenseVoice / Paraformer-zh / Whisper，"
+                            "或将 VAD 方法改为 Silero）"
+                        )
                     raise RuntimeError(
-                        f"CrispASR 执行失败 (code {self.process.returncode}): "
+                        f"CrispASR 执行失败 (code {code}){hint}: "
                         + "".join(full_output[-20:])
                     )
 
