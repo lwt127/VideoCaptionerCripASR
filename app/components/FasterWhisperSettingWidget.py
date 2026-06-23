@@ -45,7 +45,7 @@ from app.core.entities import (
     VadMethodEnum,
     WhisperModelEnum,
 )
-from app.thread.file_download_thread import FileDownloadThread
+from app.thread.file_download_thread import FileDownloadThread, _find_aria2c
 from app.thread.modelscope_download_thread import ModelscopeDownloadThread
 
 from ..common.config import cfg
