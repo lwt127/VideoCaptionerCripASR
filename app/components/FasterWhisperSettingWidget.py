@@ -59,6 +59,10 @@ from ..core.entities import (
 from .EditComboBoxSettingCard import EditComboBoxSettingCard
 from .LineEditSettingCard import LineEditSettingCard
 
+from app.core.utils.logger import setup_logger
+
+logger = setup_logger("faster_whisper_setting")
+
 # 在文件开头添加常量定义
 FASTER_WHISPER_PROGRAMS = [
     {
@@ -178,7 +182,10 @@ def check_faster_whisper_exists() -> tuple[bool, list[str]]:
     return bool(installed_versions), installed_versions
 
 
-# 添加新的解压线程类
+# 官方 7-Zip 独立精简版（支持全部 7z 过滤器，含 BCJ2；py7zr 不支持 BCJ2）
+SEVEN_ZR_URL = "https://www.7-zip.org/a/7zr.exe"
+
+
 def _find_7z():
     """查找 7z 可执行文件（PATH 或随应用打包的 resource/bin）。未找到返回 None。"""
     import shutil
@@ -190,17 +197,61 @@ def _find_7z():
     try:
         from app.config import BIN_PATH
 
-        for name in ("7z.exe", "7za.exe") if os.name == "nt" else ("7z", "7za"):
+        names = ("7z.exe", "7za.exe", "7zr.exe") if os.name == "nt" else ("7z", "7za", "7zr")
+        for name in names:
             candidate = os.path.join(str(BIN_PATH), name)
-            if os.path.exists(candidate):
+            if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
                 return candidate
     except Exception:
         pass
     return None
 
 
+def _ensure_7z(progress=None):
+    """确保有可用的 7z 可执行文件；Windows 下缺失时自动下载官方 7zr.exe。
+
+    py7zr 无法解压使用 BCJ2 过滤器的 7z（如 Faster-Whisper-XXL 包），
+    因此优先保证有真正的 7z 二进制。
+
+    Returns:
+        str | None: 7z 可执行文件路径；非 Windows 且未找到时返回 None。
+    """
+    existing = _find_7z()
+    if existing:
+        return existing
+
+    if os.name != "nt":
+        return None  # 非 Windows 交由 py7zr/zipfile 回退
+
+    import ssl
+    import urllib.request
+
+    from app.config import BIN_PATH
+
+    os.makedirs(str(BIN_PATH), exist_ok=True)
+    target = os.path.join(str(BIN_PATH), "7zr.exe")
+
+    if progress:
+        progress("正在下载解压工具 7zr.exe…")
+    logger.info("未找到 7z，正在下载官方 7zr.exe…")
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    req = urllib.request.Request(SEVEN_ZR_URL, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=30, context=ctx) as resp, open(
+        target, "wb"
+    ) as f:
+        f.write(resp.read())
+
+    if os.path.getsize(target) <= 0:
+        raise RuntimeError("下载 7zr.exe 失败（文件为空）")
+    logger.info("7zr.exe 就绪: %s", target)
+    return target
+
+
 class UnzipThread(QThread):
-    """解压线程：优先用 7z 命令，缺失时回退到纯 Python（py7zr / zipfile）。"""
+    """解压线程：使用真正的 7z 二进制（缺失则自动下载 7zr.exe）；zip 回退到 zipfile。"""
 
     finished = pyqtSignal()  # 解压完成信号
     error = pyqtSignal(str)  # 解压错误信号
@@ -213,19 +264,36 @@ class UnzipThread(QThread):
     def run(self):
         try:
             os.makedirs(self.extract_path, exist_ok=True)
+            lower = str(self.zip_file).lower()
 
-            seven_zip = _find_7z()
-            if seven_zip:
-                subprocess.run(
-                    [seven_zip, "x", self.zip_file, f"-o{self.extract_path}", "-y"],
-                    check=True,
-                    creationflags=(
-                        subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-                    ),
-                )
+            # 纯 zip 可直接用标准库
+            if lower.endswith(".zip") and not _find_7z():
+                import zipfile
+
+                with zipfile.ZipFile(self.zip_file, "r") as zf:
+                    zf.extractall(self.extract_path)
             else:
-                # 回退：纯 Python 解压
-                self._extract_python()
+                # .7z（或已有 7z 的 zip）：使用真正的 7z 二进制（必要时自动下载 7zr.exe）
+                seven_zip = _ensure_7z()
+                if not seven_zip:
+                    # 非 Windows 无 7z：尝试 py7zr（注意 BCJ2 不受支持）
+                    self._extract_python()
+                else:
+                    result = subprocess.run(
+                        [seven_zip, "x", self.zip_file, f"-o{self.extract_path}", "-y"],
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        creationflags=(
+                            subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                        ),
+                    )
+                    if result.returncode != 0:
+                        raise RuntimeError(
+                            f"7z 解压失败 (code {result.returncode}): "
+                            f"{result.stderr or result.stdout}"
+                        )
 
             # 删除压缩包
             try:
@@ -239,7 +307,7 @@ class UnzipThread(QThread):
             self.error.emit(str(e))
 
     def _extract_python(self):
-        """无 7z 命令时的纯 Python 解压（支持 .7z 与 .zip）。"""
+        """纯 Python 解压回退（.zip 用 zipfile；.7z 用 py7zr, 不支持 BCJ2）。"""
         lower = str(self.zip_file).lower()
         if lower.endswith(".7z"):
             try:
