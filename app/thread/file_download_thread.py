@@ -1,7 +1,9 @@
 import os
 import platform
 import shutil
+import ssl
 import subprocess
+import urllib.request
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
@@ -9,6 +11,24 @@ from app.config import CACHE_PATH
 from app.core.utils.logger import setup_logger
 
 logger = setup_logger("download_thread")
+
+
+def _find_aria2c():
+    """查找 aria2c 可执行文件（PATH 或随应用打包的 resource/bin）。未找到返回 None。"""
+    found = shutil.which("aria2c")
+    if found:
+        return found
+    try:
+        from app.config import BIN_PATH
+
+        name = "aria2c.exe" if os.name == "nt" else "aria2c"
+        candidate = os.path.join(str(BIN_PATH), name)
+        if os.path.exists(candidate):
+            return candidate
+    except Exception:
+        pass
+    return None
+
 
 class FileDownloadThread(QThread):
     progress = pyqtSignal(float, str)
@@ -20,6 +40,7 @@ class FileDownloadThread(QThread):
         self.url = url
         self.save_path = save_path
         self.process = None
+        self._stop_requested = False
 
     def run(self):
         try:
@@ -27,13 +48,21 @@ class FileDownloadThread(QThread):
             temp_dir = CACHE_PATH / "aria2c_download_cache"
             temp_dir.mkdir(parents=True, exist_ok=True)
             temp_file = temp_dir / os.path.basename(self.save_path)
-            
+
             # 检查是否存在未完成的下载文件
             if temp_file.exists():
                 logger.info(f"发现未完成的下载文件: {temp_file}")
             self.progress.emit(0, self.tr("正在连接..."))
+
+            # 优先使用 aria2c（多线程, 断点续传）；若不可用则回退到纯 Python 下载
+            aria2c = _find_aria2c()
+            if not aria2c:
+                logger.info("未找到 aria2c，使用内置下载器")
+                self._download_with_urllib(temp_file)
+                return
+
             cmd = [
-                'aria2c',
+                aria2c,
                 '--show-console-readout=false',
                 '--summary-interval=1',
                 '-x2',
@@ -106,8 +135,53 @@ class FileDownloadThread(QThread):
         except Exception as e:
             logger.error("下载异常: %s", str(e))
             self.error.emit(str(e))
-            
+
+    def _download_with_urllib(self, temp_file):
+        """纯 Python 下载回退（无需 aria2c），支持进度与中断。"""
+        try:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE  # 与 aria2c 的 --check-certificate=false 一致
+
+            req = urllib.request.Request(
+                self.url, headers={"User-Agent": "VideoCaptioner"}
+            )
+            with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+                total = int(resp.headers.get("Content-Length", 0))
+                downloaded = 0
+                block = 1024 * 256
+                with open(temp_file, "wb") as f:
+                    while True:
+                        if self._stop_requested:
+                            logger.info("下载已被取消")
+                            return
+                        chunk = resp.read(block)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total > 0:
+                            percent = downloaded / total * 100
+                            mb = downloaded / 1024 / 1024
+                            total_mb = total / 1024 / 1024
+                            self.progress.emit(
+                                percent,
+                                f"{mb:.1f}/{total_mb:.1f} MB",
+                            )
+                        else:
+                            self.progress.emit(
+                                0, f"{downloaded / 1024 / 1024:.1f} MB"
+                            )
+
+            os.makedirs(os.path.dirname(self.save_path), exist_ok=True)
+            shutil.move(str(temp_file), self.save_path)
+            self.finished.emit()
+        except Exception as e:
+            logger.error("内置下载器失败: %s", str(e))
+            self.error.emit(f"{self.tr('下载失败')}: {e}")
+
     def stop(self):
+        self._stop_requested = True
         if self.process:
             self.process.terminate()
             self.process.wait()
