@@ -1,0 +1,32 @@
+[package]
+name = "crispasr"
+version = "0.5.6"
+edition = "2021"
+description = "Safe Rust wrapper for CrispASR — lightweight on-device speech recognition (Whisper, Qwen3-ASR, FastConformer, and more)."
+license = "MIT"
+repository = "https://github.com/CrispStrobe/CrispASR"
+homepage = "https://github.com/CrispStrobe/CrispASR"
+documentation = "https://docs.rs/crispasr"
+readme = "README.md"
+keywords = ["asr", "speech-recognition", "whisper", "ggml", "speech-to-text"]
+categories = ["multimedia::audio", "api-bindings"]
+
+# A path dep + a version dep — the path is used during local development;
+# crates.io ignores the path and resolves from the registry, so this works
+# both for cargo workspaces and for downstream consumers.
+[dependencies]
+crispasr-sys = { path = "../crispasr-sys", version = "0.5.6" }
+
+[features]
+default = []
+cuda = ["crispasr-sys/cuda"]
+metal = ["crispasr-sys/metal"]
+vulkan = ["crispasr-sys/vulkan"]
+
+[dev-dependencies]
+hound = "3.5"
+
+[package.metadata.docs.rs]
+# docs.rs has no native libcrispasr installed — disable build.rs link
+# probing by exposing a stub, or document that docs builds need the lib.
+all-features = true

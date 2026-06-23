@@ -1,0 +1,155 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, integrated_cli]
+  pull_request:
+    branches: [main, master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ===========================================================================
+  # Linux x86_64 (CPU)
+  # ===========================================================================
+  linux-x86_64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libopenblas-dev
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_OPENBLAS=ON -DCRISPASR_BUILD_TESTS=OFF -DGGML_NATIVE=OFF
+
+      - name: Build
+        run: cmake --build build --target crispasr-cli crispasr-diff crispasr-quantize -j $(nproc)
+
+      - name: Smoke test - help
+        run: ./build/bin/crispasr --help
+
+      - name: Smoke test - list backends
+        run: ./build/bin/crispasr --list-backends
+
+  # ===========================================================================
+  # Linux x86_64 + Vulkan
+  # ===========================================================================
+  linux-vulkan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install Vulkan SDK + glslc
+        run: |
+          # Install the Vulkan headers/loader + glslc shader compiler.
+          # ubuntu-latest (24.04) ships libvulkan-dev but not glslc;
+          # the glslc binary is in the `glslc` or `shaderc` package
+          # depending on the distro version.
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libvulkan-dev spirv-headers glslc || \
+          sudo apt-get install -y cmake g++ libvulkan-dev spirv-headers glslang-tools || \
+          sudo apt-get install -y cmake g++ libvulkan-dev spirv-headers shaderc
+
+      - name: Configure with Vulkan
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DCRISPASR_BUILD_TESTS=OFF
+
+      - name: Build
+        run: cmake --build build --target crispasr-cli -j $(nproc)
+
+      - name: Smoke test
+        run: ./build/bin/crispasr --list-backends
+
+  # ===========================================================================
+  # macOS (Apple Silicon / x86_64)
+  # ===========================================================================
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Configure with Metal
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON -DCRISPASR_BUILD_TESTS=OFF
+
+      - name: Build
+        run: cmake --build build --target crispasr-cli -j $(sysctl -n hw.logicalcpu)
+
+      - name: Smoke test
+        run: ./build/bin/crispasr --list-backends
+
+  # ===========================================================================
+  # Windows (MSVC)
+  # ===========================================================================
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCRISPASR_BUILD_TESTS=OFF
+
+      - name: Build
+        run: cmake --build build --config Release --target crispasr-cli -j $env:NUMBER_OF_PROCESSORS
+
+      - name: Smoke test
+        run: .\build\bin\Release\crispasr.exe --list-backends
+
+  # ===========================================================================
+  # iOS (cross-compile gate — no runtime test)
+  # ===========================================================================
+  ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Configure for iOS
+        run: |
+          cmake -S . -B build-ios \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DGGML_METAL=OFF \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCRISPASR_BUILD_TESTS=OFF
+
+      - name: Build
+        run: cmake --build build-ios --target crispasr-lib -j $(sysctl -n hw.logicalcpu)
+
+  # ===========================================================================
+  # Android (cross-compile gate — no runtime test)
+  # ===========================================================================
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Set up NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+
+      - name: Configure for Android arm64
+        run: |
+          cmake -S . -B build-android \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-24 \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCRISPASR_BUILD_TESTS=OFF
+
+      - name: Build
+        run: cmake --build build-android --target crispasr-lib -j $(nproc)

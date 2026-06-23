@@ -1,0 +1,480 @@
+#!/usr/bin/env python3
+"""
+CrispASR — unified reference activation dumper.
+
+Loads a HuggingFace ASR model in PyTorch, runs it on an audio file, captures
+intermediate activations at every architectural boundary via forward hooks,
+and writes the collection to a single **GGUF tensor archive**. The C++ diff
+harness (`crispasr-diff`) then loads that GGUF via `core_gguf::load_weights`
+and compares each captured tensor against what the ggml forward pass
+produces — element-wise, with cosine similarity, max-abs diff, and top-1
+argmax match for logits.
+
+Replaces the per-model one-off `models/*-reference-dump.py` scripts by
+providing:
+
+  1. A consistent CLI across all backends:
+     `python tools/dump_reference.py --backend voxtral --model-dir /hf/dir
+        --audio samples/jfk.wav --output /tmp/voxtral-ref.gguf`
+
+  2. A shared WAV loader (16 kHz mono, stdlib only).
+
+  3. A shared GGUF writer that handles the float serialization + tensor
+     metadata (using the `gguf` Python package that ships with llama.cpp).
+
+  4. A plug-in registry so each backend's PyTorch hooks live in its own
+     small module (`tools/reference_backends/<name>.py`), and adding a
+     new backend is a ~60-line file instead of a ~250-line script.
+
+Stages exposed by every backend (adjust per backend as needed):
+
+  raw_audio           (N,)            F32 PCM samples
+  mel_spectrogram     (B, n_mels, T)  F32 log-mel features
+  encoder_output      (B, T_enc, D)   F32 encoder hidden state
+  encoder_layer_K     (B, T_enc, D)   F32 after encoder block K
+  projector_output    (B, N, D_llm)   F32 audio tokens for the LLM
+  llm_block_K         (B, T, D)       F32 after LLM block K
+  llm_logits          (B, T, V)       F32 language-model logits
+  llm_argmax          (B, T)          I32 greedy-decoded token IDs
+  generated_text      (string)        text decoded from argmax
+
+Backends are free to emit additional stage names (see each module's
+`DEFAULT_STAGES`). Unused stages are skipped without erroring.
+
+Usage:
+
+  python tools/dump_reference.py --list-backends
+  python tools/dump_reference.py --backend qwen3   \\
+      --model-dir /hf/qwen3-asr-0.6b               \\
+      --audio samples/jfk.wav                      \\
+      --output /tmp/qwen3-ref.gguf
+  python tools/dump_reference.py --backend voxtral \\
+      --model-dir /hf/voxtral-mini-3b-2507          \\
+      --audio samples/jfk.wav                      \\
+      --stages mel_spectrogram,encoder_output,llm_logits \\
+      --output /tmp/voxtral-ref.gguf
+
+The GGUF archive stores each activation as a named F32 tensor. Load it
+from C++ with `core_gguf::load_weights(path, backend, "ref", wl)` and
+then `wl.tensors["mel_spectrogram"]` etc.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib
+import os
+import sys
+import wave
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Backend registry
+# ---------------------------------------------------------------------------
+
+# Each entry maps a user-facing --backend name to a Python module under
+# tools/reference_backends/ that exposes a dump() function:
+#
+#   def dump(model_dir: Path, audio: np.ndarray, stages: set[str]) -> dict[str, np.ndarray]:
+#       """Run the HF model on `audio`, capture activations for the stages
+#       listed in `stages`, and return {name: ndarray}. Raise KeyError or
+#       NotImplementedError for stages this backend doesn't support."""
+#
+# For per-layer encoder/LLM captures, use `reference_backends/_hooks.py`
+# (capture_modules / drop_hooks / finalize) — it handles forward-hook
+# bookkeeping and normalises (B, T, D) → (T, D) row-major to match
+# crispasr's flat layout. See parakeet.py for a worked example.
+#
+# Adding a new backend is:
+#   1. tools/reference_backends/<name>.py  with dump() + DEFAULT_STAGES
+#   2. one line here.
+REGISTERED_BACKENDS: Dict[str, str] = {
+    "qwen3":      "reference_backends.qwen3",
+    "voxtral":    "reference_backends.voxtral",
+    "voxtral4b":  "reference_backends.voxtral4b",
+    "granite":    "reference_backends.granite",
+    "granite-4.1": "reference_backends.granite",
+    # granite-speech 4.1-2b NAR: non-autoregressive variant. Custom
+    # modeling code in the HF snapshot — needs trust_remote_code=True.
+    "granite-nle": "reference_backends.granite_nle",
+    # Encoder-decoder (NeMo + Cohere) reference backends. These capture
+    # encoder activations via forward hooks and run generate() for a
+    # greedy transcript check — no per-token logits, because the decoder
+    # autoregresses with a KV cache that doesn't have a clean "per-step
+    # logits" entry point the way the speech-LLMs do.
+    "cohere":     "reference_backends.cohere",
+    "parakeet":   "reference_backends.parakeet",
+    # Parakeet-TDT MAES beam decoding. Same model as "parakeet" but captures
+    # transducer component intermediates (prediction net, joint net) plus
+    # full MAES decode output. Config via MAES_BEAM_SIZE / MAES_NUM_STEPS /
+    # MAES_GAMMA / MAES_BETA env vars (defaults: 4 / 2 / 2.3 / 2).
+    "parakeet-maes": "reference_backends.parakeet_maes",
+    # NeMo Canary (FastConformer + Transformer decoder). model_dir may be
+    # the HF id "nvidia/canary-1b-v2" or a local .nemo path. The C++ diff
+    # branch ("canary") compares mel_spectrogram + encoder_output; the
+    # per-layer captures listed in DEFAULT_STAGES are diagnostic-only.
+    "canary":     "reference_backends.canary",
+    "gemma4":     "reference_backends.gemma4",
+    # Qwen3-TTS-12Hz Base. The audio arg is the voice-clone reference WAV
+    # (16 kHz mono); synth text + ref text come from env vars. See
+    # reference_backends/qwen3_tts.py for the full prompt contract.
+    "qwen3-tts":  "reference_backends.qwen3_tts",
+    # Qwen3-TTS-Tokenizer-12Hz codec decoder only (codes → PCM).
+    # model_dir = the Tokenizer-12Hz HF snapshot; audio arg is unused.
+    "qwen3-tts-codec": "reference_backends.qwen3_tts_codec",
+    # Qwen3-TTS ECAPA speaker encoder only.
+    # model_dir = the talker HF snapshot (contains speaker_encoder.*).
+    "qwen3-tts-spk":   "reference_backends.qwen3_tts_spk",
+    # Qwen3-TTS-Tokenizer-12Hz codec ENCODER (audio → codes).
+    # model_dir = the Tokenizer-12Hz HF snapshot. audio is unused.
+    "qwen3-tts-cenc":  "reference_backends.qwen3_tts_cenc",
+    # VibeVoice-ASR 7B: two σ-VAE encoders + connectors + Qwen2 decoder.
+    # NOTE: audio must be 16 kHz on entry (shared loader); the backend
+    # resamples to 24 kHz internally.
+    "vibevoice":  "reference_backends.vibevoice",
+    # KugelAudio-0-Open TTS (Qwen2.5-7B + diffusion + acoustic VAE).
+    # model_dir = kugelaudio/kugelaudio-0-open (HF id) or local snapshot.
+    # audio arg is unused (TTS). Text from KUGELAUDIO_TEXT env.
+    "kugelaudio": "reference_backends.kugelaudio",
+    # MiMo-Audio-Tokenizer encoder (PCM → 8-channel RVQ codes).
+    # model_dir = the MiMo-Audio-Tokenizer HF snapshot. 16 kHz mono PCM is
+    # resampled to 24 kHz internally.
+    "mimo-tokenizer": "reference_backends.mimo_tokenizer",
+    # MiMo-V2.5-ASR LM-half: input_local_transformer + 36L Qwen2 LLM.
+    # model_dir = the MiMo-V2.5-ASR HF snapshot. The audio-tokenizer path
+    # is read from MIMO_TOKENIZER_DIR (or auto-derived from a sibling dir).
+    "mimo-asr":   "reference_backends.mimo_asr",
+    # Kokoro / StyleTTS2 (iSTFTNet). Text-driven; the audio arg is a
+    # placeholder. Phonemes + voice come from KOKORO_PHONEMES / KOKORO_VOICE
+    # env vars (see reference_backends/kokoro.py for the full list).
+    "kokoro":     "reference_backends.kokoro",
+    # Orpheus-3B SNAC 24 kHz codec decoder only (codes → PCM).
+    # model_dir = hubertsiuzdak/snac_24khz HF snapshot; audio arg is unused.
+    # Driven by ORPHEUS_SNAC_T_SUPER (default 4) + ORPHEUS_SNAC_CODE
+    # (default 0); see reference_backends/orpheus_snac.py.
+    "orpheus":    "reference_backends.orpheus_snac",
+    # Chatterbox TTS: T3 (Llama AR) → S3Gen (CFM) → HiFTGenerator.
+    # model_dir = ResembleAI/chatterbox snapshot (or local with
+    # t3_cfg.safetensors + s3gen.safetensors + ve.safetensors + conds.pt).
+    # audio arg is a reference voice WAV for cloning (16 kHz); when conds.pt
+    # exists the built-in voice is used and audio is ignored.
+    "chatterbox": "reference_backends.chatterbox",
+    # IndexTTS-1.5: GPT-2 AR → BigVGAN vocoder. Text from INDEXTTS_TEXT env.
+    "indextts":   "reference_backends.indextts",
+    # Chatterbox Turbo (GPT-2 T3 + meanflow S3Gen). Per-layer encoder
+    # dumps for element-wise conformer attention validation.
+    "chatterbox_turbo": "reference_backends.chatterbox_turbo",
+    # CLD3 text-LID. Text input rides in LID_TEXT (or CLD3_TEXT) env;
+    # audio arg unused. model_dir = the cld3-f32.gguf the converter
+    # writes (or a directory containing it). Cross-checks against the
+    # pycld3 oracle and refuses to dump on argmax mismatch.
+    "lid-cld3":   "reference_backends.lid_cld3",
+    # GlotLID V3 (cis-lmu/glotlid, Apache-2.0): fastText supervised LID
+    # over 2102 ISO 639-3 + script labels. Text-only; audio arg ignored.
+    # Input text comes from GLOTLID_TEXT env var. Same backend module
+    # serves Facebook LID-176 via --backend lid-fasttext176 (model_dir
+    # points at the lid.176.bin directory).
+    "lid-glotlid":     "reference_backends.lid_glotlid",
+    "lid-fasttext176": "reference_backends.lid_glotlid",
+    # TitaNet-Large speaker verification. model_dir = HF id or local .nemo.
+    # Audio arg is a single speaker utterance (16 kHz mono).
+    "titanet":         "reference_backends.titanet",
+    # Moonshine (UsefulSensors tiny/base). model_dir = usefulsensors/moonshine-tiny
+    # or usefulsensors/moonshine-base (or a local snapshot). Audio arg is a 16 kHz
+    # mono WAV. Captures encoder_output (T_enc, hidden_dim) matching moonshine_encode().
+    "moonshine":       "reference_backends.moonshine",
+    "moonshine-base":  "reference_backends.moonshine",
+    # Moonshine-Streaming (ONNX variant from usefulsensors/moonshine).
+    # model_dir = root of the cloned repo (onnx/tiny/{preprocess,encode}.onnx).
+    # Captures encoder_output (T, 288) matching moonshine_encode() streaming path.
+    "moonshine-streaming": "reference_backends.moonshine_streaming",
+    # GLM-ASR (GGUF-direct, no PyTorch). model_dir = path to an F32 GLM-ASR GGUF
+    # (e.g. cstr/glm-asr-nano-GGUF / glm-asr-nano.gguf) or a directory containing
+    # it. Captures mel_spectrogram (128, T_mel) and encoder_output (T_proj, 2048).
+    "glm-asr": "reference_backends.glm_asr",
+    # FireRedASR-AED. model_dir = "FireRedTeam/FireRedASR2-AED" (HF id) or a local
+    # directory containing model.pth.tar + cmvn.ark. Requires `fireredasr` and
+    # `kaldi_native_fbank`. Captures mel_spectrogram (T, 80) Kaldi fbank+CMVN
+    # and encoder_output (T_enc, 1280) Conformer encoder.
+    "firered-asr": "reference_backends.firered_asr",
+    # FunAudioLLM/Fun-ASR-Nano-2512 (and MLT variant): SenseVoiceEncoderSmall
+    # (70 SANM blocks @ 512-dim) + Transformer adaptor as ctc_decoder (5 blocks)
+    # + CTC head (8749-vocab multilingual). CTC path only — the Qwen3-0.6B
+    # LLM-decoder half is left to a follow-on backend. model_dir = HF id
+    # "FunAudioLLM/Fun-ASR-Nano-2512" / "FunAudioLLM/Fun-ASR-MLT-Nano-2512"
+    # or a local snapshot. Requires `funasr` 1.3.1+.
+    "funasr":     "reference_backends.funasr",
+    # SenseVoiceSmall: multi-task encoder-only ASR (transcript + LID +
+    # emotion + audio-event via CTC head). Same SANM encoder as Fun-ASR
+    # but no LLM half. model_dir = FunAudioLLM/SenseVoiceSmall HF snapshot.
+    "sensevoice": "reference_backends.sensevoice",
+    # FunASR Paraformer-zh: NAR encoder-decoder (50 SANM blocks + CIF
+    # predictor + 16 decoder blocks). model_dir = funasr/paraformer-zh
+    # HF snapshot or local dir with model.pt + config.yaml + tokens.json.
+    "paraformer": "reference_backends.paraformer",
+    # VoxCPM2 TTS: diffusion AR TTS with 4 transformer sub-networks.
+    # model_dir = openbmb/VoxCPM2 HF snapshot. Audio arg = reference WAV
+    # for voice cloning (optional). Synth text from VOXCPM2_SYN_TEXT env.
+    "voxcpm2-tts": "reference_backends.voxcpm2_tts",
+    # CosyVoice3 TTS — Phase 3b: single-DiT-block stages only (flow
+    # model is the only thing wired through extract_stage so far).
+    # model_dir = FunAudioLLM/Fun-CosyVoice3-0.5B-2512 HF snapshot.
+    # Audio arg is unused (the per-block test vector is seeded random).
+    "cosyvoice3-tts": "reference_backends.cosyvoice3_tts",
+    # F5-TTS v1 Base: DiT-based flow-matching TTS with Vocos vocoder.
+    # model_dir = /mnt/storage/f5-tts (containing F5TTS_v1_Base/ + vocos/).
+    # Audio arg is a reference voice WAV for cloning (16 kHz); synth text
+    # from F5_TTS_SYN_TEXT env var (default "Hello world.").
+    "f5-tts":     "reference_backends.f5_tts",
+    # Parler TTS: T5 encoder + MusicGen decoder + DAC 44 kHz.
+    # model_dir = parler-tts/parler-tts-mini-v1.1 HF snapshot.
+    # Audio arg unused (text-driven). Text from PARLER_TEXT / PARLER_DESC
+    # env vars. See reference_backends/parler_tts.py for the full list.
+    "parler-tts": "reference_backends.parler_tts",
+    # MOSS-Audio-4B-Instruct: Whisper encoder + DeepStack 3-tap adapter +
+    # Qwen3-4B LM. First audio-understanding (not just ASR) backend.
+    # model_dir = OpenMOSS-Team/MOSS-Audio-4B-Instruct HF snapshot or local
+    # dir. GitHub source (modeling code) expected at ref/moss_audio/github/
+    # or via MOSS_AUDIO_GITHUB env. Prompt from MOSS_AUDIO_PROMPT env.
+    "moss-audio":  "reference_backends.moss_audio",
+    # TADA-3B-ML TTS: Llama-3.2-3B + per-token flow matching + TADA codec.
+    # model_dir = HumeAI/tada-3b-ml HF id or local snapshot.
+    # Audio arg is unused (text-driven). Text from TADA_SYN_TEXT env var.
+    "tada-tts":   "reference_backends.tada_tts",
+    # Zyphra/Zonos-v0.1-transformer: GPT-style AR TTS with 9-codebook DAC.
+    # model_dir = Zyphra/Zonos-v0.1-transformer HF id or local snapshot.
+    # Audio arg is unused (text-driven). Text + seed from env vars:
+    #   ZONOS_TTS_TEXT (default "Hello world.")
+    #   ZONOS_TTS_SEED (default 42)
+    #   ZONOS_TTS_MAX_TOKENS (default 200)
+    #   ZONOS_TTS_LANGUAGE (default "en-us")
+    # Stages: conditioning_prefix, phoneme_ids, prefill_logits, output_codes.
+    "zonos-tts":  "reference_backends.zonos_tts_reference",
+}
+
+DEFAULT_STAGES_BY_BACKEND: Dict[str, List[str]] = {}  # populated at import
+
+
+# ---------------------------------------------------------------------------
+# Shared WAV loader (stdlib only, no torchaudio / librosa)
+# ---------------------------------------------------------------------------
+
+def load_audio_16k_mono(path: Path) -> np.ndarray:
+    """Load 16 kHz mono PCM audio into a float32 numpy array in [-1, 1].
+
+    Accepts any 16-bit PCM WAV at 16 kHz. Multi-channel input is averaged
+    to mono. Raises SystemExit with a clear message for unsupported inputs.
+    """
+    with wave.open(str(path), "rb") as w:
+        sr     = w.getframerate()
+        nchan  = w.getnchannels()
+        sampw  = w.getsampwidth()
+        nframe = w.getnframes()
+        raw    = w.readframes(nframe)
+    if sampw != 2:
+        raise SystemExit(f"{path}: only 16-bit PCM supported, got {sampw*8}-bit. "
+                         f"Pre-convert with: ffmpeg -i in.X -ar 16000 -ac 1 -c:a pcm_s16le out.wav")
+    if sr != 16000:
+        raise SystemExit(f"{path}: expected 16 kHz, got {sr} Hz. "
+                         f"Pre-convert with: ffmpeg -i in.X -ar 16000 -ac 1 -c:a pcm_s16le out.wav")
+    pcm = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    if nchan > 1:
+        pcm = pcm.reshape(-1, nchan).mean(axis=1)
+    return np.ascontiguousarray(pcm)
+
+
+# ---------------------------------------------------------------------------
+# GGUF writer — ONE tensor archive per dump
+# ---------------------------------------------------------------------------
+
+def _to_contig_f32(arr: np.ndarray) -> np.ndarray:
+    """Squeeze sentinel axes that GGUF's max-4D tensor limit can't accept,
+    convert to float32, and make it C-contiguous."""
+    if not np.issubdtype(arr.dtype, np.floating) and not np.issubdtype(arr.dtype, np.integer):
+        raise TypeError(f"unsupported ndarray dtype: {arr.dtype}")
+    a = arr
+    # GGUF tensors are up to 4D. If the caller captured a 5D or 6D tensor
+    # (rare — happens for some multi-head layouts), squeeze unit axes first.
+    while a.ndim > 4:
+        # Squeeze the LEFTMOST unit axis we can find.
+        squeezable = [i for i in range(a.ndim) if a.shape[i] == 1]
+        if not squeezable:
+            raise ValueError(f"tensor has {a.ndim} dims and no unit axes to squeeze: {a.shape}")
+        a = np.squeeze(a, axis=squeezable[0])
+    if a.dtype != np.float32 and a.dtype != np.int32:
+        a = a.astype(np.float32)
+    if not a.flags["C_CONTIGUOUS"]:
+        a = np.ascontiguousarray(a)
+    return a
+
+
+def write_gguf_archive(captures: Dict[str, np.ndarray],
+                       meta: Dict[str, Any],
+                       output_path: Path) -> None:
+    """Serialize a dict of captured activations to a GGUF tensor archive.
+
+    The resulting file is loadable via core_gguf::load_weights on the C++
+    side, which returns a `WeightLoad` whose `tensors` map is keyed by the
+    names used here. Scalar metadata (backend name, model path, audio
+    path, generated text) is stored as GGUF key/value pairs in the header.
+    """
+    try:
+        import gguf
+    except ImportError as e:
+        raise SystemExit(
+            "gguf Python package not found. Install with:  pip install gguf\n"
+            "(it ships with llama.cpp and ggml; installs quickly).") from e
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    w = gguf.GGUFWriter(str(output_path), arch="crispasr.reference")
+    w.add_description("CrispASR reference activation dump")
+
+    # Metadata
+    for k, v in meta.items():
+        if isinstance(v, bool):
+            w.add_bool(f"crispasr.ref.{k}", v)
+        elif isinstance(v, int):
+            w.add_int32(f"crispasr.ref.{k}", v)
+        elif isinstance(v, float):
+            w.add_float32(f"crispasr.ref.{k}", v)
+        elif isinstance(v, str):
+            w.add_string(f"crispasr.ref.{k}", v)
+        # silently skip other types
+
+    # Tensors. GGUF orders them as the caller adds them.
+    for name, arr in sorted(captures.items()):
+        a = _to_contig_f32(arr)
+        w.add_tensor(name, a)
+
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+def _resolve_backend(name: str):
+    if name not in REGISTERED_BACKENDS:
+        raise SystemExit(
+            f"unknown backend '{name}'. Available: {sorted(REGISTERED_BACKENDS)}")
+    module_name = REGISTERED_BACKENDS[name]
+    # tools/ is on sys.path because we run dump_reference.py from that dir,
+    # OR the caller has added it. Fall back to importing via relative package.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        mod = importlib.import_module(module_name)
+    except ImportError as e:
+        raise SystemExit(
+            f"failed to import backend module '{module_name}': {e}\n"
+            f"Make sure tools/{module_name.replace('.', '/')}.py exists.")
+    return mod
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(
+        description="CrispASR unified reference activation dumper",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--backend", help="backend name (see --list-backends)")
+    p.add_argument("--model-dir", type=Path, help="HF model directory")
+    p.add_argument("--audio", type=Path, help="input WAV (16 kHz mono)")
+    p.add_argument("--output", type=Path, help="output GGUF archive path")
+    p.add_argument("--stages", default="",
+                   help="comma-separated stage names to capture; empty = backend default")
+    p.add_argument("--max-new-tokens", type=int, default=20,
+                   help="number of tokens to greedy-decode for logits capture")
+    p.add_argument("--list-backends", action="store_true",
+                   help="print available backends and exit")
+    args = p.parse_args()
+
+    if args.list_backends:
+        print("Available backends:")
+        for name, mod_path in sorted(REGISTERED_BACKENDS.items()):
+            print(f"  {name:10s}  -> tools/{mod_path.replace('.', '/')}.py")
+        return
+
+    if not (args.backend and args.model_dir and args.audio and args.output):
+        p.error("--backend, --model-dir, --audio, --output are all required "
+                "(unless --list-backends is set)")
+
+    mod = _resolve_backend(args.backend)
+
+    # Resolve stage list
+    default_stages = getattr(mod, "DEFAULT_STAGES", [])
+    if args.stages:
+        stages = set(s.strip() for s in args.stages.split(",") if s.strip())
+    else:
+        stages = set(default_stages)
+    if not stages:
+        raise SystemExit(f"no stages to capture (backend '{args.backend}' "
+                         f"has empty DEFAULT_STAGES and --stages is empty)")
+
+    # Load audio
+    print(f"Loading audio: {args.audio}")
+    audio = load_audio_16k_mono(args.audio)
+    print(f"  samples: {len(audio)}  ({len(audio)/16000:.2f} s)")
+
+    # Run backend dump
+    print(f"Running {args.backend} reference forward pass ...")
+    captures = mod.dump(
+        model_dir=args.model_dir,
+        audio=audio,
+        stages=stages,
+        max_new_tokens=args.max_new_tokens,
+    )
+
+    # Always include raw audio so C++ tests can feed it in without
+    # re-reading the WAV.
+    if "raw_audio" in stages:
+        captures.setdefault("raw_audio", audio.astype(np.float32))
+
+    print(f"Captured {len(captures)} tensors:")
+    for name in sorted(captures):
+        a = captures[name]
+        if isinstance(a, str):
+            # String-typed captures (e.g. granite/cohere generated_text)
+            # move into metadata below — skip them in the tensor listing.
+            preview = a if len(a) <= 60 else a[:57] + "..."
+            print(f"  {name:28s}  str        {preview!r}")
+            continue
+        print(f"  {name:28s}  {tuple(a.shape)}  {a.dtype}")
+
+    # Serialize
+    meta = {
+        "backend":  args.backend,
+        "model_dir": str(args.model_dir.resolve()),
+        "audio":    str(args.audio.resolve()),
+        "n_samples": int(len(audio)),
+        "sample_rate": 16000,
+        "generated_text": str(captures.pop("generated_text", "")) if "generated_text" in captures else "",
+    }
+    # Any other str-typed captures get routed into metadata too so the
+    # C++ diff harness can read them via the GGUF kv table without
+    # tripping `_to_contig_f32`'s "must be numeric ndarray" check.
+    for name in list(captures.keys()):
+        if isinstance(captures[name], str):
+            meta[name] = captures.pop(name)
+    # Pass through env-configurable prompt/text/voice metadata so diff
+    # harnesses on the C++ side can replay the exact synthesis context.
+    for env_key in ("QWEN3_TTS_SYN_TEXT", "QWEN3_TTS_REF_TEXT", "QWEN3_TTS_LANG", "QWEN3_TTS_VOICE",
+                    "KOKORO_PHONEMES", "KOKORO_VOICE", "KOKORO_SEED", "CHATTERBOX_SYN_TEXT",
+                    "VOXCPM2_SYN_TEXT", "VOXCPM2_USE_REF",
+                    "F5_TTS_SYN_TEXT", "F5_TTS_REF_TEXT", "F5_TTS_SEED",
+                    "F5_TTS_STEPS", "F5_TTS_CFG", "F5_TTS_SWAY",
+                    "LID_TEXT", "CLD3_TEXT"):
+        val = os.environ.get(env_key)
+        if val is not None:
+            meta[env_key.lower()] = val
+    write_gguf_archive(captures, meta, args.output)
+    print(f"Wrote GGUF archive: {args.output}  "
+          f"({args.output.stat().st_size/1024:.1f} KiB)")
+
+
+if __name__ == "__main__":
+    main()

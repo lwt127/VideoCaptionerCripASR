@@ -1,0 +1,95 @@
+# ===== VideoCaptioner + CrispASR source repo .gitignore =====
+# Goal: ship only SOURCE CODE (app, resource source, CrispASR source),
+# excluding bundled runtime, large models, build outputs, caches and private data.
+
+# ---- Bundled Python runtime (huge, platform-specific) ----
+/runtime/
+.venv/
+venv/
+env/
+
+# ---- Installed/runtime data dir (cache/logs/models/settings) ----
+/VideoCaptioner/
+/AppData/
+
+# ---- Your private working data ----
+/work-dir/
+
+# ---- Installer / frozen-app artifacts at root ----
+/VideoCaptioner.exe
+/unins000.exe
+/unins000.dat
+/_pystand_static.int
+/*.zip
+/backup-*.zip
+
+# ---- Misc root data / logs / transcripts ----
+/all_videocaptioner_logs.txt
+/transcribed_videos.txt
+/transcribed_video_paths.txt
+/*.srt
+/*.txt
+!/requirements*.txt
+!/README*.md
+
+# ---- CrispASR build outputs & large artifacts ----
+_build/CrispASR/build/
+_build/CrispASR/build-cuda/
+_build/CrispASR/build-vulkan/
+_build/CrispASR/build-windows/
+_build/CrispASR/target/
+_build/CrispASR/models/
+_build/CrispASR/*.wav
+_build/CrispASR/*.srt
+_build/CrispASR/*.txt
+!_build/CrispASR/**/*.md
+!_build/CrispASR/AUTHORS
+_build/CrispASR/.git/
+_build/CrispASR/.git_disabled_crispasr/
+**/.git_disabled*/
+_build/CrispASR/_vcbuild.bat
+_build/CrispASR/_vcbuild_cuda.bat
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+*.so
+*.pyd
+
+# ---- Models / weights / media (binary, large) ----
+*.bin
+*.gguf
+*.pt
+*.pth
+*.onnx
+*.ckpt
+*.safetensors
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.flv
+*.wav
+*.mp3
+*.flac
+
+# ---- Logs / databases / caches ----
+*.log
+*.db
+*.sqlite
+*.sqlite3
+.cache/
+cache/
+logs/
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp

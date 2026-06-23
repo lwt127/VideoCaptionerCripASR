@@ -1,0 +1,207 @@
+name: Lint
+
+# Run on every push / PR that touches C++ source, headers, or the tooling
+# configuration files themselves.  This is the CI analogue of the Python
+# black + ruff + mypy + bandit stack.
+#
+#   clang-format --dry-run  →  black / ruff-format check (style)
+#   clang-tidy              →  ruff-lint + mypy + bandit (correctness + types + security)
+#   cppcheck                →  additional static analysis (fast, no compilation needed)
+
+on:
+  push:
+    branches: [main, master, integrated_cli]
+    paths:
+      - '**.cpp'
+      - '**.h'
+      - '**.c'
+      - '.clang-format'
+      - '.clang-tidy'
+      - '.github/workflows/lint.yml'
+      - 'CMakeLists.txt'
+      - 'CMakePresets.json'
+      # README language drift check (issue #50)
+      - 'README.md'
+      - 'tools/check-readme-langs.py'
+  pull_request:
+    branches: [main, master]
+    paths:
+      - '**.cpp'
+      - '**.h'
+      - '**.c'
+      - '.clang-format'
+      - '.clang-tidy'
+      - '.github/workflows/lint.yml'
+      - 'CMakeLists.txt'
+      - 'CMakePresets.json'
+      # README language drift check (issue #50)
+      - 'README.md'
+      - 'tools/check-readme-langs.py'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # clang-format: style check (equivalent to black / ruff-format --check)
+  # ---------------------------------------------------------------------------
+  clang-format:
+    name: clang-format (style)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install clang-format
+        # Pin the version so the same formatting verdict is produced here and
+        # when contributors run `clang-format -i` locally. Version bumps
+        # between 14 / 18 / 20 silently flip wrapping decisions and cause
+        # "it passed on my machine" drift.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang-format-18
+          sudo update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-18 100
+
+      - name: Check formatting
+        # --dry-run: report diffs without touching files.
+        # --Werror:  exit non-zero if any file would change.
+        # Scope: project-owned C++ only — skip ggml/ and bindings/ (third-party).
+        # On failure, print the offending file:line locations so contributors
+        # don't have to guess from a bare count.
+        run: |
+          clang-format --version
+          OUT=$(find src examples/cli crisp_audio \
+               \( -name '*.cpp' -o -name '*.h' -o -name '*.c' \) \
+               ! -name 'httplib.h' \
+               ! -name 'miniaudio.h' \
+               ! -name 'json.hpp' \
+               ! -name 'stb_vorbis.c' \
+               ! -path '*/coreml/*' \
+               ! -path '*/rnnoise/*' \
+               -print0 \
+          | xargs -0 clang-format --dry-run --Werror 2>&1 || true)
+          ERRORS=$(echo "$OUT" | grep -c 'error:.*clang-format' || true)
+          echo "Format violations: $ERRORS"
+          if [ "$ERRORS" -ne 0 ]; then
+            echo "--- violations ---"
+            echo "$OUT" | grep 'error:.*clang-format' | head -50
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # clang-tidy: lint + type-checking + security (ruff-lint + mypy + bandit)
+  #
+  # We run tidy via the CMake `tidy` preset so it uses the same compile flags
+  # and include paths as the real build — this prevents false positives from
+  # missing system headers or wrong C++ standard.
+  # ---------------------------------------------------------------------------
+  clang-tidy:
+    name: clang-tidy (lint / types / security)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install build tools + clang-tidy
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang clang-tidy
+
+      - name: Configure (tidy preset)
+        # The `tidy` preset sets CMAKE_CXX_CLANG_TIDY so every TU is analysed
+        # during the build step.  We use Clang as the compiler so that clang-tidy
+        # gets the same diagnostics as the compiler it was built alongside.
+        run: |
+          cmake --preset tidy \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -G Ninja \
+            -DCRISPASR_BUILD_TESTS=OFF \
+            -DCRISPASR_BUILD_EXAMPLES=ON
+
+      - name: Build (clang-tidy fires on each TU)
+        # tee the output so the full tidy log is visible in the Actions UI even
+        # when the build succeeds; the step fails if cmake --build exits non-zero.
+        run: |
+          cmake --build build-tidy --target crispasr-lib 2>&1 | tee tidy.log
+          grep -q 'warning:' tidy.log && echo "::warning::clang-tidy warnings found" || true
+
+  # ---------------------------------------------------------------------------
+  # cppcheck: fast additional static analysis (no compilation required)
+  # Catches a complementary set of bugs vs clang-tidy.
+  # ---------------------------------------------------------------------------
+  cppcheck:
+    name: cppcheck (static analysis)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install cppcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends cppcheck
+
+      - name: Run cppcheck
+        # --error-exitcode=1: fail on any error-level finding.
+        # --enable=warning,style,performance,portability: broad coverage.
+        # --suppress=*:ggml/*: skip third-party ggml code.
+        # --std=c++17: match the codebase standard.
+        run: |
+          cppcheck \
+            --error-exitcode=1 \
+            --enable=warning,performance,portability \
+            --inline-suppr \
+            --std=c++17 \
+            --suppress=missingIncludeSystem \
+            --suppress=unmatchedSuppression \
+            --suppress=duplicateAssignExpression \
+            -i ggml \
+            -i bindings \
+            --suppress='*:examples/server/*' \
+            --suppress='*:*httplib.h' \
+            --suppress='*:*json.hpp' \
+            --suppress='*:src/miniaudio.h' \
+            --suppress='*:*miniaudio.h' \
+            --suppress='*:*stb_vorbis.c' \
+            --suppress='*:*rnnoise/*' \
+            --suppress=unknownMacro \
+            --suppress=nullPointerOutOfMemory \
+            --suppress=nullPointerArithmeticOutOfMemory \
+            --suppress=toomanyconfigs \
+            --suppress=invalidFunctionArg \
+            --quiet \
+            src/ examples/cli/ crisp_audio/
+
+  # ---------------------------------------------------------------------------
+  # README language metadata vs upstream model cards (regression catcher
+  # for issue #50: granite-4.1-plus / -nar / -3.3-2b copy-pasted `ja` into
+  # the language column from a base row that DID support Japanese, and
+  # nothing in lint or test caught the drift). Fetches each HF model link
+  # in the README's model table and asserts our language column matches
+  # the upstream card's `language:` frontmatter.
+  # ---------------------------------------------------------------------------
+  readme-langs:
+    name: README language metadata
+    runs-on: ubuntu-latest
+    # Soft-fire on schedule + push to main so a flaky HF API doesn't
+    # block PRs. The job is best-effort: missing upstream metadata or
+    # network errors degrade to "skip" without failing the lint.
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install huggingface_hub
+        run: pip install --quiet 'huggingface_hub>=0.20'
+
+      - name: Check README language columns vs HF cards
+        env:
+          # Authenticated requests get higher rate limits; the secret is
+          # optional — anonymous hits work for public repos.
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python tools/check-readme-langs.py

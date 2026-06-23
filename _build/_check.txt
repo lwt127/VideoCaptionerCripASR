@@ -1,0 +1,5 @@
+single_rows=53
+parallel_rows=99
+out_single=False
+out_par_a=False
+out_par_b=False
