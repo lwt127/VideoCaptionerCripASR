@@ -509,9 +509,11 @@ class TranscribeConfig:
     need_word_time_stamp: bool = True
     # Whisper Cpp 配置
     whisper_model: Optional[WhisperModelEnum] = None
-    # CrispASR 配置 (whisper.cpp 兼容, 复用 ggml 模型)
-    crisp_asr_model: Optional[WhisperModelEnum] = None
-    crisp_asr_use_gpu: bool = False
+    # CrispASR 配置 (多后端 ASR 引擎)
+    crisp_asr_backend: Optional[str] = None
+    crisp_asr_model: Optional[str] = None
+    crisp_asr_vad_method: Optional[str] = None
+    crisp_asr_use_gpu: bool = True
     crisp_asr_use_vad: bool = True
     # Whisper API 配置
     whisper_api_key: Optional[str] = None

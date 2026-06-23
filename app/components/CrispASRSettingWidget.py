@@ -1,184 +1,227 @@
 from pathlib import Path
 
-from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QShowEvent
+from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import QVBoxLayout, QWidget
-from qfluentwidgets import ComboBoxSettingCard
+from qfluentwidgets import ComboBox, ComboBoxSettingCard
 from qfluentwidgets import FluentIcon as FIF
 from qfluentwidgets import (
     HyperlinkCard,
-    InfoBar,
-    InfoBarPosition,
+    SettingCard,
     SettingCardGroup,
     SingleDirectionScrollArea,
     SwitchSettingCard,
 )
 
 from app.common.config import cfg
-from app.config import MODEL_PATH
-from app.core.entities import TranscribeLanguageEnum, WhisperModelEnum
+from app.config import BIN_PATH
+from app.core.bk_asr.crisp_asr_catalog import (
+    CRISP_ASR_PROJECT_URL,
+    get_backend_labels,
+    get_model_labels,
+    get_vad_labels,
+)
+from app.core.entities import TranscribeLanguageEnum
 from app.core.utils.logger import setup_logger
-
-# CrispASR 与 WhisperCpp 共用 ggml 模型，复用其模型清单与下载对话框
-from .WhisperCppSettingWidget import WHISPER_CPP_MODELS, WhisperCppDownloadDialog
 
 logger = setup_logger("crisp_asr_setting")
 
+CRISP_ASR_BIN = Path(BIN_PATH) / "CrispASR" / "crispasr.exe"
 
-def check_crisp_asr_models_exist() -> bool:
-    """检查是否存在任意可用的 ggml 模型（CrispASR 与 WhisperCpp 共用）"""
-    for model in WHISPER_CPP_MODELS:
-        if (Path(MODEL_PATH) / model["value"]).exists():
-            return True
-    return False
+
+class ComboSettingCard(SettingCard):
+    """带下拉框的设置卡片（绑定到普通字符串 ConfigItem，支持动态选项）。
+
+    与 qfluentwidgets 的 ComboBoxSettingCard 外观一致，但不要求 OptionsConfigItem，
+    因此可用于选项随其他设置联动变化的场景（如随后端联动的模型列表）。
+    """
+
+    currentTextChanged = pyqtSignal(str)
+
+    def __init__(self, config_item, icon, title, content=None, items=None, parent=None):
+        super().__init__(icon, title, content, parent)
+        self.config_item = config_item
+        self.comboBox = ComboBox(self)
+        self.hBoxLayout.addWidget(self.comboBox, 0, Qt.AlignRight)
+        self.hBoxLayout.addSpacing(16)
+
+        if items:
+            self.comboBox.addItems(items)
+
+        # 初始化当前值
+        saved = cfg.get(config_item)
+        if saved and self.comboBox.findText(saved) >= 0:
+            self.comboBox.setCurrentText(saved)
+
+        self.comboBox.currentTextChanged.connect(self._on_changed)
+
+    def _on_changed(self, text: str):
+        if text:
+            cfg.set(self.config_item, text)
+            self.currentTextChanged.emit(text)
+
+    def set_items(self, items, keep_saved=True):
+        """重设下拉项；keep_saved 时尽量保持已保存值，否则选第一项并写回配置"""
+        self.comboBox.blockSignals(True)
+        self.comboBox.clear()
+        self.comboBox.addItems(items)
+        self.comboBox.blockSignals(False)
+        if not items:
+            return
+        saved = cfg.get(self.config_item)
+        if keep_saved and saved in items:
+            self.comboBox.setCurrentText(saved)
+        else:
+            self.comboBox.setCurrentText(items[0])
+            cfg.set(self.config_item, items[0])
 
 
 class CrispASRSettingWidget(QWidget):
-    """CrispASR 转录设置面板。
+    """CrispASR 转录设置面板（多后端 ASR 引擎）。
 
-    CrispASR 是 whisper.cpp 的兼容分支，复用相同的 ggml-*.bin 模型，
-    因此模型下载沿用 WhisperCpp 的下载对话框。UI 风格与其他转录后端保持一致。
+    UI 与其他转录后端保持一致：后端引擎下拉、随后端联动的模型下拉、源语言、
+    VAD 切片开关、VAD 方法下拉，以及引擎状态卡片。
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setup_ui()
+        self._init_values()
         self._connect_signals()
-
-    def showEvent(self, a0: QShowEvent) -> None:
-        super().showEvent(a0)
-        # 没有任何已下载模型时，提示用户先下载模型
-        if not check_crisp_asr_models_exist():
-            self.show_error_info(
-                self.tr("未检测到可用模型，请先下载 ggml 模型（与 WhisperCpp 共用）")
-            )
-        return
 
     def setup_ui(self):
         self.main_layout = QVBoxLayout(self)
 
-        # 创建单向滚动区域和容器
+        # 单向滚动区域和容器
         self.scrollArea = SingleDirectionScrollArea(orient=Qt.Vertical, parent=self)
         self.scrollArea.setStyleSheet(
             "QScrollArea{background: transparent; border: none}"
         )
-
         self.container = QWidget(self)
         self.container.setStyleSheet("QWidget{background: transparent}")
         self.containerLayout = QVBoxLayout(self.container)
 
-        # ---------------- 模型设置组 ----------------
-        self.setting_group = SettingCardGroup(
-            self.tr("CrispASR 设置（✨本地推荐✨）"), self
-        )
+        # ---------------- CrispASR 设置组 ----------------
+        self.setting_group = SettingCardGroup(self.tr("CrispASR 设置"), self)
 
-        # 模型选择（与 WhisperCpp 共用 ggml 模型）
-        self.model_card = ComboBoxSettingCard(
-            cfg.crisp_asr_model,
+        # 后端引擎选择（识别架构）
+        self.backend_card = ComboSettingCard(
+            cfg.crisp_asr_backend,
             FIF.ROBOT,
+            self.tr("后端引擎"),
+            self.tr("选择 CrispASR 后端（识别架构）"),
+            get_backend_labels(),
+            self.setting_group,
+        )
+
+        # 模型选择（随后端联动）
+        self.model_card = ComboSettingCard(
+            cfg.crisp_asr_model,
+            FIF.DOWNLOAD,
             self.tr("模型"),
-            self.tr("选择模型（与 WhisperCpp 共用 ggml 模型）"),
-            [model.value for model in WhisperModelEnum],
+            self.tr("该后端可用的模型，标“自动下载”的会在首次运行时下载"),
+            [],  # 初始为空，根据后端动态填充
             self.setting_group,
         )
 
-        # 仅显示已下载的模型
-        for i in range(self.model_card.comboBox.count() - 1, -1, -1):
-            model_text = self.model_card.comboBox.itemText(i).lower()
-            model_config = next(
-                (
-                    model
-                    for model in WHISPER_CPP_MODELS
-                    if model["label"].lower() == model_text
-                ),
-                None,
-            )
-            if model_config and (MODEL_PATH / model_config["value"]).exists():
-                continue
-            self.model_card.comboBox.removeItem(i)
-
-        # 模型管理（复用 WhisperCpp 模型下载对话框）
-        self.manage_model_card = HyperlinkCard(
-            "",  # 无链接
-            self.tr("管理模型"),
-            FIF.DOWNLOAD,  # 使用下载图标
-            self.tr("模型管理"),
-            self.tr("下载或更新 ggml 模型（CrispASR 与 WhisperCpp 共用）"),
-            self.setting_group,
-        )
-
-        # 语言选择
+        # 源语言
         self.language_card = ComboBoxSettingCard(
             cfg.transcribe_language,
             FIF.LANGUAGE,
             self.tr("源语言"),
-            self.tr("音频的源语言"),
+            self.tr("音视频中说话的语言，默认自动识别"),
             [language.value for language in TranscribeLanguageEnum],
             self.setting_group,
         )
         self.language_card.comboBox.setMaxVisibleItems(6)
 
-        # ---------------- 其他设置组 ----------------
-        self.other_group = SettingCardGroup(self.tr("其他设置"), self)
-
-        # GPU 加速开关
-        self.gpu_card = SwitchSettingCard(
-            FIF.SPEED_HIGH,
-            self.tr("GPU 加速"),
-            self.tr("使用 GPU 加速转录（需要支持的显卡，默认关闭）"),
-            cfg.crisp_asr_use_gpu,
-            self.other_group,
-        )
-
-        # VAD 分段开关
+        # VAD 切片开关
         self.vad_card = SwitchSettingCard(
-            FIF.ALIGNMENT,
-            self.tr("VAD 语音分段"),
-            self.tr("使用 Silero VAD 进行语音分段，更适合字幕场景"),
+            FIF.CHECKBOX,
+            self.tr("VAD 切片"),
+            self.tr("使用语音活动检测切分长音频，长视频强烈建议开启"),
             cfg.crisp_asr_use_vad,
-            self.other_group,
+            self.setting_group,
         )
 
-        # 添加模型设置组的卡片
+        # VAD 方法
+        self.vad_method_card = ComboSettingCard(
+            cfg.crisp_asr_vad_method,
+            FIF.VOLUME,
+            self.tr("VAD 方法"),
+            self.tr("选择语音活动检测模型，默认 Silero"),
+            get_vad_labels(),
+            self.setting_group,
+        )
+
+        # 引擎状态 / 项目主页
+        engine_ok = CRISP_ASR_BIN.exists()
+        engine_desc = (
+            self.tr("已检测到 crispasr 引擎")
+            if engine_ok
+            else self.tr("未检测到 crispasr，请将其放入 resource/bin/CrispASR/ 目录")
+        )
+        self.engine_card = HyperlinkCard(
+            CRISP_ASR_PROJECT_URL,
+            self.tr("项目主页"),
+            FIF.GLOBE,
+            self.tr("CrispASR 引擎"),
+            engine_desc,
+            self.setting_group,
+        )
+
+        # 添加卡片
+        self.setting_group.addSettingCard(self.backend_card)
         self.setting_group.addSettingCard(self.model_card)
-        self.setting_group.addSettingCard(self.manage_model_card)
         self.setting_group.addSettingCard(self.language_card)
+        self.setting_group.addSettingCard(self.vad_card)
+        self.setting_group.addSettingCard(self.vad_method_card)
+        self.setting_group.addSettingCard(self.engine_card)
 
-        # 添加其他设置组的卡片
-        self.other_group.addSettingCard(self.gpu_card)
-        self.other_group.addSettingCard(self.vad_card)
-
-        # 将所有设置组添加到容器布局
         self.containerLayout.addWidget(self.setting_group)
-        self.containerLayout.addWidget(self.other_group)
         self.containerLayout.addStretch(1)
 
-        # 设置组件最小宽度
-        self.model_card.comboBox.setMinimumWidth(200)
+        # 最小宽度
+        self.backend_card.comboBox.setMinimumWidth(260)
+        self.model_card.comboBox.setMinimumWidth(260)
         self.language_card.comboBox.setMinimumWidth(200)
+        self.vad_method_card.comboBox.setMinimumWidth(260)
 
-        # 设置滚动区域
         self.scrollArea.setWidget(self.container)
         self.scrollArea.setWidgetResizable(True)
-
-        # 将滚动区域添加到主布局
         self.main_layout.addWidget(self.scrollArea)
+
+    def _init_values(self):
+        """初始化下拉框默认值与联动状态"""
+        backend_labels = get_backend_labels()
+        saved_backend = cfg.crisp_asr_backend.value
+        if saved_backend not in backend_labels:
+            saved_backend = backend_labels[0]
+            cfg.set(cfg.crisp_asr_backend, saved_backend)
+        self.backend_card.comboBox.setCurrentText(saved_backend)
+
+        # 根据后端填充模型列表（尽量保持已保存模型）
+        self.model_card.set_items(get_model_labels(saved_backend), keep_saved=True)
+
+        # VAD 方法默认值
+        vad_labels = get_vad_labels()
+        saved_vad = cfg.crisp_asr_vad_method.value
+        if saved_vad not in vad_labels:
+            saved_vad = vad_labels[0]
+            cfg.set(cfg.crisp_asr_vad_method, saved_vad)
+        self.vad_method_card.comboBox.setCurrentText(saved_vad)
+
+        # VAD 方法可用性随 VAD 开关联动
+        self._on_vad_toggled(cfg.crisp_asr_use_vad.value)
 
     def _connect_signals(self):
         """连接信号"""
-        self.manage_model_card.linkButton.clicked.connect(self._show_model_manager)
+        self.backend_card.currentTextChanged.connect(self._on_backend_changed)
+        self.vad_card.checkedChanged.connect(self._on_vad_toggled)
 
-    def _show_model_manager(self):
-        """显示模型管理对话框（与 WhisperCpp 共用 ggml 模型）"""
-        dialog = WhisperCppDownloadDialog(self.window(), self)
-        dialog.show()
+    def _on_backend_changed(self, backend_label: str):
+        """后端切换：刷新模型列表"""
+        self.model_card.set_items(get_model_labels(backend_label), keep_saved=False)
 
-    def show_error_info(self, error_msg):
-        """显示错误信息"""
-        InfoBar.error(
-            title=self.tr("提示"),
-            content=error_msg,
-            parent=self.window(),
-            duration=5000,
-            position=InfoBarPosition.BOTTOM,
-        )
+    def _on_vad_toggled(self, checked: bool):
+        """VAD 开关联动 VAD 方法卡片可用性"""
+        self.vad_method_card.setEnabled(checked)

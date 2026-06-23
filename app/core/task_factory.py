@@ -69,8 +69,10 @@ class TaskFactory:
             need_word_time_stamp=need_word_time_stamp,
             # Whisper Cpp 配置
             whisper_model=cfg.whisper_model.value.value,
-            # CrispASR 配置（复用 ggml 模型）
-            crisp_asr_model=cfg.crisp_asr_model.value.value,
+            # CrispASR 配置（多后端 ASR 引擎）
+            crisp_asr_backend=cfg.crisp_asr_backend.value,
+            crisp_asr_model=cfg.crisp_asr_model.value,
+            crisp_asr_vad_method=cfg.crisp_asr_vad_method.value,
             crisp_asr_use_gpu=cfg.crisp_asr_use_gpu.value,
             crisp_asr_use_vad=cfg.crisp_asr_use_vad.value,
             # Whisper API 配置

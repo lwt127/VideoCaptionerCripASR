@@ -17,13 +17,19 @@ CRISP_ASR_BIN = Path(BIN_PATH) / "CrispASR" / "crispasr.exe"
 
 
 class CrispASR(BaseASR):
-    """CrispASR 本地转录后端。
+    """CrispASR 本地转录后端（多后端 ASR 引擎）。
 
-    CrispASR 是 whisper.cpp 的兼容分支，CLI 参数为 whisper.cpp 的超集，
-    输出标准 SRT 字幕，并复用 whisper.cpp 的 ggml-*.bin 模型文件。
+    CrispASR 是 whisper.cpp 的兼容分支，支持多种识别后端（whisper / parakeet /
+    funasr / sensevoice / voxtral 等），输出标准 SRT 字幕。
+
+    - 后端通过 ``--backend <name>`` 选择；
+    - 模型通过 ``-m <auto|filename>`` 选择（auto 首次运行时自动下载）；
+    - VAD 通过 ``--vad -vm <method>`` 选择；
+    - 默认启用 GPU，可通过 ``--no-gpu`` 关闭。
 
     用法示例:
-        crispasr.exe -m <model.bin> -f <audio.wav> -l <lang> -osrt -of <base>
+        crispasr.exe --backend parakeet -m auto -f <audio.wav> -l <lang> \
+            -osrt -of <base> --vad -vm silero
     """
 
     def __init__(
@@ -31,8 +37,10 @@ class CrispASR(BaseASR):
         audio_path,
         language="en",
         crisp_asr_path=None,
-        whisper_model=None,
-        use_gpu: bool = False,
+        backend="whisper",
+        model="auto",
+        vad_method="silero",
+        use_gpu: bool = True,
         use_vad: bool = True,
         use_cache: bool = False,
         need_word_time_stamp: bool = False,
@@ -41,28 +49,40 @@ class CrispASR(BaseASR):
         assert os.path.exists(audio_path), f"音频文件 {audio_path} 不存在"
         assert audio_path.endswith(".wav"), f"音频文件 {audio_path} 必须是WAV格式"
 
-        # 在 models 目录下查找对应的 ggml 模型（与 WhisperCpp 共用）
-        if whisper_model:
+        self.backend = backend or "whisper"
+        self.vad_method = vad_method or "silero"
+
+        # 解析模型参数：
+        #  - "auto" 或非 ggml 文件名 → 交由 CrispASR 自动下载/解析
+        #  - "ggml-*.bin" → 在本地 models 目录查找（whisper 后端，与 WhisperCpp 共用）
+        if model and model != "auto" and "ggml" in model.lower():
             models_dir = Path(MODEL_PATH)
-            model_files = list(models_dir.glob(f"*ggml*{whisper_model}*.bin"))
-            if not model_files:
-                raise ValueError(
-                    f"在 {models_dir} 目录下未找到包含 '{whisper_model}' 的 ggml 模型文件。"
-                    f"请在「转录」设置中下载 WhisperCpp 模型（CrispASR 复用相同模型）。"
-                )
-            model_path = str(model_files[0])
-            logger.info(f"找到模型文件: {model_path}")
+            candidate = models_dir / model
+            if candidate.exists():
+                self.model_arg = str(candidate)
+            else:
+                matches = list(models_dir.glob(f"*{Path(model).stem}*.bin"))
+                if matches:
+                    self.model_arg = str(matches[0])
+                else:
+                    raise ValueError(
+                        f"在 {models_dir} 目录下未找到模型 '{model}'。"
+                        f"请在「转录」设置中下载该模型，或选择「自动下载」的模型。"
+                    )
+            logger.info(f"使用本地模型文件: {self.model_arg}")
         else:
-            raise ValueError("whisper_model 不能为空")
+            # 自动下载（CrispASR 会缓存到 ~/.cache/crispasr）
+            self.model_arg = model or "auto"
+            logger.info(f"使用自动下载模型: backend={self.backend}, model={self.model_arg}")
 
         # 定位 crispasr 可执行文件
         self.crisp_asr_path = Path(crisp_asr_path) if crisp_asr_path else CRISP_ASR_BIN
         if not self.crisp_asr_path.exists():
             raise FileNotFoundError(
-                f"未找到 CrispASR 可执行文件: {self.crisp_asr_path}"
+                f"未找到 CrispASR 可执行文件: {self.crisp_asr_path}。"
+                f"请将 crispasr 放入 resource/bin/CrispASR/ 目录。"
             )
 
-        self.model_path = model_path
         self.language = language
         self.use_gpu = use_gpu
         self.use_vad = use_vad
@@ -93,8 +113,10 @@ class CrispASR(BaseASR):
         """
         params = [
             str(self.crisp_asr_path),
+            "--backend",
+            self.backend,
             "-m",
-            str(self.model_path),
+            str(self.model_arg),
             "-f",
             str(wav_path),
             "-l",
@@ -104,16 +126,18 @@ class CrispASR(BaseASR):
             str(output_base),
         ]
 
-        # GPU 控制：默认禁用 GPU（与 WhisperCpp 行为保持一致，避免无显卡环境报错）
+        # GPU 控制：默认启用 GPU，关闭时传 --no-gpu
         if not self.use_gpu:
             params.append("--no-gpu")
 
-        # VAD 分段（更适合字幕场景）
+        # VAD 分段（更适合字幕场景），并指定 VAD 方法
         if self.use_vad:
             params.append("--vad")
+            if self.vad_method and self.vad_method != "silero":
+                params.extend(["--vad-model", self.vad_method])
 
-        # 中文模式下添加提示语
-        if self.language == "zh":
+        # 中文模式下添加提示语（whisper 后端支持 --prompt）
+        if self.language == "zh" and self.backend == "whisper":
             params.extend(
                 ["--prompt", "你好，我们需要使用简体中文，以下是普通话的句子。"]
             )
@@ -203,7 +227,7 @@ class CrispASR(BaseASR):
     def _get_key(self):
         return (
             f"crispasr-{self.crc32_hex}-{self.need_word_time_stamp}"
-            f"-{Path(self.model_path).name}-{self.language}"
+            f"-{self.backend}-{Path(str(self.model_arg)).name}-{self.language}"
         )
 
     def get_audio_duration(self, filepath: str) -> int:

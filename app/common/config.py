@@ -167,15 +167,12 @@ class Config(QConfig):
         EnumSerializer(WhisperModelEnum),
     )
 
-    # ------------------- CrispASR 配置 (whisper.cpp 兼容, 复用 ggml 模型) -------------------
-    crisp_asr_model = OptionsConfigItem(
-        "CrispASR",
-        "CrispAsrModel",
-        WhisperModelEnum.TINY,
-        OptionsValidator(WhisperModelEnum),
-        EnumSerializer(WhisperModelEnum),
-    )
-    crisp_asr_use_gpu = ConfigItem("CrispASR", "CrispAsrUseGpu", False, BoolValidator())
+    # ------------------- CrispASR 配置 (多后端 ASR 引擎) -------------------
+    # 后端引擎、模型、VAD 方法均以标签字符串存储（详见 core/bk_asr/crisp_asr_catalog.py）
+    crisp_asr_backend = ConfigItem("CrispASR", "CrispAsrBackend", "")
+    crisp_asr_model = ConfigItem("CrispASR", "CrispAsrModel", "")
+    crisp_asr_vad_method = ConfigItem("CrispASR", "CrispAsrVadMethod", "")
+    crisp_asr_use_gpu = ConfigItem("CrispASR", "CrispAsrUseGpu", True, BoolValidator())
     crisp_asr_use_vad = ConfigItem("CrispASR", "CrispAsrUseVad", True, BoolValidator())
 
     # ------------------- Faster Whisper 配置 -------------------
