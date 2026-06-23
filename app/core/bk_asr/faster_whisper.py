@@ -14,6 +14,57 @@ from .base import BaseASR
 logger = setup_logger("faster_whisper")
 
 
+def _fix_tokenizer_merges(tokenizer_path: str) -> None:
+    """将新版 tokenizer.json 的 merges（["a","b"] 数组对）转换为旧版
+    （"a b" 空格连接字符串），以兼容 Faster-Whisper-XXL r245.2 的旧 tokenizers 库。
+
+    若已是旧格式或文件不存在则不做改动。会原地备份后改写。
+    """
+    import json
+
+    if not os.path.isfile(tokenizer_path):
+        return
+    try:
+        with open(tokenizer_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        logger.warning("读取 tokenizer.json 失败，跳过兼容性修复: %s", e)
+        return
+
+    model = data.get("model")
+    if not isinstance(model, dict):
+        return
+    merges = model.get("merges")
+    if not isinstance(merges, list) or not merges:
+        return
+
+    # 仅当 merges 为“数组对”新格式时才转换
+    if not isinstance(merges[0], list):
+        return  # 已是旧格式（字符串）
+
+    new_merges = []
+    for pair in merges:
+        if isinstance(pair, list) and len(pair) == 2:
+            new_merges.append(f"{pair[0]} {pair[1]}")
+        elif isinstance(pair, str):
+            new_merges.append(pair)
+    model["merges"] = new_merges
+
+    try:
+        # 备份原文件（仅一次，保留新格式副本）
+        backup = tokenizer_path + ".newfmt.bak"
+        if not os.path.exists(backup):
+            shutil.copy2(tokenizer_path, backup)
+        with open(tokenizer_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        logger.info(
+            "已将 tokenizer.json merges 转为旧格式以兼容 Faster-Whisper-XXL (%d 条)",
+            len(new_merges),
+        )
+    except Exception as e:
+        logger.warning("写入修复后的 tokenizer.json 失败: %s", e)
+
+
 class FasterWhisperASR(BaseASR):
     def __init__(
         self,
@@ -93,6 +144,14 @@ class FasterWhisperASR(BaseASR):
                         )
                     except Exception as e:
                         logger.warning("重命名模型目录失败: %s", e)
+
+                # 兼容性修复：将新版 tokenizer.json 的 merges（数组对）转换为
+                # 旧版（空格连接字符串），以适配 Faster-Whisper-XXL r245.2 的
+                # tokenizers 库（否则报 "untagged enum ModelWrapper"）。
+                model_dir_path = (
+                    prefixed_dir if os.path.isdir(prefixed_dir) else plain_dir
+                )
+                _fix_tokenizer_merges(os.path.join(model_dir_path, "tokenizer.json"))
 
             self.model_path = bare
 
@@ -256,12 +315,20 @@ class FasterWhisperASR(BaseASR):
             return self._run_once(callback)
         except RuntimeError as e:
             msg = str(e).lower()
-            cuda_failed = (
+            # 与 GPU 无关的错误（如 tokenizer/模型格式问题），CPU 重试也不会成功，
+            # 不应触发回退，直接抛出。
+            non_gpu_error = (
+                "modelwrapper" in msg
+                or "did not match any variant" in msg
+                or "tokenizer" in msg
+            )
+            cuda_failed = (not non_gpu_error) and (
                 "cublas" in msg
-                or "cuda" in msg
                 or "cudnn" in msg
                 or "status_not_supported" in msg
                 or "out of memory" in msg
+                or "cuda error" in msg
+                or "cuda failure" in msg
             )
             # GPU 失败时自动回退到 CPU 重试一次
             if cuda_failed and self.device == "cuda":
