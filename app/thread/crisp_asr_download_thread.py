@@ -226,11 +226,35 @@ def download_crisp_asr_engine_sync(
                         progress(50, f"下载引擎 {downloaded / 1024 / 1024:.1f} MB")
 
         progress(95, "正在解压引擎…")
+        # 先解压到临时目录，再把含 crispasr.exe 的那一层“拍平”复制到目标目录，
+        # 避免 GPU 包解压成子文件夹、而旧的 CPU exe 仍残留在顶层导致不生效。
+        extract_dir = Path(tmp) / "extracted"
+        extract_dir.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(target_bin_dir)
+            zf.extractall(extract_dir)
 
-    exe = _find_exe(target_bin_dir)
+        src_exe = _find_exe(extract_dir)
+        if not src_exe:
+            raise RuntimeError("解压后未找到 crispasr 可执行文件")
+        src_dir = src_exe.parent
+
+        import shutil as _shutil
+
+        # 将 exe 所在目录的全部文件复制到目标目录（覆盖旧的 CPU 构建）
+        for item in src_dir.iterdir():
+            dest = target_bin_dir / item.name
+            try:
+                if item.is_dir():
+                    _shutil.copytree(item, dest, dirs_exist_ok=True)
+                else:
+                    _shutil.copy2(item, dest)
+            except Exception as e:
+                logger.warning("复制引擎文件失败 %s: %s", item.name, e)
+
+    exe = target_bin_dir / ("crispasr.exe" if os.name == "nt" else "crispasr")
+    if not exe.exists():
+        exe = _find_exe(target_bin_dir)
     if not exe:
-        raise RuntimeError("解压后未找到 crispasr 可执行文件")
+        raise RuntimeError("安装后未找到 crispasr 可执行文件")
     progress(100, "引擎下载完成")
     return str(exe)
