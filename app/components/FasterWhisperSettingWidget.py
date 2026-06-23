@@ -179,8 +179,28 @@ def check_faster_whisper_exists() -> tuple[bool, list[str]]:
 
 
 # 添加新的解压线程类
+def _find_7z():
+    """查找 7z 可执行文件（PATH 或随应用打包的 resource/bin）。未找到返回 None。"""
+    import shutil
+
+    for name in ("7z", "7za", "7zr"):
+        found = shutil.which(name)
+        if found:
+            return found
+    try:
+        from app.config import BIN_PATH
+
+        for name in ("7z.exe", "7za.exe") if os.name == "nt" else ("7z", "7za"):
+            candidate = os.path.join(str(BIN_PATH), name)
+            if os.path.exists(candidate):
+                return candidate
+    except Exception:
+        pass
+    return None
+
+
 class UnzipThread(QThread):
-    """7z解压线程"""
+    """解压线程：优先用 7z 命令，缺失时回退到纯 Python（py7zr / zipfile）。"""
 
     finished = pyqtSignal()  # 解压完成信号
     error = pyqtSignal(str)  # 解压错误信号
@@ -192,18 +212,51 @@ class UnzipThread(QThread):
 
     def run(self):
         try:
-            subprocess.run(
-                ["7z", "x", self.zip_file, f"-o{self.extract_path}", "-y"],
-                check=True,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-            )
+            os.makedirs(self.extract_path, exist_ok=True)
+
+            seven_zip = _find_7z()
+            if seven_zip:
+                subprocess.run(
+                    [seven_zip, "x", self.zip_file, f"-o{self.extract_path}", "-y"],
+                    check=True,
+                    creationflags=(
+                        subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                    ),
+                )
+            else:
+                # 回退：纯 Python 解压
+                self._extract_python()
+
             # 删除压缩包
-            os.remove(self.zip_file)
+            try:
+                os.remove(self.zip_file)
+            except OSError:
+                pass
             self.finished.emit()
         except subprocess.CalledProcessError as e:
             self.error.emit(f"解压失败: {str(e)}")
         except Exception as e:
             self.error.emit(str(e))
+
+    def _extract_python(self):
+        """无 7z 命令时的纯 Python 解压（支持 .7z 与 .zip）。"""
+        lower = str(self.zip_file).lower()
+        if lower.endswith(".7z"):
+            try:
+                import py7zr
+            except ImportError as e:
+                raise RuntimeError(
+                    "未安装 7z 工具，且缺少 py7zr 库。请运行: pip install py7zr"
+                ) from e
+            with py7zr.SevenZipFile(self.zip_file, mode="r") as archive:
+                archive.extractall(path=self.extract_path)
+        elif lower.endswith(".zip"):
+            import zipfile
+
+            with zipfile.ZipFile(self.zip_file, "r") as zf:
+                zf.extractall(self.extract_path)
+        else:
+            raise RuntimeError(f"不支持的压缩格式: {self.zip_file}")
 
 
 class HuggingFaceDownloadThread(QThread):
