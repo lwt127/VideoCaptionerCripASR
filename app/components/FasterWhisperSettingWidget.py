@@ -398,6 +398,13 @@ class HuggingFaceDownloadThread(QThread):
                         f"{total/1024/1024:.1f} MB",
                     )
 
+        # 校验完整性：不完整则报错（保留断点, 可重试续传）
+        if total > 0 and downloaded < total:
+            raise RuntimeError(
+                f"下载 {filename} 未完成: {downloaded/1024/1024:.1f}/"
+                f"{total/1024/1024:.1f} MB，请重试以续传"
+            )
+
     def terminate(self):
         self._stop = True
         if self.process and self.process.poll() is None:

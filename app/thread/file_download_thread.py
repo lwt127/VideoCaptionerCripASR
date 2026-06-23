@@ -207,6 +207,20 @@ class FileDownloadThread(QThread):
                                 f"{self.tr('速度')}: {speed_str}",
                             )
 
+            # 校验完整性：若已知总大小但实际下载不足，视为不完整（保留断点以便续传）
+            if total > 0 and downloaded < total:
+                logger.error(
+                    "下载不完整: %d/%d 字节（已保留断点, 可重试续传）",
+                    downloaded,
+                    total,
+                )
+                self.error.emit(
+                    f"{self.tr('下载未完成')}: "
+                    f"{downloaded/1024/1024:.1f}/{total/1024/1024:.1f} MB，"
+                    f"{self.tr('请重试以续传')}"
+                )
+                return
+
             self.progress.emit(100, self.tr("下载完成"))
             os.makedirs(os.path.dirname(self.save_path), exist_ok=True)
             shutil.move(str(temp_file), self.save_path)
