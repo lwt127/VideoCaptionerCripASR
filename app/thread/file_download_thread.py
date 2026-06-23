@@ -137,48 +137,91 @@ class FileDownloadThread(QThread):
             self.error.emit(str(e))
 
     def _download_with_urllib(self, temp_file):
-        """纯 Python 下载回退（无需 aria2c），支持进度与中断。"""
+        """纯 Python 下载回退（无需 aria2c）。
+
+        支持：HTTP Range 断点续传、进度/速度显示、可中断。
+        若服务器不支持 Range，则重新从头下载。
+        """
+        import time
+
         try:
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE  # 与 aria2c 的 --check-certificate=false 一致
 
-            req = urllib.request.Request(
-                self.url, headers={"User-Agent": "VideoCaptioner"}
-            )
-            with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
-                total = int(resp.headers.get("Content-Length", 0))
-                downloaded = 0
-                block = 1024 * 256
-                with open(temp_file, "wb") as f:
-                    while True:
-                        if self._stop_requested:
-                            logger.info("下载已被取消")
-                            return
-                        chunk = resp.read(block)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        downloaded += len(chunk)
+            # 断点续传：已存在部分文件则从断点继续
+            resume_from = 0
+            if os.path.exists(temp_file):
+                resume_from = os.path.getsize(temp_file)
+                if resume_from > 0:
+                    logger.info("尝试断点续传，已下载 %d 字节", resume_from)
+
+            headers = {"User-Agent": "Mozilla/5.0 (VideoCaptioner)"}
+            if resume_from > 0:
+                headers["Range"] = f"bytes={resume_from}-"
+
+            req = urllib.request.Request(self.url, headers=headers)
+            resp = urllib.request.urlopen(req, timeout=30, context=ctx)
+
+            # 服务器是否接受断点续传（206=部分内容）
+            if resume_from > 0 and resp.status != 206:
+                logger.info("服务器不支持断点续传，重新下载")
+                resume_from = 0
+
+            content_len = int(resp.headers.get("Content-Length", 0))
+            total = content_len + resume_from if content_len else 0
+
+            mode = "ab" if resume_from > 0 else "wb"
+            downloaded = resume_from
+            block = 1024 * 512
+            last_t = time.time()
+            last_bytes = downloaded
+
+            with resp, open(temp_file, mode) as f:
+                while True:
+                    if self._stop_requested:
+                        logger.info("下载已被取消（已保留断点, 可续传）")
+                        return
+                    chunk = resp.read(block)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+
+                    now = time.time()
+                    if now - last_t >= 0.5:
+                        speed = (downloaded - last_bytes) / (now - last_t)
+                        last_t, last_bytes = now, downloaded
+                        speed_str = self._fmt_speed(speed)
                         if total > 0:
                             percent = downloaded / total * 100
-                            mb = downloaded / 1024 / 1024
-                            total_mb = total / 1024 / 1024
                             self.progress.emit(
                                 percent,
-                                f"{mb:.1f}/{total_mb:.1f} MB",
+                                f"{downloaded/1024/1024:.1f}/{total/1024/1024:.1f} MB  "
+                                f"{self.tr('速度')}: {speed_str}",
                             )
                         else:
                             self.progress.emit(
-                                0, f"{downloaded / 1024 / 1024:.1f} MB"
+                                0,
+                                f"{downloaded/1024/1024:.1f} MB  "
+                                f"{self.tr('速度')}: {speed_str}",
                             )
 
+            self.progress.emit(100, self.tr("下载完成"))
             os.makedirs(os.path.dirname(self.save_path), exist_ok=True)
             shutil.move(str(temp_file), self.save_path)
             self.finished.emit()
         except Exception as e:
             logger.error("内置下载器失败: %s", str(e))
             self.error.emit(f"{self.tr('下载失败')}: {e}")
+
+    @staticmethod
+    def _fmt_speed(bytes_per_sec: float) -> str:
+        if bytes_per_sec >= 1024 * 1024:
+            return f"{bytes_per_sec/1024/1024:.1f} MB/s"
+        if bytes_per_sec >= 1024:
+            return f"{bytes_per_sec/1024:.0f} KB/s"
+        return f"{bytes_per_sec:.0f} B/s"
 
     def stop(self):
         self._stop_requested = True
