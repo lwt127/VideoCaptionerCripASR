@@ -1,0 +1,32 @@
+# ===== VideoCaptioner (integrated with CrispASR) — Python dependencies =====
+# Tested on Python 3.11 (the bundled runtime uses 3.11).
+# Install with:  pip install -r requirements.txt
+
+# ---- GUI framework ----
+PyQt5>=5.15
+PyQt5-Frameless-Window>=0.3
+PyQt-Fluent-Widgets[full]>=1.5.0
+
+# ---- LLM / API clients ----
+openai>=1.0.0
+
+# ---- HTTP / networking ----
+requests>=2.28
+
+# ---- Utilities ----
+retry>=0.9.2
+psutil>=5.9
+
+# ---- Media download (online video tasks) ----
+yt-dlp>=2024.1.0
+
+# ---- Optional: ModelScope model downloads (used by the model downloader) ----
+# Only needed if you download models via ModelScope inside the app.
+modelscope>=1.9
+
+# ---- Notes ----
+# * ffmpeg is required at runtime (provided via resource/bin or your system PATH).
+# * Faster-Whisper is invoked as an external program (Faster-Whisper-XXL), not a
+#   Python package — download it separately if you use that transcription backend.
+# * CrispASR runs via its prebuilt binaries in resource/bin/CrispASR/ (Windows),
+#   or build it yourself from _build/CrispASR/ for other platforms.
