@@ -54,11 +54,47 @@ class FasterWhisperASR(BaseASR):
         self.output_dir = output_dir
         self.output_format = output_format
 
-        # 解析非标准模型名到本地路径
-        if self.model_dir and not os.path.isdir(self.model_path):
-            candidate = os.path.join(self.model_dir, self.model_path)
-            if os.path.isdir(candidate):
-                self.model_path = candidate
+        # 模型名处理（faster-whisper-xxl / whisper-standalone-win 规则）：
+        # faster-whisper-xxl 解析本地模型时，会在 --model_dir 下查找
+        # 名为 "faster-whisper-<模型名>" 的文件夹，并对 -m 的值自动加前缀。
+        # 因此：① -m 传不带前缀的模型名；② 确保本地模型目录带 "faster-whisper-" 前缀。
+        STANDARD_MODELS = {
+            "tiny", "tiny.en", "base", "base.en", "small", "small.en",
+            "medium", "medium.en", "large-v1", "large-v2", "large-v3", "large",
+            "large-v3-turbo", "turbo", "distil-large-v2", "distil-medium.en",
+            "distil-small.en", "distil-large-v3",
+        }
+        if self.model_dir:
+            name = self.model_path
+            # 若误传绝对路径，且位于 model_dir 下，则还原为文件夹名
+            if os.path.isabs(name):
+                try:
+                    rel = os.path.relpath(name, self.model_dir)
+                    if not rel.startswith("..") and os.sep not in rel:
+                        name = rel
+                except Exception:
+                    pass
+            # 去掉可能已有的 faster-whisper- 前缀，得到“裸模型名”传给 -m
+            bare = name
+            if bare.startswith("faster-whisper-"):
+                bare = bare[len("faster-whisper-"):]
+
+            # 自定义本地模型：确保目录名带 faster-whisper- 前缀，否则 xxl 找不到
+            if bare not in STANDARD_MODELS:
+                prefixed_dir = os.path.join(self.model_dir, f"faster-whisper-{bare}")
+                plain_dir = os.path.join(self.model_dir, bare)
+                if not os.path.isdir(prefixed_dir) and os.path.isdir(plain_dir):
+                    try:
+                        os.rename(plain_dir, prefixed_dir)
+                        logger.info(
+                            "已将本地模型目录重命名以符合 xxl 规则: %s -> %s",
+                            plain_dir,
+                            prefixed_dir,
+                        )
+                    except Exception as e:
+                        logger.warning("重命名模型目录失败: %s", e)
+
+            self.model_path = bare
 
         # VAD 参数
         self.vad_filter = vad_filter
