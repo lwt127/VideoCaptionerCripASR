@@ -139,10 +139,10 @@ FASTER_WHISPER_MODELS = [
         "modelScopeLink": "pengzhendong/faster-whisper-large-v3-turbo",
     },
     {
-        "label": "kotoba-whisper-v2.0-faster",
-        "value": "kotoba-whisper-v2.0-faster",
+        "label": "kotoba-whisper-v2.2-faster",
+        "value": "kotoba-whisper-v2.2-faster",
         "size": "1585152",
-        "downloadLink": "https://huggingface.co/kotoba-tech/kotoba-whisper-v2.0-faster",
+        "downloadLink": "https://huggingface.co/RoachLin/kotoba-whisper-v2.2-faster",
         "modelScopeLink": "",
         "huggingfaceFiles": [
             "model.bin",

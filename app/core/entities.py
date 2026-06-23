@@ -364,7 +364,7 @@ class FasterWhisperModelEnum(Enum):
     LARGE_V2 = "large-v2"
     LARGE_V3 = "large-v3"
     LARGE_V3_TURBO = "large-v3-turbo"
-    KOTOBA_V2 = "kotoba-whisper-v2.0-faster"
+    KOTOBA_V2 = "kotoba-whisper-v2.2-faster"
 
 
 LANGUAGES = {
