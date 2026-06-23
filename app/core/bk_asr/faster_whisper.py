@@ -252,6 +252,32 @@ class FasterWhisperASR(BaseASR):
         if callback is None:
             callback = lambda x, y: None
 
+        try:
+            return self._run_once(callback)
+        except RuntimeError as e:
+            msg = str(e).lower()
+            cuda_failed = (
+                "cublas" in msg
+                or "cuda" in msg
+                or "cudnn" in msg
+                or "status_not_supported" in msg
+                or "out of memory" in msg
+            )
+            # GPU 失败时自动回退到 CPU 重试一次
+            if cuda_failed and self.device == "cuda":
+                logger.warning("CUDA 推理失败，自动回退到 CPU 重试: %s", e)
+                callback(5, "GPU 失败，改用 CPU 重试…")
+                self.device = "cpu"
+                # CPU 模式下选择对应程序与计算类型
+                if shutil.which("faster-whisper-xxl"):
+                    self.faster_whisper_program = "faster-whisper-xxl"
+                elif shutil.which("faster-whisper"):
+                    self.faster_whisper_program = "faster-whisper"
+                    self.vad_method = None
+                return self._run_once(callback)
+            raise
+
+    def _run_once(self, callback) -> str:
         temp_dir = Path(tempfile.gettempdir()) / "bk_asr"
         temp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -295,8 +321,16 @@ class FasterWhisperASR(BaseASR):
                     if "Subtitles are written to" in output:
                         is_finish = True
                         callback(100, "识别完成")
-                    if "error" in output:
-                        error_msg += output
+                    low = output.lower()
+                    if (
+                        "error" in low
+                        or "cublas" in low
+                        or "cuda" in low
+                        or "cudnn" in low
+                        or "exception" in low
+                        or "failed" in low
+                    ):
+                        error_msg += output + "\n"
                         logger.error(output)
                     else:
                         logger.info(output)
