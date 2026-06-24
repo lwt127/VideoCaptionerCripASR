@@ -194,7 +194,134 @@ class CrispASR(BaseASR):
                 or text.startswith("（")
             ):
                 filtered_segments.append(seg)
-        return filtered_segments
+
+        # 按 Faster-Whisper 的断句规则拆分过长字幕：
+        #   中/日/韩 max_line_width = 30，其它语言 = 90。
+        # CrispASR（whisper.cpp）原生不做字幕友好的断句，这里做后处理。
+        split_segments: list[ASRDataSeg] = []
+        for seg in filtered_segments:
+            split_segments.extend(self._split_long_segment(seg))
+        return split_segments
+
+    # ---- 字幕断句（对齐 Faster-Whisper 规则） ----
+
+    def _max_line_width(self) -> int:
+        """与 Faster-Whisper 一致：中/日/韩 30 字，其它语言 90 字。"""
+        return 30 if self.language in ("zh", "ja", "ko") else 90
+
+    def _is_cjk_lang(self) -> bool:
+        return self.language in ("zh", "ja", "ko")
+
+    def _text_len(self, text: str) -> int:
+        """计算“显示宽度”：CJK 字符计 1，其它也计 1（与 Faster-Whisper 字符数口径一致）。"""
+        return len(text.strip())
+
+    def _split_long_segment(self, seg: ASRDataSeg) -> list[ASRDataSeg]:
+        """将单条过长字幕拆分为多条，时间按字符数比例分配。
+
+        策略（对齐 Faster-Whisper 的 --sentence 行为）：
+          1) 先按句末标点（。！？.!? 等）切分；
+          2) 仍超长的子句再按次级标点（，、,;： 等）切分；
+          3) 还超长则按宽度硬切（CJK 按字符、其它按空格词边界）。
+        """
+        text = (seg.text or "").strip()
+        if not text:
+            return [seg]
+
+        max_width = self._max_line_width()
+        if self._text_len(text) <= max_width:
+            return [seg]
+
+        pieces = self._split_text(text, max_width)
+        if len(pieces) <= 1:
+            return [seg]
+
+        # 按字符数比例分配时间
+        total_chars = sum(max(1, self._text_len(p)) for p in pieces)
+        duration = max(0, seg.end_time - seg.start_time)
+        result: list[ASRDataSeg] = []
+        cursor = seg.start_time
+        for i, piece in enumerate(pieces):
+            if i == len(pieces) - 1:
+                end = seg.end_time
+            else:
+                frac = max(1, self._text_len(piece)) / total_chars
+                end = cursor + int(duration * frac)
+                if end <= cursor:
+                    end = cursor + 1
+            result.append(
+                ASRDataSeg(
+                    piece.strip(),
+                    int(cursor),
+                    int(end),
+                    getattr(seg, "translated_text", "") or "",
+                )
+            )
+            cursor = end
+        return result
+
+    def _split_text(self, text: str, max_width: int) -> list[str]:
+        """按标点/宽度将文本拆分为不超过 max_width 的若干片段。"""
+        # 1) 句末标点（保留标点在前一句）
+        sentence_parts = re.split(r"(?<=[。！？!?\.])\s*", text)
+        sentence_parts = [p for p in (s.strip() for s in sentence_parts) if p]
+        if not sentence_parts:
+            sentence_parts = [text]
+
+        pieces: list[str] = []
+        for part in sentence_parts:
+            if self._text_len(part) <= max_width:
+                pieces.append(part)
+                continue
+            # 2) 次级标点
+            sub_parts = re.split(r"(?<=[，、,;；:：])\s*", part)
+            sub_parts = [p for p in (s.strip() for s in sub_parts) if p]
+            if not sub_parts:
+                sub_parts = [part]
+            for sub in sub_parts:
+                if self._text_len(sub) <= max_width:
+                    pieces.append(sub)
+                else:
+                    # 3) 硬切
+                    pieces.extend(self._hard_wrap(sub, max_width))
+
+        # 合并相邻过短片段，避免出现一两字的碎句（仍不超过 max_width）
+        return self._merge_short(pieces, max_width)
+
+    def _hard_wrap(self, text: str, max_width: int) -> list[str]:
+        """按宽度硬切：CJK 直接按字符切；其它语言按空格词边界切。"""
+        if self._is_cjk_lang() or " " not in text:
+            return [text[i : i + max_width] for i in range(0, len(text), max_width)]
+
+        words = text.split()
+        lines: list[str] = []
+        current = ""
+        for w in words:
+            if not current:
+                current = w
+            elif len(current) + 1 + len(w) <= max_width:
+                current += " " + w
+            else:
+                lines.append(current)
+                current = w
+        if current:
+            lines.append(current)
+        return lines or [text]
+
+    def _merge_short(self, pieces: list[str], max_width: int) -> list[str]:
+        """合并相邻片段，只要合并后不超过 max_width，减少碎句。"""
+        if not pieces:
+            return pieces
+        merged: list[str] = []
+        sep = "" if self._is_cjk_lang() else " "
+        for p in pieces:
+            if merged:
+                candidate = merged[-1] + sep + p
+                if self._text_len(candidate) <= max_width:
+                    merged[-1] = candidate.strip()
+                    continue
+            merged.append(p.strip())
+        return merged
 
     def _build_command(self, wav_path: Path, output_base: Path) -> list[str]:
         """构建 crispasr 命令行参数。
