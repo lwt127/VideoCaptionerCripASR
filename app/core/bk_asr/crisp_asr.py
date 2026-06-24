@@ -455,7 +455,9 @@ class CrispASR(BaseASR):
                 if not output_srt.exists():
                     raise RuntimeError(f"输出文件未生成: {output_srt}")
 
-                return output_srt.read_text(encoding="utf-8")
+                # 某些后端在长音频上可能输出被截断的多字节字符，导致严格 UTF-8 解码失败。
+                # 使用 errors="replace" 容错读取，避免整个转录结果因个别坏字节而丢失。
+                return output_srt.read_text(encoding="utf-8", errors="replace")
 
             except Exception as e:
                 logger.exception("CrispASR 处理失败")
