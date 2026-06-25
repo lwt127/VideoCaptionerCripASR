@@ -71,22 +71,34 @@ CRISP_ASR_BACKENDS = [
                 "value": "ggml-large-v3.bin",
                 "backend": "whisper",
             },
+            {
+                # kotoba-whisper v2.2（日语微调）的 ggml 量化版，可在 whisper 后端运行。
+                # 该模型不在 CrispASR 内置注册表中，需通过 --hf-repo 从自定义仓库下载，
+                # 由 crisp_asr.py 的 CRISP_ASR_WHISPER_HF_REPOS 映射处理。
+                "label": "kotoba-whisper-v2.2 ✨ (日语, ggml q8_0)",
+                "value": "kotoba-whisper-v2.2-ggml-q8_0.bin",
+                "backend": "whisper",
+            },
         ],
     },
     {
+        # 注意：Parakeet 的所有变体都使用同一个 --backend "parakeet"，
+        # 具体变体通过 -m <registry-key> 选择（如 -m parakeet-ja）。
+        # CrispASR 不接受 --backend parakeet-ja（会报 "unknown backend"），
+        # 因此这些变体的 backend 必须保持 "parakeet"，变体名放在 -m 值里。
         "label": "Parakeet (NeMo, 快, 多语言, 词级时间戳)",
         "backend": "parakeet",
         "models": [
-            _auto("TDT 0.6B v3 (多语言, 默认, 自动下载)", "parakeet"),
-            _auto("TDT 0.6B v2 (英语)", "parakeet-v2"),
-            _auto("TDT 0.6B (日语)", "parakeet-ja"),
-            _auto("TDT 1.1B (英语, 更大)", "parakeet-tdt-1.1b"),
-            _auto("TDT-CTC 110M (英语, 最小)", "parakeet-tdt_ctc-110m"),
-            _auto("TDT-CTC 1.1B (含标点, 多语言)", "parakeet-tdt_ctc-1.1b"),
-            _auto("RNNT 0.6B (英语)", "parakeet-rnnt-0.6b"),
-            _auto("RNNT 1.1B (英语)", "parakeet-rnnt-1.1b"),
-            _auto("CTC 0.6B (英语)", "parakeet-ctc-0.6b"),
-            _auto("CTC 1.1B (英语)", "parakeet-ctc-1.1b"),
+            _auto("TDT 0.6B v3 (多语言, 默认, 自动下载)", "parakeet", "auto"),
+            _auto("TDT 0.6B v2 (英语)", "parakeet", "parakeet-v2"),
+            _auto("TDT 0.6B (日语)", "parakeet", "parakeet-ja"),
+            _auto("TDT 1.1B (英语, 更大)", "parakeet", "parakeet-tdt-1.1b"),
+            _auto("TDT-CTC 110M (英语, 最小)", "parakeet", "parakeet-tdt_ctc-110m"),
+            _auto("TDT-CTC 1.1B (含标点, 多语言)", "parakeet", "parakeet-tdt_ctc-1.1b"),
+            _auto("RNNT 0.6B (英语)", "parakeet", "parakeet-rnnt-0.6b"),
+            _auto("RNNT 1.1B (英语)", "parakeet", "parakeet-rnnt-1.1b"),
+            _auto("CTC 0.6B (英语)", "parakeet", "parakeet-ctc-0.6b"),
+            _auto("CTC 1.1B (英语)", "parakeet", "parakeet-ctc-1.1b"),
         ],
     },
     {
