@@ -15,14 +15,19 @@ logger = setup_logger("crisp_asr")
 # CrispASR 二进制目录（随应用打包在 resource/bin/CrispASR 下）
 CRISP_ASR_BIN = Path(BIN_PATH) / "CrispASR" / "crispasr.exe"
 
-# 非内置注册表的 whisper ggml 模型 → HuggingFace 仓库映射。
-# 这些模型需通过 `--hf-repo OWNER/REPO --hf-file FILE` 从自定义仓库下载，
-# CrispASR 会缓存到 ~/.cache/crispasr。键为 -m 传入的文件名（小写匹配）。
-CRISP_ASR_WHISPER_HF_REPOS = {
-    "kotoba-whisper-v2.2-ggml-q8_0.bin": "kenrouse/kotoba-whisper-v2.2-ggml",
-    "kotoba-whisper-v2.2-ggml-q5_0.bin": "kenrouse/kotoba-whisper-v2.2-ggml",
-    "kotoba-whisper-v2.2-ggml.bin": "kenrouse/kotoba-whisper-v2.2-ggml",
-}
+# 期望的最低引擎版本；低于该版本的本地引擎会被自动升级（下载 v0.8.8）。
+# 与 crisp_asr_download_thread.CRISP_ASR_PINNED_TAG 保持一致。
+CRISP_ASR_MIN_VERSION = (0, 8, 8)
+
+# CrispASR 引擎内部把解码后的采样点数量强转为 32 位有符号 int
+# （examples/cli/crispasr_run.cpp: `(int)samples.size()`）。解码后统一为
+# 16kHz，因此超过 2^31 / 16000 ≈ 134217.7 秒（约 37.28 小时）的音频会导致
+# 该值溢出为负数，从而报 "no speech detected" 甚至直接崩溃/读取失败。
+# 引擎的公开 C ABI（crispasr.h）以 `int n_samples` 贯穿所有后端，无法在
+# 应用侧修复；因此对确实超过该上限的超长音频，改为在 Python 侧「按静音点」
+# 切分（ffmpeg silencedetect，绝不在语句中间切割），逐段转录后拼接时间轴，
+# 从而规避引擎限制且不产生断句质量损失。阈值取 36 小时（留安全余量）。
+CRISPASR_MAX_SINGLE_RUN_SECONDS = 36 * 3600  # 129600s
 
 
 def cuda_available() -> bool:
@@ -65,6 +70,33 @@ def engine_supports_cuda(exe_path) -> bool:
         return False
 
 
+def engine_version(exe_path) -> tuple[int, int, int] | None:
+    """运行 crispasr --version，解析引擎版本号为 (major, minor, patch)。
+
+    解析失败返回 None。用于判断本地引擎是否需要升级到目标版本。
+    """
+    try:
+        r = subprocess.run(
+            [str(exe_path), "--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        out = (r.stdout or "") + (r.stderr or "")
+        # 兼容 "version : 0.8.8"、"crispasr 0.8.8 (...)" 等多种输出格式
+        m = re.search(r"(?:version\s*[:=]?\s*|crispasr\s+)v?(\d+)\.(\d+)\.(\d+)", out, re.IGNORECASE)
+        if not m:
+            m = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", out)
+        if m:
+            return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        return None
+    except Exception:
+        return None
+
+
 class CrispASR(BaseASR):
     """CrispASR 本地转录后端（多后端 ASR 引擎）。
 
@@ -80,11 +112,6 @@ class CrispASR(BaseASR):
         crispasr.exe --backend parakeet -m auto -f <audio.wav> -l <lang> \
             -osrt -of <base> --vad -vm silero
     """
-
-    # 单个 VAD 语音区间的最大时长（秒）。CrispASR 默认不限制（FLT_MAX），
-    # 会导致一段连续语音（尤其无标点/无停顿）变成 20~30 秒的超长字幕。
-    # 超过该时长的语音区间会被自动切分。
-    VAD_MAX_SPEECH_DURATION_S = 8
 
     def __init__(
         self,
@@ -105,8 +132,6 @@ class CrispASR(BaseASR):
 
         self.backend = backend or "whisper"
         self.vad_method = vad_method or "silero"
-        # 若该 whisper ggml 模型需要从自定义 HF 仓库下载，则记录其仓库；否则为 None。
-        self.hf_repo: "str | None" = None
 
         # 解析模型参数：
         #  - "auto" → 交由 CrispASR 自动下载该后端默认模型（缓存到 ~/.cache/crispasr）
@@ -115,7 +140,6 @@ class CrispASR(BaseASR):
         if model and model != "auto" and "ggml" in model.lower():
             models_dir = Path(MODEL_PATH)
             candidate = models_dir / model
-            hf_repo = CRISP_ASR_WHISPER_HF_REPOS.get(model.lower())
             if candidate.exists():
                 self.model_arg = str(candidate)
                 logger.info(f"使用本地模型文件: {self.model_arg}")
@@ -124,14 +148,6 @@ class CrispASR(BaseASR):
                 if matches:
                     self.model_arg = str(matches[0])
                     logger.info(f"使用本地模型文件: {self.model_arg}")
-                elif hf_repo:
-                    # 自定义仓库的 ggml 模型（如 kotoba-whisper）：保留文件名，
-                    # 通过 --hf-repo 从 HuggingFace 下载（CrispASR 缓存到 ~/.cache/crispasr）。
-                    self.model_arg = model
-                    self.hf_repo = hf_repo
-                    logger.info(
-                        f"使用 HuggingFace 仓库模型: --hf-repo {hf_repo} --hf-file {model}"
-                    )
                 else:
                     # 本地没有该 ggml 模型 → 交给 CrispASR 自动下载
                     self.model_arg = "auto"
@@ -164,9 +180,21 @@ class CrispASR(BaseASR):
         """
         want_cuda = self.use_gpu and cuda_available()
 
-        # 已存在引擎时：若需要 CUDA 但当前为 CPU-only，则升级为 CUDA 构建
+        # 已存在引擎时：
+        #   1) 版本低于最低要求 → 升级到目标版本（v0.8.8）；
+        #   2) 需要 CUDA 但当前为 CPU-only → 升级为 CUDA 构建。
         if self.crisp_asr_path.exists():
-            if want_cuda and not engine_supports_cuda(self.crisp_asr_path):
+            ver = engine_version(self.crisp_asr_path)
+            need_upgrade = ver is not None and ver < CRISP_ASR_MIN_VERSION
+            if need_upgrade:
+                logger.info(
+                    "当前 CrispASR 版本 %s 低于要求 %s，升级引擎…",
+                    ".".join(map(str, ver)),
+                    ".".join(map(str, CRISP_ASR_MIN_VERSION)),
+                )
+                callback(0, "正在升级 CrispASR 引擎到新版本…")
+                self._download_engine(callback, prefer_gpu=want_cuda)
+            elif want_cuda and not engine_supports_cuda(self.crisp_asr_path):
                 logger.info("检测到 NVIDIA GPU，但当前 CrispASR 为 CPU 构建，升级为 CUDA 构建…")
                 callback(0, "检测到显卡，正在下载 CUDA 版 CrispASR 引擎…")
                 self._download_engine(callback, prefer_gpu=True)
@@ -220,78 +248,133 @@ class CrispASR(BaseASR):
             ):
                 filtered_segments.append(seg)
 
-        # Python 侧后处理：拆分过长字幕段（后端无关）。
-        # 某些后端/VAD 组合（如 cohere + whisper-vad）不响应
-        # --vad-max-speech-duration-s，会产出 20~30 秒的超长字幕。
-        # 这里把超过阈值的段在标点处切分，时间按字符比例分配，
-        # 保证任何后端都能得到长度可控的字幕。
+        # 按 Faster-Whisper 的断句规则拆分过长字幕：
+        #   中/日/韩 max_line_width = 30，其它语言 = 90。
+        # CrispASR（whisper.cpp）原生不做字幕友好的断句，这里做后处理。
         split_segments: list[ASRDataSeg] = []
         for seg in filtered_segments:
             split_segments.extend(self._split_long_segment(seg))
         return split_segments
 
+    # ---- 字幕断句（对齐 Faster-Whisper 规则） ----
+
+    def _max_line_width(self) -> int:
+        """与 Faster-Whisper 一致：中/日/韩 30 字，其它语言 90 字。"""
+        return 30 if self.language in ("zh", "ja", "ko") else 90
+
+    def _is_cjk_lang(self) -> bool:
+        return self.language in ("zh", "ja", "ko")
+
+    def _text_len(self, text: str) -> int:
+        """计算“显示宽度”：CJK 字符计 1，其它也计 1（与 Faster-Whisper 字符数口径一致）。"""
+        return len(text.strip())
+
     def _split_long_segment(self, seg: ASRDataSeg) -> list[ASRDataSeg]:
-        """将时长超过阈值的字幕段递归拆分为更短的段。
+        """将单条过长字幕拆分为多条，时间按字符数比例分配。
 
-        - 优先在句末标点（。！？!?.）后切分；
-        - 其次在次级标点（、，,…）或空格处切分；
-        - 实在无标点可切时，按字符中点强制切分；
-        - 子段时间按各自字符数占比在原段时间区间内线性分配。
+        策略（对齐 Faster-Whisper 的 --sentence 行为）：
+          1) 先按句末标点（。！？.!? 等）切分；
+          2) 仍超长的子句再按次级标点（，、,;： 等）切分；
+          3) 还超长则按宽度硬切（CJK 按字符、其它按空格词边界）。
         """
-        duration_ms = seg.end_time - seg.start_time
-        text = seg.text.strip()
-        max_ms = int(self.VAD_MAX_SPEECH_DURATION_S * 1000)
-
-        # 足够短，或没有可分文本，直接返回
-        if duration_ms <= max_ms or len(text) <= 1:
+        text = (seg.text or "").strip()
+        if not text:
             return [seg]
 
-        # 选择切分位置：尽量靠近文本中点的标点
-        split_idx = self._find_split_index(text)
-        if split_idx is None:
-            # 没有任何标点，按字符中点硬切
-            split_idx = len(text) // 2
-
-        left_text = text[:split_idx].strip()
-        right_text = text[split_idx:].strip()
-        if not left_text or not right_text:
-            # 切分无效（例如标点在首尾），返回原段避免死循环
+        max_width = self._max_line_width()
+        if self._text_len(text) <= max_width:
             return [seg]
 
-        # 按字符数占比分配时间
-        total_chars = len(left_text) + len(right_text)
-        left_ratio = len(left_text) / total_chars
-        mid_time = seg.start_time + int(duration_ms * left_ratio)
+        pieces = self._split_text(text, max_width)
+        if len(pieces) <= 1:
+            return [seg]
 
-        left_seg = ASRDataSeg(left_text, seg.start_time, mid_time)
-        right_seg = ASRDataSeg(right_text, mid_time, seg.end_time)
-
-        # 递归处理，直到所有子段都不超过阈值
+        # 按字符数比例分配时间
+        total_chars = sum(max(1, self._text_len(p)) for p in pieces)
+        duration = max(0, seg.end_time - seg.start_time)
         result: list[ASRDataSeg] = []
-        result.extend(self._split_long_segment(left_seg))
-        result.extend(self._split_long_segment(right_seg))
+        cursor = seg.start_time
+        for i, piece in enumerate(pieces):
+            if i == len(pieces) - 1:
+                end = seg.end_time
+            else:
+                frac = max(1, self._text_len(piece)) / total_chars
+                end = cursor + int(duration * frac)
+                if end <= cursor:
+                    end = cursor + 1
+            result.append(
+                ASRDataSeg(
+                    piece.strip(),
+                    int(cursor),
+                    int(end),
+                    getattr(seg, "translated_text", "") or "",
+                )
+            )
+            cursor = end
         return result
 
-    @staticmethod
-    def _find_split_index(text: str) -> "int | None":
-        """返回最接近文本中点的切分位置（标点后一位）。
+    def _split_text(self, text: str, max_width: int) -> list[str]:
+        """按标点/宽度将文本拆分为不超过 max_width 的若干片段。"""
+        # 1) 句末标点（保留标点在前一句）
+        sentence_parts = re.split(r"(?<=[。！？!?\.])\s*", text)
+        sentence_parts = [p for p in (s.strip() for s in sentence_parts) if p]
+        if not sentence_parts:
+            sentence_parts = [text]
 
-        先找句末标点，找不到再找次级标点/空格。返回 None 表示无标点。
-        """
-        primary = "。！？!?."
-        secondary = "、，,…　 "
-        mid = len(text) / 2
+        pieces: list[str] = []
+        for part in sentence_parts:
+            if self._text_len(part) <= max_width:
+                pieces.append(part)
+                continue
+            # 2) 次级标点
+            sub_parts = re.split(r"(?<=[，、,;；:：])\s*", part)
+            sub_parts = [p for p in (s.strip() for s in sub_parts) if p]
+            if not sub_parts:
+                sub_parts = [part]
+            for sub in sub_parts:
+                if self._text_len(sub) <= max_width:
+                    pieces.append(sub)
+                else:
+                    # 3) 硬切
+                    pieces.extend(self._hard_wrap(sub, max_width))
 
-        def best_after(chars: str) -> "int | None":
-            positions = [i + 1 for i, c in enumerate(text) if c in chars]
-            # 排除位于首尾、会切出空串的位置
-            positions = [p for p in positions if 0 < p < len(text)]
-            if not positions:
-                return None
-            # 选离中点最近的切分点，使左右更均衡
-            return min(positions, key=lambda p: abs(p - mid))
+        # 合并相邻过短片段，避免出现一两字的碎句（仍不超过 max_width）
+        return self._merge_short(pieces, max_width)
 
-        return best_after(primary) or best_after(secondary)
+    def _hard_wrap(self, text: str, max_width: int) -> list[str]:
+        """按宽度硬切：CJK 直接按字符切；其它语言按空格词边界切。"""
+        if self._is_cjk_lang() or " " not in text:
+            return [text[i : i + max_width] for i in range(0, len(text), max_width)]
+
+        words = text.split()
+        lines: list[str] = []
+        current = ""
+        for w in words:
+            if not current:
+                current = w
+            elif len(current) + 1 + len(w) <= max_width:
+                current += " " + w
+            else:
+                lines.append(current)
+                current = w
+        if current:
+            lines.append(current)
+        return lines or [text]
+
+    def _merge_short(self, pieces: list[str], max_width: int) -> list[str]:
+        """合并相邻片段，只要合并后不超过 max_width，减少碎句。"""
+        if not pieces:
+            return pieces
+        merged: list[str] = []
+        sep = "" if self._is_cjk_lang() else " "
+        for p in pieces:
+            if merged:
+                candidate = merged[-1] + sep + p
+                if self._text_len(candidate) <= max_width:
+                    merged[-1] = candidate.strip()
+                    continue
+            merged.append(p.strip())
+        return merged
 
     def _build_command(self, wav_path: Path, output_base: Path) -> list[str]:
         """构建 crispasr 命令行参数。
@@ -315,26 +398,6 @@ class CrispASR(BaseASR):
             str(output_base),
         ]
 
-        # 自定义 HuggingFace 仓库模型（如 kotoba-whisper）：通过 --hf-repo / --hf-file
-        # 让 CrispASR 从指定仓库下载并缓存（--hf-repo 本身即隐含 auto-download）。
-        if self.hf_repo:
-            params.extend(["--hf-repo", self.hf_repo, "--hf-file", str(self.model_arg)])
-
-        # 当指定了具体模型文件名（而非本地已存在的路径，也非 "auto"）时，
-        # 该模型可能尚未下载到 CrispASR 缓存（~/.cache/crispasr）。
-        # 此时显式加上 --auto-download，让引擎按名称自动下载该模型，
-        # 否则会以 "model not found locally" 报错退出 (code 13)。
-        # 说明：
-        #  - model_arg == "auto" 时引擎本身即会自动下载，无需此参数；
-        #  - model_arg 为本地已存在的绝对路径时，os.path.exists 为真，跳过；
-        #  - 使用 --hf-repo 时已隐含自动下载，无需重复追加；
-        #  - 其余情况（如 cohere-asr-ja-q4_k.gguf 这类按名引用的模型）才追加。
-        elif self.model_arg != "auto" and not os.path.exists(str(self.model_arg)):
-            params.append("--auto-download")
-
-        # 在句末标点（. ! ? 。！？）处断句，生成更适合字幕的短句。
-        params.append("--split-on-punct")
-
         # GPU 控制：默认启用 GPU，关闭时传 --no-gpu
         if not self.use_gpu:
             params.append("--no-gpu")
@@ -344,11 +407,6 @@ class CrispASR(BaseASR):
             params.append("--vad")
             if self.vad_method and self.vad_method != "silero":
                 params.extend(["--vad-model", self.vad_method])
-            # 关键：限制单个语音区间的最大时长（默认 FLT_MAX 表示不限制，
-            # 正是出现 20~30 秒超长字幕的根因）。超过该时长的语音会被自动切分。
-            params.extend(
-                ["--vad-max-speech-duration-s", str(self.VAD_MAX_SPEECH_DURATION_S)]
-            )
 
         # 中文模式下添加提示语（whisper 后端支持 --prompt）
         if self.language == "zh" and self.backend == "whisper":
@@ -362,8 +420,32 @@ class CrispASR(BaseASR):
         if callback is None:
             callback = lambda x, y: None
 
-        # 确保引擎可用：缺失则自动下载（模型则由 CrispASR 自身按需自动下载）
+        # 确保引擎可用：缺失/版本过低则自动下载升级（模型由 CrispASR 自身按需下载）
         self._ensure_engine(callback)
+
+        total_duration = self.get_audio_duration(self.audio_path) or 600
+        logger.info("音频总时长: %d 秒", total_duration)
+
+        # 超过引擎 32 位采样点上限（~37.28h）的超长音频：按静音点切分后逐段转录。
+        if total_duration > CRISPASR_MAX_SINGLE_RUN_SECONDS:
+            logger.warning(
+                "音频时长 %ds 超过 CrispASR 引擎单次上限 %ds，改用按静音切分的分段转录。",
+                total_duration,
+                CRISPASR_MAX_SINGLE_RUN_SECONDS,
+            )
+            return self._run_split_on_silence(total_duration, callback)
+
+        return self._transcribe_wav_to_srt(self.audio_path, total_duration, callback)
+
+    def _transcribe_wav_to_srt(self, audio_path, total_duration: int, callback) -> str:
+        """对单个 WAV 文件执行一次 crispasr 转录，返回 SRT 文本。
+
+        Args:
+            audio_path: 输入 WAV 路径（需为 16k 单声道 WAV）
+            total_duration: 该音频总时长（秒），用于进度换算
+            callback: 进度回调 callback(progress:int, msg:str)
+        """
+        total_duration = max(1, int(total_duration))
 
         temp_root = Path(tempfile.gettempdir()) / "bk_asr"
         temp_root.mkdir(parents=True, exist_ok=True)
@@ -375,7 +457,7 @@ class CrispASR(BaseASR):
             output_srt = output_base.with_suffix(".srt")
 
             try:
-                shutil.copy2(self.audio_path, wav_path)
+                shutil.copy2(audio_path, wav_path)
 
                 params = self._build_command(wav_path, output_base)
                 logger.info("完整命令行参数: %s", " ".join(params))
@@ -391,9 +473,6 @@ class CrispASR(BaseASR):
                         subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
                     ),
                 )
-
-                total_duration = self.get_audio_duration(self.audio_path) or 600
-                logger.info("音频总时长: %d 秒", total_duration)
 
                 full_output = []
                 while True:
@@ -458,11 +537,184 @@ class CrispASR(BaseASR):
                 logger.exception("CrispASR 处理失败")
                 raise RuntimeError(f"生成 SRT 文件失败: {str(e)}")
 
+    # ---- 超长音频：按静音点切分 → 分段转录 → 时间轴拼接 ----
+
+    def _run_split_on_silence(self, total_duration: int, callback) -> str:
+        """对超过引擎单次上限的超长音频，按静音点切分为若干段分别转录后拼接。
+
+        - 切点由 ffmpeg ``silencedetect`` 在目标位置附近寻找静音区间，保证不会在
+          语句中间切割（无断句质量损失）；
+        - 每段落在引擎的 32 位采样点上限之内；
+        - 各段 SRT 的时间戳按该段在原音频中的起始偏移平移后合并重排。
+        """
+        # 每段目标时长：取上限的 90%，为寻找静音切点留出浮动空间。
+        segment_target = int(CRISPASR_MAX_SINGLE_RUN_SECONDS * 0.9)
+        boundaries = self._find_silence_split_points(total_duration, segment_target)
+        # 组装 [(start, end), ...] 段区间
+        cut_points = [0.0] + boundaries + [float(total_duration)]
+        segments = [
+            (cut_points[i], cut_points[i + 1]) for i in range(len(cut_points) - 1)
+        ]
+        segments = [(s, e) for (s, e) in segments if e - s > 0.5]
+        n_seg = len(segments)
+        logger.info("超长音频将切分为 %d 段进行转录", n_seg)
+
+        temp_root = Path(tempfile.gettempdir()) / "bk_asr"
+        temp_root.mkdir(parents=True, exist_ok=True)
+
+        all_segments: list[ASRDataSeg] = []
+        with tempfile.TemporaryDirectory(dir=temp_root) as temp_path:
+            temp_dir = Path(temp_path)
+            for idx, (start, end) in enumerate(segments):
+                seg_dur = end - start
+                seg_wav = temp_dir / f"seg_{idx:03d}.wav"
+                # 从原音频裁剪出该段，输出 16k 单声道 WAV（RF64 自动，规避 4GiB 上限）
+                self._extract_segment(self.audio_path, start, seg_dur, seg_wav)
+
+                base_pct = int(idx / n_seg * 100)
+
+                def _seg_cb(p, msg, _base=base_pct, _span=int(100 / n_seg)):
+                    callback(min(98, _base + int(p * _span / 100)),
+                             f"[{idx + 1}/{n_seg}] {msg}")
+
+                _seg_cb(0, "分段转录中")
+                seg_srt = self._transcribe_wav_to_srt(
+                    str(seg_wav), int(seg_dur) or 1, _seg_cb
+                )
+
+                # 将该段字幕时间轴平移 start(ms) 后并入总结果
+                offset_ms = int(start * 1000)
+                seg_data = ASRData.from_srt(seg_srt)
+                for s in seg_data.segments:
+                    all_segments.append(
+                        ASRDataSeg(
+                            s.text,
+                            s.start_time + offset_ms,
+                            s.end_time + offset_ms,
+                            getattr(s, "translated_text", "") or "",
+                        )
+                    )
+
+                # 段转录完成后删除临时 WAV，避免超长音频的多段切片同时占用磁盘
+                try:
+                    seg_wav.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        callback(100, "转换完成")
+        merged = ASRData(all_segments)
+        return merged.to_srt()
+
+    def _find_silence_split_points(
+        self, total_duration: int, segment_target: int
+    ) -> list[float]:
+        """用 ffmpeg silencedetect 找到接近各目标切点的静音中点，返回切点时间(秒)列表。
+
+        若某目标点附近找不到静音，则回退为该目标点本身（极少见；此时仅该点可能
+        有一次断句，不影响其余切点）。
+        """
+        if total_duration <= segment_target:
+            return []
+
+        # 需要的切点数量
+        n_cuts = int((total_duration - 1) // segment_target)
+        targets = [segment_target * (i + 1) for i in range(n_cuts)]
+
+        silences = self._detect_silences(self.audio_path)
+
+        split_points: list[float] = []
+        for t in targets:
+            best = None
+            best_dist = None
+            for (s_start, s_end) in silences:
+                mid = (s_start + s_end) / 2.0
+                # 只在目标点前后一段窗口内找（窗口 = 目标段长的 20%）
+                if abs(mid - t) > segment_target * 0.2:
+                    continue
+                d = abs(mid - t)
+                if best_dist is None or d < best_dist:
+                    best_dist = d
+                    best = mid
+            split_points.append(best if best is not None else float(t))
+        # 去重并保证递增
+        uniq: list[float] = []
+        for p in split_points:
+            if not uniq or p > uniq[-1] + 0.5:
+                uniq.append(p)
+        return uniq
+
+    def _detect_silences(self, audio_path) -> list[tuple]:
+        """运行 ffmpeg silencedetect，返回静音区间列表 [(start_s, end_s), ...]。"""
+        cmd = [
+            "ffmpeg",
+            "-i",
+            str(audio_path),
+            "-af",
+            "silencedetect=noise=-30dB:d=0.5",
+            "-f",
+            "null",
+            "-",
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+        except Exception as e:
+            logger.warning("silencedetect 执行失败，将按固定时间点切分: %s", e)
+            return []
+
+        info = result.stderr or ""
+        starts = [float(m) for m in re.findall(r"silence_start:\s*([\d.]+)", info)]
+        ends = [float(m) for m in re.findall(r"silence_end:\s*([\d.]+)", info)]
+        pairs = []
+        for i, s in enumerate(starts):
+            e = ends[i] if i < len(ends) else s + 0.5
+            pairs.append((s, e))
+        logger.info("检测到 %d 段静音", len(pairs))
+        return pairs
+
+    def _extract_segment(self, src, start_s: float, dur_s: float, out_wav) -> None:
+        """从源音频裁剪 [start_s, start_s+dur_s) 段，输出 16k 单声道 WAV（RF64 自动）。"""
+        cmd = [
+            "ffmpeg",
+            "-ss",
+            f"{start_s:.3f}",
+            "-i",
+            str(src),
+            "-t",
+            f"{dur_s:.3f}",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-af",
+            "aresample=async=1",
+            "-rf64",
+            "auto",
+            "-y",
+            str(out_wav),
+        ]
+        logger.info("裁剪分段音频: %s", " ".join(cmd))
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        if result.returncode != 0 or not Path(out_wav).is_file():
+            raise RuntimeError(f"分段音频裁剪失败: {result.stderr[-500:]}")
+
     def _get_key(self):
-        # "sp" 标记启用了 --split-on-punct，确保与旧缓存（未断句结果）区分开
         return (
             f"crispasr-{self.crc32_hex}-{self.need_word_time_stamp}"
-            f"-{self.backend}-{Path(str(self.model_arg)).name}-{self.language}-sp"
+            f"-{self.backend}-{Path(str(self.model_arg)).name}-{self.language}"
         )
 
     def get_audio_duration(self, filepath: str) -> int:

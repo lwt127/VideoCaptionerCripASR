@@ -48,6 +48,16 @@ def video2audio(input_file: str, output: str = "") -> bool:
         "16000",
         "-af",
         "aresample=async=1",  # 处理音频同步问题
+        # 标准 RIFF/WAV 的 chunk size 字段是 32 位，超过约 4GiB 的数据会导致
+        # size 字段溢出/回绕，写出一个损坏的 WAV 头（RIFF/data chunk 大小错误）。
+        # 对于超长音频（例如 mono/16kHz/16bit 下 >约 37 小时），这会导致
+        # 下游解码器（如 CrispASR 内置的 miniaudio/dr_wav）读取到错误的帧数，
+        # 报错 "failed to read the frames of the audio data (Invalid argument)"。
+        # "-rf64 auto" 让 ffmpeg 在数据量增长到需要时自动切换为 RF64 头
+        # （64 位大小字段），普通大小的文件仍写标准 RIFF，完全向后兼容，
+        # 且 dr_wav/miniaudio 已支持解析 RF64 容器。
+        "-rf64",
+        "auto",
         "-y",
         output,
     ]

@@ -27,6 +27,11 @@ from app.core.utils.logger import setup_logger
 logger = setup_logger("crisp_asr_download")
 
 
+# 固定下载的 CrispASR 引擎版本（确定性升级；置为 None 时回退到 releases/latest）。
+# v0.8.8 提供完整的 Windows CUDA 可执行包（crispasr-windows-x86_64-cuda.zip）。
+CRISP_ASR_PINNED_TAG = "v0.8.8"
+
+
 def _windows_asset_name(prefer_gpu: bool = False) -> str:
     """选择 Windows 平台的发行包资产名。默认使用自包含的 CPU 版（最稳）。"""
     if prefer_gpu:
@@ -35,7 +40,11 @@ def _windows_asset_name(prefer_gpu: bool = False) -> str:
 
 
 def get_release_asset_url(prefer_gpu: bool = False) -> str:
-    """查询 CrispASR 最新 Release，返回匹配当前平台的资产下载链接。"""
+    """查询 CrispASR Release，返回匹配当前平台的资产下载链接。
+
+    默认锁定到 ``CRISP_ASR_PINNED_TAG``（确定性升级）；若该 tag 查询失败，
+    则回退到 ``releases/latest``。
+    """
     system = platform.system()
     if system != "Windows":
         raise RuntimeError(
@@ -43,14 +52,32 @@ def get_release_asset_url(prefer_gpu: bool = False) -> str:
         )
 
     asset_name = _windows_asset_name(prefer_gpu)
-    api_url = f"https://api.github.com/repos/{CRISP_ASR_REPO}/releases/latest"
 
     ctx = ssl.create_default_context()
-    req = urllib.request.Request(
-        api_url, headers={"User-Agent": "VideoCaptioner-CrispASR"}
-    )
-    with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+
+    def _fetch(api_url: str):
+        req = urllib.request.Request(
+            api_url, headers={"User-Agent": "VideoCaptioner-CrispASR"}
+        )
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    # 优先使用固定 tag，失败（网络/该 tag 不存在）时回退 latest。
+    data = None
+    if CRISP_ASR_PINNED_TAG:
+        try:
+            data = _fetch(
+                f"https://api.github.com/repos/{CRISP_ASR_REPO}/releases/tags/{CRISP_ASR_PINNED_TAG}"
+            )
+            logger.info("使用固定 CrispASR 版本: %s", CRISP_ASR_PINNED_TAG)
+        except Exception as e:
+            logger.warning(
+                "查询固定版本 %s 失败，回退到 latest: %s", CRISP_ASR_PINNED_TAG, e
+            )
+    if data is None:
+        data = _fetch(
+            f"https://api.github.com/repos/{CRISP_ASR_REPO}/releases/latest"
+        )
 
     assets = data.get("assets", [])
 
@@ -83,8 +110,9 @@ def get_release_asset_url(prefer_gpu: bool = False) -> str:
     if url:
         return url
 
+    tag = CRISP_ASR_PINNED_TAG or "latest"
     raise RuntimeError(
-        f"在最新 Release 中未找到 Windows 资产（期望: {asset_name}）"
+        f"在 Release {tag} 中未找到 Windows 资产（期望: {asset_name}）"
     )
 
 
