@@ -104,6 +104,7 @@ class TranslatorServiceEnum(Enum):
     DEEPLX = "DeepLx 翻译"
     BING = "微软翻译"
     GOOGLE = "谷歌翻译"
+    SAKANA = "Sakana 翻译 ✨"
 
 
 class VadMethodEnum(Enum):
@@ -549,6 +550,8 @@ class SubtitleConfig:
     need_reflect: bool = False
     thread_num: int = 10
     batch_size: int = 10
+    # 源语言（用于不支持自动检测的翻译服务，例如 Sakana Translate）
+    source_language: Optional[str] = None
     # 字幕布局和分割
     split_type: Optional[SplitTypeEnum] = None
     subtitle_layout: Optional[str] = None

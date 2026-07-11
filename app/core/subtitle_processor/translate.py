@@ -25,6 +25,10 @@ from app.core.subtitle_processor.prompt import (
     REFLECT_TRANSLATE_PROMPT,
     SINGLE_TRANSLATE_PROMPT,
 )
+from app.core.subtitle_processor.sakana_translate_client import (
+    SakanaTranslateClient,
+    SakanaTranslateError,
+)
 from app.core.storage.cache_manager import CacheManager
 from app.config import CACHE_PATH
 from app.core.utils.logger import setup_logger
@@ -40,6 +44,7 @@ class TranslatorType(Enum):
     GOOGLE = "google"
     BING = "bing"
     DEEPLX = "deeplx"
+    SAKANA = "sakana"
 
 
 class BaseTranslator(ABC):
@@ -686,6 +691,122 @@ class DeepLXTranslator(BaseTranslator):
         return result
 
 
+class SakanaTranslator(BaseTranslator):
+    """Sakana Translate 翻译器（非官方接口，参见 sakana_translate_client.py）"""
+
+    # Sakana 接口仅支持这四种语言代码（不支持自动检测）
+    LANG_MAP = {
+        "简体中文": "zh",
+        "繁体中文": "zh-Hant",
+        "英语": "en",
+        "日本語": "ja",
+        "中文": "zh",
+        "Chinese": "zh",
+        "English": "en",
+        "Japanese": "ja",
+        "zh": "zh",
+        "zh-Hant": "zh-Hant",
+        "en": "en",
+        "ja": "ja",
+    }
+
+    def __init__(
+        self,
+        thread_num: int = 3,
+        batch_num: int = 1,
+        target_language: str = "Chinese",
+        source_language: Optional[str] = None,
+        retry_times: int = 1,
+        timeout: int = 30,
+        update_callback: Optional[Callable] = None,
+        variant: str = "casual",
+    ):
+        # Sakana 接口有较严格的分钟级限速，线程数/批大小不宜过高
+        thread_num = min(thread_num, 3)
+        batch_num = 1  # 该接口不支持批量翻译，强制逐条处理
+        super().__init__(
+            thread_num=thread_num,
+            batch_num=batch_num,
+            target_language=target_language,
+            retry_times=retry_times,
+            timeout=timeout,
+            update_callback=update_callback,
+        )
+        self.client = SakanaTranslateClient(timeout=timeout)
+        self.variant = variant
+        self.source_language = source_language
+        # 保留实例属性以兼容旧代码引用
+        self.lang_map = self.LANG_MAP
+
+        # 源语言在初始化阶段就校验，不支持则立即报错（而非等到逐条翻译时才失败）
+        self.source_lang_code = self._resolve_lang_code(
+            source_language, role="源语言"
+        )
+
+    @classmethod
+    def _resolve_lang_code(cls, language: Optional[str], role: str) -> str:
+        """将应用内部的语言名称/代码解析为 Sakana 支持的语言代码。
+
+        Sakana Translate 只支持 en/ja/zh/zh-Hant，且不支持自动检测。
+        如果传入的语言不在支持范围内，直接抛出异常提示用户改用其他翻译服务，
+        而不是静默回退到某个默认语言（避免产生误导性的错误翻译）。
+        """
+        if language and language in cls.LANG_MAP:
+            return cls.LANG_MAP[language]
+
+        supported = "、".join(sorted(set(cls.LANG_MAP.values())))
+        raise SakanaTranslateError(
+            f"Sakana 翻译服务不支持当前{role}「{language}」。"
+            f"该服务仅支持：{supported}（不支持自动检测），"
+            f"请在设置中改用其他翻译服务（谷歌翻译/微软翻译/DeepLx/LLM大模型翻译）。"
+        )
+
+    def _translate_chunk(self, subtitle_chunk: Dict[str, str]) -> Dict[str, str]:
+        """翻译字幕块（Sakana 接口不支持批量，逐条翻译）"""
+        result = {}
+        # 目标语言同样只允许 en/ja/zh/zh-Hant，解析失败则整块翻译失败
+        target_lang = self._resolve_lang_code(self.target_language, role="目标语言")
+        source_lang = self.source_lang_code
+
+        for idx, text in subtitle_chunk.items():
+            try:
+                cache_params = {
+                    "source_language": source_lang,
+                    "target_language": target_lang,
+                    "variant": self.variant,
+                }
+                cache_result = self.cache_manager.get_translation(
+                    text, TranslatorType.SAKANA.value, **cache_params
+                )
+                if cache_result:
+                    result[idx] = cache_result
+                    logger.info(f"使用缓存的Sakana翻译结果：{idx}")
+                    continue
+
+                if not text.strip():
+                    result[idx] = text
+                    continue
+
+                translated_text = self.client.translate(
+                    text=text,
+                    source_lang=source_lang,
+                    target_lang=target_lang,
+                    variant=self.variant,
+                )
+
+                self.cache_manager.set_translation(
+                    text, translated_text, TranslatorType.SAKANA.value, **cache_params
+                )
+                result[idx] = translated_text
+            except SakanaTranslateError as e:
+                logger.error(f"Sakana翻译失败 {idx}: {str(e)}")
+                result[idx] = "ERROR"
+            except Exception as e:
+                logger.error(f"Sakana翻译失败 {idx}: {str(e)}")
+                result[idx] = "ERROR"
+        return result
+
+
 class TranslatorFactory:
     """翻译器工厂类"""
 
@@ -695,6 +816,7 @@ class TranslatorFactory:
         thread_num: int = 5,
         batch_num: int = 10,
         target_language: str = "Chinese",
+        source_language: Optional[str] = None,
         model: str = "gpt-4o-mini",
         custom_prompt: str = "",
         temperature: float = 0.7,
@@ -736,6 +858,16 @@ class TranslatorFactory:
                     thread_num=thread_num,
                     batch_num=batch_num,
                     target_language=target_language,
+                    update_callback=update_callback,
+                )
+            elif translator_type == TranslatorType.SAKANA:
+                thread_num = min(thread_num, 3)
+                batch_num = 1
+                return SakanaTranslator(
+                    thread_num=thread_num,
+                    batch_num=batch_num,
+                    target_language=target_language,
+                    source_language=source_language,
                     update_callback=update_callback,
                 )
             else:

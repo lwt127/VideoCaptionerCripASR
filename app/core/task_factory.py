@@ -177,6 +177,8 @@ class TaskFactory:
             deeplx_endpoint=cfg.deeplx_endpoint.value,
             # 翻译服务
             translator_service=cfg.translator_service.value,
+            # 源语言（转录语言，用于不支持自动检测的翻译服务，例如 Sakana Translate）
+            source_language=cfg.transcribe_language.value.value,
             # 字幕处理
             split_type=split_type,
             need_reflect=cfg.need_reflect_translate.value,

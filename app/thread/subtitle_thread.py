@@ -121,6 +121,7 @@ class SubtitleThread(QThread):
                             TranslatorServiceEnum.DEEPLX,
                             TranslatorServiceEnum.BING,
                             TranslatorServiceEnum.GOOGLE,
+                            TranslatorServiceEnum.SAKANA,
                         ]
                     )
                 )
@@ -172,6 +173,7 @@ class SubtitleThread(QThread):
                 TranslatorServiceEnum.DEEPLX: TranslatorType.DEEPLX,
                 TranslatorServiceEnum.BING: TranslatorType.BING,
                 TranslatorServiceEnum.GOOGLE: TranslatorType.GOOGLE,
+                TranslatorServiceEnum.SAKANA: TranslatorType.SAKANA,
             }
             if subtitle_config.need_translate:
                 self.progress.emit(0, self.tr("翻译字幕..."))
@@ -183,6 +185,7 @@ class SubtitleThread(QThread):
                     thread_num=subtitle_config.thread_num,
                     batch_num=subtitle_config.batch_size,
                     target_language=subtitle_config.target_language,
+                    source_language=subtitle_config.source_language,
                     model=subtitle_config.llm_model,
                     custom_prompt=custom_prompt,
                     is_reflect=subtitle_config.need_reflect,

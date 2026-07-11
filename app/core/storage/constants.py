@@ -8,6 +8,7 @@ class TranslatorType(Enum):
     BING = "bing"
     LLM = "llm"
     DEEPLX = "deeplx"
+    SAKANA = "sakana"
 
 
 class OperationType(Enum):
