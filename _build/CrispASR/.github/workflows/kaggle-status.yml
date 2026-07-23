@@ -45,6 +45,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Install kaggle CLI
         run: pip install kaggle

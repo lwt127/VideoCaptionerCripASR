@@ -4,9 +4,24 @@
 #include "mel.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
+
+#if defined(HAVE_BLAS)
+#if defined(__APPLE__)
+#include <Accelerate/Accelerate.h>
+#else
+#include <cblas.h>
+#endif
+#endif
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace core_mel {
 
@@ -97,23 +112,69 @@ std::vector<float> compute(const float* samples, int n_samples, const float* win
         return {};
     }
 
+    const bool mel_timing = (std::getenv("CRISPASR_MEL_TIMING") != nullptr);
+    // §176f: OpenMP-parallel STFT. Each frame's window-multiply + FFT + power
+    // write touches only its own [t] row of `power` and thread-private scratch,
+    // so the loop is data-race free and bit-identical to the serial path. It is
+    // OPT-IN (CRISPASR_MEL_PARALLEL=1, default serial) because the `fft` callable
+    // is supplied per backend (cohere_fft_r2c, glm_fft, voxtral_fft_wrapper, …)
+    // and the parallel path is only safe when that callable is re-entrant. Flip
+    // a backend to parallel-by-default once its fft is confirmed thread-safe
+    // (audit: see Params::allow_parallel_stft) AND benched faster on the arch.
+    // Measured (cohere, M1, 8 cores): warm STFT ~2.4× (43→18 ms / 800 frames).
+    // Enabled by the global env var OR the per-backend Params flag.
+    const bool mel_parallel = (std::getenv("CRISPASR_MEL_PARALLEL") != nullptr) || p.allow_parallel_stft;
+    const auto t_stft0 = std::chrono::steady_clock::now();
+    bool ran_parallel = false;
+
     std::vector<float> power((size_t)T * n_freqs, 0.0f);
     {
-        std::vector<float> fft_in((size_t)n_fft);
-        std::vector<float> fft_out((size_t)n_fft * 2);
         const bool use_magnitude = (p.spec_kind == SpecKind::Magnitude);
-        for (int t = 0; t < T; t++) {
+        auto compute_frame = [&](int t, float* fft_in, float* fft_out) {
             const float* frame = in_ptr + (size_t)(t + t_start) * hop;
             for (int n = 0; n < n_fft; n++)
                 fft_in[n] = frame[n] * window[n];
-            fft(fft_in.data(), n_fft, fft_out.data());
+            fft(fft_in, n_fft, fft_out);
             for (int k = 0; k < n_freqs; k++) {
                 const float re = fft_out[2 * k];
                 const float im = fft_out[2 * k + 1];
                 const float pw = re * re + im * im;
                 power[(size_t)t * n_freqs + k] = use_magnitude ? std::sqrt(pw) : pw;
             }
+        };
+#ifdef _OPENMP
+        // Threshold: below ~256 frames (≈2.5 s at 100 fps) thread-spawn overhead
+        // dominates the handful of FFTs, so stay serial regardless of the flag.
+        if (mel_parallel && T >= 256) {
+            ran_parallel = true;
+#pragma omp parallel
+            {
+                std::vector<float> fft_in((size_t)n_fft);
+                std::vector<float> fft_out((size_t)n_fft * 2);
+#pragma omp for schedule(static)
+                for (int t = 0; t < T; t++)
+                    compute_frame(t, fft_in.data(), fft_out.data());
+            }
+        } else
+#endif
+        {
+            std::vector<float> fft_in((size_t)n_fft);
+            std::vector<float> fft_out((size_t)n_fft * 2);
+            for (int t = 0; t < T; t++)
+                compute_frame(t, fft_in.data(), fft_out.data());
         }
+    }
+
+    if (mel_timing) {
+        const double stft_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_stft0).count();
+        int nthreads = 1;
+#ifdef _OPENMP
+        if (ran_parallel)
+            nthreads = omp_get_max_threads();
+#endif
+        fprintf(stderr, "core_mel: STFT %d frames (n_fft=%d) %.2f ms [%d thread(s)%s]\n", T, n_fft, stft_ms, nthreads,
+                ran_parallel ? "" : ", serial");
     }
 
     // -----------------------------------------------------------------
@@ -136,7 +197,6 @@ std::vector<float> compute(const float* samples, int n_samples, const float* win
                         s += static_cast<Acc>(pp[k]) * static_cast<Acc>(fb[k]);
                     }
                 } else {
-                    // FreqsMels: fb[k * nmels + m]
                     for (int k = 0; k < n_freqs; k++) {
                         s += static_cast<Acc>(pp[k]) * static_cast<Acc>(mel_fb[(size_t)k * nmels + m]);
                     }
@@ -145,10 +205,24 @@ std::vector<float> compute(const float* samples, int n_samples, const float* win
             }
         }
     };
-    if (p.matmul == MatmulPrecision::Double)
+    if (p.matmul == MatmulPrecision::Double) {
         do_matmul(double{0});
-    else
+    } else {
+#if defined(HAVE_BLAS)
+        if (p.fb_layout == FbLayout::MelsFreqs) {
+            // mel[T, nmels] = power[T, n_freqs] × mel_fb^T[n_freqs, nmels]
+            // mel_fb is row-major (nmels, n_freqs); CblasTrans transposes for the multiply.
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, nmels, n_freqs, 1.0f, power.data(), n_freqs, mel_fb,
+                        n_freqs, 0.0f, mel_tn.data(), nmels);
+        } else {
+            // FreqsMels: mel_fb is (n_freqs, nmels); mel = power × mel_fb (no transpose).
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, T, nmels, n_freqs, 1.0f, power.data(), n_freqs,
+                        mel_fb, nmels, 0.0f, mel_tn.data(), nmels);
+        }
+#else
         do_matmul(float{0.0f});
+#endif
+    }
 
     // -----------------------------------------------------------------
     // 5. log with guard (no-op when log_base == None)

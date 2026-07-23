@@ -14,6 +14,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -55,8 +56,14 @@ struct crispasr_segment {
     std::string text;
     int64_t t0 = 0; // centiseconds, absolute
     int64_t t1 = 0;
-    std::string speaker;                // empty if no diarization
-    bool speaker_turn_next = false;     // whisper tinydiarize
+    std::string speaker;            // empty if no diarization
+    bool speaker_turn_next = false; // whisper tinydiarize
+    // #292: which chunk/slice this segment came from, or -1 for a single-pass
+    // (unchunked) run. Speaker labels like "(speaker 1)" are CHUNK-LOCAL — they
+    // restart per chunk — so a consumer needs chunk_id to tell "same speaker,
+    // same chunk" (continuity) from "speaker 1 in chunk 0" vs "speaker 1 in
+    // chunk 2" (which may be different people). Only set when there is >1 chunk.
+    int chunk_id = -1;
     std::vector<crispasr_word> words;   // may be empty
     std::vector<crispasr_token> tokens; // may be empty
     // Multi-task ASR metadata (SenseVoice and similar). Empty when the
@@ -65,6 +72,14 @@ struct crispasr_segment {
     std::string emotion;     // e.g. "HAPPY", "NEUTRAL"
     std::string audio_event; // e.g. "Speech", "Music"
     std::string itn_flag;    // "withitn" or "woitn"
+};
+
+struct crispasr_ctc_logits {
+    int n_frames = 0;
+    int n_vocab = 0;
+    std::vector<float> data;        // frame-major: data[t * n_vocab + v]
+    std::string normalization;      // "logits" or "log_probs"
+    std::vector<std::string> vocab; // optional raw token pieces indexed by id
 };
 
 // ---------------------------------------------------------------------------
@@ -89,14 +104,36 @@ enum crispasr_capability : uint32_t {
     CAP_PARALLEL_PROCESSORS = 1u << 14, // whisper-style n_processors
     CAP_VAD_INTERNAL = 1u << 15,        // backend handles VAD internally (whisper)
     CAP_TTS = 1u << 16,                 // text-to-speech synthesis
+    CAP_S2S = 1u << 21,                 // speech-to-speech (audio in → audio out)
     CAP_VOICE_CLONING = 1u << 17,       // TTS: synthesise with --voice <reference.wav>
     CAP_PUNCTUATION_NATIVE = 1u << 18,  // backend already emits punctuation by default
     CAP_UNBOUNDED_INPUT = 1u << 19,     // encoder handles arbitrary-length audio without chunking
                                         // (FastConformer, CTC-only encoders). LLM-based backends
                                         // and whisper's fixed-window encoder do NOT set this.
+    CAP_SEPARATE = 1u << 22,            // audio source separation (stems)
     CAP_INTERNAL_CHUNKING = 1u << 20,   // backend handles its own long-audio chunking internally
                                         // (PLAN #104: parakeet uses chunked-encode + single-decode).
                                         // Skip the crispasr_run.cpp auto-chunk fallback for these.
+    CAP_STREAMING = 1u << 23,           // backend supports true token-level streaming output
+    CAP_PITCH = 1u << 24,               // monophonic F0 / pitch-track estimation (audio in ->
+                                        // pitch frames out). Like CAP_SEPARATE this is a task
+                                        // marker for --list-backends, NOT a transcribe() path:
+                                        // routing happens in the --pitch dispatcher.
+    CAP_CHORDS = 1u << 25,              // chord recognition (audio in -> chord timeline out).
+                                        // Same task-marker role as CAP_PITCH/CAP_SEPARATE;
+                                        // routing happens in the --chords dispatcher.
+    CAP_PIANO = 1u << 27,               // polyphonic piano transcription (audio in -> note
+                                        // events out). Task marker like CAP_CHORDS/CAP_PITCH;
+                                        // routing happens in the --piano dispatcher.
+    CAP_BEATS = 1u << 26,               // beat / downbeat tracking (audio in -> beat grid out).
+                                        // Same task-marker role as CAP_CHORDS; routing happens
+                                        // in the --beats dispatcher.
+    CAP_TAB = 1u << 28,                 // guitar tablature emission scoring (audio in ->
+                                        // per-frame per-string fret SCORES out). Task marker
+                                        // like CAP_CHORDS; routing happens in the --tab
+                                        // dispatcher. Note this backend emits scores, not a
+                                        // decided tablature: the constrained Viterbi/DP that
+                                        // picks a playable fingering belongs to the caller.
 };
 
 // ---------------------------------------------------------------------------
@@ -118,12 +155,24 @@ public:
     // they care about.
     virtual bool init(const whisper_params& params) = 0;
 
-    // Transcribe a single audio slice of 16 kHz mono PCM samples.
+    // Sample rate the backend expects for input PCM (default 16000).
+    // The CLI loads audio at this rate via crispasr_audio_load_at_rate,
+    // avoiding the lossy down-then-up resample for non-16 kHz backends.
+    virtual int input_sample_rate() const { return 16000; }
+
+    // Transcribe a single audio slice of mono PCM samples at the rate
+    // returned by input_sample_rate() (16 kHz unless overridden).
     // t_offset_cs is the absolute start of this slice in centiseconds; all
     // returned segment/word/token timestamps must be absolute (include the
     // offset).
     virtual std::vector<crispasr_segment> transcribe(const float* samples, int n_samples, int64_t t_offset_cs,
                                                      const whisper_params& params) = 0;
+
+    // Optional per-frame dense CTC grid captured by the most recent transcribe()
+    // when params.return_logits is true. Backends that do not produce a dense
+    // CTC grid return nullptr. The pointer is owned by the backend and valid
+    // until the next transcribe() / shutdown().
+    virtual const crispasr_ctc_logits* last_ctc_logits() const { return nullptr; }
 
     // Optional stereo-aware overload for backends that can split stereo
     // channels for diarization (currently: whisper). Default
@@ -151,11 +200,38 @@ public:
         return {};
     }
 
+    // Streaming TTS callback: invoked once per generated PCM chunk as the
+    // backend produces audio, with the last chunk flagged is_final=true.
+    // `pcm` is mono float32 at `tts_sample_rate()`.
+    using crispasr_pcm_stream_callback = std::function<void(const float* pcm, int n_samples, bool is_final)>;
+
+    // Synthesize with streaming output. Default implementation falls back to
+    // the whole-clip synthesize() and emits it as a single final chunk.
+    // Backends with CAP_STREAMING override to emit incrementally.
+    virtual void synthesize_streaming(const std::string& text, const whisper_params& p,
+                                      crispasr_pcm_stream_callback cb) {
+        auto v = synthesize(text, p);
+        if (!v.empty())
+            cb(v.data(), (int)v.size(), true);
+    }
+
     // Sample rate of `synthesize()` output PCM. Defaults to 24 kHz since most
     // TTS backends (kokoro, qwen3-tts, vibevoice, chatterbox, orpheus, indextts)
     // produce 24 kHz. Backends that emit a different rate (e.g. voxcpm2-tts at
     // 48 kHz) override this.
     virtual int tts_sample_rate() const { return 24000; }
+
+    // S2S: speech-to-speech transform. Takes 16 kHz mono PCM input, returns
+    // PCM output at `tts_sample_rate()`. If out_text is non-null, writes the
+    // intermediate transcript. Default returns empty (not supported). Only
+    // backends with CAP_S2S override.
+    virtual std::vector<float> speech_to_speech(const float* samples, int n_samples, std::string* out_text,
+                                                const whisper_params& /*params*/) {
+        (void)samples;
+        (void)n_samples;
+        (void)out_text;
+        return {};
+    }
 
     // Text-to-text translation. m2m100 and any future translate-only
     // backend overrides this. Default returns empty (not supported).
@@ -166,6 +242,49 @@ public:
         (void)src_lang;
         (void)tgt_lang;
         return {};
+    }
+
+    // Whether the backend should auto-enable VAD for long audio when the
+    // user didn't explicitly set --chunk-seconds or --vad. Backends whose
+    // encoder degenerates on arbitrary-length chunks (e.g. parakeet-ja)
+    // override this to get silence-bounded segments that match training.
+    virtual bool prefers_vad() const { return false; }
+
+    // Maximum VAD slice duration (seconds) the backend can decode reliably
+    // in one pass; 0 = unbounded. VAD merges continuous speech into slices
+    // as long as the speech runs (40 s+ on podcast audio) — issue #89:
+    // parakeet-ja's encoder collapses past ~12 s, so slices are re-split at
+    // energy minima down to this cap before transcription. Only applied on
+    // the VAD path when the user didn't pass an explicit --chunk-seconds.
+    virtual int vad_slice_cap_seconds() const { return 0; }
+
+    // Streaming transcription callback type.
+    // Called with partial text (empty string counts as keep-alive)
+    // and is_final flag. When is_final is true, partial_text is the
+    // complete final result.
+    using crispasr_stream_callback = std::function<void(const std::string& partial_text, bool is_final)>;
+
+    // Transcribe with streaming output. Default implementation falls back
+    // to non-streaming transcribe().
+    virtual void transcribe_streaming(const float* samples, int n_samples, int64_t t_offset_cs,
+                                      const whisper_params& params, crispasr_stream_callback on_text) {
+        (void)samples;
+        (void)n_samples;
+        (void)t_offset_cs;
+        (void)params;
+        (void)on_text;
+        // Fallback: run non-streaming, then push result at once.
+        auto segments = transcribe(samples, n_samples, t_offset_cs, params);
+        std::string full;
+        for (const auto& seg : segments) {
+            if (!seg.text.empty()) {
+                full += seg.text;
+            }
+        }
+        if (!full.empty()) {
+            on_text(full, false); // partial
+        }
+        on_text(full, true); // final
     }
 
     // Warmup: run a short dummy transcribe to amortize first-call
@@ -192,6 +311,12 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
 // key using gguf_init_from_file() and maps it to a backend name. Returns
 // an empty string if detection fails.
 std::string crispasr_detect_backend_from_gguf(const std::string& model_path);
+
+// True if the GGUF at model_path is a pure-CTC FastConformer model (no RNN-T
+// decoder/joint tensors) — i.e. a parakeet-ctc / stt_*_fastconformer_ctc that must
+// run on the fastconformer-ctc backend, not the parakeet (transducer) backend.
+// Cheap: reads tensor infos only (no weights). Returns false on any read failure.
+bool crispasr_gguf_is_pure_ctc(const std::string& model_path);
 
 // List the backend names that were compiled into this binary.
 std::vector<std::string> crispasr_list_backends();

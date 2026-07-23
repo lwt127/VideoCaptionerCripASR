@@ -64,10 +64,55 @@ This is the **first speech-LLM** in the CrispASR family — every other model in
 | --- | ---: | --- |
 | `qwen3-asr-0.6b.gguf`        | 1.88 GB | F16 |
 | `qwen3-asr-0.6b-q8_0.gguf`   | 961 MB  | Q8_0, near-lossless |
-| `qwen3-asr-0.6b-q4_k.gguf`   | 676 MB  | **Q4_K — recommended default**, faster than realtime on a 4-core CPU |
+| `qwen3-asr-0.6b-q4_k.gguf`   | 631 MB  | **Q4_K — recommended default**, faster than realtime on a 4-core CPU |
+| `qwen3-asr-0.6b-q4_k-imatrix.gguf` | 631 MB | Q4_K, **importance-matrix calibrated** — see below. |
+| `qwen3-asr-0.6b-q3_k-imatrix.gguf` | 531 MB | Q3_K + imatrix — smallest usable variant. |
+| `qwen3-asr-0.6b-en-de.imatrix.gguf` | 913 KB | The importance matrix itself (CC0 Common Voice EN+DE calibration), for reproducibility / re-quantising other sizes. |
 
 All quantisations produce the correct transcript on `samples/jfk.wav`:
 > And so, my fellow Americans, ask not what your country can do for you; ask what you can do for your country.
+
+### 2026-07 rebake — audio tower now Q8_0 (fixes long-audio repetition loops)
+
+The sub-Q8 quantisations were re-baked with the 18-layer **audio encoder kept
+at Q8_0** (previously Q4_0/Q4_K like the LLM body; ~90 MB larger per file).
+Diff-harness analysis on a real 145 s clip
+([CrispASR #218](https://github.com/CrispStrobe/CrispASR/issues/218)) showed
+sub-8-bit encoder weights compound per-block drift (block 0 cos 0.9996 → block
+17 cos 0.973 vs the bf16 reference) until greedy decode flips into repetition
+loops ("hey, hey, hey, …") or an empty "language none" answer on long audio.
+With the Q8_0 tower the encoder output is back at cos ≈ 0.9997 and the full
+145 s clip transcribes cleanly in one pass — matching the bf16 reference — with
+no repetition post-processing needed. Q8_0 / F16 files were never affected.
+
+### About the imatrix variant
+
+`-q4_k-imatrix.gguf` is a Q4_K build quantised with an **importance
+matrix**: per-column activation statistics
+collected by running real audio through the F16 model
+(`CRISPASR_IMATRIX_OUT`), so the quantiser spends precision on the columns the
+model actually uses (the same idea as llama.cpp's `llama-imatrix`, but computed
+from **audio** rather than a text corpus).
+
+Calibrated on a **CC0 [Mozilla Common Voice](https://commonvoice.mozilla.org)**
+English + German sample, published at
+[`cstr/crispasr-imatrix-calib`](https://huggingface.co/datasets/cstr/crispasr-imatrix-calib).
+Measured with the `tools/imatrix_ab.py` A/B harness (prefill first-token-logit
+cosine vs the F16 gold, held-out clips):
+
+| | mean cos vs F16 | delta |
+| --- | ---: | ---: |
+| Q4_K (same recipe, no imatrix) | 0.890 | — |
+| **Q4_K + imatrix** | **0.941** | **+0.051** (every EN/DE clip improved; DE most) |
+
+So the imatrix recovers a good part of the quantisation's logit error at no
+size cost. **Calibration language coverage matters** — an English-only corpus
+made the imatrix *worse*; the EN+DE mix is what produced the gains above.
+
+**Long-form caveat:** the calibration corpus is short utterances. On long
+single-pass audio (`--chunk-seconds 0`, several minutes in one prompt) the
+imatrix variants can still drift into repetition where the plain `-q4_k.gguf`
+stays clean — for long-form use prefer `-q4_k.gguf` or `-q8_0.gguf`.
 
 The mel filterbank from `WhisperFeatureExtractor` is **baked into the GGUF** as `audio.mel_filters` (along with `audio.mel_window`), so the C++ runtime computes the log-mel spectrogram natively without needing torch / librosa / scipy at inference time.
 

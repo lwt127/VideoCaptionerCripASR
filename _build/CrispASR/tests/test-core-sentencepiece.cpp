@@ -57,8 +57,8 @@ RefResult ref_viterbi(const std::string& s, const std::unordered_map<std::string
             int32_t id;
             if (it != vocab.end()) {
                 int32_t tid = it->second;
-                double sc = (tid >= 0 && tid < (int32_t)scores.size()) ? (double)scores[tid]
-                                                                       : (double)cfg.oov_score_default;
+                double sc =
+                    (tid >= 0 && tid < (int32_t)scores.size()) ? (double)scores[tid] : (double)cfg.oov_score_default;
                 cand = best[i] + sc;
                 id = tid;
             } else if (j == i + 1) {
@@ -138,6 +138,88 @@ TEST_CASE("core_spm: single-byte unk fallback + merge", "[unit][core-spm]") {
     }
 }
 
+TEST_CASE("core_spm: OOV multi-byte codepoint does not collapse the string", "[unit][core-spm]") {
+    // Regression (#221): in utf8_aligned mode the Viterbi must keep a valid
+    // path across a codepoint that is absent from the vocab. Before the
+    // codepoint fallback, the single-byte unk edge (i→i+1) was illegal at a
+    // multi-byte lead (i+1 is a continuation byte, skipped by the alignment
+    // guard), so nothing left position i, every later position became
+    // unreachable, and the backtrack returned EMPTY — an emoji not in the
+    // vocab dropped the whole utterance to just the BOS. Here "あ" (3-byte,
+    // U+3042) is in vocab; the ear emoji 👂 (4-byte, U+1F442) and the exhale
+    // ZWJ sequence 😮‍💨 are not.
+    const std::string A = "\xE3\x81\x82";                                      // あ  (in vocab)
+    const std::string EAR = "\xF0\x9F\x91\x82";                                // 👂 (4-byte, OOV)
+    const std::string EXHALE = "\xF0\x9F\x98\xAE\xE2\x80\x8D\xF0\x9F\x92\xA8"; // 😮‍💨 (OOV, ZWJ seq)
+    std::unordered_map<std::string, int32_t> v = {{A, 0}};
+    std::vector<float> sc = {-1.0f};
+    Config cfg;
+    cfg.unk_id = 99;
+    cfg.unk_penalty = -100.0f;
+    cfg.utf8_aligned = true;
+
+    SECTION("known char + OOV emoji round-trips to [あ, <unk>]") {
+        cfg.merge_consecutive_unk = true;
+        auto ids = tokenize(A + EAR, v, sc, cfg, /*prepend_space=*/false);
+        REQUIRE(ids == std::vector<int32_t>{0, 99});
+    }
+    SECTION("interleaved known/OOV keeps every known token") {
+        cfg.merge_consecutive_unk = true;
+        // あ 👂 あ 😮‍💨 あ  →  あ <unk> あ <unk> あ  (each OOV char is one unk,
+        // and no two OOV chars are adjacent so nothing merges away).
+        auto ids = tokenize(A + EAR + A + EXHALE + A, v, sc, cfg, false);
+        REQUIRE(ids == std::vector<int32_t>{0, 99, 0, 99, 0});
+    }
+    SECTION("consecutive OOV emojis merge to a single unk") {
+        cfg.merge_consecutive_unk = true;
+        auto ids = tokenize(EAR + EXHALE + EAR, v, sc, cfg, false);
+        REQUIRE(ids == std::vector<int32_t>{99});
+    }
+    SECTION("without merge, each OOV codepoint is its own unk") {
+        cfg.merge_consecutive_unk = false;
+        auto ids = tokenize(EAR + EXHALE, v, sc, cfg, false);
+        // One <unk> per codepoint (NOT per byte): 👂 is one codepoint, and
+        // 😮‍💨 is a 3-codepoint ZWJ sequence (😮 + ZWJ + 💨) → 4 unks total.
+        REQUIRE(ids == std::vector<int32_t>{99, 99, 99, 99});
+    }
+}
+
+TEST_CASE("core_spm: byte_fallback emits <0xHH> tokens, not <unk>", "[unit][core-spm]") {
+    // Regression (#221): SentencePiece byte_fallback. An OOV byte must become
+    // its "<0xHH>" byte token (one per byte), NOT a single <unk> — the
+    // Irodori-TTS emoji emotion controls (👂 etc.) are OOV and the model was
+    // trained on their UTF-8 byte tokens; collapsing them to <unk> plays noise.
+    const std::string A = "\xE3\x81\x82";       // あ (in vocab, id 0)
+    const std::string EAR = "\xF0\x9F\x91\x82"; // 👂 (4-byte, OOV) → 4 byte tokens
+    std::unordered_map<std::string, int32_t> v = {{A, 0}};
+    std::vector<float> sc = {-1.0f};
+    // Byte tokens: give the 4 emoji bytes ids 10..13; unmapped bytes = -1.
+    std::vector<int32_t> bf(256, -1);
+    bf[0xF0] = 10;
+    bf[0x9F] = 11;
+    bf[0x91] = 12;
+    bf[0x82] = 13;
+    sc.resize(14, -3.0f); // scores for ids up to 13 (byte tokens exist & scored)
+    sc[0] = -1.0f;
+    Config cfg;
+    cfg.unk_id = 99;
+    cfg.utf8_aligned = true;
+    cfg.merge_consecutive_unk = true;
+    cfg.byte_fallback = &bf;
+
+    SECTION("known char + OOV emoji → [あ, <0xF0>,<0x9F>,<0x91>,<0x82>]") {
+        auto ids = tokenize(A + EAR, v, sc, cfg, /*prepend_space=*/false);
+        REQUIRE(ids == std::vector<int32_t>{0, 10, 11, 12, 13});
+    }
+    SECTION("no byte token for a byte → falls back to <unk> for that byte") {
+        std::vector<int32_t> bf2(256, -1); // no byte tokens at all
+        cfg.byte_fallback = &bf2;
+        cfg.merge_consecutive_unk = false;
+        auto ids = tokenize(EAR, v, sc, cfg, false);
+        REQUIRE(ids == std::vector<int32_t>{99, 99, 99, 99}); // 4 bytes → 4 <unk>
+    }
+}
+
 TEST_CASE("core_spm: oov_score_default is honored (indextts -20 vs t5 0)", "[unit][core-spm]") {
     // The big piece "zz" has id 5, which is out of range of `scores`, so its
     // score is cfg.oov_score_default. It competes with covering "zz" as two
@@ -164,7 +246,10 @@ TEST_CASE("core_spm: leading-space / ▁ handling", "[unit][core-spm]") {
     // With prepend_space, input "a b" → "▁a▁b". Vocab has the ▁-pieces.
     const std::string U = "\xE2\x96\x81"; // ▁
     std::unordered_map<std::string, int32_t> v = {
-        {U + "a", 0}, {U + "b", 1}, {"a", 2}, {"b", 3},
+        {U + "a", 0},
+        {U + "b", 1},
+        {"a", 2},
+        {"b", 3},
     };
     std::vector<float> sc = {-1.0f, -1.0f, -5.0f, -5.0f};
     Config cfg;

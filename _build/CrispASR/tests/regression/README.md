@@ -272,3 +272,13 @@ enforces this.
 6. **Verify locally** with `tests/regression/run_one.py <name>` —
    should pass at the current commit. Commit `manifest.json` (and
    any new sample WAV in `samples/`) on the same branch.
+
+## CI secrets
+
+The nightly regression workflow needs one GitHub secret:
+
+- **`HF_TOKEN`** — a HuggingFace read token (no write scope needed).
+  Without it, 29 concurrent runners hit anonymous rate limits (HTTP 429).
+  Set via: Settings → Secrets and variables → Actions → New repository secret.
+  The token is passed as `HF_TOKEN` env var; `huggingface_hub` picks it up
+  automatically. `run_one.py` also retries with exponential backoff on 429.

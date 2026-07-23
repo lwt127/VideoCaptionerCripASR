@@ -6,6 +6,7 @@
 //   - Same projector topology (stack-4-frames + 2×Linear)
 
 #include "voxtral4b.h"
+#include "core/crispasr_env.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -13,6 +14,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "crispasr_imatrix.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
 
@@ -40,6 +42,33 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+// ===========================================================================
+// Bench instrumentation — `VOXTRAL4B_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool voxtral4b_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_VOXTRAL4B_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct voxtral4b_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit voxtral4b_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~voxtral4b_bench_stage() {
+        if (!voxtral4b_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  voxtral4b_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
+
 // ===========================================================================
 // Hyper-parameters
 // ===========================================================================
@@ -197,6 +226,12 @@ struct voxtral4b_context {
     int n_threads = 4;
     int delay_tokens = 6;          // 480ms default
     std::vector<float> ada_scales; // (n_layers × d_model), precomputed
+
+    // §176s: cached encoder graph — reused when T_mel matches.
+    ggml_cgraph* cached_enc_gf = nullptr;
+    ggml_context* cached_enc_ctx = nullptr;
+    std::vector<uint8_t> cached_enc_meta;
+    int cached_enc_T_mel = 0;
 };
 
 // ===========================================================================
@@ -472,6 +507,7 @@ static void voxtral4b_fft(float* in, int N, float* out) {
 #include "core/mel.h"
 #include "core/ffn.h"
 #include "core/attention.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -495,6 +531,7 @@ extern "C" float* voxtral4b_compute_mel(voxtral4b_context* ctx, const float* sam
                                         int* out_T_mel) {
     if (!ctx || !samples || n_samples <= 0)
         return nullptr;
+    voxtral4b_bench_stage _b("mel");
     if (!ctx->model.audio.mel_filters || !ctx->model.audio.mel_window)
         return nullptr;
     const int n_fft = 400, hop = 160, n_mels = 128, n_freqs = 201;
@@ -549,7 +586,8 @@ extern "C" float* voxtral4b_compute_mel(voxtral4b_context* ctx, const float* sam
 
 static const float kRmsEps = 1e-5f;
 
-static ggml_cgraph* voxtral4b_build_graph_encoder(voxtral4b_context* ctx, int T_mel) {
+static ggml_cgraph* voxtral4b_build_graph_encoder(voxtral4b_context* ctx, int T_mel,
+                                                  ggml_context* arena_ctx = nullptr) {
     const auto& m = ctx->model;
     const auto& hp = m.hparams;
     const int d = (int)hp.audio_d_model;
@@ -563,12 +601,13 @@ static ggml_cgraph* voxtral4b_build_graph_encoder(voxtral4b_context* ctx, int T_
     // so the build stays warning-free.
     const float attn_scale = 1.0f / std::sqrt((float)head_dim);
 
-    ggml_init_params ip = {
-        ctx->compute_meta.size(),
-        ctx->compute_meta.data(),
-        true,
-    };
-    ggml_context* ctx0 = ggml_init(ip);
+    ggml_context* ctx0;
+    if (arena_ctx) {
+        ctx0 = arena_ctx;
+    } else {
+        ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
+        ctx0 = ggml_init(ip);
+    }
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
 
     // Input: mel spectrogram (n_mels=128, T_mel=3000) F32
@@ -671,7 +710,8 @@ static ggml_cgraph* voxtral4b_build_graph_encoder(voxtral4b_context* ctx, int T_
 
     ggml_set_name(cur, "encoder_out");
     ggml_build_forward_expand(gf, cur);
-    ggml_free(ctx0);
+    if (!arena_ctx)
+        ggml_free(ctx0);
     return gf;
 }
 
@@ -891,7 +931,7 @@ extern "C" struct voxtral4b_context* voxtral4b_init_from_file(const char* path,
     ctx->params = params;
     ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
-    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
     if (!ctx->backend)
         ctx->backend = ggml_backend_cpu_init();
     ctx->backend_cpu = ggml_backend_cpu_init();
@@ -913,6 +953,7 @@ extern "C" struct voxtral4b_context* voxtral4b_init_from_file(const char* path,
         if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
             backends[n_be++] = ctx->backend_cpu;
         ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+        crispasr_imatrix_install(ctx->sched); // no-op unless CRISPASR_IMATRIX_OUT is set
     }
     ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
 
@@ -1006,6 +1047,8 @@ extern "C" struct voxtral4b_context* voxtral4b_init_from_file(const char* path,
 extern "C" void voxtral4b_free(voxtral4b_context* ctx) {
     if (!ctx)
         return;
+    if (ctx->cached_enc_ctx)
+        ggml_free(ctx->cached_enc_ctx);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->kv_buf)
@@ -1205,13 +1248,28 @@ extern "C" float* voxtral4b_run_encoder(voxtral4b_context* ctx, const float* mel
                                         int* out_dim) {
     if (!ctx || !mel || n_mels != 128 || T_mel <= 0 || T_mel % 2 != 0)
         return nullptr;
+    voxtral4b_bench_stage _b("encoder");
     const int T_enc = (T_mel + 1) / 2;
     // Truncate to be divisible by 4 (downsample factor)
     const int T_enc_ds = (T_enc / 4) * 4; // round down
     const int N_out = T_enc_ds / 4;
     const int dim = (int)ctx->model.hparams.proj_out_dim;
 
-    ggml_cgraph* gf = voxtral4b_build_graph_encoder(ctx, T_mel);
+    // #235: always rebuild — cached graph has stale GPU buffer handles after sched regrow
+    ggml_cgraph* gf;
+    {
+        if (ctx->cached_enc_ctx) {
+            ggml_free(ctx->cached_enc_ctx);
+            ctx->cached_enc_ctx = nullptr;
+            ctx->cached_enc_gf = nullptr;
+        }
+        ctx->cached_enc_meta.assign(ctx->compute_meta.size(), 0);
+        ggml_init_params aip = {ctx->cached_enc_meta.size(), ctx->cached_enc_meta.data(), true};
+        ctx->cached_enc_ctx = ggml_init(aip);
+        gf = voxtral4b_build_graph_encoder(ctx, T_mel, ctx->cached_enc_ctx);
+        ctx->cached_enc_gf = gf;
+        ctx->cached_enc_T_mel = T_mel;
+    }
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
         return nullptr;
@@ -1339,6 +1397,7 @@ extern "C" void voxtral4b_kv_reset(voxtral4b_context* ctx) {
 // LLM forward with KV cache
 extern "C" float* voxtral4b_run_llm_kv(voxtral4b_context* ctx, const float* inputs_embeds, int n_tokens, int n_past,
                                        int* out_n_tokens, int* out_vocab_size) {
+    voxtral4b_bench_stage _b("llm_kv");
     if (!ctx || !inputs_embeds || n_tokens <= 0)
         return nullptr;
     const auto& hp = ctx->model.hparams;

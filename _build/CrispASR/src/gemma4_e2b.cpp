@@ -11,10 +11,13 @@
 #include "core/attention.h"
 #include "core/bpe.h"
 #include "core/ffn.h"
+#include "core/lang_names.h"
 #include "core/gguf_loader.h"
 #include "core/beam_decode.h"
 #include "core/greedy_decode.h"
 #include "core/mel.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml.h"
 #include "gguf.h"
@@ -22,6 +25,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -29,6 +33,32 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+// ===========================================================================
+// Bench instrumentation — `GEMMA4_E2B_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool gemma4_e2b_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_GEMMA4_E2B_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct gemma4_e2b_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit gemma4_e2b_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~gemma4_e2b_bench_stage() {
+        if (!gemma4_e2b_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  gemma4_e2b_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ── Hyperparameters ─────────────────────────────────────────────────────────
 
@@ -259,42 +289,13 @@ struct gemma4_e2b_context {
     std::vector<int32_t> ple_token_ids;
 };
 
+// gemma4-specific wrapper: the empty/"auto" case has a translate-direction
+// nuance ("its original language" vs "English") that the generic map can't
+// express; everything else defers to the shared core_lang::iso_to_english().
 static std::string g4e_lang_name(const std::string& lang, bool allow_original = false) {
     if (lang.empty() || lang == "auto")
         return allow_original ? std::string("its original language") : std::string("English");
-    if (lang == "en")
-        return "English";
-    if (lang == "de")
-        return "German";
-    if (lang == "fr")
-        return "French";
-    if (lang == "es")
-        return "Spanish";
-    if (lang == "it")
-        return "Italian";
-    if (lang == "pt")
-        return "Portuguese";
-    if (lang == "ru")
-        return "Russian";
-    if (lang == "ja")
-        return "Japanese";
-    if (lang == "zh")
-        return "Chinese";
-    if (lang == "nl")
-        return "Dutch";
-    if (lang == "ko")
-        return "Korean";
-    if (lang == "tr")
-        return "Turkish";
-    if (lang == "pl")
-        return "Polish";
-    if (lang == "uk")
-        return "Ukrainian";
-    if (lang == "vi")
-        return "Vietnamese";
-    if (lang == "hi")
-        return "Hindi";
-    return lang;
+    return core_lang::iso_to_english(lang);
 }
 
 static std::vector<int32_t> g4e_tokenize_text(gemma4_e2b_context* ctx, const std::string& text) {
@@ -1159,6 +1160,18 @@ static ggml_cgraph* g4e_build_graph_llm_kv(gemma4_e2b_context* ctx, int n_past, 
                                              kv_v_for_layer->nb[2], (size_t)donor_il * kv_v_for_layer->nb[3]));
 
             if (kvp.gqa_mode != core_attn::GQA_NATIVE && grp_e > 1) {
+                // Vulkan has no f16→f16 REPEAT; cast the F16 cache reads to F32
+                // before the head-expansion so it lowers to a supported F32
+                // REPEAT (issue #200/#192). This inline donor-layer path bypasses
+                // core_attn::kv_self_attn, so it needs its own guard; the helper
+                // handles every other call. No-op on Metal/CPU.
+                if (Kfull->type == GGML_TYPE_F16 && kv_k_for_layer->buffer) {
+                    const char* bn = ggml_backend_buft_name(ggml_backend_buffer_get_type(kv_k_for_layer->buffer));
+                    if (bn && std::strstr(bn, "Vulkan") != nullptr) {
+                        Kfull = ggml_cast(ctx0, Kfull, GGML_TYPE_F32);
+                        Vfull = ggml_cast(ctx0, Vfull, GGML_TYPE_F32);
+                    }
+                }
                 ggml_tensor* K4 = ggml_reshape_4d(ctx0, Kfull, hd_e, Lk, 1, n_kv_e);
                 ggml_tensor* V4 = ggml_reshape_4d(ctx0, Vfull, hd_e, Lk, 1, n_kv_e);
                 K4 = ggml_repeat_4d(ctx0, K4, hd_e, Lk, grp_e, n_kv_e);
@@ -1374,6 +1387,34 @@ static float* g4e_embed_tokens(gemma4_e2b_context* ctx, const int32_t* ids, int 
     // placeholders, before the prefill forward).
     ctx->ple_token_ids.assign(ids, ids + n);
 
+    // Fast path: single-token lookup avoids graph build + sched overhead.
+    // Must apply Gemma embedding scale (sqrt(hidden_size)) manually.
+    // Gated by CRISPASR_GEMMA4_E2B_EMBED_FAST (default ON).
+    static int use_fast = -1;
+    if (use_fast < 0) {
+        const char* e = std::getenv("CRISPASR_GEMMA4_E2B_EMBED_FAST");
+        use_fast = (!e || *e != '0') ? 1 : 0;
+    }
+    if (n == 1 && use_fast && ctx->model.llm_embed_w) {
+        const ggml_tensor* w = ctx->model.llm_embed_w;
+        const size_t row_bytes = ggml_row_size(w->type, d);
+        float* result = (float*)malloc((size_t)d * sizeof(float));
+        if (!result)
+            return nullptr;
+        std::vector<uint8_t> raw(row_bytes);
+        ggml_backend_tensor_get(w, raw.data(), (size_t)ids[0] * row_bytes, row_bytes);
+        if (w->type == GGML_TYPE_F32) {
+            std::memcpy(result, raw.data(), (size_t)d * sizeof(float));
+        } else {
+            ggml_get_type_traits(w->type)->to_float(raw.data(), result, d);
+        }
+        // Gemma embedding scale: multiply by sqrt(hidden_size)
+        const float scale = std::sqrt((float)d);
+        for (int i = 0; i < d; i++)
+            result[i] *= scale;
+        return result;
+    }
+
     ggml_cgraph* gf = g4e_build_graph_embed(ctx, n);
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
@@ -1469,12 +1510,13 @@ static std::vector<int32_t> g4e_build_text_prompt_ids(gemma4_e2b_context* ctx, c
 
 static char* g4e_run_prompt(gemma4_e2b_context* ctx, const std::vector<int32_t>& prompt_ids, int audio_insert_pos,
                             int n_audio, const float* audio_emb, int audio_dim, std::vector<int32_t>* out_token_ids,
-                            std::vector<float>* out_token_probs) {
+                            std::vector<float>* out_token_probs, gemma4_e2b_token_cb on_tok = nullptr,
+                            void* on_tok_ud = nullptr) {
     if (!ctx || prompt_ids.empty())
         return nullptr;
     auto& m = ctx->model;
     auto& lhp = m.llm_hp;
-    const bool verbose = ctx->verbosity >= 2 || getenv("GEMMA4_E2B_BENCH");
+    const bool verbose = ctx->verbosity >= 2 || crispasr_env::get("CRISPASR_GEMMA4_E2B_BENCH");
     const int d = (int)lhp.hidden_size;
     const int total = (int)prompt_ids.size();
 
@@ -1488,7 +1530,11 @@ static char* g4e_run_prompt(gemma4_e2b_context* ctx, const std::vector<int32_t>&
     }
 
     int64_t t_llm0 = ggml_time_us();
-    float* prompt_emb = g4e_embed_tokens(ctx, prompt_ids.data(), total);
+    float* prompt_emb = nullptr;
+    {
+        gemma4_e2b_bench_stage _b("token embed");
+        prompt_emb = g4e_embed_tokens(ctx, prompt_ids.data(), total);
+    }
     if (!prompt_emb) {
         fprintf(stderr, "gemma4_e2b: failed to embed prompt tokens\n");
         return nullptr;
@@ -1533,7 +1579,11 @@ static char* g4e_run_prompt(gemma4_e2b_context* ctx, const std::vector<int32_t>&
         return nullptr;
     }
 
-    float* prefill_logits = g4e_run_llm_kv(ctx, combined.data(), total, 0, nullptr, nullptr);
+    float* prefill_logits = nullptr;
+    {
+        gemma4_e2b_bench_stage _b("prefill");
+        prefill_logits = g4e_run_llm_kv(ctx, combined.data(), total, 0, nullptr, nullptr);
+    }
     if (!prefill_logits) {
         fprintf(stderr, "gemma4_e2b: prefill failed\n");
         return nullptr;
@@ -1551,6 +1601,7 @@ static char* g4e_run_prompt(gemma4_e2b_context* ctx, const std::vector<int32_t>&
     const int eos = ctx->end_of_turn_id >= 0 ? ctx->end_of_turn_id : ctx->eos_id;
     const bool capture_probs = (out_token_ids && out_token_probs);
 
+    gemma4_e2b_bench_stage _b_dec("decode loop");
     std::vector<int32_t> dec_tokens;
     std::vector<float> dec_probs;
     if (ctx->beam_size > 1) {
@@ -1578,10 +1629,18 @@ static char* g4e_run_prompt(gemma4_e2b_context* ctx, const std::vector<int32_t>&
         cfg.eos_id = eos;
         cfg.vocab_size = vocab;
         cfg.temperature = ctx->temperature;
-        auto gr =
-            core_greedy_decode::run_with_probs(ctx, first_token, first_p, total, g4e_embed_tokens, g4e_run_llm_kv, cfg);
-        dec_tokens = std::move(gr.tokens);
-        dec_probs = std::move(gr.probs);
+        if (on_tok) {
+            auto gr = core_greedy_decode::run_with_probs_cb(
+                ctx, first_token, first_p, total, g4e_embed_tokens, g4e_run_llm_kv,
+                [on_tok, on_tok_ud](int32_t id, float p) { on_tok(id, p, on_tok_ud); }, cfg);
+            dec_tokens = std::move(gr.tokens);
+            dec_probs = std::move(gr.probs);
+        } else {
+            auto gr = core_greedy_decode::run_with_probs(ctx, first_token, first_p, total, g4e_embed_tokens,
+                                                         g4e_run_llm_kv, cfg);
+            dec_tokens = std::move(gr.tokens);
+            dec_probs = std::move(gr.probs);
+        }
     }
     free(prefill_logits);
 
@@ -1754,7 +1813,7 @@ extern "C" struct gemma4_e2b_context* gemma4_e2b_init_from_file(const char* path
     }
     ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
 
-    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ctx->backend_cpu;
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (!ctx->backend)
         ctx->backend = ctx->backend_cpu;
 
@@ -2050,15 +2109,17 @@ extern "C" struct gemma4_e2b_context* gemma4_e2b_init_from_file(const char* path
 // tokens. The legacy `gemma4_e2b_transcribe` calls this with nullptr out.
 static char* gemma4_e2b_transcribe_impl(struct gemma4_e2b_context* ctx, const float* pcm, int n_samples, bool translate,
                                         const char* source_lang, const char* target_lang,
-                                        std::vector<int32_t>* out_token_ids, std::vector<float>* out_token_probs) {
+                                        std::vector<int32_t>* out_token_ids, std::vector<float>* out_token_probs,
+                                        gemma4_e2b_token_cb on_tok = nullptr, void* on_tok_ud = nullptr) {
     if (!ctx || !pcm || n_samples <= 0)
         return nullptr;
 
     auto& m = ctx->model;
     auto& ahp = m.audio_hp;
     auto& lhp = m.llm_hp;
-    const bool verbose = ctx->verbosity >= 2 || getenv("GEMMA4_E2B_BENCH");
+    const bool verbose = ctx->verbosity >= 2 || crispasr_env::get("CRISPASR_GEMMA4_E2B_BENCH");
     const float eps = lhp.rms_norm_eps;
+    gemma4_e2b_bench_stage _b_total("total");
 
     if (ctx->verbosity >= 1)
         fprintf(stderr, "gemma4_e2b: %d samples (%.1fs)\n", n_samples, n_samples / 16000.0f);
@@ -2086,8 +2147,12 @@ static char* gemma4_e2b_transcribe_impl(struct gemma4_e2b_context* ctx, const fl
 
     int T_mel = 0;
     const float mel_floor = 0.001f; // HF default
-    auto mel = g4e_compute_mel_hf_faithful(pcm, n_samples, n_fft, win_length, hop, n_mels, hann_ptr, filt_ptr,
-                                           mel_floor, T_mel);
+    std::vector<float> mel;
+    {
+        gemma4_e2b_bench_stage _b("mel");
+        mel = g4e_compute_mel_hf_faithful(pcm, n_samples, n_fft, win_length, hop, n_mels, hann_ptr, filt_ptr, mel_floor,
+                                          T_mel);
+    }
     if (mel.empty()) {
         fprintf(stderr, "gemma4_e2b: mel computation failed\n");
         return nullptr;
@@ -2311,7 +2376,7 @@ static char* gemma4_e2b_transcribe_impl(struct gemma4_e2b_context* ctx, const fl
     int audio_insert_pos = 0;
     std::vector<int32_t> prompt_ids = g4e_build_audio_prompt_ids(ctx, user_body, N_audio, &audio_insert_pos);
     return g4e_run_prompt(ctx, prompt_ids, audio_insert_pos, N_audio, audio_emb.data(), proj_dim, out_token_ids,
-                          out_token_probs);
+                          out_token_probs, on_tok, on_tok_ud);
 }
 
 extern "C" char* gemma4_e2b_transcribe(struct gemma4_e2b_context* ctx, const float* pcm, int n_samples) {
@@ -2342,6 +2407,20 @@ extern "C" struct gemma4_e2b_result* gemma4_e2b_transcribe_with_probs(struct gem
         }
     }
     return r;
+}
+
+extern "C" int gemma4_e2b_is_control_token(struct gemma4_e2b_context* ctx, int id) {
+    if (!ctx)
+        return 0;
+    return (id == ctx->bos_id || id == ctx->eos_id || id == ctx->start_of_turn_id || id == ctx->end_of_turn_id) ? 1 : 0;
+}
+
+extern "C" void gemma4_e2b_transcribe_cb(struct gemma4_e2b_context* ctx, const float* pcm, int n_samples,
+                                         gemma4_e2b_token_cb cb, void* userdata) {
+    if (!ctx || !pcm || n_samples <= 0 || !cb)
+        return;
+    char* s = gemma4_e2b_transcribe_impl(ctx, pcm, n_samples, false, nullptr, nullptr, nullptr, nullptr, cb, userdata);
+    free(s);
 }
 
 extern "C" char* gemma4_e2b_translate_text(struct gemma4_e2b_context* ctx, const char* text, const char* source_lang,

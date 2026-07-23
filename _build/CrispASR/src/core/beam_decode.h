@@ -116,6 +116,11 @@ inline double compute_logZ(const float* logits, int vocab) {
 
 // Pick top-K tokens from `logits` and return their log-softmax values.
 // `out_ids` and `out_lps` are sized to K, sorted descending by logit.
+//
+// Uses a min-heap of size K: O(V log K) instead of the previous
+// O(V + V log K) partial_sort that allocated a full vocab-sized index
+// vector per call (§176r). For beam_size=4 and vocab=32K-150K this
+// eliminates a ~128-600 KB alloc per beam expansion step.
 inline void top_k_log_softmax(const float* logits, int vocab, int K, std::vector<int>& out_ids,
                               std::vector<double>& out_lps) {
     if (K > vocab)
@@ -125,14 +130,33 @@ inline void top_k_log_softmax(const float* logits, int vocab, int K, std::vector
 
     const double logZ = compute_logZ(logits, vocab);
 
-    std::vector<int> idx((size_t)vocab);
-    for (int i = 0; i < vocab; i++)
-        idx[(size_t)i] = i;
-    std::partial_sort(idx.begin(), idx.begin() + K, idx.end(),
-                      [logits](int a, int b) { return logits[a] > logits[b]; });
+    // Min-heap: stores (logit, token_id) pairs; the smallest logit is
+    // at the top so we can cheaply evict it when a larger one arrives.
+    // Reused across calls (thread-local) so the K-element heap isn't
+    // re-allocated on every beam-expansion step (B×T per transcribe). clear()
+    // keeps capacity; the heap is rebuilt from scratch below, so the result is
+    // bit-identical to a fresh vector. (§176r follow-up)
+    using Pair = std::pair<float, int>;
+    static thread_local std::vector<Pair> heap;
+    heap.clear();
+    heap.reserve((size_t)K);
+    for (int i = 0; i < vocab; i++) {
+        if ((int)heap.size() < K) {
+            heap.push_back({logits[i], i});
+            if ((int)heap.size() == K)
+                std::make_heap(heap.begin(), heap.end(),
+                               [](const Pair& a, const Pair& b) { return a.first > b.first; });
+        } else if (logits[i] > heap[0].first) {
+            std::pop_heap(heap.begin(), heap.end(), [](const Pair& a, const Pair& b) { return a.first > b.first; });
+            heap.back() = {logits[i], i};
+            std::push_heap(heap.begin(), heap.end(), [](const Pair& a, const Pair& b) { return a.first > b.first; });
+        }
+    }
+    // Sort descending by logit.
+    std::sort(heap.begin(), heap.end(), [](const Pair& a, const Pair& b) { return a.first > b.first; });
     for (int i = 0; i < K; i++) {
-        out_ids[(size_t)i] = idx[(size_t)i];
-        out_lps[(size_t)i] = (double)logits[idx[(size_t)i]] - logZ;
+        out_ids[(size_t)i] = heap[(size_t)i].second;
+        out_lps[(size_t)i] = (double)heap[(size_t)i].first - logZ;
     }
 }
 

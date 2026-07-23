@@ -23,9 +23,12 @@
 #include "csm_tts.h"
 
 #include "core/attention.h"
+#include "core/conv.h"
 #include "core/bpe.h"
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -34,6 +37,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -49,6 +53,32 @@
 // ===================================================================
 
 namespace {
+
+// ===========================================================================
+// Bench instrumentation — `CSM_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool csm_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_CSM_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct csm_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit csm_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~csm_bench_stage() {
+        if (!csm_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  csm_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 struct csm_hparams {
     // Backbone (Llama-3.2 1B)
@@ -130,6 +160,7 @@ struct mimi_tfm_layer {
 struct seanet_conv {
     ggml_tensor* w = nullptr;
     ggml_tensor* b = nullptr;
+    ggml_tensor* w_perm = nullptr;
 };
 
 struct seanet_resblock {
@@ -190,6 +221,8 @@ struct csm_model {
     // Weight memory
     ggml_context* ctx_w = nullptr;
     ggml_backend_buffer_t buf_w = nullptr;
+    ggml_context* ctx_perm = nullptr;
+    ggml_backend_buffer_t buf_perm = nullptr;
 };
 
 } // namespace
@@ -243,6 +276,10 @@ struct csm_tts_context {
             ggml_backend_buffer_free(dd_kv_buf);
         if (dd_kv_ctx)
             ggml_free(dd_kv_ctx);
+        if (model.buf_perm)
+            ggml_backend_buffer_free(model.buf_perm);
+        if (model.ctx_perm)
+            ggml_free(model.ctx_perm);
         if (model.buf_w)
             ggml_backend_buffer_free(model.buf_w);
         if (model.ctx_w)
@@ -385,15 +422,18 @@ static ggml_tensor* resblock_fwd(ggml_context* ctx, const seanet_resblock& rb, g
 
 // Transposed conv1d for SEANet decoder (right-padded to match encoder's left-padded causal)
 static ggml_tensor* conv1d_transpose(ggml_context* ctx, const seanet_conv& conv, ggml_tensor* x, int stride) {
+    if (conv.w_perm) {
+        const int K = (int)conv.w->ne[0];
+        return core_convt::convt1d_decomp_tf(ctx, x, conv.w_perm, conv.b, stride, K, 0, K - stride);
+    }
     // ggml_conv_transpose_1d: kernel a, data b
     ggml_tensor* out = ggml_conv_transpose_1d(ctx, conv.w, x, stride, 0, 1);
     // Trim the right padding: output length should be stride * input_len
     int in_len = (int)x->ne[0];
-    int out_channels = (int)conv.w->ne[1]; // output channels for transpose
+    int out_channels = (int)conv.w->ne[1];
     int expected_len = in_len * stride;
     int actual_len = (int)out->ne[0];
     if (actual_len > expected_len) {
-        // Trim from the right
         out = ggml_view_2d(ctx, out, expected_len, out_channels, out->nb[1], 0);
         out = ggml_cont(ctx, out);
     }
@@ -848,6 +888,19 @@ static ggml_tensor* build_mimi_dec_transformer(ggml_context* ctx, const std::vec
     int T = (int)x->ne[1];
     int dim = (int)x->ne[0];
 
+    // Causal + sliding-window is the DEFAULT (symmetric with kyutai_stt's Mimi
+    // encoder), matching moshi's streaming Mimi. TTS→ASR A/B (2026-07, ~256 dec
+    // frames > 250): causal 9.3% WER vs non-causal 12.0% — causal wins (modest,
+    // single-sample) and is never worse; both stay fully intelligible (unlike the
+    // STT side where non-causal truncated). CRISPASR_MIMI_NONCAUSAL=1 restores the
+    // old full-attention path. Filled by the caller after alloc.
+    ggml_tensor* attn_mask = nullptr;
+    if (!std::getenv("CRISPASR_MIMI_NONCAUSAL")) {
+        attn_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, T, T); // [Lk, Lq]
+        ggml_set_name(attn_mask, "mimi_dec_causal_mask");
+        ggml_set_input(attn_mask);
+    }
+
     ggml_tensor* positions = ggml_arange(ctx, 0.0f, (float)T, 1.0f);
     positions = ggml_cast(ctx, positions, GGML_TYPE_I32);
 
@@ -881,8 +934,9 @@ static ggml_tensor* build_mimi_dec_transformer(ggml_context* ctx, const std::vec
         K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));
         V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));
 
-        // Non-causal full attention for decoder transformer
-        ggml_tensor* attn = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, 1.0f / sqrtf((float)head_dim), 0.0f, 0.0f);
+        // Non-causal by default; causal+windowed if the mask was built
+        // (CRISPASR_MIMI_CAUSAL).
+        ggml_tensor* attn = ggml_flash_attn_ext(ctx, Q, K, V, attn_mask, 1.0f / sqrtf((float)head_dim), 0.0f, 0.0f);
         attn = ggml_reshape_2d(ctx, attn, dim, T);
 
         attn = ggml_mul_mat(ctx, L.attn_out_w, attn);
@@ -975,7 +1029,7 @@ extern "C" struct csm_tts_context* csm_tts_init_from_file(const char* path_model
     }
 
     // Backend
-    c->backend = params.use_gpu ? ggml_backend_init_best() : ggml_backend_cpu_init();
+    c->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
     if (!c->backend)
         c->backend = ggml_backend_cpu_init();
     c->backend_cpu = ggml_backend_cpu_init();
@@ -1010,6 +1064,17 @@ extern "C" struct csm_tts_context* csm_tts_init_from_file(const char* path_model
         fprintf(stderr, "csm_tts: failed to bind weights\n");
         delete c;
         return nullptr;
+    }
+
+    // Permute ConvTranspose1d weights
+    {
+        ggml_tensor *srcs[4], **dsts_arr[4];
+        for (int i = 0; i < 4; i++) {
+            srcs[i] = c->model.seanet_dec.conv_stride[i].w;
+            dsts_arr[i] = &c->model.seanet_dec.conv_stride[i].w_perm;
+        }
+        core_convt::permute_convt1d_weights_batch(srcs, dsts_arr, 4, c->backend, &c->model.ctx_perm,
+                                                  &c->model.buf_perm);
     }
 
     // Scheduler
@@ -1108,7 +1173,11 @@ extern "C" float* csm_tts_synthesize_with_reference(struct csm_tts_context* ctx,
     int topk = ctx->params.topk;
 
     // 1. Tokenize text
-    std::vector<int32_t> text_tokens = tokenize_text(m, std::string(text));
+    std::vector<int32_t> text_tokens;
+    {
+        csm_bench_stage _b("tokenize");
+        text_tokens = tokenize_text(m, std::string(text));
+    }
     if (text_tokens.empty()) {
         fprintf(stderr, "csm_tts: empty text after tokenization\n");
         return nullptr;
@@ -1782,6 +1851,7 @@ mimi_decode:
     }
 
     // 3. Mimi decode: codes -> PCM
+    csm_bench_stage _b_mimi("mimi_decode");
     int T_frames = (int)all_codes.size();
 
     // Flatten codes to [n_codebooks, T_frames] layout
@@ -1915,6 +1985,20 @@ mimi_decode:
         // Set upsampled input data
         ggml_tensor* inp = ggml_graph_get_tensor(graph, "mimi_upsampled");
         ggml_backend_tensor_set(inp, continuous.data(), 0, continuous.size() * sizeof(float));
+
+        // Fill the optional Mimi causal+sliding-window mask (CRISPASR_MIMI_CAUSAL):
+        // attend iff key k <= query q AND (q - k) < window (moshi Mimi = 250).
+        if (ggml_tensor* mmask = ggml_graph_get_tensor(graph, "mimi_dec_causal_mask")) {
+            const int Tm = (int)mmask->ne[1];
+            const int window = 250;
+            std::vector<ggml_fp16_t> md((size_t)Tm * Tm, ggml_fp32_to_fp16(0.0f));
+            const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+            for (int q = 0; q < Tm; q++)
+                for (int k = 0; k < Tm; k++)
+                    if (k > q || (q - k) >= window)
+                        md[(size_t)q * Tm + k] = ninf;
+            ggml_backend_tensor_set(mmask, md.data(), 0, md.size() * sizeof(ggml_fp16_t));
+        }
 
         // Compute
         ggml_backend_sched_graph_compute(ctx->sched, graph);

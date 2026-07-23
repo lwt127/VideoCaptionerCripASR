@@ -94,6 +94,17 @@ inline bool read_wav_mono_pcm16(const std::string& path, std::vector<float>& pcm
         return false;
     }
 
+    // Clamp the untrusted `data` chunk size to the bytes the file actually
+    // holds from the current position, so a header declaring a huge data_size
+    // cannot drive a ~2 GB allocation from a tiny file (mirrors the AU reader).
+    long data_pos = std::ftell(f);
+    if (data_pos >= 0 && std::fseek(f, 0, SEEK_END) == 0) {
+        long file_end = std::ftell(f);
+        std::fseek(f, data_pos, SEEK_SET);
+        if (file_end >= data_pos && (long)data_size > file_end - data_pos)
+            data_size = (int32_t)(file_end - data_pos);
+    }
+
     sample_rate = sr;
     int n_samples_total = data_size / (n_channels * (bits_per_sample / 8));
     if (n_samples_total <= 0) {

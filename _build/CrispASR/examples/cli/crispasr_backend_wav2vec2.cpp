@@ -13,6 +13,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "core/crispasr_env.h"
 
 namespace {
 
@@ -45,8 +46,9 @@ public:
     }
 
     std::vector<crispasr_segment> transcribe(const float* samples, int n_samples, int64_t t_offset_cs,
-                                             const whisper_params& /*params*/) override {
+                                             const whisper_params& params) override {
         std::vector<crispasr_segment> out;
+        last_logits_ = {};
         if (!model_)
             return out;
 
@@ -58,6 +60,12 @@ public:
 
         const int V = (int)model_->hparams.vocab_size;
         const int T = (int)(logits.size() / V);
+        if (params.return_logits) {
+            last_logits_.n_frames = T;
+            last_logits_.n_vocab = V;
+            last_logits_.data = logits;
+            last_logits_.normalization = "logits";
+        }
 
         auto token_probs = wav2vec2_greedy_decode_with_probs(*model_, logits.data(), T);
 
@@ -71,7 +79,7 @@ public:
         auto hi = text.find_last_not_of(' ');
         text = (lo == std::string::npos) ? "" : text.substr(lo, hi - lo + 1);
 
-        if (getenv("WAV2VEC2_BENCH"))
+        if (crispasr_env::get("CRISPASR_WAV2VEC2_BENCH"))
             fprintf(stderr, "wav2vec2: decoded %d frames → %zu chars (%zu emissions)\n", T, text.size(),
                     token_probs.size());
 
@@ -96,8 +104,13 @@ public:
 
     void shutdown() override { model_.reset(); }
 
+    const crispasr_ctc_logits* last_ctc_logits() const override {
+        return last_logits_.data.empty() ? nullptr : &last_logits_;
+    }
+
 private:
     std::unique_ptr<wav2vec2_model> model_;
+    crispasr_ctc_logits last_logits_;
     int n_threads_ = 4;
 };
 

@@ -124,6 +124,36 @@ TEST_CASE("greedy_decode: run_with_probs produces correct sequence", "[unit][dec
     REQUIRE(found_eos);
 }
 
+TEST_CASE("greedy_decode: run_with_probs_cb streams tokens", "[unit][decode]") {
+    MockCtx ctx;
+    core_greedy_decode::Config cfg;
+    cfg.max_new_tokens = 10;
+    cfg.eos_id = 5;
+    cfg.vocab_size = 8;
+    float* logits = mock_llm(&ctx, nullptr, 0, 0, nullptr, nullptr);
+
+    int32_t first_token = core_greedy_decode::argmax(logits, cfg.vocab_size);
+    float first_prob = core_greedy_decode::softmax_of(logits, cfg.vocab_size, cfg.temperature, logits[first_token]);
+
+    std::vector<int32_t> streamed_ids;
+    core_greedy_decode::run_with_probs_cb(
+        &ctx, first_token, first_prob, 0, [](MockCtx* c, const int32_t* ids, int n) { return mock_embed(c, ids, n); },
+        [](MockCtx* c, const float* emb, int n_tok, int past, int* on, int* ov) {
+            return mock_llm(c, emb, n_tok, past, on, ov);
+        },
+        [&](int32_t id, float prob) { streamed_ids.push_back(id); }, cfg);
+
+    // The initial call_count in mock_llm is 1 (for the initial logits), then run_with_probs_cb
+    // calls it for each new token. mock_llm emits '3' up to call_count=3, so:
+    // Call 1: logits[3]=5 (initial) -> callback gets 3
+    // Call 2: mock_llm returns logits[3]=5 -> callback gets 3
+    // Call 3: mock_llm returns logits[3]=5 -> callback gets 3
+    // Call 4: mock_llm returns logits[5]=5 (EOS) -> loop terminates, callback not called for EOS
+    REQUIRE(streamed_ids == std::vector<int32_t>{3, 3, 3, 5});
+    REQUIRE(ctx.call_count == 4); // 1 manual, 3 inside loop
+    free(logits);
+}
+
 static float* mock_llm_repeat_pair(MockCtx* ctx, const float* embeds, int n_tokens, int n_past, int* out_n,
                                    int* out_vocab) {
     (void)embeds;

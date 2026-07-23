@@ -40,6 +40,11 @@ jobs:
           - { tag: "main-musa", dockerfile: ".devops/main-musa.Dockerfile", platform: "linux/amd64" }
           - { tag: "main-intel", dockerfile: ".devops/main-intel.Dockerfile", platform: "linux/amd64" }
           - { tag: "main-cuda", dockerfile: ".devops/main-cuda.Dockerfile", platform: "linux/amd64" }
+          # main-cuda-portable = same CUDA GPU build as main-cuda, but the CPU ggml backend
+          # is generic SSE2 (every optional ISA OFF). For pre-Haswell CPUs where the stock
+          # main-cuda image SIGILLs at startup on a BMI2 instruction inside ggml_cpu_init()
+          # (#261). Slower CPU kernels; GPU ASR is identical.
+          - { tag: "main-cuda-portable", dockerfile: ".devops/main-cuda-portable.Dockerfile", platform: "linux/amd64" }
           # main-cuda-12 = legacy CUDA 12.4 build for hosts with NVIDIA driver R510-R534
           # (RHEL/older Ubuntu/enterprise clusters). main-cuda needs R535+. Caps at sm_90;
           # RTX 50xx (sm_120, Blackwell) is unsupported here — those users want main-cuda.
@@ -49,6 +54,8 @@ jobs:
     steps:
       - name: Check out the repo
         uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4

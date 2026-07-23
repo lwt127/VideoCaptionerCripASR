@@ -112,6 +112,10 @@ char* granite_nle_ctc_decode(struct granite_nle_context* ctx, const int32_t* ids
 // before the LLM's editing forward pass.
 int granite_nle_eos_token_id(struct granite_nle_context* ctx);
 
+// CTC beam search for the BPE decode step. beam_size=1 (default) uses greedy.
+// gamma > 0 enables MAES-style gamma-threshold pruning.
+void granite_nle_set_beam_size(struct granite_nle_context* ctx, int beam_size, float gamma);
+
 #ifdef __cplusplus
 }
 #endif

@@ -106,7 +106,8 @@ static inline ggml_tensor* attn_noncausal(ggml_context* ctx0, ggml_tensor* x, co
 static inline ggml_tensor* build_decoder(ggml_context* ctx0, ggml_cgraph* gf, ggml_tensor* inputs_embeds,
                                          ggml_tensor* positions, ggml_tensor* causal_mask, ggml_tensor* kv_k,
                                          ggml_tensor* kv_v, int n_past, const std::vector<LayerWeights>& blocks,
-                                         ggml_tensor* output_norm_w, const Hparams& hp, bool is_causal) {
+                                         ggml_tensor* output_norm_w, const Hparams& hp, bool is_causal,
+                                         int fixed_kv_len = 0, ggml_tensor* kv_indices = nullptr) {
     const int n_q = hp.n_heads;
     const int n_kv = hp.n_kv_heads;
     const int hd = hp.head_dim;
@@ -138,7 +139,8 @@ static inline ggml_tensor* build_decoder(ggml_context* ctx0, ggml_cgraph* gf, gg
         if (is_causal) {
             attn = core_attn::kv_self_attn(ctx0, gf, cur, b.attn_q_w, b.attn_k_w, b.attn_v_w, b.attn_out_w,
                                            /*q_norm_w*/ nullptr, /*k_norm_w*/ nullptr, positions, causal_mask, kv_k,
-                                           kv_v, il, n_past, kvp);
+                                           kv_v, il, n_past, kvp,
+                                           /*qkv_w=*/nullptr, fixed_kv_len, kv_indices);
         } else {
             attn = attn_noncausal(ctx0, cur, b, positions, n_q, n_kv, hd, hp.rope_theta, hp.attention_multiplier);
         }

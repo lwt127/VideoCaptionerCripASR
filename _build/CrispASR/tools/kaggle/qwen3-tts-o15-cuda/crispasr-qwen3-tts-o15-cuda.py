@@ -51,20 +51,26 @@ def run(cmd, check=True, env=None, timeout=None):
 
 
 # ── Clone + CUDA build ──────────────────────────────────────────────
+import shutil
 print(f"[start] ref={CRISPASR_REF}", flush=True)
-if REPO.exists():
-    import shutil
+print(f"  disk: {shutil.disk_usage('/kaggle/working')}", flush=True)
+Path("/kaggle/working/started.txt").write_text("started\n")
 
+if REPO.exists():
     shutil.rmtree(REPO)
 run(
     [
         "git", "clone", "--depth", "1", "--branch", CRISPASR_REF,
-        "--recursive", CRISPASR_REPO, str(REPO),
+        CRISPASR_REPO, str(REPO),
     ]
 )
 
 sys.path.insert(0, os.path.join(str(REPO), "tools", "kaggle"))
-import kaggle_harness as kh
+try:
+    import kaggle_harness as kh
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import kaggle_harness as kh
 
 kh.init_progress()
 kh.resolve_hf_token()

@@ -343,6 +343,7 @@ bool phonemize_espeak_dlopen(const std::string& lang, const std::string& text, s
             out += chunk;
         }
     }
+    strip_espeak_lang_markers(out);
     return !out.empty();
 }
 
@@ -383,6 +384,7 @@ bool phonemize_espeak_popen(const std::string& lang, const std::string& text, st
         out.append(buf, len);
     }
     PHON_PCLOSE(fp);
+    strip_espeak_lang_markers(out);
     return !out.empty();
 #undef PHON_POPEN
 #undef PHON_PCLOSE

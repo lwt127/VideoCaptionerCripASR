@@ -101,6 +101,8 @@ void main() {
       'crispasr_cache_dir_abi',
       'crispasr_registry_lookup_abi',
       'crispasr_registry_lookup_by_filename_abi',
+      'crispasr_registry_default_bundle_info_abi',
+      'crispasr_registry_default_bundle_artifact_abi',
       // Canonical C-ABI version symbol (was `crispasr_dart_helpers_version`
       // before the file moved to `src/crispasr_c_api.cpp`).
       'crispasr_c_api_version',
@@ -198,8 +200,8 @@ void main() {
     // on the whisper transcribe dispatch. Symbol-presence test;
     // the real parse-and-bind path is exercised by the
     // CrispasrSession.setGrammar() Dart smoke below.
-    expect(() => lib.lookup('crispasr_session_set_grammar_text'),
-        returnsNormally,
+    expect(
+        () => lib.lookup('crispasr_session_set_grammar_text'), returnsNormally,
         reason: 'rebuild libcrispasr — 0.5.9 grammar setter is missing');
   });
 
@@ -237,8 +239,7 @@ void main() {
     // transcribe pre-step. Pre-0.5.12 dylibs don't have the symbol;
     // the Dart wrapper raises UnsupportedError so apps can
     // graceful-degrade to the un-enhanced PCM.
-    expect(() => lib.lookup('crispasr_enhance_audio_rnnoise'),
-        returnsNormally,
+    expect(() => lib.lookup('crispasr_enhance_audio_rnnoise'), returnsNormally,
         reason: 'rebuild libcrispasr — 0.5.12 audio enhancement '
             'helper is missing');
   });
@@ -249,9 +250,7 @@ void main() {
     // on every whisper transcribe. Pre-0.5.11 dylibs don't have
     // the symbol; the Dart wrapper raises UnsupportedError so
     // apps can graceful-degrade.
-    expect(
-        () => lib
-            .lookup('crispasr_session_set_whisper_decode_extras'),
+    expect(() => lib.lookup('crispasr_session_set_whisper_decode_extras'),
         returnsNormally,
         reason: 'rebuild libcrispasr — 0.5.11 whisper decode-extras '
             'setter is missing');
@@ -263,14 +262,14 @@ void main() {
     // whisper transcribe. Pre-0.5.10 dylibs don't have the
     // symbol; the Dart wrapper raises UnsupportedError so apps
     // can graceful-degrade.
-    expect(
-        () => lib.lookup('crispasr_session_set_fallback_thresholds'),
+    expect(() => lib.lookup('crispasr_session_set_fallback_thresholds'),
         returnsNormally,
         reason: 'rebuild libcrispasr — 0.5.10 fallback-threshold '
             'setter is missing');
   });
 
-  test('C-ABI parity: parakeet + kokoro + vad_slices + lcs symbols resolve', () {
+  test('C-ABI parity: parakeet + kokoro + vad_slices + lcs symbols resolve',
+      () {
     for (final s in [
       'crispasr_parakeet_init',
       'crispasr_parakeet_free',

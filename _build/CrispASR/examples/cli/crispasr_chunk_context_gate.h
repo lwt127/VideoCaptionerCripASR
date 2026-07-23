@@ -35,12 +35,30 @@ namespace crispasr_chunk_context {
 // gemma4-e2b, glm-asr, and kyutai-stt blow past a 15 min wallclock on a
 // 5 min clip (LLM-decode retry loop on the over-long buffer). voxtral4b
 // is not affected — different model architecture despite the shared name.
-// All six were caught by the A/B sweep in tools/check-overlap-save-bug.sh.
+// granite-speech-4.1-2b-plus emits native [T:N] word timestamps that do not
+// align with the overlap-save slice boundaries, so the word-level trim drops
+// most of each slice — a 2.5 min clip collapsed to ~36 s of output, missing
+// whole passages (#205); the bare-slice path recovers them. moss-transcribe is
+// an LLM decoder (Qwen3-1.7B) that emits neither word nor token timestamps, so
+// the overlap-save trim falls back to segment-level filtering that keeps the
+// whole extended segment — the ±chunk_overlap acoustic context gets transcribed
+// twice and duplicates at every 30 s seam ("...of the fence. Don't move much to
+// the fence.", #218); the over-long (30 s + 2×3 s) buffer also pushes the
+// greedy decoder further out of its trained window and worsens the repeated-
+// phrase loops the same issue is about. The bare-slice path avoids both.
+// canary-qwen (FastConformer + Qwen3-1.7B LLM decoder) emits no per-token or
+// word timestamps — all tokens receive the segment-level t0/t1, so the
+// word-level overlap-save trim cannot excise the context region and the acoustic
+// overlap is decoded twice, duplicating text at every seam (#218). The backend
+// also declares CAP_INTERNAL_CHUNKING, meaning overlap-save context from the
+// external chunker is redundant as well as harmful. The blocked backends were
+// caught by the A/B sweep in tools/check-overlap-save-bug.sh.
 inline bool backend_allows_chunk_context(const char* backend_name) {
     if (backend_name == nullptr) {
         return true;
     }
-    static const char* const kBlocked[] = {"cohere", "gemma4-e2b", "glm-asr", "kyutai-stt", "qwen3", "voxtral"};
+    static const char* const kBlocked[] = {"canary-qwen", "cohere",          "gemma4-e2b", "glm-asr", "granite",
+                                           "kyutai-stt",  "moss-transcribe", "qwen3",      "voxtral"};
     for (const char* b : kBlocked) {
         if (std::strcmp(backend_name, b) == 0) {
             return false;
@@ -65,6 +83,20 @@ inline bool should_use_chunk_context(int effective_chunk_seconds, std::size_t n_
                                      bool vad_slicing, bool backend_allows_chunk_context = true) {
     return backend_allows_chunk_context && !vad_slicing && effective_chunk_seconds > 0 && n_slices > 1 &&
            chunk_overlap_seconds > 0.0f;
+}
+
+// Issue #257: a backend that chunks internally (CAP_INTERNAL_CHUNKING — parakeet
+// / canary FastConformer) produces coherent output only when it sees the whole
+// clip and slices at the encoder-frame level. When the user forces
+// --chunk-seconds on such a backend, the dispatcher's per-slice transcribe +
+// overlap-save trim + LCS merge corrupts it (degraded short-chunk decodes,
+// dropped boundary words). Returns true iff the dispatcher should BYPASS its own
+// slicing and hand the whole clip to the backend, which honours the requested
+// chunk size via its internal chunker. cohere/granite lack CAP_INTERNAL_CHUNKING,
+// so their dispatcher chunking is unchanged.
+inline bool backend_self_chunks_on_explicit(bool has_internal_chunking, bool chunk_seconds_explicit,
+                                            int chunk_seconds) {
+    return has_internal_chunking && chunk_seconds_explicit && chunk_seconds > 0;
 }
 
 } // namespace crispasr_chunk_context

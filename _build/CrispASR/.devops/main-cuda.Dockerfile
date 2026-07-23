@@ -32,8 +32,30 @@ ENV LIBRARY_PATH=/usr/local/cuda-13.0/lib64/stubs:/usr/local/cuda-13.0/compat:$L
 
 COPY . .
 ARG CRISPASR_BUILD_JOBS
+# GGML_NATIVE=OFF is REQUIRED for a distributed image (#261). Without it ggml
+# defaults GGML_NATIVE=ON → `-march=native`, baking the BUILD runner's CPU
+# instruction set (e.g. AVX-512) into the CPU ggml kernels. GPU ASR runs fine
+# on any host, but the CPU-only paths — Silero VAD and pyannote diarization —
+# then hit an illegal instruction (SIGILL) on hosts without those extensions
+# (common on consumer / WSL2 CPUs) and the server dies silently.
+#
+# ⚠ GGML_NATIVE=OFF does NOT mean "only the ISAs listed below". ggml's CMake:
+#     if (GGML_NATIVE OR NOT GGML_NATIVE_DEFAULT)  set(INS_ENB OFF)
+#     else()                                       set(INS_ENB ON)
+#     option(GGML_BMI2 "..." ${INS_ENB})   # and GGML_SSE42 / GGML_AVX
+# GGML_NATIVE_DEFAULT is ON for a normal (non-cross) build, so passing
+# GGML_NATIVE=OFF lands in the else branch → INS_ENB=ON → BMI2/SSE42/AVX
+# default ON and ggml-cpu is compiled with `-mbmi2`. So the real baseline is
+# Haswell-class (AVX2+FMA+F16C+BMI2), not "AVX2/FMA/F16C" as previously
+# claimed here. Spell every extension out so the contract is visible and can't
+# drift silently — a #261 reporter's pre-AVX2 CPU SIGILL'd inside
+# ggml_cpu_init() on a BMI2 instruction while the old cpu-isa self-check (which
+# only read CrispASR's own baseline TUs) still printed "OK".
+# AVX-512 stays off. The GPU kernels are unaffected.
 RUN jobs="${CRISPASR_BUILD_JOBS:-$(nproc)}" && \
     cmake -S . -B build -G Ninja -DCRISPASR_BUILD_TESTS=OFF -DGGML_CUDA=1 \
+        -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
+        -DGGML_BMI2=ON -DGGML_SSE42=ON -DGGML_AVX=ON -DGGML_AVX512=OFF \
         -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-real;120-real;120-virtual" \
         -DCMAKE_EXE_LINKER_FLAGS="-Wl,--allow-shlib-undefined" && \
     cmake --build build -j"${jobs}" --target crispasr-cli

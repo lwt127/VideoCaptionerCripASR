@@ -25,6 +25,7 @@ before running this backend.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Dict, Set
 
@@ -102,9 +103,18 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
     # CohereAsrPreTrainedModel._init_weights re-initializes all Linear/Conv
     # weights to normal(0, 0.02), overwriting the pretrained values.  Detect
     # and patch by reloading ALL weight tensors from the safetensors file.
-    _conv0 = model.encoder.pre_encode.conv[0].weight
-    _conv0_rms = float(_conv0.norm() / _conv0.numel() ** 0.5)
-    if _conv0_rms < 0.1:
+    # Find the first conv-like weight anywhere in the resolved encoder
+    # (base model: encoder.pre_encode.conv[0]; Parakeet-style Arabic model:
+    # encoder.subsampling.layers[0]). Structure varies, so search generically.
+    _enc_probe, _ = _resolve_encoder(model)
+    _conv0 = None
+    for _m in _enc_probe.modules():
+        _w = getattr(_m, "weight", None)
+        if _w is not None and hasattr(_w, "dim") and _w.dim() >= 3:
+            _conv0 = _w
+            break
+    _conv0_rms = float(_conv0.norm() / _conv0.numel() ** 0.5) if _conv0 is not None else None
+    if _conv0_rms is not None and _conv0_rms < 0.1:
         print(f"  WARNING: weights appear random-init (rms={_conv0_rms:.4f}), patching ALL from safetensors")
         from safetensors import safe_open
         sf_path = Path(model_dir) / "model.safetensors"
@@ -114,10 +124,44 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
                 if key in model_sd:
                     model_sd[key].data.copy_(sf.get_tensor(key).float())
 
+    # Workaround #2: some checkpoints (e.g. cohere-transcribe-arabic-07-2026)
+    # ship ~10 encoder LayerNorm weights ZEROED in model.safetensors
+    # (encoder.layers.N.norm_self_att / norm_conv / norm_feed_forward1, ...).
+    # Left as zeros they null those Conformer sub-layers -> the decoder emits a
+    # 🎵/repetition loop instead of a transcript. Patch them from a known-good
+    # GGUF given by CRISPASR_COHERE_NORM_PATCH_GGUF (the corrected converter's
+    # output, whose norms are non-zero). Verified: patching only these 10 makes
+    # both this Python reference and the C++ port transcribe correctly.
+    import torch as _torch
+    _patch_gguf = os.environ.get("CRISPASR_COHERE_NORM_PATCH_GGUF")
+    if _patch_gguf and Path(_patch_gguf).exists():
+        import torch.nn as _nn
+        from gguf import GGUFReader as _GR, dequantize as _dq
+        _gg = {t.name: t for t in _GR(_patch_gguf).tensors}
+        _sfx = {"norm_self_att": "attn.norm", "norm_conv": "conv.norm",
+                "norm_feed_forward1": "ff1.norm", "norm_feed_forward2": "ff2.norm",
+                "norm_out": "out_norm"}
+        _npatch = 0
+        for _n, _mod in model.named_modules():
+            if isinstance(_mod, _nn.LayerNorm) and float(_mod.weight.abs().max()) < 1e-6:
+                _p = _n.split(".")
+                _gn = (f"enc.blk.{_p[2]}.{_sfx[_p[3]]}.weight"
+                       if len(_p) >= 4 and _p[2].isdigit() and _p[3] in _sfx else None)
+                if _gn and _gn in _gg:
+                    _t = _gg[_gn]
+                    _v = np.asarray(_dq(_t.data, _t.tensor_type), dtype=np.float32)
+                    _mod.weight.data.copy_(_torch.from_numpy(_v.copy()).reshape_as(_mod.weight))
+                    _npatch += 1
+        if _npatch:
+            print(f"  patched {_npatch} zeroed encoder LayerNorm weights from "
+                  f"{Path(_patch_gguf).name}")
+
     # ---- Feature extraction (processor handles pre-emphasis + mel + norm) ----
-    # CohereProcessor mirrors WhisperFeatureExtractor's API.
+    # CohereProcessor mirrors WhisperFeatureExtractor's API. Language for the
+    # decoder prompt is overridable (Arabic model needs "ar", not "en").
     inputs = processor(
-        audio, sampling_rate=16000, return_tensors="pt", language="en")
+        audio, sampling_rate=16000, return_tensors="pt",
+        language=os.environ.get("CRISPASR_COHERE_REF_LANG", "en"))
     # Cast to the same dtype as the model to match the rust reference's
     # bf16→f32 path (we load in f32 here so this is a no-op).
     if "input_features" in inputs:
@@ -164,7 +208,7 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
     # The conv subsampling module lives at encoder.pre_encode in the
     # rust reference; accept any of the common attribute names.
     pre_encode = None
-    for name in ("pre_encode", "conv_subsampling", "subsample", "conv_subsample"):
+    for name in ("pre_encode", "subsampling", "conv_subsampling", "subsample", "conv_subsample"):
         if hasattr(encoder, name):
             pre_encode = getattr(encoder, name)
             break
@@ -173,7 +217,10 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
             pre_encode.register_forward_hook(cap("enc_pre_subsample_out")))
 
     # ---- Layer-0 sub-stage monkey-patch ----
-    want_substages = stages & {"L0_ff1", "L0_attn", "L0_conv", "L0_ff2"}
+    # ParakeetEncoderBlock.forward has a different signature than the base
+    # ConformerLayer, so the sub-stage monkey-patch below can't replicate it.
+    # Skip it — the per-layer encoder_layer_i captures localize divergence.
+    want_substages = set()  # was: stages & {"L0_ff1", "L0_attn", "L0_conv", "L0_ff2"}
     if want_substages:
         layer0 = encoder.layers[0]
         _orig_forward = layer0.forward
@@ -209,15 +256,24 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
         layer0.forward = _patched_forward
 
     # ---- Encoder forward ----
+    # Run the FULL model (encoder + 1 decode step) rather than calling
+    # encoder(feats) directly: the encoder's forward signature varies by
+    # model variant (ParakeetEncoder needs a length/mask), whereas
+    # model.generate() drives the encoder through its own known call path.
+    # The per-layer + encoder-output hooks capture during this forward.
     enc_hidden = None
+    _enc_hidden_holder = {}
+
+    def _enc_out_hook(_m, _i, o):
+        t = (o.last_hidden_state if hasattr(o, "last_hidden_state")
+             else (o[0] if isinstance(o, tuple) else o))
+        _enc_hidden_holder["h"] = t.detach().clone()
+
+    _eh = encoder.register_forward_hook(_enc_out_hook)
     with torch.no_grad():
-        feats = inputs.get("input_features", inputs.get("input_values"))
-        if feats is None:
-            raise RuntimeError("cohere reference: processor produced no features")
-        enc_out = encoder(feats)
-        enc_hidden = (
-            enc_out.last_hidden_state if hasattr(enc_out, "last_hidden_state")
-            else (enc_out[0] if isinstance(enc_out, tuple) else enc_out))
+        model.generate(**inputs, max_new_tokens=1, do_sample=False, num_beams=1)
+    _eh.remove()
+    enc_hidden = _enc_hidden_holder.get("h")
 
     for h in handles:
         h.remove()

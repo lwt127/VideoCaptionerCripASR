@@ -19,7 +19,7 @@ library_name: ggml
 
 GGUF / ggml conversion of [`hubertsiuzdak/snac_24khz`](https://huggingface.co/hubertsiuzdak/snac_24khz) — the 24 kHz Multi-Scale Neural Audio Codec used by Orpheus-TTS — for use with **[CrispStrobe/CrispASR](https://github.com/CrispStrobe/CrispASR)**.
 
-SNAC is a small (~25 MB) Residual Vector Quantisation codec by Hubert Siuzdak. Pair it with the [`cstr/orpheus-3b-base-GGUF`](https://huggingface.co/cstr/orpheus-3b-base-GGUF) talker (or any other GGUF orpheus checkpoint) — the talker emits codec tokens but doesn't render audio without this codec.
+SNAC is a small (~25 MB) Residual Vector Quantisation codec by Hubert Siuzdak. Pair it with the [`cstr/orpheus-3b-0.1-ft-GGUF`](https://huggingface.co/cstr/orpheus-3b-0.1-ft-GGUF) talker (or any other GGUF orpheus checkpoint) — the talker emits codec tokens but doesn't render audio without this codec.
 
 ## Files
 
@@ -32,11 +32,11 @@ The codec runs in C++ inside `libcrispasr` once `--codec-model snac-24khz.gguf` 
 ## Quick start
 
 ```bash
-huggingface-cli download cstr/orpheus-3b-base-GGUF orpheus-3b-base-q8_0.gguf --local-dir .
+huggingface-cli download cstr/orpheus-3b-0.1-ft-GGUF orpheus-3b-0.1-ft-q8_0.gguf --local-dir .
 huggingface-cli download cstr/snac-24khz-GGUF       snac-24khz.gguf            --local-dir .
 
 ./build/bin/crispasr --backend orpheus \
-    -m orpheus-3b-base-q8_0.gguf \
+    -m orpheus-3b-0.1-ft-q8_0.gguf \
     --codec-model snac-24khz.gguf \
     --voice tara --temperature 0.6 \
     --tts "Hello, my name is Tara." \
@@ -70,7 +70,7 @@ No quantisation — the model is small enough (~25 MB) that the disk savings wou
 
 ## Used by
 
-- [`cstr/orpheus-3b-base-GGUF`](https://huggingface.co/cstr/orpheus-3b-base-GGUF) — canonical English Orpheus 3B-FT.
+- [`cstr/orpheus-3b-0.1-ft-GGUF`](https://huggingface.co/cstr/orpheus-3b-0.1-ft-GGUF) — canonical English Orpheus 3B-FT.
 - (queued) `cstr/orpheus-kartoffel-de-GGUF` — German Kartoffel_Orpheus finetunes.
 - (queued) `cstr/orpheus-3b-de-q8_0-GGUF` — lex-au Orpheus-3B-DE Q8 mirror.
 

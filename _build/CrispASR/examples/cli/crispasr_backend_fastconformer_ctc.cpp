@@ -64,8 +64,9 @@ public:
     }
 
     std::vector<crispasr_segment> transcribe(const float* samples, int n_samples, int64_t t_offset_cs,
-                                             const whisper_params& /*params*/) override {
+                                             const whisper_params& params) override {
         std::vector<crispasr_segment> out;
+        last_logits_ = {};
         if (!ctx_)
             return out;
 
@@ -76,6 +77,12 @@ public:
         if (rc != 0 || !logits) {
             fprintf(stderr, "crispasr[fastconformer-ctc]: compute_logits failed (%d)\n", rc);
             return out;
+        }
+        if (params.return_logits) {
+            last_logits_.n_frames = T_enc;
+            last_logits_.n_vocab = V;
+            last_logits_.data.assign(logits, logits + (size_t)T_enc * V);
+            last_logits_.normalization = "log_probs";
         }
 
         // Stage 2: greedy CTC collapse → SentencePiece-detokenized text +
@@ -119,8 +126,13 @@ public:
         }
     }
 
+    const crispasr_ctc_logits* last_ctc_logits() const override {
+        return last_logits_.data.empty() ? nullptr : &last_logits_;
+    }
+
 private:
     canary_ctc_context* ctx_ = nullptr;
+    crispasr_ctc_logits last_logits_;
 };
 
 } // namespace

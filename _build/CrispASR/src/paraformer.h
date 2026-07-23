@@ -28,6 +28,7 @@ struct paraformer_context_params {
     int n_threads;
     int verbosity; // 0 = silent, 1 = normal, 2 = debug
     bool flash_attn;
+    bool use_gpu;
 };
 
 paraformer_context_params paraformer_context_default_params();

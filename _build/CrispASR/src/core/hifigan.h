@@ -31,6 +31,8 @@
 
 #pragma once
 
+#include "conv.h"
+#include "core/dac_decoder.h" // core_dac::fastconv_cache (shared FASTCONV)
 #include "ggml.h"
 
 #include <cassert>
@@ -96,15 +98,43 @@ static inline ggml_tensor* conv1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor
     return y;
 }
 
+// FASTCONV overload (docs/perf-sweep/PLAN.md): use the baked-F32 kernel from the
+// shared cache so the fork's per-graph F16→F32 cast becomes a no-op. Time-major
+// layout here (x is (T,C_in)) so the k=1→matmul trick doesn't apply, but killing
+// the cast is the main win. `fc == nullptr`/disabled → identical to the legacy
+// path above (clean A/B gate). Used by the HiFi-GAN family (fastpitch, speecht5,
+// bananamind); each bakes its vocoder conv kernels and passes &fc.
+static inline ggml_tensor* conv1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* weight, ggml_tensor* bias, int stride,
+                                  int padding, int dilation, const core_dac::fastconv_cache* fc) {
+    ggml_tensor* w = (fc && fc->enabled) ? fc->get(weight) : weight;
+    ggml_tensor* y = ggml_conv_1d(ctx, w, x, stride, padding, dilation);
+    if (bias) {
+        ggml_tensor* b = ggml_reshape_2d(ctx, bias, 1, (int)bias->ne[0]);
+        y = ggml_add(ctx, y, b);
+    }
+    return y;
+}
+
 // ── ConvTranspose1d helper ─────────────────────────────────────────
 //
 // weight: (in_ch, out_ch, kernel) stored as ggml (kernel, out_ch, in_ch)
+// w_perm: (in_ch, kernel*out_ch) pre-permuted weight for decomposed path,
+//         or nullptr to use the old ggml_conv_transpose_1d path.
 // For ggml_conv_transpose_1d: (a=weight, b=input, stride, padding, dilation)
 // PyTorch padding = (kernel - stride) / 2
 
-static inline ggml_tensor* conv_transpose_1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* weight, ggml_tensor* bias,
-                                             int stride, int padding) {
-    // ggml_conv_transpose_1d requires padding=0. Apply padding by trimming output.
+static inline ggml_tensor* conv_transpose_1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* weight,
+                                             ggml_tensor* w_perm, ggml_tensor* bias, int stride, int padding) {
+    if (w_perm) {
+        // The HiFi-GAN forward() pipeline is time-major: every ggml_conv_1d here
+        // produces (T, C) (ne0=time, ne1=channel). The decomposed transpose-conv
+        // must therefore use the time-first variant — convt1d_decomp (channel-major)
+        // would mul_mat w_perm[IC,K*OC] against x whose ne0 is T, not IC, and abort
+        // on the shape check. Symmetric crop matches the old conv_transpose path.
+        const int K = (int)weight->ne[0];
+        return core_convt::convt1d_decomp_tf(ctx, x, w_perm, bias, stride, K, padding, padding);
+    }
+    // Old path — stable, works on CPU without the col2im op.
     ggml_tensor* y = ggml_conv_transpose_1d(ctx, weight, x, stride, 0 /*p0*/, 1);
     // Trim padding from both ends: crop from [padding .. T_out - padding]
     if (padding > 0) {
@@ -135,7 +165,8 @@ static inline ggml_tensor* conv_transpose_1d(ggml_context* ctx, ggml_tensor* x, 
 static inline ggml_tensor* resblock_forward(ggml_context* ctx, ggml_tensor* x,
                                             const std::map<std::string, ggml_tensor*>& tensors,
                                             const std::string& prefix, int kernel_size,
-                                            const std::vector<int>& dilations, float slope) {
+                                            const std::vector<int>& dilations, float slope,
+                                            const core_dac::fastconv_cache* fc = nullptr) {
     for (int d = 0; d < (int)dilations.size(); d++) {
         ggml_tensor* residual = x;
 
@@ -144,19 +175,51 @@ static inline ggml_tensor* resblock_forward(ggml_context* ctx, ggml_tensor* x,
         std::string c1w = prefix + ".convs1." + std::to_string(d) + ".weight";
         std::string c1b = prefix + ".convs1." + std::to_string(d) + ".bias";
         int pad1 = dilations[d] * (kernel_size - 1) / 2;
-        x = conv1d(ctx, x, T(tensors, c1w), T(tensors, c1b), 1, pad1, dilations[d]);
+        x = conv1d(ctx, x, T(tensors, c1w), T(tensors, c1b), 1, pad1, dilations[d], fc);
 
         // Second conv: dilation=1
         x = leaky_relu(ctx, x, slope);
         std::string c2w = prefix + ".convs2." + std::to_string(d) + ".weight";
         std::string c2b = prefix + ".convs2." + std::to_string(d) + ".bias";
         int pad2 = (kernel_size - 1) / 2;
-        x = conv1d(ctx, x, T(tensors, c2w), T(tensors, c2b), 1, pad2, 1);
+        x = conv1d(ctx, x, T(tensors, c2w), T(tensors, c2b), 1, pad2, 1, fc);
 
         // Residual connection
         x = ggml_add(ctx, x, residual);
     }
     return x;
+}
+
+// ── FASTCONV kernel collection ─────────────────────────────────────
+//
+// Every conv kernel that forward() routes through conv1d(), i.e. exactly the set
+// a fastconv_cache should bake. The ups.* kernels are deliberately EXCLUDED:
+// they go through conv_transpose_1d, which the cache does not serve, so baking
+// them would allocate F32 copies nothing ever reads.
+//
+// Usage (per backend, at vocoder load):
+//   ctx->voc_fc.bake(backend, core_hifigan::collect_fastconv_kernels(tensors, "voc", hp), on);
+//   ... core_hifigan::forward(g, mel, tensors, "voc", hp, ups_w_perm, &ctx->voc_fc);
+
+static inline std::vector<ggml_tensor*> collect_fastconv_kernels(const std::map<std::string, ggml_tensor*>& tensors,
+                                                                 const std::string& prefix, const hparams& hp) {
+    std::vector<ggml_tensor*> out;
+    out.push_back(T(tensors, prefix + ".conv_pre.weight"));
+    out.push_back(T(tensors, prefix + ".conv_post.weight"));
+
+    for (int i = 0; i < hp.num_upsamples(); i++) {
+        for (int j = 0; j < hp.num_kernels(); j++) {
+            const int rb_idx = i * hp.num_kernels() + j;
+            const std::string rb_prefix = prefix + ".resblocks." + std::to_string(rb_idx);
+            const std::vector<int>& dils = (j < (int)hp.resblock_dilation_sizes.size()) ? hp.resblock_dilation_sizes[j]
+                                                                                        : hp.resblock_dilation_sizes[0];
+            for (int d = 0; d < (int)dils.size(); d++) {
+                out.push_back(T(tensors, rb_prefix + ".convs1." + std::to_string(d) + ".weight"));
+                out.push_back(T(tensors, rb_prefix + ".convs2." + std::to_string(d) + ".weight"));
+            }
+        }
+    }
+    return out; // nulls / non-F16 are skipped by fastconv_cache::bake()
 }
 
 // ── Full HiFi-GAN forward pass ──────────────────────────────────
@@ -168,12 +231,17 @@ static inline ggml_tensor* resblock_forward(ggml_context* ctx, ggml_tensor* x,
 // tensors: map of GGUF tensor name -> ggml_tensor*
 // prefix: tensor name prefix (e.g. "voc" for "voc.conv_pre.weight")
 // hp: hyperparameters
+// ups_w_perm: pre-permuted upsample weights [IC, K*OC] for each stage,
+//             or empty to use the old conv_transpose_1d path. When
+//             provided, must have hp.num_upsamples() elements (nullptr
+//             entries fall back to the old path for that stage).
 //
 // Returns: (1, T_audio) F32, mono waveform in [-1, 1].
 
 static inline ggml_tensor* forward(ggml_context* ctx, ggml_tensor* mel,
                                    const std::map<std::string, ggml_tensor*>& tensors, const std::string& prefix,
-                                   const hparams& hp) {
+                                   const hparams& hp, const std::vector<ggml_tensor*>& ups_w_perm = {},
+                                   const core_dac::fastconv_cache* fc = nullptr) {
     ggml_tensor* x = mel;
 
     // Optional normalization: (mel - mean) / scale
@@ -191,7 +259,7 @@ static inline ggml_tensor* forward(ggml_context* ctx, ggml_tensor* mel,
     }
 
     // conv_pre: Conv1d(mel_dim, init_ch, k=7, s=1, p=3)
-    x = conv1d(ctx, x, T(tensors, prefix + ".conv_pre.weight"), T(tensors, prefix + ".conv_pre.bias"), 1, 3, 1);
+    x = conv1d(ctx, x, T(tensors, prefix + ".conv_pre.weight"), T(tensors, prefix + ".conv_pre.bias"), 1, 3, 1, fc);
 
     // Upsample stages
     for (int i = 0; i < hp.num_upsamples(); i++) {
@@ -203,7 +271,8 @@ static inline ggml_tensor* forward(ggml_context* ctx, ggml_tensor* mel,
 
         std::string ups_w = prefix + ".ups." + std::to_string(i) + ".weight";
         std::string ups_b = prefix + ".ups." + std::to_string(i) + ".bias";
-        x = conv_transpose_1d(ctx, x, T(tensors, ups_w), T(tensors, ups_b), rate, pad);
+        ggml_tensor* wp = (i < (int)ups_w_perm.size()) ? ups_w_perm[i] : nullptr;
+        x = conv_transpose_1d(ctx, x, T(tensors, ups_w), wp, T(tensors, ups_b), rate, pad);
 
         // MRF: sum of resblocks / num_kernels
         ggml_tensor* res_sum = nullptr;
@@ -216,7 +285,7 @@ static inline ggml_tensor* forward(ggml_context* ctx, ggml_tensor* mel,
                                                        : hp.resblock_dilation_sizes[0];
 
             ggml_tensor* rb_out =
-                resblock_forward(ctx, x, tensors, rb_prefix, rb_kernel, rb_dilations, hp.leaky_relu_slope);
+                resblock_forward(ctx, x, tensors, rb_prefix, rb_kernel, rb_dilations, hp.leaky_relu_slope, fc);
             if (res_sum == nullptr) {
                 res_sum = rb_out;
             } else {
@@ -229,7 +298,7 @@ static inline ggml_tensor* forward(ggml_context* ctx, ggml_tensor* mel,
 
     // Final activation + conv_post + tanh
     x = leaky_relu(ctx, x, hp.leaky_relu_slope);
-    x = conv1d(ctx, x, T(tensors, prefix + ".conv_post.weight"), T(tensors, prefix + ".conv_post.bias"), 1, 3, 1);
+    x = conv1d(ctx, x, T(tensors, prefix + ".conv_post.weight"), T(tensors, prefix + ".conv_post.bias"), 1, 3, 1, fc);
     x = ggml_tanh(ctx, x);
 
     return x;

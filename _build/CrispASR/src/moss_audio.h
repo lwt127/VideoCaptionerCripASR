@@ -81,6 +81,19 @@ const char* moss_audio_token_text(struct moss_audio_context* ctx, int token_id);
 // Seed for sampling.
 void moss_audio_set_seed(struct moss_audio_context* ctx, uint32_t seed);
 
+// Beam search. 1 = greedy (default). >1 = beam search via
+// core_beam_decode replay-from-prefix (§167g).
+void moss_audio_set_beam_size(struct moss_audio_context* ctx, int beam_size);
+
+// Per-token streaming callback. Fires once per generated token (id, softmax prob, userdata).
+typedef void (*moss_audio_token_cb)(int tok_id, float prob, void* userdata);
+
+// Like moss_audio_process() but fires cb(tok_id, prob, userdata) for each generated token.
+// The final assembled text is NOT returned; all output is via the callback.
+// Falls back to greedy decode (beam_size ignored).
+void moss_audio_process_cb(struct moss_audio_context* ctx, const float* samples, int n_samples, const char* prompt,
+                           moss_audio_token_cb cb, void* userdata);
+
 #ifdef __cplusplus
 }
 #endif

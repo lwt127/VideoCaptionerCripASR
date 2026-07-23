@@ -1,6 +1,7 @@
 # ASR Ecosystem Comparison
 
 Comparison of CrispASR with other ggml-based ASR implementations.
+Last reviewed: 2026-07-11.
 
 ## Audio Model Support
 
@@ -21,11 +22,14 @@ Comparison of CrispASR with other ggml-based ASR implementations.
 | FireRedASR2-AED | ✔ native | — | — |
 | Moonshine (tiny/base) | ✔ native | — | — |
 | Ultravox | — | ✔ via mtmd | ✔ |
-| Gemma 4 Audio Conformer | — | ✔ via mtmd | — |
+| Gemma 4 Audio Conformer | ✔ native (gemma4-e2b/e4b) | ✔ via mtmd | — |
 | Qwen2.5/3 Omni | — | ✔ via mtmd | ✔ |
-| LFM2-Audio | — | ✔ via mtmd | — |
+| LFM2-Audio | ✔ native (ASR + TTS) | ✔ via mtmd | — |
 
-**CrispASR: 15 backends** (all native, single GGUF per model)
+**CrispASR: 30+ ASR backend families** (all native, single GGUF per model;
+plus ~25 TTS backends, translation, punctuation, LID — see the README
+model table for the full list incl. canary-qwen, MOSS/Qwen3-Omni-based,
+SenseVoice, Paraformer, OmniASR, mega-asr, higgs-stt, mimo-asr)
 **llama.cpp: 7 audio models** (via libmtmd, mmproj-style split GGUF)
 **koboldcpp: 4 audio models** (fork of llama.cpp, AGPL-3.0)
 
@@ -37,7 +41,7 @@ Comparison of CrispASR with other ggml-based ASR implementations.
 | FireRedVAD (DFSMN) | ✔ | — | — |
 | Pyannote Segmentation | ✔ | — | — |
 | Silero LID | ✔ | — | — |
-| CTC Forced Aligner | ✔ (canary, qwen3) | — | — |
+| CTC Forced Aligner | ✔ (canary-ctc, wav2vec2, firered, omniasr) | — | — |
 
 ## Architecture Approaches
 
@@ -63,8 +67,8 @@ Comparison of CrispASR with other ggml-based ASR implementations.
 ## Optimizations to Adopt from llama.cpp
 
 1. **`ggml_soft_max_ext` with baked scale** — saves one `ggml_scale` op per attention layer
-2. **Chunked window attention** — O(N*W) instead of O(N²) for long sequences
-3. **Conv2d subsampling** via ggml ops (llama.cpp does this for Qwen3-ASR)
+2. ~~**Chunked window attention**~~ — DONE for qwen3-asr (`CRISP_AUDIO_WINDOWED_ATTN=1`, opt-in; default-flip evaluated and rejected, see PERFORMANCE.md)
+3. ~~**Conv2d subsampling** via ggml ops~~ — DONE (crisp_audio qwen3 tower)
 4. **Frame stacking** in projector (Voxtral does 4x stacking before LLM)
 
 ## Models We Could Add (from llama.cpp reference)
@@ -72,5 +76,4 @@ Comparison of CrispASR with other ggml-based ASR implementations.
 | Model | Effort | Value |
 |---|---|---|
 | Ultravox | Medium — Whisper encoder + Llama decoder | Speech understanding, not just ASR |
-| Gemma 4 Audio | High — Conformer + chunked attention | Streaming, multimodal |
 | Qwen2.5 Omni | Medium — Whisper encoder + Qwen decoder | Multimodal (audio+vision+text) |

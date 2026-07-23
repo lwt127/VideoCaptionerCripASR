@@ -1,56 +1,59 @@
-FROM ubuntu:22.04 AS build
-WORKDIR /src
-
-# archive.ubuntu.com flakes intermittently from CI runners; retries +
-# longer timeouts let transient connection failures resolve themselves
-# rather than failing the whole build.
-RUN printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
-      > /etc/apt/apt.conf.d/80-retries && \
-  apt-get update && \
-  apt-get install -y --fix-missing build-essential cmake git curl ninja-build && \
-  rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
-
-ARG CRISPASR_REPO=https://github.com/CrispStrobe/CrispASR
-ARG CRISPASR_REF=main
-
-RUN git clone --depth 1 "${CRISPASR_REPO}" /src/CrispASR && \
-  git -C /src/CrispASR fetch --depth 1 origin "${CRISPASR_REF}" && \
-  git -C /src/CrispASR checkout --detach FETCH_HEAD
-WORKDIR /src/CrispASR
-ARG CRISPASR_BUILD_JOBS
-RUN jobs="${CRISPASR_BUILD_JOBS:-$(nproc)}" && \
-  cmake -S . -B build -G Ninja -DCRISPASR_BUILD_TESTS=OFF && \
-  cmake --build build -j"${jobs}" --target crispasr-lib crispasr-lid
-
-FROM ubuntu:22.04 AS runtime
+FROM ubuntu:24.04
 WORKDIR /space
 
 RUN printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
       > /etc/apt/apt.conf.d/80-retries && \
   apt-get update && \
-  apt-get install -y --fix-missing bash curl ffmpeg python3 python3-pip && \
+  apt-get install -y --fix-missing bash curl ffmpeg python3 python3-pip \
+      libomp5 libgomp1 && \
   rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
-COPY --from=build /src/CrispASR/build /opt/crispasr/build
-COPY --from=build /src/CrispASR/samples /space/samples
-COPY hf-space/requirements.txt /space/requirements.txt
-RUN pip3 install --no-cache-dir -r /space/requirements.txt
-RUN find /opt/crispasr/build -type f -name 'lib*.so*' -exec cp -a {} /usr/local/lib/ \; && ldconfig
+# Pre-built binaries from GitHub Releases — avoids the 6+ minute C++
+# compilation that exceeds the HF free-tier Docker build timeout.
+# v3: tarball with SOVERSION symlinks now includes lib symlinks (libcrispasr.so → libcrispasr.so.0.7.1 etc.)
+ARG BIN_URL=https://github.com/CrispStrobe/CrispASR/releases/download/hf-space-bin/crispasr-bin-linux-x64.tar.gz?v=4
+RUN mkdir -p /opt/crispasr/build/bin && \
+  curl -sL "${BIN_URL}" -o /tmp/crispasr-bin.tar.gz && \
+  tar xzf /tmp/crispasr-bin.tar.gz -C /opt/crispasr/build/bin/ && \
+  rm /tmp/crispasr-bin.tar.gz && \
+  find /opt/crispasr/build/bin -name 'lib*.so*' -exec cp -a {} /usr/local/lib/ \; && \
+  ldconfig
 
-COPY hf-space/app.py hf-space/start.sh /space/
+# Pre-download G2P dicts + kokoro model so TTS works on first call.
+RUN mkdir -p /cache/.cache/crispasr && \
+  curl -sL "https://huggingface.co/datasets/cstr/g2p-dicts/resolve/main/espeak_en.tsv" \
+       -o /cache/.cache/crispasr/espeak_en.tsv && \
+  curl -sL "https://raw.githubusercontent.com/cmusphinx/cmudict/refs/heads/master/cmudict.dict" \
+       -o /cache/.cache/crispasr/cmudict.dict && \
+  curl -sL "https://huggingface.co/cstr/kokoro-82m-GGUF/resolve/main/kokoro-82m-q8_0.gguf" \
+       -o /cache/kokoro-82m-q8_0.gguf && \
+  curl -sL "https://huggingface.co/cstr/kokoro-voices-GGUF/resolve/main/kokoro-voice-af_heart.gguf" \
+       -o /cache/kokoro-voice-af_heart.gguf && \
+  ls -lh /cache/ /cache/.cache/crispasr/ || true
+
+# Fetch bundled sample audio from the GitHub repo (optional).
+ARG CRISPASR_REPO=https://github.com/CrispStrobe/CrispASR
+RUN mkdir -p /space/samples && \
+  curl -sL "${CRISPASR_REPO}/raw/main/samples/jfk.wav" -o /space/samples/jfk.wav 2>/dev/null || true
+
+COPY requirements.txt /space/requirements.txt
+RUN pip3 install --no-cache-dir --break-system-packages -r /space/requirements.txt
+
+COPY app.py start.sh /space/
 RUN chmod +x /space/start.sh && \
-  useradd -m -u 1000 app && \
+  id -u 1000 >/dev/null 2>&1 || useradd -m -u 1000 app && \
   mkdir -p /models /cache && \
-  chown -R app:app /space /opt/crispasr /models /cache
+  chown -R 1000:1000 /space /opt/crispasr /models /cache
 
 ENV PATH=/opt/crispasr/build/bin:$PATH
+ENV HOME=/cache
 ENV CRISPASR_SERVER_URL=http://127.0.0.1:8080
 ENV CRISPASR_CACHE_DIR=/cache
 ENV CRISPASR_SAMPLES_DIR=/space/samples
 ENV GRADIO_SERVER_NAME=0.0.0.0
 ENV GRADIO_SERVER_PORT=7860
 
-USER app
+USER 1000
 EXPOSE 7860
 EXPOSE 8080
 ENTRYPOINT ["/space/start.sh"]

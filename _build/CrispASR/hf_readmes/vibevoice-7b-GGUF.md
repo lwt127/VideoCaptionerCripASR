@@ -92,13 +92,20 @@ VibeVoice-7B is the **largest model** in Microsoft's VibeVoice family — a 9.3B
 
 | File | Size | Notes |
 | --- | ---: | --- |
-| `vibevoice-7b-q3_k.gguf` | 4.7 GB | Q3_K — ASR only (TTS quality too low) |
-| `vibevoice-7b-q4_0.gguf` | 5.6 GB | Q4_0 — fast decode |
-| `vibevoice-7b-q4_k.gguf` | 5.8 GB | **Q4_K — recommended default (ASR + TTS)** |
-| `vibevoice-7b-q5_k.gguf` | 6.8 GB | Q5_K — higher quality |
-| `vibevoice-7b-q6_k.gguf` | 7.9 GB | Q6_K — near-lossless |
-| `vibevoice-7b-q8_0.gguf` | 9.8 GB | Q8_0 — reference quality |
+| `vibevoice-7b-q3_k.gguf` | 5.7 GB | Q3_K — ASR only (TTS quality too low) |
+| `vibevoice-7b-q4_0.gguf` | 6.7 GB | Q4_0 — fast decode |
+| `vibevoice-7b-q4_k.gguf` | 6.7 GB | **Q4_K — recommended default (ASR + TTS)** |
+| `vibevoice-7b-q5_k.gguf` | 7.7 GB | Q5_K — higher quality |
+| `vibevoice-7b-q6_k.gguf` | 8.7 GB | Q6_K — near-lossless |
+| `vibevoice-7b-q8_0.gguf` | 10.4 GB | Q8_0 — reference quality |
 | `vibevoice-7b-f16.gguf` | 17.4 GB | F16 — full precision |
+
+> The quantized files keep the diffusion prediction head, connectors and
+> EOS classifier at full precision (only the LM backbone is quantized). The
+> head runs under classifier-free guidance, so quantizing it could push the
+> first frames onto a wrong trajectory that decodes as a brief non-speech
+> "music"/hum onset before the voice; keeping it full-precision avoids that
+> at a small size cost.
 
 ## Quick Start
 

@@ -8,10 +8,38 @@
 #include "firered_lid.h"
 #include "firered_asr.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include "core/crispasr_env.h"
+
+// ===========================================================================
+// Bench instrumentation — `FIRERED_LID_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool firered_lid_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_FIRERED_LID_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct firered_lid_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit firered_lid_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~firered_lid_bench_stage() {
+        if (!firered_lid_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  firered_lid_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 struct firered_lid_context {
     firered_asr_context* asr_ctx = nullptr;
@@ -50,6 +78,7 @@ extern "C" const char* firered_lid_detect(struct firered_lid_context* ctx, const
     constexpr int kMaxLidSamples = 16000 * 5; // 5 seconds at 16kHz
     int n_use = (n_samples > kMaxLidSamples) ? kMaxLidSamples : n_samples;
 
+    firered_lid_bench_stage _bs_total("detect_total");
     char* result = firered_asr_transcribe(ctx->asr_ctx, samples, n_use);
     if (!result)
         return nullptr;

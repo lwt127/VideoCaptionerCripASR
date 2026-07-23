@@ -65,6 +65,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
 
       # Probe whether the trusted publisher is configured AND the package
@@ -108,6 +109,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
 
       # Fail fast (and clearly) if the token isn't set, instead of letting
@@ -151,11 +153,15 @@ jobs:
     name: Publish Dart wrapper to pub.dev
     runs-on: ubuntu-latest
     continue-on-error: true
+    environment:
+      name: pub.dev
+      url: https://pub.dev/packages/crispasr
     permissions:
       id-token: write  # for pub.dev OIDC publishing
     steps:
       - uses: actions/checkout@v6
         with:
+          submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
 
       # pub.dev's automated publishing requires the package to already

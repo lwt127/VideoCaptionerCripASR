@@ -122,7 +122,8 @@ void whisper_print_usage(int /*argc*/, char** argv, const whisper_params& params
     fprintf(stderr, "  -c ID,    --capture ID    [%-7d] capture device ID\n", params.capture_id);
     fprintf(stderr, "  -mt N,    --max-tokens N  [%-7d] maximum number of tokens per audio chunk\n", params.max_tokens);
     fprintf(stderr, "  -ac N,    --audio-ctx N   [%-7d] audio context size (0 - all)\n", params.audio_ctx);
-    fprintf(stderr, "  -bs N,    --beam-size N   [%-7d] beam size for beam search\n", params.beam_size);
+    fprintf(stderr, "  -bs N,    --beam-size N   [%-7s] beam size (default: greedy, -bs 5 for beam search)\n",
+            params.beam_size > 0 ? std::to_string(params.beam_size).c_str() : "greedy");
     fprintf(stderr, "  -vth N,   --vad-thold N   [%-7.2f] voice activity detection threshold\n", params.vad_thold);
     fprintf(stderr, "  -fth N,   --freq-thold N  [%-7.2f] high-pass frequency cutoff\n", params.freq_thold);
     fprintf(stderr, "  -tr,      --translate     [%-7s] translate from source language to english\n",
@@ -358,7 +359,7 @@ int main(int argc, char** argv) {
             wparams.max_tokens = params.max_tokens;
             wparams.language = params.language.c_str();
             wparams.n_threads = params.n_threads;
-            wparams.beam_search.beam_size = params.beam_size;
+            wparams.beam_search.beam_size = params.beam_size > 0 ? params.beam_size : 5;
 
             wparams.audio_ctx = params.audio_ctx;
 

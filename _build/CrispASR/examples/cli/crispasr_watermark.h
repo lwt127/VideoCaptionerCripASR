@@ -27,6 +27,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -133,10 +134,36 @@ struct wm_bin {
     int sign; // +1 or -1
 };
 
-inline std::vector<wm_bin> generate_bin_pattern(uint64_t key, int n_fft, int n_bins) {
+// Watermark band + strength.
+//
+// v2 (issue #260): the comb lives in the SPEECH band (~1.5–4 kHz) where speech
+// formants mask it. The original v1 spread the same 32-bin comb across
+// ~1.5–11.7 kHz; ~20 of those bins landed at 4–11.8 kHz where clean TTS speech
+// is near-silent, so the comb painted an audible "tinny" tone (a fixed set of
+// horizontal lines on the spectrogram) over the high-frequency near-silence.
+// Keeping the comb inside the speech band + lowering alpha makes it inaudible
+// while detection stays well above threshold on real speech.
+//
+// CRISPASR_WATERMARK_LEGACY=1 restores the pre-#260 wideband/loud behavior so
+// the two paths can be A/B'd and old watermarks re-detected. Both embed and
+// detect read the same env, so they always agree on the band.
+inline void wm_params(int n_fft, int& lo_bin, int& hi_bin, float& default_alpha) {
+    lo_bin = n_fft / 16; // skip lowest ~6% (sub-bass) — ~1.5 kHz @ 24 kHz
+    if (std::getenv("CRISPASR_WATERMARK_LEGACY")) {
+        hi_bin = n_fft / 2 - 1; // ~11.7 kHz — audible comb (legacy A/B only)
+        default_alpha = 0.08f;
+    } else {
+        // ~4.8 kHz: caps the comb below 5 kHz, removing the entire 5–12 kHz
+        // "tinny" region that was the audible complaint, while reaching just
+        // into the fricative/sibilance band so detection stays robust on tonal
+        // voiced speech (~0.88 on real qwen3-tts vs 0.94 legacy).
+        hi_bin = n_fft / 5;
+        default_alpha = 0.05f;
+    }
+}
+
+inline std::vector<wm_bin> generate_bin_pattern(uint64_t key, int n_fft, int n_bins, int lo_bin, int hi_bin) {
     prng rng(key);
-    const int lo_bin = n_fft / 16;    // skip lowest ~6% (sub-bass)
-    const int hi_bin = n_fft / 2 - 1; // below Nyquist
     const int range = hi_bin - lo_bin;
     if (range <= 0 || n_bins <= 0)
         return {};
@@ -165,13 +192,23 @@ inline std::vector<wm_bin> generate_bin_pattern(uint64_t key, int n_fft, int n_b
 // threshold for speech masking is ~20 dB; 38 dB is 18 dB below perception.
 //
 // The function is a no-op for very short audio (< 1 FFT frame).
-inline void crispasr_watermark_embed_impl(float* pcm, int n_samples, float alpha = 0.08f) {
+// alpha < 0 selects the band-appropriate default (0.05 speech-band, 0.08 legacy).
+// alpha == 0 is an explicit zero-strength no-op (leaves the signal unchanged);
+// alpha > 0 uses that exact strength.
+inline void crispasr_watermark_embed_impl(float* pcm, int n_samples, float alpha = -1.0f) {
     const int n_fft = 1024;
     const int hop = n_fft / 2; // 50% overlap
     if (n_samples < n_fft)
         return;
 
-    const auto bins = crispasr_wm::generate_bin_pattern(CRISPASR_WATERMARK_KEY, n_fft, CRISPASR_WATERMARK_NBINS);
+    int lo_bin, hi_bin;
+    float default_alpha;
+    crispasr_wm::wm_params(n_fft, lo_bin, hi_bin, default_alpha);
+    if (alpha < 0.0f)
+        alpha = default_alpha;
+
+    const auto bins =
+        crispasr_wm::generate_bin_pattern(CRISPASR_WATERMARK_KEY, n_fft, CRISPASR_WATERMARK_NBINS, lo_bin, hi_bin);
     if (bins.empty())
         return;
 
@@ -247,10 +284,17 @@ inline void crispasr_watermark_embed_impl(float* pcm, int n_samples, float alpha
         }
     }
 
-    // Normalize and write back
+    // Normalize and write back only the watermark delta. Near the first and
+    // last Hann-window edges the overlap-add normalization can be tiny; using
+    // a short boundary ramp avoids turning that into an audible impulse.
     for (int i = 0; i < n_samples; i++) {
-        if (norm[i] > 1e-8f)
-            pcm[i] = out[i] / norm[i];
+        if (norm[i] > 1e-4f) {
+            float watermarked = out[i] / norm[i];
+            float delta = watermarked - pcm[i];
+            float ramp_in = std::min(1.0f, (float)i / (float)n_fft);
+            float ramp_out = std::min(1.0f, (float)(n_samples - 1 - i) / (float)n_fft);
+            pcm[i] += delta * std::min(ramp_in, ramp_out);
+        }
     }
 }
 
@@ -272,7 +316,11 @@ inline float crispasr_watermark_detect_impl(const float* pcm, int n_samples) {
     if (n_samples < n_fft)
         return 0.0f;
 
-    const auto bins = crispasr_wm::generate_bin_pattern(CRISPASR_WATERMARK_KEY, n_fft, CRISPASR_WATERMARK_NBINS);
+    int lo_bin, hi_bin;
+    float default_alpha_unused;
+    crispasr_wm::wm_params(n_fft, lo_bin, hi_bin, default_alpha_unused);
+    const auto bins =
+        crispasr_wm::generate_bin_pattern(CRISPASR_WATERMARK_KEY, n_fft, CRISPASR_WATERMARK_NBINS, lo_bin, hi_bin);
     if (bins.empty())
         return 0.0f;
 

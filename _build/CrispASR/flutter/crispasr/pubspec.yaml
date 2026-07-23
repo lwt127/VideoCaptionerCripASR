@@ -1,7 +1,15 @@
 name: crispasr
 description: Lightweight on-device speech recognition via ggml. Supports Whisper, Qwen3-ASR, FastConformer, and more.
-version: 0.5.15
+version: 0.8.21
 homepage: https://github.com/CrispStrobe/CrispASR
+repository: https://github.com/CrispStrobe/CrispASR/tree/main/flutter/crispasr
+
+topics:
+  - asr
+  - speech-recognition
+  - transcription
+  - ffi
+  - ggml
 
 environment:
   # 3.1.0+: chat.dart uses NativeCallable.listener and Array<Int8> inline
@@ -15,5 +23,6 @@ dependencies:
 
 dev_dependencies:
   test: ^1.24.0
+  lints: ^5.0.0
   # `Pointer<Utf8>` and `toDartString` come from `package:ffi`, which is a
   # runtime dep — nothing else needed for the smoke tests.

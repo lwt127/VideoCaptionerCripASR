@@ -25,6 +25,8 @@
 
 #include "core/gguf_loader.h"
 #include "core/hifigan.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -33,6 +35,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -40,6 +43,32 @@
 #include <map>
 #include <string>
 #include <vector>
+
+// ===========================================================================
+// Bench instrumentation — `SPEECHT5_TTS_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool speecht5_tts_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_SPEECHT5_TTS_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct speecht5_tts_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit speecht5_tts_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~speecht5_tts_bench_stage() {
+        if (!speecht5_tts_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  speecht5_tts_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -199,6 +228,24 @@ struct speecht5_tts_context {
     float threshold = 0.5f;
     int max_len = 0;
 
+    // Pre-permuted HiFi-GAN upsample weights for decomposed col2im path
+    std::vector<ggml_tensor*> ups_w_perm;
+    ggml_context* ctx_perm = nullptr;
+    ggml_backend_buffer_t buf_perm = nullptr;
+
+    // FASTCONV: baked F32 copies of the vocoder's F16 conv kernels, so the
+    // fork's per-graph F16→F32 cast becomes a no-op (docs/perf-sweep/PLAN.md).
+    // Gated CRISPASR_SPEECHT5_FASTCONV; disabled → legacy path unchanged.
+    core_dac::fastconv_cache voc_fc;
+
+    // §202 Cross-attention K/V pre-computed from encoder output (constant per utterance).
+    // Shape: [decoder_layers] tensors, each (hidden_size, T_enc) on device.
+    ggml_context* ctx_cross_kv = nullptr;
+    ggml_backend_buffer_t buf_cross_kv = nullptr;
+    std::vector<ggml_tensor*> cross_kv_k;
+    std::vector<ggml_tensor*> cross_kv_v;
+    int cross_kv_T_enc = 0;
+
     // Speaker embedding (512-dim x-vector)
     std::vector<float> speaker_emb;
 
@@ -225,6 +272,10 @@ struct speecht5_tts_context {
 
     ~speecht5_tts_context() {
         core_gguf::free_weights(wl);
+        if (ctx_cross_kv)
+            ggml_free(ctx_cross_kv);
+        if (buf_cross_kv)
+            ggml_backend_buffer_free(buf_cross_kv);
         if (sched) {
             ggml_backend_sched_free(sched);
         }
@@ -516,6 +567,84 @@ static std::vector<float> run_encoder(speecht5_tts_context* ctx, const std::vect
     return result;
 }
 
+// ── §202 Cross-attention K/V pre-computation ──────────────────────
+// Computes cross_kv_k[l] = W_k[l] @ enc_hidden + b_k[l] and
+// cross_kv_v[l] = W_v[l] @ enc_hidden + b_v[l] for all decoder layers
+// once per utterance. Results are device-resident and reused every step.
+static void precompute_cross_kv(speecht5_tts_context* ctx, const std::vector<float>& encoder_out, int T_enc) {
+    const auto& hp = ctx->hp;
+    const auto& ts = ctx->tensors();
+    const int n_layers = hp.decoder_layers;
+
+    if (ctx->buf_cross_kv && ctx->cross_kv_T_enc != T_enc) {
+        ggml_free(ctx->ctx_cross_kv);
+        ctx->ctx_cross_kv = nullptr;
+        ggml_backend_buffer_free(ctx->buf_cross_kv);
+        ctx->buf_cross_kv = nullptr;
+        ctx->cross_kv_k.clear();
+        ctx->cross_kv_v.clear();
+    }
+
+    if (!ctx->buf_cross_kv) {
+        ggml_init_params p{};
+        p.mem_size = (size_t)ggml_tensor_overhead() * (size_t)n_layers * 2 + 256;
+        p.no_alloc = true;
+        ctx->ctx_cross_kv = ggml_init(p);
+        ctx->cross_kv_k.resize(n_layers);
+        ctx->cross_kv_v.resize(n_layers);
+        for (int l = 0; l < n_layers; l++) {
+            ctx->cross_kv_k[l] = ggml_new_tensor_2d(ctx->ctx_cross_kv, GGML_TYPE_F16, hp.hidden_size, T_enc);
+            ctx->cross_kv_v[l] = ggml_new_tensor_2d(ctx->ctx_cross_kv, GGML_TYPE_F16, hp.hidden_size, T_enc);
+        }
+        ctx->buf_cross_kv = ggml_backend_alloc_ctx_tensors(ctx->ctx_cross_kv, ctx->backend);
+        ctx->cross_kv_T_enc = T_enc;
+        if (!ctx->buf_cross_kv) {
+            fprintf(stderr, "speecht5: cross-kv alloc failed\n");
+            return;
+        }
+    }
+
+    mini_graph mg(ctx->sched);
+    auto* gc = mg.ctx;
+
+    ggml_tensor* enc_h = ggml_new_tensor_2d(gc, GGML_TYPE_F32, hp.hidden_size, T_enc);
+    ggml_set_name(enc_h, "enc_h_cross_kv");
+    ggml_set_input(enc_h);
+
+    ggml_cgraph* gf = ggml_new_graph_custom(gc, (size_t)n_layers * 16, false);
+
+    for (int l = 0; l < n_layers; l++) {
+        std::string pfx = "dec.layer." + std::to_string(l);
+        ggml_tensor* ck_w = W(ts, pfx + ".cross_attn.k.weight");
+        ggml_tensor* ck_b = W(ts, pfx + ".cross_attn.k.bias");
+        ggml_tensor* cv_w = W(ts, pfx + ".cross_attn.v.weight");
+        ggml_tensor* cv_b = W(ts, pfx + ".cross_attn.v.bias");
+
+        if (!ck_w || !cv_w) {
+            fprintf(stderr, "speecht5: cross-kv missing weights for layer %d\n", l);
+            continue;
+        }
+
+        ggml_tensor* ck = ggml_mul_mat(gc, ck_w, enc_h);
+        if (ck_b)
+            ck = ggml_add(gc, ck, ck_b);
+        ggml_build_forward_expand(gf, ggml_cpy(gc, ck, ctx->cross_kv_k[l]));
+
+        ggml_tensor* cv = ggml_mul_mat(gc, cv_w, enc_h);
+        if (cv_b)
+            cv = ggml_add(gc, cv, cv_b);
+        ggml_build_forward_expand(gf, ggml_cpy(gc, cv, ctx->cross_kv_v[l]));
+    }
+
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        fprintf(stderr, "speecht5: cross-kv precompute alloc failed\n");
+        return;
+    }
+    mg.set_input(enc_h, encoder_out.data(), (size_t)T_enc * hp.hidden_size * sizeof(float));
+    ggml_backend_sched_graph_compute(ctx->sched, gf);
+}
+
 // ── Decoder step (one AR step) ────────────────────────────────────
 // Runs decoder prenet + 6 decoder layers + feat_out + prob_out.
 // Returns mel frame (reduction_factor * num_mel_bins) and stop prob.
@@ -525,25 +654,22 @@ struct decoder_step_result {
     float stop_prob = 0.0f;
 };
 
+// dec_pe_step: pre-sliced sinusoidal PE for this step, length hidden_size.
 static decoder_step_result run_decoder_step(speecht5_tts_context* ctx,
-                                            const std::vector<float>& encoder_out, // (hidden_size * T_enc)
-                                            int T_enc,
-                                            const std::vector<float>& prev_mel_frame, // (num_mel_bins) - last mel frame
-                                            int dec_step // current decoder step (0-indexed)
+                                            const std::vector<float>& prev_mel_frame, // (num_mel_bins)
+                                            int dec_step,                             // current step (0-indexed)
+                                            const float* dec_pe_step                  // (hidden_size)
 ) {
     const auto& hp = ctx->hp;
     const auto& ts = ctx->tensors();
+    const int T_enc = ctx->cross_kv_T_enc;
     decoder_step_result result;
     result.mel_frame.resize(hp.reduction_factor * hp.num_mel_bins, 0.0f);
 
     mini_graph mg(ctx->sched);
     auto* gc = mg.ctx;
 
-    // Inputs
-    ggml_tensor* enc_hidden = ggml_new_tensor_2d(gc, GGML_TYPE_F32, hp.hidden_size, T_enc);
-    ggml_set_name(enc_hidden, "enc_hidden");
-    ggml_set_input(enc_hidden);
-
+    // Inputs (no enc_hidden — cross-attn K/V are pre-computed device tensors)
     ggml_tensor* mel_input = ggml_new_tensor_1d(gc, GGML_TYPE_F32, hp.num_mel_bins);
     ggml_set_name(mel_input, "mel_input");
     ggml_set_input(mel_input);
@@ -554,7 +680,7 @@ static decoder_step_result run_decoder_step(speecht5_tts_context* ctx,
 
     ggml_tensor* dec_pe = ggml_new_tensor_1d(gc, GGML_TYPE_F32, hp.hidden_size);
     ggml_set_name(dec_pe, "dec_pe");
-    ggml_set_input(dec_pe);
+    ggml_set_input(dec_pe); // filled from dec_pe_step parameter below (after alloc)
 
     // ── Prenet ──
     // 2x Linear + ReLU (no dropout at inference)
@@ -770,14 +896,10 @@ static decoder_step_result run_decoder_step(speecht5_tts_context* ctx,
                 x = ggml_add(gc, x, ln_self_b);
         }
 
-        // Cross-attention: Q from decoder, K/V from encoder
+        // Cross-attention: Q from decoder, K/V from pre-computed device tensors (§202)
         residual = x;
         ggml_tensor* cq_w = W(ts, pfx + ".cross_attn.q.weight");
         ggml_tensor* cq_b = W(ts, pfx + ".cross_attn.q.bias");
-        ggml_tensor* ck_w = W(ts, pfx + ".cross_attn.k.weight");
-        ggml_tensor* ck_b = W(ts, pfx + ".cross_attn.k.bias");
-        ggml_tensor* cv_w = W(ts, pfx + ".cross_attn.v.weight");
-        ggml_tensor* cv_b = W(ts, pfx + ".cross_attn.v.bias");
         ggml_tensor* co_w = W(ts, pfx + ".cross_attn.o.weight");
         ggml_tensor* co_b = W(ts, pfx + ".cross_attn.o.bias");
 
@@ -787,14 +909,9 @@ static decoder_step_result run_decoder_step(speecht5_tts_context* ctx,
             cq = ggml_add(gc, cq, cq_b);
         cq = ggml_scale(gc, cq, 1.0f / sqrtf((float)hp.head_dim()));
 
-        // K, V: from encoder hidden (hidden_size, T_enc)
-        ggml_tensor* ck = ggml_mul_mat(gc, ck_w, enc_hidden);
-        if (ck_b)
-            ck = ggml_add(gc, ck, ck_b);
-
-        ggml_tensor* cv = ggml_mul_mat(gc, cv_w, enc_hidden);
-        if (cv_b)
-            cv = ggml_add(gc, cv, cv_b);
+        // K, V: pre-computed device tensors — no per-step matmul needed
+        ggml_tensor* ck = ctx->cross_kv_k[i]; // (hidden_size, T_enc)
+        ggml_tensor* cv = ctx->cross_kv_v[i]; // (hidden_size, T_enc)
 
         // Multi-head cross-attention
         // (n_heads and hd already declared above in self-attention)
@@ -904,7 +1021,6 @@ static decoder_step_result run_decoder_step(speecht5_tts_context* ctx,
     }
 
     // Set inputs
-    mg.set_input(enc_hidden, encoder_out.data(), T_enc * hp.hidden_size * sizeof(float));
     mg.set_input(mel_input, prev_mel_frame.data(), hp.num_mel_bins * sizeof(float));
 
     // Normalized speaker embedding
@@ -920,15 +1036,7 @@ static decoder_step_result run_decoder_step(speecht5_tts_context* ctx,
         }
     }
     mg.set_input(spk_input, spk_norm_data.data(), hp.speaker_dim * sizeof(float));
-
-    // Decoder PE for current step
-    auto dec_pe_full = make_sinusoidal_pe(dec_step + 2, hp.hidden_size);
-    // Use step dec_step (0-indexed)
-    std::vector<float> dec_pe_step(hp.hidden_size);
-    for (int d = 0; d < hp.hidden_size; d++) {
-        dec_pe_step[d] = dec_pe_full[dec_step * hp.hidden_size + d];
-    }
-    mg.set_input(dec_pe, dec_pe_step.data(), hp.hidden_size * sizeof(float));
+    mg.set_input(dec_pe, dec_pe_step, hp.hidden_size * sizeof(float));
 
     // Set past KV cache inputs
     for (int i = 0; i < hp.decoder_layers; i++) {
@@ -944,7 +1052,7 @@ static decoder_step_result run_decoder_step(speecht5_tts_context* ctx,
 
     // ── SPEECHT5_DUMP_DIR: per-step intermediate dumps ──
     {
-        static const char* dump_dir = getenv("SPEECHT5_DUMP_DIR");
+        static const char* dump_dir = crispasr_env::get("CRISPASR_SPEECHT5_DUMP_DIR");
         if (dump_dir) {
             auto dump_f32 = [&](const char* tag, const float* data, size_t n) {
                 std::string path = std::string(dump_dir) + "/step" + std::to_string(dec_step) + "_" + tag + ".f32";
@@ -1149,7 +1257,7 @@ static std::vector<float> run_vocoder(speecht5_tts_context* ctx,
     ggml_set_input(mel_in);
 
     // Run HiFi-GAN — input is (T, C_in) = (T_mel, mel_dim)
-    ggml_tensor* waveform = core_hifigan::forward(gc, mel_in, ts, "voc", vhp);
+    ggml_tensor* waveform = core_hifigan::forward(gc, mel_in, ts, "voc", vhp, ctx->ups_w_perm, &ctx->voc_fc);
 
     ggml_set_name(waveform, "waveform");
 
@@ -1203,7 +1311,7 @@ struct speecht5_tts_context* speecht5_tts_init(const char* path, struct speecht5
     ctx->max_len = params.max_len;
 
     // Backend — prefer GPU (CUDA/Metal/Vulkan) when available + requested
-    ctx->backend = params.use_gpu ? ggml_backend_init_best() : nullptr;
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : nullptr;
     if (!ctx->backend) {
         ctx->backend = ggml_backend_cpu_init();
     }
@@ -1302,6 +1410,36 @@ struct speecht5_tts_context* speecht5_tts_init(const char* path, struct speecht5
         return nullptr;
     }
 
+    // Permute HiFi-GAN upsample ConvTranspose1d weights
+    {
+        const int n = ctx->voc_hp.num_upsamples();
+        std::vector<ggml_tensor*> srcs(n);
+        std::vector<ggml_tensor**> dsts(n);
+        ctx->ups_w_perm.resize(n, nullptr);
+        auto& ts = ctx->tensors();
+        for (int i = 0; i < n; i++) {
+            std::string wname = "voc.ups." + std::to_string(i) + ".weight";
+            auto it = ts.find(wname);
+            srcs[i] = (it != ts.end()) ? it->second : nullptr;
+            dsts[i] = &ctx->ups_w_perm[i];
+        }
+        core_convt::permute_convt1d_weights_batch(srcs.data(), dsts.data(), n, ctx->backend, &ctx->ctx_perm,
+                                                  &ctx->buf_perm);
+    }
+
+    // FASTCONV: bake one F32 copy of each F16 vocoder conv kernel (default on;
+    // set CRISPASR_SPEECHT5_FASTCONV=0 for the legacy A/B arm).
+    {
+        const char* e = std::getenv("CRISPASR_SPEECHT5_FASTCONV");
+        const bool on = !e || (e[0] != '0');
+        auto convs = core_hifigan::collect_fastconv_kernels(ctx->tensors(), "voc", ctx->voc_hp);
+        ctx->voc_fc.bake(ctx->backend, convs, on);
+        if (std::getenv("CRISPASR_SPEECHT5_FASTCONV_DEBUG")) {
+            fprintf(stderr, "speecht5: FASTCONV %s — baked %zu F32 kernels from %zu voc convs\n",
+                    ctx->voc_fc.enabled ? "ON" : "OFF", ctx->voc_fc.f32.size(), convs.size());
+        }
+    }
+
     if (params.verbosity > 0) {
         fprintf(stderr, "speecht5: backend=%s\n", ggml_backend_name(ctx->backend));
         fprintf(stderr, "speecht5: loaded model — hidden=%d mel=%d enc=%d dec=%d vocab=%d\n", hp.hidden_size,
@@ -1338,6 +1476,8 @@ float* speecht5_tts_synthesize(struct speecht5_tts_context* ctx, const char* tex
         return nullptr;
     }
 
+    speecht5_tts_bench_stage _bs_synth("synthesize");
+
     // Tokenize
     std::vector<int32_t> token_ids = ctx->tokenizer.encode(text);
     if (token_ids.empty()) {
@@ -1350,7 +1490,11 @@ float* speecht5_tts_synthesize(struct speecht5_tts_context* ctx, const char* tex
 
     // Run encoder
     int T_enc = 0;
-    auto encoder_out = run_encoder(ctx, token_ids, &T_enc);
+    std::vector<float> encoder_out;
+    {
+        speecht5_tts_bench_stage _bs("encoder");
+        encoder_out = run_encoder(ctx, token_ids, &T_enc);
+    }
     if (encoder_out.empty()) {
         fprintf(stderr, "speecht5: encoder failed\n");
         return nullptr;
@@ -1365,6 +1509,12 @@ float* speecht5_tts_synthesize(struct speecht5_tts_context* ctx, const char* tex
     int min_steps = (int)(T_enc * 0.0f / hp.reduction_factor); // minlenratio=0
     std::vector<float> all_mel_frames;                         // accumulated mel frames
 
+    // Pre-compute cross-attention K/V once (§202)
+    precompute_cross_kv(ctx, encoder_out, T_enc);
+
+    // Pre-compute sinusoidal PE table for all steps
+    auto dec_pe_table = make_sinusoidal_pe(max_steps + 1, hp.hidden_size);
+
     // Reset KV cache for this synthesis
     ctx->self_kv_cache.reset(hp.decoder_layers);
 
@@ -1372,7 +1522,8 @@ float* speecht5_tts_synthesize(struct speecht5_tts_context* ctx, const char* tex
     std::vector<float> prev_mel(hp.num_mel_bins, 0.0f);
 
     for (int step = 0; step < max_steps; step++) {
-        auto result = run_decoder_step(ctx, encoder_out, T_enc, prev_mel, step);
+        const float* step_pe = dec_pe_table.data() + (size_t)step * hp.hidden_size;
+        auto result = run_decoder_step(ctx, prev_mel, step, step_pe);
 
         // Append mel frame
         all_mel_frames.insert(all_mel_frames.end(), result.mel_frame.begin(), result.mel_frame.end());
@@ -1407,14 +1558,22 @@ float* speecht5_tts_synthesize(struct speecht5_tts_context* ctx, const char* tex
     }
 
     // Run post-net
-    auto mel_refined = run_postnet(ctx, all_mel_frames, T_mel);
+    std::vector<float> mel_refined;
+    {
+        speecht5_tts_bench_stage _bs("postnet");
+        mel_refined = run_postnet(ctx, all_mel_frames, T_mel);
+    }
     if (mel_refined.empty()) {
         fprintf(stderr, "speecht5: postnet failed, using unrefined mel\n");
         mel_refined = all_mel_frames;
     }
 
     // Run vocoder
-    auto waveform = run_vocoder(ctx, mel_refined, T_mel);
+    std::vector<float> waveform;
+    {
+        speecht5_tts_bench_stage _bs("vocoder");
+        waveform = run_vocoder(ctx, mel_refined, T_mel);
+    }
     if (waveform.empty()) {
         fprintf(stderr, "speecht5: vocoder failed\n");
         return nullptr;
@@ -1439,5 +1598,12 @@ void speecht5_tts_pcm_free(float* pcm) {
 }
 
 void speecht5_tts_free(struct speecht5_tts_context* ctx) {
+    if (ctx) {
+        ctx->voc_fc.free();
+        if (ctx->buf_perm)
+            ggml_backend_buffer_free(ctx->buf_perm);
+        if (ctx->ctx_perm)
+            ggml_free(ctx->ctx_perm);
+    }
     delete ctx;
 }

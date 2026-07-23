@@ -15,9 +15,9 @@ TEST_CASE("ARPAbet to IPA conversion", "[g2p][arpabet]") {
     SECTION("basic vowels") {
         CHECK(g2p_en::arpa_to_ipa("AA0") == "ɑː");
         CHECK(g2p_en::arpa_to_ipa("AE1") == "ˈæ");
-        CHECK(g2p_en::arpa_to_ipa("IY0") == "i");    // unstressed → short
-        CHECK(g2p_en::arpa_to_ipa("UW2") == "ˌuː");   // secondary stress emitted
-        CHECK(g2p_en::arpa_to_ipa("AH0") == "ə");    // unstressed → schwa
+        CHECK(g2p_en::arpa_to_ipa("IY0") == "i");   // unstressed → short
+        CHECK(g2p_en::arpa_to_ipa("UW2") == "ˌuː"); // secondary stress emitted
+        CHECK(g2p_en::arpa_to_ipa("AH0") == "ə");   // unstressed → schwa
         CHECK(g2p_en::arpa_to_ipa("EY1") == "ˈeɪ");
     }
     SECTION("basic consonants") {
@@ -32,11 +32,11 @@ TEST_CASE("ARPAbet to IPA conversion", "[g2p][arpabet]") {
         CHECK(g2p_en::arpa_to_ipa("JH") == "dʒ");
     }
     SECTION("stress markers and reductions") {
-        CHECK(g2p_en::arpa_to_ipa("AH0") == "ə");     // unstressed → schwa
-        CHECK(g2p_en::arpa_to_ipa("AH1") == "ˈʌ");    // primary stress → ʌ
-        CHECK(g2p_en::arpa_to_ipa("AH2") == "ˌʌ");    // secondary stress
-        CHECK(g2p_en::arpa_to_ipa("IH0") == "ɪ");      // espeak uses ɪ for unstressed
-        CHECK(g2p_en::arpa_to_ipa("ER1") == "ˈɜː");   // stressed → ɜː
+        CHECK(g2p_en::arpa_to_ipa("AH0") == "ə");   // unstressed → schwa
+        CHECK(g2p_en::arpa_to_ipa("AH1") == "ˈʌ");  // primary stress → ʌ
+        CHECK(g2p_en::arpa_to_ipa("AH2") == "ˌʌ");  // secondary stress
+        CHECK(g2p_en::arpa_to_ipa("IH0") == "ɪ");   // espeak uses ɪ for unstressed
+        CHECK(g2p_en::arpa_to_ipa("ER1") == "ˈɜː"); // stressed → ɜː
     }
     SECTION("case insensitivity") {
         CHECK(g2p_en::arpa_to_ipa("ah0") == "ə");
@@ -58,8 +58,10 @@ TEST_CASE("LTS rule-based phonemization", "[g2p][lts]") {
         bool has_hh = false, has_vowel = false;
         for (auto& p : phs) {
             std::string upper;
-            for (char c : p) upper += (char)toupper((unsigned char)c);
-            if (upper == "HH" || upper == "H") has_hh = true;
+            for (char c : p)
+                upper += (char)toupper((unsigned char)c);
+            if (upper == "HH" || upper == "H")
+                has_hh = true;
             if (upper.find("AH") != std::string::npos || upper.find("EH") != std::string::npos ||
                 upper.find("OW") != std::string::npos || upper.find("IY") != std::string::npos)
                 has_vowel = true;
@@ -74,8 +76,10 @@ TEST_CASE("LTS rule-based phonemization", "[g2p][lts]") {
         bool has_th = false;
         for (auto& p : phs) {
             std::string upper;
-            for (char c : p) upper += (char)toupper((unsigned char)c);
-            if (upper == "TH") has_th = true;
+            for (char c : p)
+                upper += (char)toupper((unsigned char)c);
+            if (upper == "TH")
+                has_th = true;
         }
         CHECK(has_th);
     }
@@ -91,8 +95,10 @@ TEST_CASE("LTS rule-based phonemization", "[g2p][lts]") {
         bool has_sh = false;
         for (auto& p : phs) {
             std::string upper;
-            for (char c : p) upper += (char)toupper((unsigned char)c);
-            if (upper == "SH") has_sh = true;
+            for (char c : p)
+                upper += (char)toupper((unsigned char)c);
+            if (upper == "SH")
+                has_sh = true;
         }
         CHECK(has_sh);
     }
@@ -109,7 +115,10 @@ TEST_CASE("word_to_ipa produces IPA output", "[g2p][ipa]") {
         // IPA should contain non-ASCII characters (ɛ, ʌ, etc.)
         bool has_nonascii = false;
         for (unsigned char c : ipa) {
-            if (c >= 0x80) { has_nonascii = true; break; }
+            if (c >= 0x80) {
+                has_nonascii = true;
+                break;
+            }
         }
         CHECK(has_nonascii);
     }
@@ -207,7 +216,8 @@ TEST_CASE("neural G2P JSON loading", "[g2p][neural]") {
         if (path.empty()) {
             // Try cache dir
             const char* home = std::getenv("HOME");
-            if (home) path = std::string(home) + "/.cache/crispasr/g2p_en.json";
+            if (home)
+                path = std::string(home) + "/.cache/crispasr/g2p_en.json";
         }
         if (path.empty() || !g2p_en::load_neural_g2p_file(nm, path)) {
             SKIP("g2p_en.json not available — set CRISPASR_G2P_MODEL_PATH");
@@ -221,7 +231,8 @@ TEST_CASE("neural G2P JSON loading", "[g2p][neural]") {
             auto phs = g2p_en::neural_predict(nm, "hello");
             REQUIRE(!phs.empty());
             INFO("neural prediction for 'hello': ");
-            for (auto& p : phs) INFO("  " << p);
+            for (auto& p : phs)
+                INFO("  " << p);
         }
     }
 }
@@ -233,11 +244,7 @@ TEST_CASE("CMUdict file loading", "[g2p][cmudict]") {
 
     SECTION("load from file") {
         // Try loading CMUdict from known locations
-        const char* paths[] = {
-            "/tmp/cmudict.dict",
-            "models/cmudict.dict",
-            nullptr
-        };
+        const char* paths[] = {"/tmp/cmudict.dict", "models/cmudict.dict", nullptr};
         bool loaded = false;
         for (int i = 0; paths[i]; i++) {
             int n = g2p_en::load_cmudict_file(ctx.dict, paths[i]);
@@ -273,7 +280,8 @@ TEST_CASE("CMUdict file loading", "[g2p][cmudict]") {
             // THE -> DH AH0 or DH AH1 or DH IY0
             bool has_dh = false;
             for (auto& ph : it->second) {
-                if (ph == "DH") has_dh = true;
+                if (ph == "DH")
+                    has_dh = true;
             }
             CHECK(has_dh);
         }
@@ -312,10 +320,8 @@ TEST_CASE("CMUdict IPA output quality", "[g2p][cmudict][quality]") {
 
 TEST_CASE("filter_to_inventory strips unmapped chars", "[phonemizer][inventory]") {
     // Simulated piper phoneme map (subset)
-    std::set<std::string> valid = {
-        "t", "s", "ʃ", "d", "ʒ", "a", "e", "i", "o", "u",
-        "ɪ", "ɛ", "ɔ", "ʊ", "ə", "ˈ", "ˌ", "ː", "ŋ"
-    };
+    std::set<std::string> valid = {"t", "s", "ʃ", "d", "ʒ", "a", "e", "i", "o", "u",
+                                   "ɪ", "ɛ", "ɔ", "ʊ", "ə", "ˈ", "ˌ", "ː", "ŋ"};
 
     SECTION("passes valid IPA through") {
         std::string filtered = crispasr::filter_to_inventory("tʃaɪ", valid);
@@ -324,7 +330,7 @@ TEST_CASE("filter_to_inventory strips unmapped chars", "[phonemizer][inventory]"
 
     SECTION("strips unknown combining marks") {
         // U+0361 combining tie should be stripped if not in valid set
-        std::string with_tie = "t\xCD\xA1s";  // t͡s
+        std::string with_tie = "t\xCD\xA1s"; // t͡s
         std::string filtered = crispasr::filter_to_inventory(with_tie, valid);
         CHECK(filtered == "ts");
     }
@@ -372,7 +378,116 @@ TEST_CASE("phonemize() cascade works", "[phonemizer]") {
     // Should contain IPA characters
     bool has_ipa = false;
     for (unsigned char c : out) {
-        if (c >= 0x80) { has_ipa = true; break; }
+        if (c >= 0x80) {
+            has_ipa = true;
+            break;
+        }
     }
     CHECK(has_ipa);
+}
+
+// ── espeak language-marker stripping (#169) ─────────────────────────
+
+TEST_CASE("strip espeak language markers", "[phonemizer][espeak]") {
+    using crispasr::strip_espeak_lang_markers;
+
+    SECTION("basic (en) and (it) markers") {
+        std::string s = "lassistɛnte vokʈale dɪ (en)wˈeɪ(it)";
+        strip_espeak_lang_markers(s);
+        CHECK(s.find("(en)") == std::string::npos);
+        CHECK(s.find("(it)") == std::string::npos);
+        CHECK(s.find("wˈeɪ") != std::string::npos); // IPA preserved
+    }
+
+    SECTION("region codes (de-AT), (pt-BR)") {
+        std::string s = "fü(de-AT)nf (pt-BR)teste";
+        strip_espeak_lang_markers(s);
+        CHECK(s.find("(de-AT)") == std::string::npos);
+        CHECK(s.find("(pt-BR)") == std::string::npos);
+    }
+
+    SECTION("three-letter codes (cmn)") {
+        std::string s = "hello (cmn)ni hao (en)world";
+        strip_espeak_lang_markers(s);
+        CHECK(s.find("(cmn)") == std::string::npos);
+        CHECK(s.find("(en)") == std::string::npos);
+        CHECK(s.find("hello") != std::string::npos);
+        CHECK(s.find("world") != std::string::npos);
+    }
+
+    SECTION("no markers passes through unchanged") {
+        std::string s = "həlˈoʊ wˈɜːld";
+        std::string orig = s;
+        strip_espeak_lang_markers(s);
+        CHECK(s == orig);
+    }
+
+    SECTION("non-language parens preserved") {
+        std::string s = "test (1234) and (AB) keep";
+        std::string orig = s;
+        strip_espeak_lang_markers(s);
+        CHECK(s == orig); // not language codes
+    }
+
+    SECTION("empty string") {
+        std::string s;
+        strip_espeak_lang_markers(s);
+        CHECK(s.empty());
+    }
+}
+
+// ── Technical token normalization (#216) ─────────────────────────────
+
+TEST_CASE("Technical token normalization", "[g2p][normalize]") {
+    SECTION("C++ expanded") {
+        auto r = g2p_en::normalize_technical_tokens("modern C++, Linux");
+        CHECK(r == "modern C plus plus, Linux");
+    }
+
+    SECTION("C# expanded") {
+        auto r = g2p_en::normalize_technical_tokens("wrote it in C# and F#");
+        CHECK(r == "wrote it in C sharp and F sharp");
+    }
+
+    SECTION(".NET expanded") {
+        auto r = g2p_en::normalize_technical_tokens("using .NET for web");
+        CHECK(r == "using dot net for web");
+    }
+
+    SECTION("Node.js expanded") {
+        auto r = g2p_en::normalize_technical_tokens("built with Node.js");
+        CHECK(r == "built with Node J S");
+    }
+
+    SECTION("case insensitive") {
+        auto r = g2p_en::normalize_technical_tokens("c++ and node.js");
+        CHECK(r == "C plus plus and Node J S");
+    }
+
+    SECTION("mid-word not matched") {
+        // "AC++" should not match — C++ must be at a word boundary
+        auto r = g2p_en::normalize_technical_tokens("AC++ test");
+        CHECK(r == "AC++ test");
+    }
+
+    SECTION("no technical tokens passes through") {
+        std::string input = "hello world, this is a test.";
+        auto r = g2p_en::normalize_technical_tokens(input);
+        CHECK(r == input);
+    }
+
+    SECTION("multiple tokens in one sentence") {
+        auto r = g2p_en::normalize_technical_tokens("C++ and C# with .NET on Node.js");
+        CHECK(r == "C plus plus and C sharp with dot net on Node J S");
+    }
+
+    SECTION("CI/CD expanded") {
+        auto r = g2p_en::normalize_technical_tokens("setup CI/CD pipeline");
+        CHECK(r == "setup C I C D pipeline");
+    }
+
+    SECTION("empty string") {
+        auto r = g2p_en::normalize_technical_tokens("");
+        CHECK(r.empty());
+    }
 }

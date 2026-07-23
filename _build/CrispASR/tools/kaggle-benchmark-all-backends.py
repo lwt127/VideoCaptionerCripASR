@@ -82,6 +82,13 @@ SLOW_BACKENDS = [
     ("granite-4.1-plus",  "Granite Speech 4.1 2B+",  300, "Q4_K, ~2.96GB, LLM-AR plus variant"),
     ("granite-4.1-nar",   "Granite Speech 4.1 NAR",  300, "Q4_K, ~3.2GB, non-autoregressive"),
     ("mimo-asr",          "MiMo-ASR",                420, "Q4_K ~4.2GB; PLAN #115 forces CPU (~297s/11s clip)"),
+    # ── previously-uncovered ASR backends (full-sweep coverage) ──
+    ("nemotron",          "Nemotron Streaming",      180, "Q4_K, FastConformer streaming encoder"),
+    ("moss-audio",        "MOSS Audio",              300, "Q4_K, Whisper enc + Qwen3 LLM"),
+    ("lfm2-audio",        "LFM2-Audio 1.5B",         240, "Q5_K, hybrid conv+attn backbone"),
+    ("mini-omni2",        "Mini-Omni2",              300, "Q4_K, multi-stream speech+chat"),
+    # NOTE: vibevoice-1.5b is a TTS model (vibevoice-1.5b-tts-q4_k.gguf), not ASR
+    # — moved to TTS_BACKENDS below (running it as ASR produced an empty transcript).
 ]
 
 # TTS backends suitable for Kaggle time limits (small/fast models first,
@@ -101,6 +108,26 @@ TTS_BACKENDS = [
     ("parler-tts",        "Parler TTS Mini v1.1",    180, "Q8_0, ~1GB, T5 + MusicGen decoder"),
     ("dia",               "Dia 1.6B",                240, "Q8_0, ~1.6GB, byte-level + DAC 44.1 kHz"),
     ("orpheus",           "Orpheus 3B-FT",           300, "Q8_0, ~3.5GB, Llama-3.2 + SNAC"),
+    # ── previously-uncovered TTS backends (full-sweep coverage) ──
+    ("qwen3-tts-customvoice", "Qwen3-TTS CustomVoice", 300, "Q8_0, talker+12Hz codec, built-in speakers"),
+    ("vibevoice-tts",     "VibeVoice TTS",           300, "Q4_K, diffusion TTS"),
+    ("chatterbox",        "Chatterbox",              300, "Q4_K, T3 + S3Gen voice clone"),
+    ("cosyvoice3",        "CosyVoice3",              300, "Q4_K, flow-matching + HiFT"),
+    ("indextts",          "IndexTTS",                300, "Q4_K, GPT + BigVGAN vocoder"),
+    ("zonos",             "Zonos",                   240, "F16, transformer TTS (EOS-sensitive on Q4_K)"),
+    ("melotts",           "MeloTTS",                  90, "F16, VITS multilingual"),
+    ("outetts",           "OuteTTS",                 180, "Q8_0, Llama + WavTokenizer"),
+    ("tada",              "TADA 3B",                 300, "Q4_K, multilingual AR TTS"),
+    ("voxcpm2-tts",       "VoxCPM2 TTS",             300, "F16, VAE encoder + LLM"),
+    ("vibevoice-1.5b",    "VibeVoice 1.5B TTS",      300, "Q4_K ~1.6GB; was mis-listed as ASR"),
+    ("kugelaudio",        "KugelAudio",              420, "Q4_K ~5.7GB (F16 ~14GB) — large, slow; bumped timeout"),
+]
+
+# Text MT backends (translate a sentence; not ASR/TTS but part of the backend
+# set). Tested only when BENCHMARK_MT=1 since they need text in/out, not audio.
+MT_BACKENDS = [
+    ("m2m100",            "M2M-100 418M",            120, "Q8_0, multilingual MT"),
+    ("madlad",            "MADLAD-400 3B",           240, "Q4_K, 400-lang MT"),
 ]
 
 print(f"CrispASR Benchmark — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
@@ -175,6 +202,89 @@ import kaggle_harness as kh  # noqa: E402
 kh.init_progress(progress_path=f"{WORK}/progress.jsonl")
 kh.resolve_hf_token()  # env → Kaggle Secret(retry) → mounted dataset
 kh.step("clone.done")
+
+# ── Incremental result streaming to an HF dataset (resumable) ────────────────
+# After EACH backend we upload its result JSON to an HF dataset so interim
+# results survive a kernel crash/timeout, and on a fresh run of the SAME kernel
+# we SKIP backends that already have a result file (resume). The run tag is
+# stable across restarts by default ("latest"), so re-running the kernel
+# continues where it left off; bump CRISPASR_SWEEP_RUN for a clean run.
+from huggingface_hub import HfApi as _HfApi
+import io as _io
+
+# Target the EXISTING progress dataset (same one kaggle_harness streams step
+# progress to), under a sweep-specific prefix so it doesn't collide with the
+# harness's runs/*.jsonl.
+SWEEP_REPO = os.environ.get("CRISPASR_SWEEP_REPO", "cstr/crispasr-kaggle-progress")
+RUN_TAG = os.environ.get("CRISPASR_SWEEP_RUN", "latest")
+SWEEP_PREFIX = f"full-backend-sweep/{RUN_TAG}"
+# Optional subset filter: CRISPASR_SWEEP_ONLY="f5-tts,chatterbox,..." runs ONLY
+# those backends (skips all others) — for targeted re-tests of a fixed subset.
+SWEEP_ONLY = {x.strip() for x in os.environ.get("CRISPASR_SWEEP_ONLY", "").split(",") if x.strip()}
+
+
+def sweep_skip_only(backend):
+    return bool(SWEEP_ONLY) and backend not in SWEEP_ONLY
+_hf_token = (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+             or os.environ.get("HUGGINGFACE_TOKEN"))
+_hf_api = _HfApi(token=_hf_token)
+_sweep_ok = False
+_done_keys = set()
+
+
+def _sweep_key(category, backend):
+    return f"{category}__{backend}".replace("/", "-")
+
+
+# Up-front WRITE test: actually push a heartbeat file. whoami() / create_repo
+# don't reliably exercise write perms on an existing repo, so do a real upload —
+# a bad/expired token then fails LOUDLY here, not silently after the ~78-min
+# sweep (the 2026-06-20 run wasted a full pass because the attached token 401'd).
+try:
+    if not _hf_token:
+        raise RuntimeError("no HF token in env (HF_TOKEN) — resolve_hf_token must run first")
+    _who = _hf_api.whoami().get("name", "?")
+    _hf_api.upload_file(path_or_fileobj=_io.BytesIO(b"alive\n"),
+                        path_in_repo=f"{SWEEP_PREFIX}/_heartbeat.txt",
+                        repo_type="dataset", repo_id=SWEEP_REPO,
+                        commit_message="sweep heartbeat (token write-test)")
+    for f in _hf_api.list_repo_files(SWEEP_REPO, repo_type="dataset"):
+        if f.startswith(f"{SWEEP_PREFIX}/results/") and f.endswith(".json"):
+            _done_keys.add(f.split("/")[-1][:-5])
+    _sweep_ok = True
+    print(f"[sweep] HF streaming OK → {SWEEP_REPO}/{SWEEP_PREFIX} (token user={_who}); "
+          f"{len(_done_keys)} backend(s) already done — resume/skip")
+except Exception as e:
+    print("=" * 72)
+    print(f"[sweep] !! HF STREAMING DISABLED — token WRITE-TEST FAILED: {e!r}")
+    print(f"[sweep] !! results will stay LOCAL ONLY this run. Fix the HF token in the")
+    print(f"[sweep] !! attached dataset: hf_token.txt needs WRITE access to {SWEEP_REPO}.")
+    print("=" * 72)
+
+
+def sweep_done(category, backend):
+    """True if this backend already has a streamed result for this run (resume)."""
+    return _sweep_key(category, backend) in _done_keys
+
+
+def sweep_publish(category, result):
+    """Upload one backend's result JSON to the HF dataset (interim, resumable)."""
+    if not _sweep_ok or not result:
+        return
+    key = _sweep_key(category, result.get("backend", "unknown"))
+    payload = dict(result)
+    payload["_category"] = category
+    payload["_run"] = RUN_TAG
+    data = json.dumps(payload, indent=2, default=str).encode()
+    try:
+        _hf_api.upload_file(path_or_fileobj=_io.BytesIO(data),
+                            path_in_repo=f"{SWEEP_PREFIX}/results/{key}.json",
+                            repo_type="dataset", repo_id=SWEEP_REPO,
+                            commit_message=f"sweep {RUN_TAG}: {key}")
+        _done_keys.add(key)
+        print(f"  [sweep] ↑ streamed → {SWEEP_REPO}/{SWEEP_PREFIX}/results/{key}.json")
+    except Exception as e:
+        print(f"  [sweep] ! upload failed for {key}: {e!r}")
 
 # Detect GPU — try CUDA first, fall back to CPU if cmake fails
 has_gpu = os.path.exists("/usr/local/cuda/bin/nvcc")
@@ -514,22 +624,34 @@ def benchmark_backend(backend, display_name, timeout, notes):
 
 # Run all fast backends
 for backend, name, timeout, notes in BACKENDS:
+    if sweep_skip_only(backend):
+        continue
+    if sweep_done("asr", backend):
+        print(f"⏭ {name} ({backend}): already streamed for run '{RUN_TAG}' — resume skip")
+        continue
     r = benchmark_backend(backend, name, timeout, notes)
     results.append(r)
+    sweep_publish("asr", r)  # stream interim result immediately (resumable)
 
 # Optionally run slow backends
 # Run slow backends if requested (voxtral 3B/4B, granite — need more time)
 BENCHMARK_SLOW = os.environ.get("BENCHMARK_SLOW", "1")  # ON by default on Kaggle
 if BENCHMARK_SLOW == "1":
     for backend, name, timeout, notes in SLOW_BACKENDS:
+        if sweep_skip_only(backend):
+            continue
+        if sweep_done("asr", backend):
+            print(f"⏭ {name} ({backend}): already streamed for run '{RUN_TAG}' — resume skip")
+            continue
         r = benchmark_backend(backend, name, timeout, notes)
         results.append(r)
+        sweep_publish("asr", r)
 else:
     print(f"\n⏭ Skipping {len(SLOW_BACKENDS)} slow backends "
           f"(set BENCHMARK_SLOW=1 to include)")
 
 # TTS smoke benchmark (opt-in, separate from ASR)
-BENCHMARK_TTS = os.environ.get("BENCHMARK_TTS", "0")
+BENCHMARK_TTS = os.environ.get("BENCHMARK_TTS", "1")  # full sweep: ASR + TTS by default
 if BENCHMARK_TTS == "1":
     # Install espeak-ng for kokoro (piper also benefits from it)
     print("\nInstalling espeak-ng for TTS backends...")
@@ -540,6 +662,11 @@ if BENCHMARK_TTS == "1":
     TTS_PHRASE = "The quick brown fox jumps over the lazy dog."
 
     for backend, name, timeout, notes in TTS_BACKENDS:
+        if sweep_skip_only(backend):
+            continue
+        if sweep_done("tts", backend):
+            print(f"⏭ TTS {name} ({backend}): already streamed for run '{RUN_TAG}' — resume skip")
+            continue
         print(f"\n{'='*60}")
         print(f"  TTS: {name} (--backend {backend})")
         print(f"{'='*60}")
@@ -547,31 +674,55 @@ if BENCHMARK_TTS == "1":
         cmd = [CRISPASR, "--backend", backend, "-m", "auto", "--auto-download",
                "--tts-output", outfile, "--no-prints"]
 
-        # Per-backend phrase and voice overrides
+        # Per-backend voice/speaker overrides. Several TTS backends REQUIRE a
+        # reference voice or speaker and produce 0-byte output without one — the
+        # earlier sweep's bare `--tts` made them look like failures when the cause
+        # was just missing args. Provide the right voice per backend:
+        #   - voice-CLONING (f5/chatterbox/cosyvoice3/vibevoice): a reference wav
+        #     (jfk.wav, always cloned with the repo) + the --i-have-rights consent
+        #     flag the CLI requires for .wav cloning; cosyvoice3 also needs --ref-text.
+        #   - fastpitch: a speaker index (multi-speaker, 5 speakers) via --voice 0.
+        #   - orpheus: a built-in voice name.
+        REF_WAV = f"{CRISPASR_DIR}/samples/jfk.wav"
+        JFK_RT = ("And so my fellow Americans, ask not what your country can do for you, "
+                  "ask what you can do for your country.")
+        voice_args = {
+            "f5-tts":         ["--voice", REF_WAV, "--i-have-rights"],
+            "chatterbox":     ["--voice", REF_WAV, "--i-have-rights"],
+            "cosyvoice3":     ["--voice", REF_WAV, "--ref-text", JFK_RT, "--i-have-rights"],
+            "vibevoice-tts":  ["--voice", REF_WAV, "--i-have-rights"],
+            "vibevoice-1.5b": ["--voice", REF_WAV, "--i-have-rights"],
+            "fastpitch":      ["--voice", "0"],
+            "orpheus":        ["--voice", "tara"],
+        }
+        cmd += voice_args.get(backend, [])
+
         phrase = TTS_PHRASE
         if backend == "dia":
             phrase = "[S1] The quick brown fox jumps over the lazy dog. This is a longer prompt for Dia which needs over one hundred characters to produce good output quality."
-        elif backend == "orpheus":
-            cmd += ["--voice", "tara"]
 
         cmd += ["--tts", phrase]
 
         t0 = time.time()
+        tts_r = None
         try:
             proc = subprocess.run(cmd, timeout=timeout, capture_output=True, text=True)
             wall = time.time() - t0
             ok = proc.returncode == 0 and os.path.isfile(outfile) and os.path.getsize(outfile) > 1000
             sz = os.path.getsize(outfile) if os.path.isfile(outfile) else 0
             status = "PASS" if ok else "FAIL"
-            tts_results.append({"backend": backend, "name": name, "wall_s": round(wall, 1),
-                                "status": status, "wav_bytes": sz})
+            tts_r = {"backend": backend, "name": name, "wall_s": round(wall, 1),
+                     "status": status, "wav_bytes": sz}
             print(f"  {status} — {wall:.1f}s, {sz} bytes")
             if not ok and proc.stderr:
                 print(f"  stderr: {proc.stderr[-300:]}")
         except subprocess.TimeoutExpired:
-            tts_results.append({"backend": backend, "name": name, "wall_s": timeout,
-                                "status": "TIMEOUT", "wav_bytes": 0})
+            tts_r = {"backend": backend, "name": name, "wall_s": timeout,
+                     "status": "TIMEOUT", "wav_bytes": 0}
             print(f"  TIMEOUT after {timeout}s")
+        if tts_r:
+            tts_results.append(tts_r)
+            sweep_publish("tts", tts_r)  # stream interim result immediately (resumable)
         if os.path.isfile(outfile):
             os.remove(outfile)
         _cleanup_cache(backend)
@@ -587,6 +738,53 @@ if BENCHMARK_TTS == "1":
 else:
     print(f"\n⏭ Skipping {len(TTS_BACKENDS)} TTS backends "
           f"(set BENCHMARK_TTS=1 to include)")
+
+# ── Text MT backends (m2m100, madlad) — opt-in, translate a sentence ────────
+BENCHMARK_MT = os.environ.get("BENCHMARK_MT", "1")
+mt_results = []
+if BENCHMARK_MT == "1":
+    MT_TEXT = "The quick brown fox jumps over the lazy dog."
+    for backend, name, timeout, notes in MT_BACKENDS:
+        if sweep_skip_only(backend):
+            continue
+        if sweep_done("mt", backend):
+            print(f"⏭ MT {name} ({backend}): already streamed for run '{RUN_TAG}' — resume skip")
+            continue
+        print(f"\n{'='*60}\n  MT: {name} (--backend {backend})\n{'='*60}")
+        cmd = [CRISPASR, "--backend", backend, "-m", "auto", "--auto-download",
+               "-sl", "en", "-tl", "de", "--text", MT_TEXT, "--no-prints"]
+        t0 = time.time()
+        mt_r = None
+        try:
+            proc = subprocess.run(cmd, timeout=timeout, capture_output=True, text=True)
+            wall = time.time() - t0
+            out = (proc.stdout or "").strip()
+            ok = proc.returncode == 0 and len(out) > 0
+            mt_r = {"backend": backend, "name": name, "wall_s": round(wall, 1),
+                    "status": "PASS" if ok else "FAIL", "output": out[:200]}
+            print(f"  {'PASS' if ok else 'FAIL'} — {wall:.1f}s — {out[:80]!r}")
+            if not ok and proc.stderr:
+                print(f"  stderr: {proc.stderr[-300:]}")
+        except subprocess.TimeoutExpired:
+            mt_r = {"backend": backend, "name": name, "wall_s": timeout, "status": "TIMEOUT", "output": ""}
+            print(f"  TIMEOUT after {timeout}s")
+        if mt_r:
+            mt_results.append(mt_r)
+            sweep_publish("mt", mt_r)
+        _cleanup_cache(backend)
+
+# ── Final combined summary → HF dataset (one index for the whole run) ────────
+if _sweep_ok:
+    import io as _io
+    summary = {"run": RUN_TAG, "asr": results, "tts": tts_results, "mt": mt_results,
+               "counts": {"asr": len(results), "tts": len(tts_results), "mt": len(mt_results)}}
+    try:
+        _hf_api.upload_file(path_or_fileobj=_io.BytesIO(json.dumps(summary, indent=2, default=str).encode()),
+                            path_in_repo=f"{SWEEP_PREFIX}/summary.json", repo_type="dataset",
+                            repo_id=SWEEP_REPO, commit_message=f"sweep {RUN_TAG}: summary")
+        print(f"[sweep] ↑ combined summary → {SWEEP_REPO}/{SWEEP_PREFIX}/summary.json")
+    except Exception as e:
+        print(f"[sweep] ! summary upload failed: {e!r}")
 
 # ─────────────────────────── cell 7 (code) ───────────────────────────
 # ── Format results table ───────────────────────────────────────────────────

@@ -8,6 +8,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "core/crispasr_env.h"
 
 class MoonshineStreamingBackend : public CrispasrBackend {
 public:
@@ -28,7 +29,15 @@ public:
         cp.n_threads = params.n_threads;
         cp.verbosity = params.no_prints ? 0 : 1;
         cp.temperature = params.temperature;
-        if (getenv("CRISPASR_VERBOSE") || getenv("MOONSHINE_STREAMING_BENCH"))
+        // use_gpu deliberately NOT forwarded by default: the streaming encoder
+        // runs ~550 frame-by-frame forward passes, which are launch-bound on
+        // GPU — measured 3.2x SLOWER on M1 Metal (27.4s vs 8.5s CPU, identical
+        // text). Revisit once the offline batch-encoder fast-path lands
+        // (PLAN §232 Fix 2). MOONSHINE_STREAMING_GPU=1 opts in for A/B (and to
+        // exercise the §232 hybrid decoder-weight placement).
+        if (const char* g = crispasr_env::get("CRISPASR_MOONSHINE_STREAMING_GPU"))
+            cp.use_gpu = (g[0] == '1');
+        if (getenv("CRISPASR_VERBOSE") || crispasr_env::get("CRISPASR_MOONSHINE_STREAMING_BENCH"))
             cp.verbosity = 2;
         ctx_ = moonshine_streaming_init_from_file(params.model.c_str(), cp);
         return ctx_ != nullptr;
@@ -40,6 +49,9 @@ public:
         if (!ctx_)
             return out;
 
+        if (!params.language.empty() && params.language != "auto" && params.language != "en")
+            fprintf(stderr, "crispasr[moonshine-streaming]: English-only model; language='%s' ignored\n",
+                    params.language.c_str());
         moonshine_streaming_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1);
         moonshine_streaming_result* r = moonshine_streaming_transcribe_with_probs(ctx_, samples, n_samples);
         if (!r || !r->text || !r->text[0]) {
@@ -71,6 +83,41 @@ public:
         if (!seg.text.empty())
             out.push_back(std::move(seg));
         return out;
+    }
+
+    void transcribe_streaming(const float* samples, int n_samples, int64_t /*t_offset_cs*/,
+                              const whisper_params& params, crispasr_stream_callback on_text) override {
+        if (!ctx_) {
+            CrispasrBackend::transcribe_streaming(samples, n_samples, 0, params, on_text);
+            return;
+        }
+        std::string accumulated;
+        bool first_tok = true;
+        auto cb = [&](int tok_id, float /*prob*/, void* /*ud*/) {
+            const char* raw = moonshine_streaming_token_text(ctx_, tok_id);
+            if (!raw || !*raw)
+                return;
+            std::string piece(raw);
+            size_t pos = 0;
+            while ((pos = piece.find("\xe2\x96\x81", pos)) != std::string::npos) {
+                piece.replace(pos, 3, " ");
+                pos++;
+            }
+            if (first_tok) {
+                size_t sp = 0;
+                while (sp < piece.size() && (piece[sp] == ' ' || piece[sp] == '\n'))
+                    sp++;
+                piece = piece.substr(sp);
+                if (!piece.empty())
+                    first_tok = false;
+            }
+            accumulated += piece;
+            if (!accumulated.empty())
+                on_text(accumulated.c_str(), false);
+        };
+        auto cb_fn = [](int id, float p, void* ud) { (*static_cast<decltype(cb)*>(ud))(id, p, nullptr); };
+        moonshine_streaming_transcribe_cb(ctx_, samples, n_samples, cb_fn, &cb);
+        on_text(accumulated.c_str(), true);
     }
 
     void shutdown() override {

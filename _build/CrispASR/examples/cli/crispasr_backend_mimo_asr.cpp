@@ -11,6 +11,7 @@
 #include "crispasr_backend_utils.h"
 #include "mimo_asr.h"
 #include "whisper_params.h"
+#include "core/bpe.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -20,6 +21,11 @@
 #include <vector>
 
 namespace {
+
+// Thin alias — delegates to core_bpe::token_bytes_to_utf8().
+static std::string mimo_decode_bpe_piece(const std::string& s) {
+    return core_bpe::token_bytes_to_utf8(s);
+}
 
 bool file_exists(const std::string& p) {
     struct stat st;
@@ -61,7 +67,7 @@ public:
         //                         into cp.temperature → decode cfg
         //   CAP_DIARIZE           framework post-step on segment list
         return CAP_AUTO_DOWNLOAD | CAP_TOKEN_CONFIDENCE | CAP_TIMESTAMPS_CTC | CAP_FLASH_ATTN | CAP_TEMPERATURE |
-               CAP_DIARIZE;
+               CAP_DIARIZE | CAP_BEAM_SEARCH;
     }
 
     bool init(const whisper_params& params) override {
@@ -100,10 +106,21 @@ public:
 
     std::vector<crispasr_segment> transcribe(const float* samples, int n_samples, int64_t t_offset_cs,
                                              const whisper_params& params) override {
-        (void)params;
         std::vector<crispasr_segment> out;
         if (!ctx_)
             return out;
+        mimo_asr_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1);
+        // #292: forward --max-new-tokens only when explicit; 0 keeps the backend default.
+        mimo_asr_set_max_new_tokens(ctx_, params.max_new_tokens_explicit ? params.max_new_tokens : 0);
+        if (!params.ask.empty()) {
+            mimo_asr_set_ask(ctx_, params.ask.c_str());
+        } else if (!params.language.empty() && params.language != "auto") {
+            const std::string instr =
+                "Please transcribe this audio in " + crispasr_iso_to_english_lang(params.language) + ".";
+            mimo_asr_set_ask(ctx_, instr.c_str());
+        } else {
+            mimo_asr_set_ask(ctx_, nullptr);
+        }
         char* text = mimo_asr_transcribe(ctx_, samples, n_samples);
         if (text) {
             crispasr_segment seg;
@@ -114,6 +131,45 @@ public:
             free(text);
         }
         return out;
+    }
+
+    void transcribe_streaming(const float* samples, int n_samples, int64_t /*t_offset_cs*/,
+                              const whisper_params& params, crispasr_stream_callback on_text) override {
+        if (!ctx_) {
+            CrispasrBackend::transcribe_streaming(samples, n_samples, 0, params, on_text);
+            return;
+        }
+        if (!params.ask.empty()) {
+            mimo_asr_set_ask(ctx_, params.ask.c_str());
+        } else if (!params.language.empty() && params.language != "auto") {
+            const std::string instr =
+                "Please transcribe this audio in " + crispasr_iso_to_english_lang(params.language) + ".";
+            mimo_asr_set_ask(ctx_, instr.c_str());
+        } else {
+            mimo_asr_set_ask(ctx_, nullptr);
+        }
+        std::string accumulated;
+        bool first_tok = true;
+        auto cb = [&](int tok_id, float /*prob*/, void* /*ud*/) {
+            const char* raw = mimo_asr_token_text(ctx_, tok_id);
+            if (!raw || !*raw)
+                return;
+            std::string piece = mimo_decode_bpe_piece(std::string(raw));
+            if (first_tok) {
+                size_t sp = 0;
+                while (sp < piece.size() && (piece[sp] == ' ' || piece[sp] == '\n'))
+                    sp++;
+                piece = piece.substr(sp);
+                if (!piece.empty())
+                    first_tok = false;
+            }
+            accumulated += piece;
+            if (!accumulated.empty())
+                on_text(accumulated.c_str(), false);
+        };
+        auto cb_fn = [](int id, float p, void* ud) { (*static_cast<decltype(cb)*>(ud))(id, p, nullptr); };
+        mimo_asr_transcribe_cb(ctx_, samples, n_samples, cb_fn, &cb);
+        on_text(accumulated.c_str(), true);
     }
 
     void shutdown() override {

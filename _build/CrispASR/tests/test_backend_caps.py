@@ -74,10 +74,49 @@ _VOICE_CLONING_BACKENDS = {
     "lahgtna-chatterbox",
     "vibevoice-1.5b",
     "indextts",
+    "omnivoice",
     "voxcpm2-tts",
     "qwen3-tts",
     "qwen3-tts-1.7b-base",
 }
+
+
+class TestVoiceCloningSessionDispatch(unittest.TestCase):
+    """Voice-cloning capabilities must be reachable through the public session API."""
+
+    @classmethod
+    def setUpClass(cls):
+        source = (REPO / "src" / "crispasr_c_api.cpp").read_text(encoding="utf-8")
+        cls.set_codec = source.split("CA_EXPORT int crispasr_session_set_codec_path", 1)[1].split(
+            "CA_EXPORT int crispasr_session_set_voice", 1
+        )[0]
+        cls.set_voice = source.split("CA_EXPORT int crispasr_session_set_voice", 1)[1].split(
+            "CA_EXPORT int crispasr_session_tada_set_makeref_models", 1
+        )[0]
+
+    def test_omnivoice_dispatches_audio_tokenizer(self):
+        self.assertIn(
+            "omnivoice_set_tokenizer_path(s->omnivoice_ctx, path)",
+            self.set_codec,
+        )
+
+    def test_chatterbox_dispatches_s3gen(self):
+        self.assertIn(
+            "chatterbox_set_s3gen_path(s->chatterbox_ctx, path)",
+            self.set_codec,
+        )
+
+    def test_chatterbox_dispatches_to_native_voice_loader(self):
+        self.assertIn(
+            "chatterbox_set_voice_from_wav(s->chatterbox_ctx, path)",
+            self.set_voice,
+        )
+
+    def test_omnivoice_dispatches_wav_and_reference_text(self):
+        self.assertIn(
+            "omnivoice_set_voice_prompt(s->omnivoice_ctx, path, ref_text_or_null)",
+            self.set_voice,
+        )
 
 # Backends that must NOT declare voice-cloning (preset-speaker, not reference-WAV cloning).
 _NO_VOICE_CLONING_BACKENDS = {

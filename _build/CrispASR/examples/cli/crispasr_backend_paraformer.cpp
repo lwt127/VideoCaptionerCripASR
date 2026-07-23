@@ -24,6 +24,7 @@ public:
         cp.n_threads = p.n_threads;
         cp.verbosity = p.no_prints ? 0 : 1;
         cp.flash_attn = p.flash_attn;
+        cp.use_gpu = crispasr_backend_should_use_gpu(p);
         ctx_ = paraformer_init_from_file(p.model.c_str(), cp);
         if (!ctx_) {
             fprintf(stderr, "crispasr[paraformer]: failed to load model '%s'\n", p.model.c_str());

@@ -1,10 +1,12 @@
 name: Examples Tests
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     paths:
       - examples/addon.node/**
       - crispasr.h
+      - .github/workflows/examples.yml
   pull_request:
     branches: [main]
     paths:
@@ -24,6 +26,8 @@ jobs:
     steps:
       - name: Clone
         uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Dependencies
         run: |
@@ -42,7 +46,11 @@ jobs:
         run: npm install
 
       - name: Compile addon.node
-        run: npx cmake-js compile -T addon.node -B Release
+        # Pin cmake-js to the node-16/18-compatible 7.x line (matches the
+        # ^7.1.1 devDependency). This step runs from the repo root, where there
+        # is no local node_modules, so an unpinned `npx cmake-js` would fetch
+        # cmake-js@8 — which requires node >=20 and crashes on this matrix.
+        run: npx cmake-js@7 compile -T addon.node -B Release
 
       - name: Download test model
         run: |

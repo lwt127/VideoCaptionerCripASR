@@ -133,6 +133,11 @@ _SETTER_SPECS = [
         [ctypes.c_void_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int],
         [None, 0, b"", 0],
     ),
+    (
+        "crispasr_session_set_return_logits",
+        [ctypes.c_void_p, ctypes.c_int],
+        [None, 1],
+    ),
 ]
 
 # Python Session method names that must exist on the binding class.
@@ -156,6 +161,7 @@ _BINDING_METHODS = [
     "set_grammar_text",
     "set_fallback_thresholds",
     "set_whisper_decode_extras",
+    "set_return_logits",
 ]
 
 
@@ -236,6 +242,9 @@ class TestSetterSymbols(unittest.TestCase):
 
     def test_whisper_decode_extras_null_returns_neg1(self):
         self.assertEqual(self._call_setter(*_SETTER_SPECS[18]), -1)
+
+    def test_return_logits_null_returns_neg1(self):
+        self.assertEqual(self._call_setter(*_SETTER_SPECS[19]), -1)
 
 
 class TestBindingMethods(unittest.TestCase):

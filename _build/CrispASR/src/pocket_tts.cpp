@@ -26,9 +26,14 @@
 
 #include "pocket_tts.h"
 
+#include "core/conv.h"
+#include "core/cpu_ops.h" // core_cpu::to_f32 (quantized-safe weight read)
 #include "core/gguf_loader.h"
 #include "core/sentencepiece.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
@@ -36,14 +41,16 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <map>
 #include <random>
 #include <string>
-#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -54,6 +61,32 @@
 // core_spm::tokenize Viterbi segmenter.
 
 namespace {
+
+// ===========================================================================
+// Bench instrumentation — `POCKET_TTS_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool pocket_tts_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_POCKET_TTS_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct pocket_tts_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit pocket_tts_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~pocket_tts_bench_stage() {
+        if (!pocket_tts_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  pocket_tts_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ── Hyperparameters ────────────────────────────────────────────────
 
@@ -194,6 +227,7 @@ struct seanet_decoder_stage {
     // Transposed conv for upsampling
     ggml_tensor* convtr_w = nullptr;
     ggml_tensor* convtr_b = nullptr;
+    ggml_tensor* convtr_w_perm = nullptr; // pre-permuted for decomposed col2im path
     // Residual blocks
     std::vector<seanet_resblock_weights> resblocks;
 };
@@ -299,6 +333,8 @@ struct pocket_tts_context {
     ggml_backend_sched_t sched = nullptr;
     ggml_context* ctx_w = nullptr;         // weight tensor metadata
     ggml_backend_buffer_t buf_w = nullptr; // weight data buffer
+    ggml_context* ctx_perm = nullptr;      // permuted ConvTranspose1d weights
+    ggml_backend_buffer_t buf_perm = nullptr;
 
     // KV caches
     pocket_tts_kv_cache backbone_kv;
@@ -316,6 +352,10 @@ struct pocket_tts_context {
 };
 
 namespace { // reopen anonymous namespace for internal helpers
+
+static ggml_backend_t pocket_cpu_backend(pocket_tts_context* pctx) {
+    return pctx->backend_cpu;
+}
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -784,15 +824,8 @@ static inline float* tensor_f32_data(ggml_tensor* t) {
     if (it != g_f16_cache.end()) {
         return it->second.data();
     }
-    int64_t n = ggml_nelements(t);
     auto& buf = g_f16_cache[t->data];
-    buf.resize(n);
-    if (t->type == GGML_TYPE_F16) {
-        ggml_fp16_to_fp32_row((const ggml_fp16_t*)t->data, buf.data(), n);
-    } else {
-        // Unsupported type — zero-fill as fallback
-        memset(buf.data(), 0, n * sizeof(float));
-    }
+    buf = core_cpu::to_f32(t); // F32/F16/quantized-safe (no raw ->data read)
     return buf.data();
 }
 
@@ -895,6 +928,47 @@ static void linear_f32(float* out, const float* x, ggml_tensor* W, ggml_tensor* 
         for (int o = 0; o < out_dim; o++)
             out[o] += b_data[o];
     }
+}
+
+// §224: CRISPASR_POCKET_MIMI_SCALAR=1 restores the eager per-timestep /
+// per-conv scalar mimi paths (A/B ground truth for the batched ggml ones).
+static bool pocket_mimi_scalar() {
+    static const bool v = [] {
+        const char* e = std::getenv("CRISPASR_POCKET_MIMI_SCALAR");
+        return e && *e && *e != '0';
+    }();
+    return v;
+}
+
+static ggml_backend_t pocket_cpu_backend(pocket_tts_context* pctx); // defined above
+
+// Batched linear: out[M, out_dim] = x[M, in_dim] @ W^T (+ bias), through one
+// ggml mul_mat on the native (F16) weight — replaces M scalar linear_f32
+// calls in the bulk mimi paths (weights read once, SIMD kernels, threads).
+static void linear_batch_ggml(pocket_tts_context* pctx, float* out, const float* x, ggml_tensor* W, ggml_tensor* bias,
+                              int M, int out_dim, int in_dim) {
+    ggml_backend_t be = pocket_cpu_backend(pctx);
+    size_t mem = ggml_tensor_overhead() * 10 + ggml_graph_overhead();
+    struct ggml_init_params gp = {mem, nullptr, true};
+    ggml_context* c0 = ggml_init(gp);
+    ggml_tensor* inp = ggml_new_tensor_2d(c0, GGML_TYPE_F32, in_dim, M);
+    ggml_set_input(inp);
+    ggml_tensor* cur = ggml_mul_mat(c0, W, inp); // (out_dim, M) — row-major (M, out_dim)
+    if (bias) {
+        ggml_tensor* b = bias->type == GGML_TYPE_F32 ? bias : ggml_cast(c0, bias, GGML_TYPE_F32);
+        cur = ggml_add(c0, cur, b);
+    }
+    ggml_set_output(cur);
+    ggml_cgraph* gf = ggml_new_graph(c0);
+    ggml_build_forward_expand(gf, cur);
+    ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
+    if (ggml_gallocr_alloc_graph(ga, gf)) {
+        ggml_backend_tensor_set(inp, x, 0, (size_t)M * in_dim * sizeof(float));
+        if (ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS)
+            ggml_backend_tensor_get(cur, out, 0, (size_t)M * out_dim * sizeof(float));
+    }
+    ggml_gallocr_free(ga);
+    ggml_free(c0);
 }
 
 // RoPE: apply rotary embedding to a single vector (head_dim,) at position pos.
@@ -1296,7 +1370,7 @@ static void backbone_forward_step(pocket_tts_context* pctx, const float* x_in, f
 // Dispatch: ggml or manual backbone forward step.
 // --no-gpu (use_gpu=false) forces legacy manual path; env var POCKET_MANUAL_BACKBONE=1 also works.
 static void backbone_step(pocket_tts_context* pctx, const float* x_in, float* out) {
-    if (!pctx->params.use_gpu || getenv("POCKET_MANUAL_BACKBONE")) {
+    if (!pctx->params.use_gpu || crispasr_env::get("CRISPASR_POCKET_MANUAL_BACKBONE")) {
         backbone_forward_step(pctx, x_in, out);
     } else {
         backbone_forward_step_ggml(pctx, x_in, out);
@@ -1367,7 +1441,7 @@ static void flow_net_eval(pocket_tts_context* pctx, const float* cond, // (d_mod
     vec_add(y.data(), t_combined.data(), c_emb.data(), FD);
 
     // Dump y for diff
-    if (getenv("POCKET_DUMP_DIR")) {
+    if (crispasr_env::get("CRISPASR_POCKET_DUMP_DIR")) {
         float yn = 0, tcn = 0, cn = 0;
         for (int i = 0; i < FD; i++) {
             yn += y[i] * y[i];
@@ -1407,7 +1481,7 @@ static void flow_net_eval(pocket_tts_context* pctx, const float* cond, // (d_mod
         for (int i = 0; i < FD; i++)
             x[i] += gate[i] * h_out[i];
 
-        if (getenv("POCKET_DUMP_DIR")) {
+        if (crispasr_env::get("CRISPASR_POCKET_DUMP_DIR")) {
             float xn = 0, gn = 0, hn = 0;
             for (int i = 0; i < FD; i++) {
                 xn += x[i] * x[i];
@@ -1432,7 +1506,7 @@ static void flow_net_eval(pocket_tts_context* pctx, const float* cond, // (d_mod
     layer_norm(normed.data(), x.data(), FD, nullptr, nullptr, 1e-6f);
 
     // Dump pre-modulation x norm and post-modulation for debugging
-    if (getenv("POCKET_DUMP_DIR")) {
+    if (crispasr_env::get("CRISPASR_POCKET_DUMP_DIR")) {
         float x_norm = 0, normed_norm = 0;
         for (int i = 0; i < FD; i++) {
             x_norm += x[i] * x[i];
@@ -1522,7 +1596,11 @@ static ggml_tensor* pocket_conv1d_causal(ggml_context* ctx, ggml_tensor* x, ggml
 // Input x: (T, Cin), weight w: ggml (K, Cout, Cin), bias b: (Cout,) or nullptr.
 // Returns (T_in * stride, Cout).
 static ggml_tensor* pocket_convtr1d_causal(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w, ggml_tensor* b,
-                                           int stride) {
+                                           int stride, ggml_tensor* w_perm = nullptr) {
+    if (w_perm) {
+        const int K = (int)w->ne[0];
+        return core_convt::convt1d_decomp_tf(ctx, x, w_perm, b, stride, K, /*crop_left=*/0, /*crop_right=*/K - stride);
+    }
     int T_in = (int)x->ne[0];
     int Cout = (int)w->ne[1];
     ggml_tensor* out = ggml_conv_transpose_1d(ctx, w, x, stride, 0, 1);
@@ -1671,7 +1749,7 @@ static ggml_tensor* build_pocket_seanet_dec(ggml_context* ctx, const pocket_tts_
 
         // ConvTranspose1d (upsample by ratio) — causal trim
         if (stage.convtr_w) {
-            x = pocket_convtr1d_causal(ctx, x, stage.convtr_w, stage.convtr_b, ratio);
+            x = pocket_convtr1d_causal(ctx, x, stage.convtr_w, stage.convtr_b, ratio, stage.convtr_w_perm);
         }
 
         // Residual blocks
@@ -1817,8 +1895,8 @@ static void mimi_decode_ggml(pocket_tts_context* pctx, const float* latent_seq, 
     }
 
     // Dump post-upsample (same as manual path for comparison)
-    if (pctx->verbosity >= 2 || getenv("POCKET_DUMP_DIR")) {
-        const char* dd = getenv("POCKET_DUMP_DIR");
+    if (pctx->verbosity >= 2 || crispasr_env::get("CRISPASR_POCKET_DUMP_DIR")) {
+        const char* dd = crispasr_env::get("CRISPASR_POCKET_DUMP_DIR");
         if (dd) {
             // Convert to channels-first for dump compatibility with manual path
             std::vector<float> dump_cf(OD * T_xfmr);
@@ -1894,7 +1972,7 @@ static void mimi_decode_ggml(pocket_tts_context* pctx, const float* latent_seq, 
 
     // Dump hook: mark post-transformer output
     ggml_tensor* post_xfmr = x;
-    if (getenv("POCKET_DUMP_DIR")) {
+    if (crispasr_env::get("CRISPASR_POCKET_DUMP_DIR")) {
         ggml_set_name(post_xfmr, "post_xfmr");
         ggml_set_output(post_xfmr);
     }
@@ -1957,13 +2035,13 @@ static void mimi_decode_ggml(pocket_tts_context* pctx, const float* latent_seq, 
     }
 
     // Dump post-transformer if requested
-    if (getenv("POCKET_DUMP_DIR")) {
+    if (crispasr_env::get("CRISPASR_POCKET_DUMP_DIR")) {
         ggml_tensor* pxfmr = ggml_graph_get_tensor(gf, "post_xfmr");
         if (pxfmr) {
             int n_elem = (int)ggml_nelements(pxfmr);
             std::vector<float> xfmr_data(n_elem);
             ggml_backend_tensor_get(pxfmr, xfmr_data.data(), 0, n_elem * sizeof(float));
-            const char* dd = getenv("POCKET_DUMP_DIR");
+            const char* dd = crispasr_env::get("CRISPASR_POCKET_DUMP_DIR");
             std::string p = std::string(dd) + "/cpp_mimi_post_xfmr.f32";
             FILE* f = fopen(p.c_str(), "wb");
             if (f) {
@@ -1995,8 +2073,8 @@ static void mimi_decode_ggml(pocket_tts_context* pctx, const float* latent_seq, 
 // approach since sequence lengths are modest (< 2000 frames).
 // Mimi transformer: shared between encoder and decoder (same architecture, different weights).
 // Processes seq in-place: (T, D) with causal attention, RoPE, LayerScale, GELU FFN.
-static void mimi_transformer_forward(const std::vector<pocket_tts_transformer_layer>& layers, float* seq, int T, int D,
-                                     int num_heads, int dim_feedforward, int context_size) {
+static void mimi_transformer_forward_scalar(const std::vector<pocket_tts_transformer_layer>& layers, float* seq, int T,
+                                            int D, int num_heads, int dim_feedforward, int context_size) {
     const int NH = num_heads;
     const int HD = D / NH;
     const int FF = dim_feedforward;
@@ -2099,6 +2177,102 @@ static void mimi_transformer_forward(const std::vector<pocket_tts_transformer_la
     }
 }
 
+// §224 batched twin of the scalar transformer: the four linear projections
+// (QKV, out-proj, FFN×2 — ~95% of the FLOPs) run as one ggml mul_mat over
+// the whole sequence each; the causal limited-context attention keeps the
+// scalar path's exact math. Valid because K/V at every position depend only
+// on the layer INPUT (never on same-layer outputs), so precomputing them for
+// all t is order-equivalent to the per-t loop.
+static void mimi_transformer_forward_batched(pocket_tts_context* pctx,
+                                             const std::vector<pocket_tts_transformer_layer>& layers, float* seq, int T,
+                                             int D, int num_heads, int dim_feedforward, int context_size) {
+    const int NH = num_heads;
+    const int HD = D / NH;
+    const int FF = dim_feedforward;
+    const int NL = (int)layers.size();
+
+    std::vector<float> normed_all((size_t)T * D), qkv_all((size_t)T * 3 * D);
+    std::vector<float> attn_all((size_t)T * D), proj_all((size_t)T * D);
+    std::vector<float> ffh_all((size_t)T * FF), ffo_all((size_t)T * D);
+    std::vector<float> k_layer((size_t)T * D), v_layer((size_t)T * D);
+
+    for (int l = 0; l < NL; l++) {
+        const auto& L = layers[l];
+
+        // 1. Pre-norm + QKV, batched over all positions
+        for (int t = 0; t < T; t++)
+            layer_norm(&normed_all[(size_t)t * D], &seq[(size_t)t * D], D, tensor_f32_data(L.attn_norm_w),
+                       tensor_f32_data(L.attn_norm_b));
+        linear_batch_ggml(pctx, qkv_all.data(), normed_all.data(), L.attn_in_proj, nullptr, T, 3 * D, D);
+
+        // 2. RoPE on Q/K + fill the K/V caches
+        for (int t = 0; t < T; t++) {
+            float* Q = &qkv_all[(size_t)t * 3 * D];
+            float* K = Q + D;
+            float* V = Q + 2 * D;
+            for (int h = 0; h < NH; h++) {
+                apply_rope_inplace(&Q[h * HD], HD, t, 10000.0f);
+                apply_rope_inplace(&K[h * HD], HD, t, 10000.0f);
+            }
+            vec_copy(&k_layer[(size_t)t * D], K, D);
+            vec_copy(&v_layer[(size_t)t * D], V, D);
+        }
+
+        // 3. Causal attention with limited context (identical to scalar path)
+        for (int t = 0; t < T; t++) {
+            const float* Q = &qkv_all[(size_t)t * 3 * D];
+            float* attn_out = &attn_all[(size_t)t * D];
+            vec_zero(attn_out, D);
+            int start_pos = std::max(0, t - context_size + 1);
+            int att_len = t - start_pos + 1;
+            for (int h = 0; h < NH; h++) {
+                std::vector<float> scores(att_len);
+                float scale = 1.0f / std::sqrt((float)HD);
+                for (int p = 0; p < att_len; p++)
+                    scores[p] = vec_dot(&Q[h * HD], &k_layer[(size_t)(start_pos + p) * D + h * HD], HD) * scale;
+                float max_s = *std::max_element(scores.begin(), scores.end());
+                float sum_exp = 0.0f;
+                for (int p = 0; p < att_len; p++) {
+                    scores[p] = std::exp(scores[p] - max_s);
+                    sum_exp += scores[p];
+                }
+                for (int p = 0; p < att_len; p++)
+                    scores[p] /= sum_exp;
+                for (int p = 0; p < att_len; p++)
+                    vec_fma(&attn_out[h * HD], &v_layer[(size_t)(start_pos + p) * D + h * HD], scores[p], HD);
+            }
+        }
+
+        // 4. Out-proj (batched) + LayerScale + residual
+        linear_batch_ggml(pctx, proj_all.data(), attn_all.data(), L.attn_out_proj, nullptr, T, D, D);
+        const float* ls1 = L.layer_scale_1 ? tensor_f32_data(L.layer_scale_1) : nullptr;
+        for (int t = 0; t < T; t++)
+            for (int i = 0; i < D; i++)
+                seq[(size_t)t * D + i] += ls1 ? proj_all[(size_t)t * D + i] * ls1[i] : proj_all[(size_t)t * D + i];
+
+        // 5. FFN, batched
+        for (int t = 0; t < T; t++)
+            layer_norm(&normed_all[(size_t)t * D], &seq[(size_t)t * D], D, tensor_f32_data(L.ffn_norm_w),
+                       tensor_f32_data(L.ffn_norm_b));
+        linear_batch_ggml(pctx, ffh_all.data(), normed_all.data(), L.ffn_linear1, nullptr, T, FF, D);
+        for (size_t i = 0; i < (size_t)T * FF; i++)
+            ffh_all[i] = gelu_f(ffh_all[i]);
+        linear_batch_ggml(pctx, ffo_all.data(), ffh_all.data(), L.ffn_linear2, nullptr, T, D, FF);
+        const float* ls2 = L.layer_scale_2 ? tensor_f32_data(L.layer_scale_2) : nullptr;
+        for (int t = 0; t < T; t++)
+            for (int i = 0; i < D; i++)
+                seq[(size_t)t * D + i] += ls2 ? ffo_all[(size_t)t * D + i] * ls2[i] : ffo_all[(size_t)t * D + i];
+    }
+}
+
+static void mimi_transformer_forward(pocket_tts_context* pctx, const std::vector<pocket_tts_transformer_layer>& layers,
+                                     float* seq, int T, int D, int num_heads, int dim_feedforward, int context_size) {
+    if (pocket_mimi_scalar())
+        mimi_transformer_forward_scalar(layers, seq, T, D, num_heads, dim_feedforward, context_size);
+    else
+        mimi_transformer_forward_batched(pctx, layers, seq, T, D, num_heads, dim_feedforward, context_size);
+}
+
 // ELU activation
 static inline float elu_f(float x, float alpha = 1.0f) {
     return x >= 0.0f ? x : alpha * (std::exp(x) - 1.0f);
@@ -2134,6 +2308,52 @@ static void conv1d_eager(float* out, const float* in, int Cin, int T_in, ggml_te
             out[co * T_out + t] = val;
         }
     }
+}
+
+// §224: ggml-graph twin of conv1d_eager — identical layout contract
+// (channels-first (Cin,T) flat = ggml ne (T, Cin); weight ne (K, Cin, Cout)
+// is exactly ggml_conv_1d's kernel layout). Threaded im2col+matmul instead
+// of scalar loops; the SEANet voice-conditioning encoder alone was 27 s of
+// scalar convs on a 16.5 s reference.
+static void conv1d_ggml(pocket_tts_context* pctx, float* out, const float* in, int Cin, int T_in, ggml_tensor* w_tensor,
+                        ggml_tensor* b_tensor, int stride, int pad_left, int pad_right) {
+    if (pocket_mimi_scalar()) {
+        conv1d_eager(out, in, Cin, T_in, w_tensor, b_tensor, stride, pad_left, pad_right);
+        return;
+    }
+    ggml_backend_t be = pocket_cpu_backend(pctx);
+    const int K = (int)w_tensor->ne[0];
+    const int Cout = (int)w_tensor->ne[2];
+    const int T_out = (T_in + pad_left + pad_right - K) / stride + 1;
+
+    size_t mem = ggml_tensor_overhead() * 14 + ggml_graph_overhead();
+    struct ggml_init_params gp = {mem, nullptr, true};
+    ggml_context* c0 = ggml_init(gp);
+    ggml_tensor* inp = ggml_new_tensor_2d(c0, GGML_TYPE_F32, T_in, Cin);
+    ggml_set_input(inp);
+    ggml_tensor* x = (pad_left || pad_right) ? ggml_pad_ext(c0, inp, pad_left, pad_right, 0, 0, 0, 0, 0, 0) : inp;
+    ggml_tensor* cur = ggml_conv_1d(c0, w_tensor, x, stride, 0, 1); // (T_out, Cout)
+    if (b_tensor) {
+        ggml_tensor* b = b_tensor->type == GGML_TYPE_F32 ? b_tensor : ggml_cast(c0, b_tensor, GGML_TYPE_F32);
+        cur = ggml_add(c0, cur, ggml_reshape_2d(c0, b, 1, Cout));
+    }
+    ggml_set_output(cur);
+    ggml_cgraph* gf = ggml_new_graph(c0);
+    ggml_build_forward_expand(gf, cur);
+    ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
+    bool ok = false;
+    if (ggml_gallocr_alloc_graph(ga, gf)) {
+        ggml_backend_tensor_set(inp, in, 0, (size_t)Cin * T_in * sizeof(float));
+        if (ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS) {
+            // (T_out, Cout) flat == channels-first (Cout, T_out) — direct copy
+            ggml_backend_tensor_get(cur, out, 0, (size_t)Cout * T_out * sizeof(float));
+            ok = true;
+        }
+    }
+    ggml_gallocr_free(ga);
+    ggml_free(c0);
+    if (!ok)
+        conv1d_eager(out, in, Cin, T_in, w_tensor, b_tensor, stride, pad_left, pad_right);
 }
 
 // ConvTranspose1d (naive)
@@ -2275,8 +2495,8 @@ static void mimi_decode(pocket_tts_context* pctx, const float* latent_seq, int n
     int T_xfmr = T_up_causal;
 
     // Dump post-upsample
-    if (pctx->verbosity >= 2 || getenv("POCKET_DUMP_DIR")) {
-        const char* dd = getenv("POCKET_DUMP_DIR");
+    if (pctx->verbosity >= 2 || crispasr_env::get("CRISPASR_POCKET_DUMP_DIR")) {
+        const char* dd = crispasr_env::get("CRISPASR_POCKET_DUMP_DIR");
         if (dd) {
             std::string p = std::string(dd) + "/cpp_mimi_upsample.f32";
             FILE* f = fopen(p.c_str(), "wb");
@@ -2306,7 +2526,7 @@ static void mimi_decode(pocket_tts_context* pctx, const float* latent_seq, int n
         xfmr_seq = std::move(proj_seq);
     }
 
-    mimi_transformer_forward(m.dec_transformer_layers, xfmr_seq.data(), T_xfmr, OD, (int)mi.xfmr_num_heads,
+    mimi_transformer_forward(pctx, m.dec_transformer_layers, xfmr_seq.data(), T_xfmr, OD, (int)mi.xfmr_num_heads,
                              (int)mi.xfmr_dim_feedforward, (int)mi.xfmr_context);
 
     // Apply output projection if present
@@ -2319,8 +2539,8 @@ static void mimi_decode(pocket_tts_context* pctx, const float* latent_seq, int n
     }
 
     // Dump post-transformer
-    if (getenv("POCKET_DUMP_DIR")) {
-        const char* dd = getenv("POCKET_DUMP_DIR");
+    if (crispasr_env::get("CRISPASR_POCKET_DUMP_DIR")) {
+        const char* dd = crispasr_env::get("CRISPASR_POCKET_DUMP_DIR");
         std::string p = std::string(dd) + "/cpp_mimi_post_xfmr.f32";
         FILE* f = fopen(p.c_str(), "wb");
         if (f) {
@@ -2363,8 +2583,8 @@ static void mimi_decode(pocket_tts_context* pctx, const float* latent_seq, int n
     int pad_init_left = seanet_K - 1; // effective_kernel - stride, stride=1
     std::vector<float> seanet_buf(C_init * T_cur);
     if (sd.initial_conv_w) {
-        conv1d_eager(seanet_buf.data(), dec_in.data(), C_cur, T_cur, sd.initial_conv_w, sd.initial_conv_b, 1,
-                     pad_init_left, 0);
+        conv1d_ggml(pctx, seanet_buf.data(), dec_in.data(), C_cur, T_cur, sd.initial_conv_w, sd.initial_conv_b, 1,
+                    pad_init_left, 0);
         C_cur = C_init;
     } else {
         seanet_buf = dec_in;
@@ -2422,7 +2642,7 @@ static void mimi_decode(pocket_tts_context* pctx, const float* latent_seq, int n
                 // Dilated conv — causal: pad_left = (K-1)*dilation, pad_right = 0
                 int eff_K = (res_K - 1) * dilation + 1; // effective kernel size
                 int pad_d_left = eff_K - 1;             // causal left padding
-                conv1d_eager(h.data(), act_buf.data(), C_cur, T_cur, rb.conv0_w, rb.conv0_b, 1, pad_d_left, 0);
+                conv1d_ggml(pctx, h.data(), act_buf.data(), C_cur, T_cur, rb.conv0_w, rb.conv0_b, 1, pad_d_left, 0);
                 int C_h = (int)rb.conv0_w->ne[2];
 
                 // ELU
@@ -2433,7 +2653,7 @@ static void mimi_decode(pocket_tts_context* pctx, const float* latent_seq, int n
                 int K1 = (int)rb.conv1_w->ne[0];
                 int pad1_left = K1 - 1;
                 std::vector<float> h2(C_cur * T_cur);
-                conv1d_eager(h2.data(), h.data(), C_h, T_cur, rb.conv1_w, rb.conv1_b, 1, pad1_left, 0);
+                conv1d_ggml(pctx, h2.data(), h.data(), C_h, T_cur, rb.conv1_w, rb.conv1_b, 1, pad1_left, 0);
 
                 // Residual add
                 for (int i = 0; i < C_cur * T_cur; i++)
@@ -2451,8 +2671,8 @@ static void mimi_decode(pocket_tts_context* pctx, const float* latent_seq, int n
     int n_out_samples = T_cur;      // causal pad preserves length
     std::vector<float> pcm_buf(n_out_samples);
     if (sd.final_conv_w) {
-        conv1d_eager(pcm_buf.data(), seanet_buf.data(), C_cur, T_cur, sd.final_conv_w, sd.final_conv_b, 1,
-                     pad_last_left, 0);
+        conv1d_ggml(pctx, pcm_buf.data(), seanet_buf.data(), C_cur, T_cur, sd.final_conv_w, sd.final_conv_b, 1,
+                    pad_last_left, 0);
     }
 
     // Allocate output
@@ -2480,11 +2700,31 @@ static void mimi_encode(pocket_tts_context* pctx, const float* pcm, int n_sample
         return;
     }
 
-    // 1. Pad PCM to hop_length multiple
-    int hop = (int)mi.hop_length(); // 120
-    int n_padded = ((n_samples + hop - 1) / hop) * hop;
+    // 1. Pad PCM up to a whole LATENT frame, not just a hop.
+    // The encoder maps samples -> hop-length STFT frames -> a further /downsample_stride
+    // conv to reach the 12.5 Hz latent rate. Padding only to a hop multiple can leave the
+    // downsample one short (floor), giving one fewer latent frame than the reference model,
+    // which ceils. A missing voice frame shifts every downstream RoPE position by one and
+    // corrupts the very first generated latent, which the Mimi decoder renders as an onset
+    // "gong". Pad to a full latent frame (hop * downsample_stride samples) so the encoded
+    // frame count matches the reference.
+    int hop = (int)mi.hop_length();                     // 120
+    int latent_hop = hop * (int)mi.downsample_stride(); // 120 * 16 = 1920
+    int n_padded = ((n_samples + latent_hop - 1) / latent_hop) * latent_hop;
     std::vector<float> pcm_padded(n_padded, 0.0f);
     memcpy(pcm_padded.data(), pcm, n_samples * sizeof(float));
+
+    const auto _t_enc0 = std::chrono::steady_clock::now();
+    auto bench_mark = [&](const char* what) {
+        if (!pocket_tts_bench_enabled())
+            return;
+        static thread_local std::chrono::steady_clock::time_point prev;
+        auto now = std::chrono::steady_clock::now();
+        auto from = (what[0] == 's') ? _t_enc0 : prev; // "seanet" measures from start
+        fprintf(stderr, "  pocket_tts_bench: mimi_enc_%-13s %.2f ms\n", what,
+                std::chrono::duration<double, std::milli>(now - from).count());
+        prev = now;
+    };
 
     // 2. SEANet encoder (all convolutions are causal)
     int T_cur = n_padded;
@@ -2503,7 +2743,8 @@ static void mimi_encode(pocket_tts_context* pctx, const float* pcm, int n_sample
     std::vector<float> enc_buf(C_init * T_cur);
 
     // Input is single-channel: (1, T_cur)
-    conv1d_eager(enc_buf.data(), pcm_padded.data(), C_cur, T_cur, se.initial_conv_w, se.initial_conv_b, 1, pad_init, 0);
+    conv1d_ggml(pctx, enc_buf.data(), pcm_padded.data(), C_cur, T_cur, se.initial_conv_w, se.initial_conv_b, 1,
+                pad_init, 0);
     C_cur = C_init;
 
     // Encoder stages: {ResBlock → ELU → stride_conv} × n_stages
@@ -2529,7 +2770,7 @@ static void mimi_encode(pocket_tts_context* pctx, const float* pcm, int n_sample
                 int eff_K = (res_K - 1) * dilation + 1;
                 int pad_d = eff_K - 1; // causal
                 std::vector<float> h(C_hidden * T_cur);
-                conv1d_eager(h.data(), act_buf.data(), C_cur, T_cur, rb.conv0_w, rb.conv0_b, 1, pad_d, 0);
+                conv1d_ggml(pctx, h.data(), act_buf.data(), C_cur, T_cur, rb.conv0_w, rb.conv0_b, 1, pad_d, 0);
                 int C_h = (int)rb.conv0_w->ne[2];
 
                 for (int i = 0; i < C_h * T_cur; i++)
@@ -2538,7 +2779,7 @@ static void mimi_encode(pocket_tts_context* pctx, const float* pcm, int n_sample
                 int K1 = (int)rb.conv1_w->ne[0];
                 int pad1 = K1 - 1; // causal
                 std::vector<float> h2(C_cur * T_cur);
-                conv1d_eager(h2.data(), h.data(), C_h, T_cur, rb.conv1_w, rb.conv1_b, 1, pad1, 0);
+                conv1d_ggml(pctx, h2.data(), h.data(), C_h, T_cur, rb.conv1_w, rb.conv1_b, 1, pad1, 0);
 
                 // Residual add
                 for (int i = 0; i < C_cur * T_cur; i++)
@@ -2558,7 +2799,8 @@ static void mimi_encode(pocket_tts_context* pctx, const float* pcm, int n_sample
             int pad_s = K_s - ratio; // causal pad for strided conv: kernel - stride
             int T_new = (T_cur + pad_s - K_s) / ratio + 1;
             std::vector<float> down_buf(C_out * T_new);
-            conv1d_eager(down_buf.data(), enc_buf.data(), C_cur, T_cur, stage.conv_w, stage.conv_b, ratio, pad_s, 0);
+            conv1d_ggml(pctx, down_buf.data(), enc_buf.data(), C_cur, T_cur, stage.conv_w, stage.conv_b, ratio, pad_s,
+                        0);
             enc_buf = std::move(down_buf);
             T_cur = T_new;
             C_cur = C_out;
@@ -2573,13 +2815,15 @@ static void mimi_encode(pocket_tts_context* pctx, const float* pcm, int n_sample
     int pad_last = last_K - 1; // causal
     std::vector<float> enc_out(OD * T_cur);
     if (se.final_conv_w) {
-        conv1d_eager(enc_out.data(), enc_buf.data(), C_cur, T_cur, se.final_conv_w, se.final_conv_b, 1, pad_last, 0);
+        conv1d_ggml(pctx, enc_out.data(), enc_buf.data(), C_cur, T_cur, se.final_conv_w, se.final_conv_b, 1, pad_last,
+                    0);
     }
     int T_enc = T_cur; // encoder frame rate (200 Hz for 24kHz / 120 hop)
 
     if (pctx->verbosity >= 2)
         fprintf(stderr, "pocket_tts: seanet encode: %d samples → %d frames (C=%d)\n", n_samples, T_enc, OD);
 
+    bench_mark("seanet");
     // 3. Encoder transformer (2L, causal, RoPE, LayerScale)
     // Convert to seq-first: (T_enc, OD)
     std::vector<float> xfmr_seq(T_enc * OD);
@@ -2595,7 +2839,7 @@ static void mimi_encode(pocket_tts_context* pctx, const float* pcm, int n_sample
         xfmr_seq = std::move(proj);
     }
 
-    mimi_transformer_forward(m.enc_transformer_layers, xfmr_seq.data(), T_enc, OD, (int)mi.xfmr_num_heads,
+    mimi_transformer_forward(pctx, m.enc_transformer_layers, xfmr_seq.data(), T_enc, OD, (int)mi.xfmr_num_heads,
                              (int)mi.xfmr_dim_feedforward, (int)mi.xfmr_context);
 
     // Apply output projection if present
@@ -2612,6 +2856,7 @@ static void mimi_encode(pocket_tts_context* pctx, const float* pcm, int n_sample
         for (int c = 0; c < OD; c++)
             enc_cf[c * T_enc + t] = xfmr_seq[t * OD + c];
 
+    bench_mark("xfmr");
     // 4. Downsample: Conv1d(OD→LD, kernel=downsample_stride*2, stride=downsample_stride)
     // Causal: pad_left = kernel - stride, pad_right = 0
     if (m.downsample_conv_w) {
@@ -2620,8 +2865,8 @@ static void mimi_encode(pocket_tts_context* pctx, const float* pcm, int n_sample
         int pad_ds = K_ds - DS; // causal
         int T_down = (T_enc + pad_ds - K_ds) / DS + 1;
         std::vector<float> down_buf(LD * T_down);
-        conv1d_eager(down_buf.data(), enc_cf.data(), OD, T_enc, m.downsample_conv_w, m.downsample_conv_b, DS, pad_ds,
-                     0);
+        conv1d_ggml(pctx, down_buf.data(), enc_cf.data(), OD, T_enc, m.downsample_conv_w, m.downsample_conv_b, DS,
+                    pad_ds, 0);
 
         // Output: (T_down, LD) — allocate and return
         *n_frames_out = T_down;
@@ -2630,6 +2875,16 @@ static void mimi_encode(pocket_tts_context* pctx, const float* pcm, int n_sample
         for (int t = 0; t < T_down; t++)
             for (int d = 0; d < LD; d++)
                 (*latent_out)[t * LD + d] = down_buf[d * T_down + t];
+
+        // POCKET_MIMI_DUMP=<path>: dump the (deterministic) conditioning
+        // latents for scalar-vs-batched A/B — the sampler is stochastic, so
+        // WAV comparison cannot validate the encoder.
+        if (const char* dp = crispasr_env::get("CRISPASR_POCKET_MIMI_DUMP")) {
+            if (FILE* f = fopen(dp, "wb")) {
+                fwrite(*latent_out, sizeof(float), (size_t)T_down * LD, f);
+                fclose(f);
+            }
+        }
 
         if (pctx->verbosity >= 1)
             fprintf(stderr, "pocket_tts: mimi encode: %d samples → %d latent frames\n", n_samples, T_down);
@@ -2728,7 +2983,7 @@ struct pocket_tts_context* pocket_tts_init_from_file(const char* path_model, str
     }
     ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads);
 
-    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ctx->backend_cpu;
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (!ctx->backend)
         ctx->backend = ctx->backend_cpu;
 
@@ -2759,6 +3014,27 @@ struct pocket_tts_context* pocket_tts_init_from_file(const char* path_model, str
 
     load_mimi_decoder_tensors(wl.tensors, ctx->model);
     load_mimi_encoder_tensors(wl.tensors, ctx->model);
+
+    // Permute SEANet decoder ConvTranspose1d weights for decomposed col2im path
+    {
+        auto& sd = ctx->model.seanet_dec;
+        const int n = (int)sd.stages.size();
+        if (n > 0) {
+            std::vector<ggml_tensor*> srcs(n);
+            std::vector<ggml_tensor**> dsts(n);
+            for (int i = 0; i < n; i++) {
+                srcs[i] = sd.stages[i].convtr_w;
+                dsts[i] = &sd.stages[i].convtr_w_perm;
+            }
+            // Allocate permuted weights on the GPU backend (ctx->backend)
+            // so the ggml scheduler doesn't need cross-backend copies
+            // during mimi_decode_ggml. CPU-resident permuted weights
+            // trigger scheduler cross-backend copy bugs (see upstream
+            // PR #10 / #11) that corrupt the data on Vulkan and Metal.
+            core_convt::permute_convt1d_weights_batch(srcs.data(), dsts.data(), n, ctx->backend, &ctx->ctx_perm,
+                                                      &ctx->buf_perm);
+        }
+    }
 
     // ── Create backend scheduler ──
     {
@@ -2805,6 +3081,16 @@ struct pocket_tts_context* pocket_tts_init_from_file(const char* path_model, str
 void pocket_tts_free(struct pocket_tts_context* ctx) {
     if (!ctx)
         return;
+    // Drop this model's dequantized weights from the file-scope cache. It is
+    // keyed by tensor data pointer, which the allocator may hand back to a
+    // subsequently loaded model; without this, that model would read stale
+    // entries — i.e. this model's weights. (A per-model cache would be the
+    // fuller fix; see tensor_f32_data.)
+    g_f16_cache.clear();
+    if (ctx->buf_perm)
+        ggml_backend_buffer_free(ctx->buf_perm);
+    if (ctx->ctx_perm)
+        ggml_free(ctx->ctx_perm);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->buf_w)
@@ -2836,11 +3122,13 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
     //   cpp_latents.f32      — (n_frames, latent_dim) AR latent sequence
     //   cpp_pcm.f32          — final PCM
     // POCKET_FORCE_LATENTS=f : teacher-force AR latents from file f
-    const char* pocket_dump_dir = getenv("POCKET_DUMP_DIR");
-    const char* pocket_force_lat = getenv("POCKET_FORCE_LATENTS");
+    const char* pocket_dump_dir = crispasr_env::get("CRISPASR_POCKET_DUMP_DIR");
+    const char* pocket_force_lat = crispasr_env::get("CRISPASR_POCKET_FORCE_LATENTS");
     auto dump_path = [&](const char* name) -> std::string {
         return std::string(pocket_dump_dir ? pocket_dump_dir : ".") + "/" + name;
     };
+
+    pocket_tts_bench_stage _bs_synth("synthesize");
 
     // 1. Tokenize text
     std::vector<int32_t> tokens = tokenize_text(ctx, text);
@@ -2878,10 +3166,26 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
         max_frames = std::min(max_frames, 500); // ~40s max
     }
     // Allow env override for testing
-    if (const char* mf_env = getenv("POCKET_MAX_FRAMES")) {
+    if (const char* mf_env = crispasr_env::get("CRISPASR_POCKET_MAX_FRAMES")) {
         max_frames = std::atoi(mf_env);
         if (max_frames <= 0)
             max_frames = 25;
+    }
+    // POCKET_FORCE_LATENTS teacher-forces a fixed frame count; the actual file
+    // is read below, but the KV cache must be sized for it HERE (the override
+    // used to happen after kv_cache_init, so a short prompt undersized the cache
+    // and the forced loop overflowed it → SIGSEGV). Peek the frame count from
+    // the file size so max_seq covers it.
+    if (pocket_force_lat && LD > 0) {
+        FILE* pf = fopen(pocket_force_lat, "rb");
+        if (pf) {
+            fseek(pf, 0, SEEK_END);
+            long sz = ftell(pf);
+            fclose(pf);
+            int forced_frames = (int)(sz / (long)sizeof(float) / LD);
+            if (forced_frames > 0)
+                max_frames = forced_frames;
+        }
     }
 
     // 2. Initialize KV cache for backbone
@@ -2974,10 +3278,19 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
 
     std::normal_distribution<float> noise_dist(0.0f, 1.0f);
 
+    // §235 measurement: split the AR-loop wall between the backbone step and
+    // the flow net so we know which to optimize (POCKET_TTS_BENCH=1).
+    double t_backbone_ms = 0.0, t_flow_ms = 0.0;
+    const bool _pt_bench = pocket_tts_bench_enabled();
+
     for (int frame = 0; frame < max_frames; frame++) {
         // Run backbone on current input
         std::vector<float> backbone_out(D);
+        auto _t_bb0 = std::chrono::steady_clock::now();
         backbone_step(ctx, prev_input.data(), backbone_out.data());
+        if (_pt_bench)
+            t_backbone_ms +=
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t_bb0).count();
         ctx->backbone_kv.offset++;
 
         // Dump step-0 backbone output for diff testing
@@ -3010,7 +3323,7 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
             // Allow forcing step-0 noise from file for diff testing
             bool noise_forced = false;
             if (frame == 0) {
-                const char* nf = getenv("POCKET_FORCE_NOISE");
+                const char* nf = crispasr_env::get("CRISPASR_POCKET_FORCE_NOISE");
                 if (nf) {
                     FILE* fn = fopen(nf, "rb");
                     if (fn) {
@@ -3043,7 +3356,11 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
             }
 
             // Flow net: predict latent from backbone output + noise
+            auto _t_fl0 = std::chrono::steady_clock::now();
             flow_net_forward(ctx, backbone_out.data(), noise.data(), lsd_steps, latent.data());
+            if (_pt_bench)
+                t_flow_ms +=
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t_fl0).count();
         }
 
         // Append to sequence
@@ -3060,6 +3377,10 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
     if (ctx->verbosity >= 1)
         fprintf(stderr, "pocket_tts: generated %d audio frames (%.1f s at 12.5 Hz)\n", n_gen_frames,
                 n_gen_frames / 12.5f);
+    if (_pt_bench && n_gen_frames > 0)
+        fprintf(stderr,
+                "  pocket_tts_bench: ar_loop backbone=%.1f ms (%.2f/frame)  flow=%.1f ms (%.2f/frame)  frames=%d\n",
+                t_backbone_ms, t_backbone_ms / n_gen_frames, t_flow_ms, t_flow_ms / n_gen_frames, n_gen_frames);
 
     // Dump latent sequence
     if (pocket_dump_dir && n_gen_frames > 0) {
@@ -3077,11 +3398,40 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
     // 5. Mimi decode: latent sequence -> PCM
     float* pcm = nullptr;
     int pcm_samples = 0;
-    // --no-gpu (use_gpu=false) forces legacy manual Mimi path; env var POCKET_MANUAL_MIMI=1 also works.
-    if (!ctx->params.use_gpu || getenv("POCKET_MANUAL_MIMI")) {
-        mimi_decode(ctx, latent_sequence.data(), n_gen_frames, &pcm, &pcm_samples);
-    } else {
-        mimi_decode_ggml(ctx, latent_sequence.data(), n_gen_frames, &pcm, &pcm_samples);
+    {
+        pocket_tts_bench_stage _bs("mimi_decode");
+        // use_gpu=false forces the manual CPU Mimi path; env POCKET_MANUAL_MIMI=1 also.
+        bool force_cpu_mimi = !ctx->params.use_gpu || crispasr_env::get("CRISPASR_POCKET_MANUAL_MIMI");
+
+        // Vulkan workgroup-limit guard (issue #256). The Mimi decoder transformer
+        // dispatches ~T_xfmr^2 workgroups over the causal attention (T_xfmr scales
+        // with n_gen_frames); on constrained iGPUs (e.g. AMD 780M / gfx1103) this
+        // exceeds maxComputeWorkGroupCount[0] and ggml-vulkan aborts. Fall back to
+        // the (validated) CPU Mimi path for long generations. Threshold is
+        // conservative and overridable: POCKET_VULKAN_MIMI_MAX_FRAMES=<n> tunes it,
+        // <=0 disables the guard (always attempt GPU).
+        if (!force_cpu_mimi && ctx->backend) {
+            const char* be_name = ggml_backend_name(ctx->backend);
+            if (be_name && strstr(be_name, "Vulkan")) {
+                int max_frames = 120;
+                if (const char* env = crispasr_env::get("CRISPASR_POCKET_VULKAN_MIMI_MAX_FRAMES"))
+                    max_frames = atoi(env);
+                if (max_frames > 0 && n_gen_frames > max_frames) {
+                    force_cpu_mimi = true;
+                    if (ctx->verbosity >= 1)
+                        fprintf(stderr,
+                                "pocket_tts: Vulkan workgroup-limit guard triggered (%d frames > %d), "
+                                "falling back to CPU Mimi decode\n",
+                                n_gen_frames, max_frames);
+                }
+            }
+        }
+
+        if (force_cpu_mimi) {
+            mimi_decode(ctx, latent_sequence.data(), n_gen_frames, &pcm, &pcm_samples);
+        } else {
+            mimi_decode_ggml(ctx, latent_sequence.data(), n_gen_frames, &pcm, &pcm_samples);
+        }
     }
 
     if (!pcm || pcm_samples <= 0) {
@@ -3124,10 +3474,91 @@ int pocket_tts_set_voice(struct pocket_tts_context* ctx, const float* ref_pcm_24
     const int D = (int)m.flow_lm_hp.d_model;
     const int LD = (int)m.mimi_hp.inner_dim;
 
-    // 1. Encode reference audio -> latents
+    // §224: conditioning latents are deterministic per (encoder weights,
+    // reference PCM), cost ~2 s to compute (39 s before the ggml mimi port)
+    // and only ~17 KB to store — cache them on disk in the shared crispasr
+    // cache dir, keyed by an FNV-1a hash of the PCM and an encoder-weight
+    // fingerprint. CRISPASR_POCKET_VOICE_CACHE=0 disables.
+    std::string latent_cache_path;
+    {
+        const char* e = std::getenv("CRISPASR_POCKET_VOICE_CACHE");
+        const bool cache_on = !(e && *e && *e == '0');
+        if (cache_on && m.seanet_enc.initial_conv_w) {
+            uint64_t h = 1469598103934665603ull; // FNV-1a 64
+            auto mix = [&h](const void* p, size_t n) {
+                const uint8_t* b = (const uint8_t*)p;
+                for (size_t i = 0; i < n; i++) {
+                    h ^= b[i];
+                    h *= 1099511628211ull;
+                }
+            };
+            mix(ref_pcm_24khz, (size_t)n_ref_samples * sizeof(float));
+            mix(&n_ref_samples, sizeof(n_ref_samples));
+            // Encoder fingerprint: first bytes + total size of the initial conv.
+            ggml_tensor* fp = m.seanet_enc.initial_conv_w;
+            size_t fp_n = std::min<size_t>(4096, ggml_nbytes(fp));
+            std::vector<uint8_t> fp_buf(fp_n);
+            ggml_backend_tensor_get(fp, fp_buf.data(), 0, fp_n);
+            mix(fp_buf.data(), fp_n);
+            uint64_t total = (uint64_t)ggml_nbytes(fp);
+            mix(&total, sizeof(total));
+
+            char name[64];
+            snprintf(name, sizeof(name), "pocket-voice-%016llx.latents", (unsigned long long)h);
+            // Same resolution order as crispasr_cache::dir() (which lives in
+            // crispasr-lib, ABOVE this target — can't link it from here):
+            // CRISPASR_CACHE_DIR → CRISPASR_MODELS_DIR → $HOME/.cache/crispasr.
+            std::string cdir;
+            if (const char* d = std::getenv("CRISPASR_CACHE_DIR"); d && *d)
+                cdir = d;
+            else if (const char* d2 = std::getenv("CRISPASR_MODELS_DIR"); d2 && *d2)
+                cdir = d2;
+            else if (const char* home = std::getenv("HOME"); home && *home)
+                cdir = std::string(home) + "/.cache/crispasr";
+            std::error_code ec;
+            if (!cdir.empty() &&
+                (std::filesystem::is_directory(cdir, ec) || std::filesystem::create_directories(cdir, ec)))
+                latent_cache_path = cdir + "/" + name;
+        }
+    }
+
+    // 1. Encode reference audio -> latents (or load from the cache)
     float* ref_latents = nullptr;
     int n_ref_frames = 0;
-    mimi_encode(ctx, ref_pcm_24khz, n_ref_samples, &ref_latents, &n_ref_frames);
+    if (!latent_cache_path.empty()) {
+        if (FILE* f = fopen(latent_cache_path.c_str(), "rb")) {
+            uint32_t magic = 0, nf = 0, ld = 0;
+            if (fread(&magic, 4, 1, f) == 1 && magic == 0x50564c31u /* 'PVL1' */ && fread(&nf, 4, 1, f) == 1 &&
+                fread(&ld, 4, 1, f) == 1 && (int)ld == LD && nf > 0 && nf < 1000000) {
+                ref_latents = (float*)malloc((size_t)nf * LD * sizeof(float));
+                if (ref_latents && fread(ref_latents, sizeof(float), (size_t)nf * LD, f) == (size_t)nf * LD) {
+                    n_ref_frames = (int)nf;
+                    if (ctx->verbosity >= 1)
+                        fprintf(stderr, "pocket_tts: voice latents loaded from cache (%d frames)\n", n_ref_frames);
+                } else {
+                    free(ref_latents);
+                    ref_latents = nullptr;
+                }
+            }
+            fclose(f);
+        }
+    }
+    if (!ref_latents) {
+        mimi_encode(ctx, ref_pcm_24khz, n_ref_samples, &ref_latents, &n_ref_frames);
+        if (ref_latents && n_ref_frames > 0 && !latent_cache_path.empty()) {
+            std::string tmp = latent_cache_path + ".tmp";
+            if (FILE* f = fopen(tmp.c_str(), "wb")) {
+                uint32_t magic = 0x50564c31u, nf = (uint32_t)n_ref_frames, ld = (uint32_t)LD;
+                bool ok = fwrite(&magic, 4, 1, f) == 1 && fwrite(&nf, 4, 1, f) == 1 && fwrite(&ld, 4, 1, f) == 1 &&
+                          fwrite(ref_latents, sizeof(float), (size_t)nf * LD, f) == (size_t)nf * LD;
+                fclose(f);
+                if (ok)
+                    rename(tmp.c_str(), latent_cache_path.c_str());
+                else
+                    remove(tmp.c_str());
+            }
+        }
+    }
     if (!ref_latents || n_ref_frames <= 0) {
         fprintf(stderr, "pocket_tts: mimi_encode failed for voice reference\n");
         return -1;

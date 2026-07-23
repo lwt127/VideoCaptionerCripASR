@@ -4,7 +4,7 @@ One-page dependency map for contributors. Start here if you need to
 know which file to edit for a given change, or which models would be
 affected by a given `src/core/` refactor.
 
-For user-facing docs see `README.md`. For pending work see `TODO.md`.
+For user-facing docs see `README.md`. For pending work see `PLAN.md`.
 For the reasoning behind design choices see `LEARNINGS.md`.
 
 ---

@@ -15,11 +15,14 @@
 #include "chatterbox.h"
 #include "chatterbox_s3gen.h"
 #include "chatterbox_ve.h"
+#include "chatterbox_text_prep.h"
 #include "core/attention.h"
 #include "core/audio_resample.h"
 #include "core/bpe.h"
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -27,7 +30,10 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
+#include <chrono>
+#include <thread>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -40,6 +46,32 @@
 #include <vector>
 
 namespace {
+
+// ===========================================================================
+// Bench instrumentation — `CHATTERBOX_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool chatterbox_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_CHATTERBOX_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct chatterbox_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit chatterbox_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~chatterbox_bench_stage() {
+        if (!chatterbox_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  chatterbox_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ── Hyperparameters ──────────────────────────────────────────────
 
@@ -173,47 +205,6 @@ struct cb_tokenizer {
     bool bpe_space_token = false;
 };
 
-// ── Punctuation normalization (from chatterbox/tts.py) ──────────
-
-static std::string punc_norm(const std::string& text) {
-    if (text.empty()) {
-        return "You need to add some text for me to talk.";
-    }
-    std::string s = text;
-
-    // Capitalise first letter
-    if (!s.empty() && s[0] >= 'a' && s[0] <= 'z') {
-        s[0] = s[0] - 'a' + 'A';
-    }
-
-    // Replace uncommon punctuation
-    auto replace_all = [](std::string& str, const std::string& from, const std::string& to) {
-        size_t pos = 0;
-        while ((pos = str.find(from, pos)) != std::string::npos) {
-            str.replace(pos, from.size(), to);
-            pos += to.size();
-        }
-    };
-    replace_all(s, "...", ", ");
-    replace_all(s, ":", ",");
-    replace_all(s, " - ", ", ");
-    replace_all(s, ";", ", ");
-    replace_all(s, " ,", ",");
-
-    // Trim trailing spaces
-    while (!s.empty() && s.back() == ' ')
-        s.pop_back();
-
-    // Add period if no sentence ender
-    if (!s.empty()) {
-        char last = s.back();
-        if (last != '.' && last != '!' && last != '?' && last != '-' && last != ',') {
-            s += '.';
-        }
-    }
-    return s;
-}
-
 // ── Text tokenization ───────────────────────────────────────────
 
 static std::vector<int32_t> tokenize_text(const cb_tokenizer& tok, const std::string& text) {
@@ -274,27 +265,62 @@ static std::vector<int32_t> tokenize_text_bpe(const cb_tokenizer& tok, const std
         core_bpe::bpe_one(tok.token_to_id, tok.merge_rank, encoded, result);
     };
 
-    size_t i = 0;
+    // BPE a contiguous run of ordinary (non-special) text via the GPT-2
+    // space-split pre-tokenizer.
+    auto bpe_segment = [&](const char* sbeg, const char* send) {
+        const char* p = sbeg;
+        while (p < send) {
+            const char* start = p;
+            if (*p == ' ') {
+                // Consume one leading space if it's followed by a non-space char
+                // (the " ?\p{L}+" arm). Multiple consecutive spaces are emitted as
+                // one whitespace chunk (the "\s+" arm), so the BPE merger can
+                // recover any multi-Ġ vocab entry the trained tokenizer used.
+                if (p + 1 < send && *(p + 1) != ' ') {
+                    ++p;
+                } else {
+                    while (p < send && *p == ' ')
+                        ++p;
+                    encode_chunk(start, p);
+                    continue;
+                }
+            }
+            while (p < send && *p != ' ')
+                ++p;
+            encode_chunk(start, p);
+        }
+    };
+
+    // §217: emit known bracketed special/added tokens directly as their vocab
+    // id instead of BPE-ing the literal characters. These are the chatterbox-
+    // turbo emotion/style controls ([laugh], [whispering], [clear throat], …,
+    // ids 50257..50275 from added_tokens.json) and base [SPACE]/[START]/[STOP].
+    // A bracketed substring is special iff its exact string is a vocab key — the
+    // byte-level GPT-2 base vocab never stores literal "[...]" strings, so a hit
+    // is necessarily an added token. Falls back to literal BPE when the GGUF
+    // lacks the token (older 50257 turbo files), so behaviour is unchanged for
+    // text without recognised tags.
+    size_t i = 0, seg_start = 0;
     while (i < text.size()) {
-        const size_t start = i;
-        if (text[i] == ' ') {
-            // Consume one leading space if it's followed by a non-space char
-            // (the " ?\p{L}+" arm). Multiple consecutive spaces are emitted as
-            // one whitespace chunk (the "\s+" arm), so the BPE merger can
-            // recover any multi-Ġ vocab entry the trained tokenizer used.
-            if (i + 1 < text.size() && text[i + 1] != ' ') {
-                ++i;
-            } else {
-                while (i < text.size() && text[i] == ' ')
-                    ++i;
-                encode_chunk(text.data() + start, text.data() + i);
-                continue;
+        if (text[i] == '[') {
+            const size_t close = text.find(']', i);
+            if (close != std::string::npos) {
+                const std::string cand = text.substr(i, close - i + 1);
+                auto it = tok.token_to_id.find(cand);
+                if (it != tok.token_to_id.end()) {
+                    if (i > seg_start)
+                        bpe_segment(text.data() + seg_start, text.data() + i);
+                    result.push_back(it->second);
+                    i = close + 1;
+                    seg_start = i;
+                    continue;
+                }
             }
         }
-        while (i < text.size() && text[i] != ' ')
-            ++i;
-        encode_chunk(text.data() + start, text.data() + i);
+        ++i;
     }
+    if (seg_start < text.size())
+        bpe_segment(text.data() + seg_start, text.data() + text.size());
     return result;
 }
 
@@ -742,6 +768,7 @@ struct chatterbox_context {
     cb_ve_model ve;
     cb_tokenizer tokenizer;
     cb_precomputed_conds conds;
+    std::string language; // multilingual: "[de]", "[fr]", etc. Empty = English
 
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
@@ -775,6 +802,77 @@ struct chatterbox_context {
     ggml_tensor* kv_k_cfg = nullptr;
     ggml_tensor* kv_v_cfg = nullptr;
 
+    // §186 Lk-bucketed T3 AR step graphs (PLAN §186). Pre-built graphs at
+    // fixed Lk sizes eliminate per-step sched reset + graph rebuild + alloc
+    // for T=1 cond-pass decode steps. Gated: only when no debug dump env vars
+    // are active and use_kv_k == nullptr (cond pass). kv_max_ctx-bounded.
+    struct T3Bucket {
+        int lk = 0;
+        ggml_context* ctx = nullptr;
+        std::vector<uint8_t> meta;
+        ggml_cgraph* gf = nullptr;
+    };
+    static constexpr int kT3NBuckets = 4;
+    static constexpr int kT3BucketLks[kT3NBuckets] = {512, 1024, 2048, 4096};
+    std::array<T3Bucket, kT3NBuckets> t3_buckets{};
+    ggml_backend_sched_t t3_step_sched = nullptr;
+    int t3_active_bucket = -1;
+    // §212: optional parallel bucket cache for the CFG *unconditioned* pass,
+    // bound to kv_k_cfg/kv_v_cfg with its own scheduler so cond + uncond can
+    // both stay allocated and alternate without re-allocating every token. The
+    // unconditioned pass otherwise skips the bucket fast path (use_kv_k set) and
+    // rebuilds + re-allocates its graph each step. Same graph topology as the
+    // cond bucket — only the KV-cache binding differs — so it is bit-identical
+    // (token-parity verified). Opt IN with CRISPASR_CHATTERBOX_T3_CFG_BUCKET=1;
+    // default OFF because graph-rebuild is negligible on this compute-bound
+    // decode (cf. §208) and the dual-scheduler path showed no win on contended
+    // M1. Kept gated for quiet-machine evaluation + regression bisection.
+    std::array<T3Bucket, kT3NBuckets> t3_buckets_cfg{};
+    ggml_backend_sched_t t3_step_sched_cfg = nullptr;
+    int t3_active_bucket_cfg = -1;
+
+    // §214: dedicated scheduler for the batched classifier-free-guidance (B=2)
+    // T3 decode step (CRISPASR_CHATTERBOX_T3_CFG_B2). Kept separate from c->sched
+    // and the bucket schedulers so the B=2 graph can rebuild + re-alloc per step
+    // without disturbing the cond/uncond bucket allocations.
+    ggml_backend_sched_t t3_sched_b2 = nullptr;
+
+    // §214: F16 GPU-resident copies of the T3 matmul weights, built lazily for
+    // the B=2 decode when T3 is on GPU with quantized weights. Metal's batched
+    // (ne[2]=2) quantized mat-vec misses the PREC_F32 mul_mv_q*_K exact-dot
+    // kernel and degenerates; dequantizing the weights to F16 once (same trick
+    // as s3gen's dequant_cfm_f16) routes the batched matmul through the correct
+    // mul_mm_f16 path. Empty on CPU / F16 models (B=2 uses the native weights).
+    ggml_context* t3_ctx_f16 = nullptr;
+    ggml_backend_buffer_t t3_buf_f16 = nullptr;
+    std::vector<cb_t3_layer> t3_blocks_f16;
+    ggml_tensor* t3_speech_head_f16 = nullptr;
+
+    // §214: CHATTERBOX_BENCH_B2 per-step build+alloc vs compute counters (decide
+    // whether a cached/bucketed B2 graph is worth it — see PLAN §214).
+    int64_t t3_b2_build_alloc_us = 0;
+    int64_t t3_b2_compute_us = 0;
+    int t3_b2_steps = 0;
+
+    // §188: CPU-side F32 copies of embedding tables.
+    // Populated once at init; eliminates tensor_get_f32 on every decode step.
+    std::vector<float> speech_emb_cache;     // (speech_vocab_size × hidden)
+    std::vector<float> speech_pos_emb_cache; // (speech_pos_emb_size × hidden)
+    std::vector<float> text_emb_cache;       // (text_vocab_size × hidden)
+    std::vector<float> text_pos_emb_cache;   // (text_pos_emb_size × hidden)
+    std::vector<float> wpe_cache;            // (wpe_max_positions × hidden) GPT-2 path
+
+    // Per-call performance counters (populated when CHATTERBOX_BENCH=1)
+    struct {
+        int64_t t_tokenize_us = 0;
+        int64_t t_prefill_build_us = 0;
+        int64_t t_prefill_us = 0;
+        int64_t t_decode_us = 0;
+        int n_text_tokens = 0;
+        int n_prefill_tokens = 0;
+        int n_speech_tokens = 0;
+    } last_perf;
+
     // S3Gen context (lazy-loaded from set_s3gen_path)
     std::string s3gen_path;
     chatterbox_s3gen_context* s3gen_ctx = nullptr;
@@ -787,6 +885,22 @@ struct chatterbox_context {
     ~chatterbox_context() {
         if (s3gen_ctx)
             chatterbox_s3gen_free(s3gen_ctx);
+        if (t3_step_sched)
+            ggml_backend_sched_free(t3_step_sched);
+        if (t3_step_sched_cfg)
+            ggml_backend_sched_free(t3_step_sched_cfg);
+        if (t3_sched_b2)
+            ggml_backend_sched_free(t3_sched_b2);
+        if (t3_buf_f16)
+            ggml_backend_buffer_free(t3_buf_f16);
+        if (t3_ctx_f16)
+            ggml_free(t3_ctx_f16);
+        for (auto& bk : t3_buckets)
+            if (bk.ctx)
+                ggml_free(bk.ctx);
+        for (auto& bk : t3_buckets_cfg)
+            if (bk.ctx)
+                ggml_free(bk.ctx);
         if (sched)
             ggml_backend_sched_free(sched);
         if (kv_cfg_buf)
@@ -811,6 +925,39 @@ struct chatterbox_context {
             ggml_backend_free(backend_cpu);
     }
 };
+
+static void prepend_language_token(chatterbox_context* ctx, std::vector<int32_t>& text_tokens) {
+    if (!ctx || ctx->language.empty() || text_tokens.empty()) {
+        return;
+    }
+    const auto it = ctx->tokenizer.token_to_id.find(ctx->language);
+    if (it == ctx->tokenizer.token_to_id.end()) {
+        return;
+    }
+    text_tokens.insert(text_tokens.begin(), it->second);
+}
+
+// #182: cap the text token sequence to the model's positional-embedding
+// capacity. The text positions index a fixed learned table — text_pos_emb
+// (text_pos_emb_size, base T3) or the shared WPE (wpe_max_positions, turbo/GPT-2)
+// — so a prompt longer than the table read past it and segfaulted. Real
+// long-form input should be sentence-chunked by the caller (the CLI/server
+// chunk helpers); this is the library-level guard that keeps any single
+// prefill within the table. Truncates with a one-time warning. Call AFTER all
+// token insertions (lang / SOT / EOT) so the cap bounds the final length.
+static void cap_text_tokens(chatterbox_context* c, std::vector<int32_t>& text_tokens, bool is_gpt2) {
+    // GPT-2/turbo: text shares the WPE table with the conditioning prefix
+    // (speaker + speech-prompt tokens), so leave generous headroom for cond.
+    const int limit =
+        is_gpt2 ? std::max(1, (int)c->hp.wpe_max_positions - 1024) : std::max(1, (int)c->hp.text_pos_emb_size);
+    if ((int)text_tokens.size() > limit) {
+        fprintf(stderr,
+                "chatterbox: text too long (%zu tokens > %d positional limit) — truncating. Chunk long "
+                "input on sentence boundaries for full synthesis (#182).\n",
+                text_tokens.size(), limit);
+        text_tokens.resize(limit);
+    }
+}
 
 namespace {
 
@@ -1107,6 +1254,34 @@ static bool kv_alloc(chatterbox_context* c, int max_ctx) {
     if (c->kv_ctx && max_ctx <= c->kv_max_ctx)
         return true;
 
+    // #182/§218: reallocating the KV cache invalidates anything that baked in
+    // pointers to the old kv_k/kv_v (and kv_k_cfg/kv_v_cfg) tensors — namely the
+    // §186 cached bucket step graphs and their scheduler allocations. Without
+    // this, a second synthesize() with longer text reallocates the cache and the
+    // next bucketed decode reads freed tensors (use-after-free crash, hit by the
+    // CLI/server long-form chunk loop). Drop the cached bucket graphs so they
+    // rebuild against the new tensors; the step schedulers re-alloc lazily once
+    // the active-bucket marker is cleared. (The non-bucket run_t3_kv path and the
+    // B2 path rebuild their graphs against c->kv_k every call, so they're safe.)
+    for (auto& bk : c->t3_buckets) {
+        if (bk.ctx)
+            ggml_free(bk.ctx);
+        bk.ctx = nullptr;
+        bk.gf = nullptr;
+    }
+    for (auto& bk : c->t3_buckets_cfg) {
+        if (bk.ctx)
+            ggml_free(bk.ctx);
+        bk.ctx = nullptr;
+        bk.gf = nullptr;
+    }
+    c->t3_active_bucket = -1;
+    c->t3_active_bucket_cfg = -1;
+    if (c->t3_step_sched)
+        ggml_backend_sched_reset(c->t3_step_sched);
+    if (c->t3_step_sched_cfg)
+        ggml_backend_sched_reset(c->t3_step_sched_cfg);
+
     // Free existing
     if (c->kv_buf)
         ggml_backend_buffer_free(c->kv_buf);
@@ -1175,8 +1350,14 @@ static bool kv_alloc(chatterbox_context* c, int max_ctx) {
 
 // Llama-520M transformer: inputs_embeds (D, T) → speech logits (speech_vocab,)
 // Uses core_attn::kv_self_attn for each layer, matching orpheus pattern.
+// fixed_kv_len > 0: pin Lk to a constant (bucket mode). Graph topology is
+// then invariant across calls with different n_past; kv_indices=positions
+// redirects K/V writes to the correct cache row at runtime. arena_ctx
+// provides the ggml_context for the long-lived bucket graph (caller owns it
+// and must NOT pass it to ggml_free; omit for per-call dynamic graphs).
 static ggml_cgraph* build_graph_t3_kv(chatterbox_context* c, int n_past, int n_tokens, ggml_tensor* use_kv_k = nullptr,
-                                      ggml_tensor* use_kv_v = nullptr) {
+                                      ggml_tensor* use_kv_v = nullptr, int fixed_kv_len = 0,
+                                      ggml_context* arena_ctx = nullptr) {
     // Use provided KV tensors or default to c->kv_k/kv_v
     if (!use_kv_k)
         use_kv_k = c->kv_k;
@@ -1191,12 +1372,12 @@ static ggml_cgraph* build_graph_t3_kv(chatterbox_context* c, int n_past, int n_t
     const float eps = hp.rms_norm_eps;
     const float attn_scale = 1.0f / std::sqrt((float)hd);
     const int T = n_tokens;
-    const int Lk = n_past + T;
+    const int Lk = fixed_kv_len > 0 ? fixed_kv_len : (n_past + T);
 
     GGML_ASSERT(c->kv_k && c->kv_v && Lk <= c->kv_max_ctx);
 
     ggml_init_params ip = {c->compute_meta.size(), c->compute_meta.data(), true};
-    ggml_context* ctx0 = ggml_init(ip);
+    ggml_context* ctx0 = arena_ctx ? arena_ctx : ggml_init(ip);
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
 
     ggml_tensor* embeds = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, D, T);
@@ -1211,8 +1392,9 @@ static ggml_cgraph* build_graph_t3_kv(chatterbox_context* c, int n_past, int n_t
         ggml_set_name(rope_freq_factors, "rope_freq_factors");
         ggml_set_input(rope_freq_factors);
     }
+    // Bucket mode always needs a mask: un-written tail slots must be -inf.
     ggml_tensor* causal_mask = nullptr;
-    if (T > 1) {
+    if (T > 1 || fixed_kv_len > 0) {
         causal_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, Lk, T);
         ggml_set_name(causal_mask, "causal_mask");
         ggml_set_input(causal_mask);
@@ -1299,10 +1481,12 @@ static ggml_cgraph* build_graph_t3_kv(chatterbox_context* c, int n_past, int n_t
             }
         }
 
-        ggml_tensor* attn =
-            core_attn::kv_self_attn(ctx0, gf, x, b.attn_q_w, b.attn_k_w, b.attn_v_w, b.attn_output_w,
-                                    /*q_norm_w*/ nullptr, /*k_norm_w*/ nullptr, positions,
-                                    (T == 1) ? nullptr : causal_mask, use_kv_k, use_kv_v, (int)il, n_past, kvp);
+        ggml_tensor* eff_kv_indices = fixed_kv_len > 0 ? positions : nullptr;
+        ggml_tensor* attn = core_attn::kv_self_attn(ctx0, gf, x, b.attn_q_w, b.attn_k_w, b.attn_v_w, b.attn_output_w,
+                                                    /*q_norm_w*/ nullptr, /*k_norm_w*/ nullptr, positions, causal_mask,
+                                                    use_kv_k, use_kv_v, (int)il, n_past, kvp,
+                                                    /*qkv_w=*/nullptr, /*fixed_kv_len=*/fixed_kv_len,
+                                                    /*kv_indices=*/eff_kv_indices);
         if (std::getenv("CRISPASR_CHATTERBOX_DUMP_ATTN_AT")) {
             const char* lyr_env = std::getenv("CRISPASR_CHATTERBOX_DUMP_LAYER");
             const int dbg_layer = lyr_env ? (int)std::strtol(lyr_env, nullptr, 10) : 0;
@@ -1357,13 +1541,544 @@ static ggml_cgraph* build_graph_t3_kv(chatterbox_context* c, int n_past, int n_t
         }
     }
 
-    ggml_free(ctx0);
+    if (!arena_ctx)
+        ggml_free(ctx0);
     return gf;
+}
+
+// §214: lazily build F16 GPU-resident copies of the T3 matmul weights for the
+// B=2 decode (only needed when T3 is on GPU with quantized weights — see the
+// t3_blocks_f16 field comment + LEARNINGS §214). Dequantizes each matmul weight
+// q*→F32→F16 on the host and uploads to c->backend, mirroring s3gen's
+// dequant_cfm_f16. Norms (used in ggml_mul, not matmul) keep their originals.
+// Returns true on success (or if no dequant is needed). Built once; reused.
+static bool ensure_t3_b2_f16_weights(chatterbox_context* c) {
+    if (!c->t3_blocks_f16.empty())
+        return true; // already built
+    const size_t nl = c->t3.blocks.size();
+    if (nl == 0)
+        return false;
+
+    // Collect the matmul weights that are quantized and need an F16 copy.
+    std::vector<ggml_tensor*> qsrc;
+    auto want = [&](ggml_tensor* w) {
+        if (w && ggml_is_quantized(w->type))
+            qsrc.push_back(w);
+    };
+    for (auto& b : c->t3.blocks) {
+        want(b.attn_q_w);
+        want(b.attn_k_w);
+        want(b.attn_v_w);
+        want(b.attn_output_w);
+        want(b.ffn_gate_w);
+        want(b.ffn_up_w);
+        want(b.ffn_down_w);
+    }
+    want(c->t3.speech_head_w);
+    if (qsrc.empty())
+        return false; // nothing quantized — caller should use native weights
+
+    const size_t meta = ggml_tensor_overhead() * (qsrc.size() + 8) + 4096;
+    struct ggml_init_params fp = {meta, nullptr, true};
+    c->t3_ctx_f16 = ggml_init(fp);
+    if (!c->t3_ctx_f16)
+        return false;
+
+    std::map<ggml_tensor*, ggml_tensor*> q2f16;
+    for (ggml_tensor* s : qsrc) {
+        if (q2f16.count(s))
+            continue; // shared weight — dequant once
+        ggml_tensor* d = ggml_new_tensor(c->t3_ctx_f16, GGML_TYPE_F16, ggml_n_dims(s), s->ne);
+        if (!d) {
+            ggml_free(c->t3_ctx_f16);
+            c->t3_ctx_f16 = nullptr;
+            return false;
+        }
+        ggml_set_name(d, ggml_get_name(s));
+        q2f16[s] = d;
+    }
+    c->t3_buf_f16 = ggml_backend_alloc_ctx_tensors(c->t3_ctx_f16, c->backend);
+    if (!c->t3_buf_f16) {
+        ggml_free(c->t3_ctx_f16);
+        c->t3_ctx_f16 = nullptr;
+        return false;
+    }
+
+    size_t bytes_q = 0, bytes_f16 = 0;
+    std::vector<char> raw;
+    std::vector<float> f32;
+    std::vector<ggml_fp16_t> f16;
+    for (auto& kv : q2f16) {
+        ggml_tensor* s = kv.first;
+        ggml_tensor* d = kv.second;
+        const auto* tt = ggml_get_type_traits(s->type);
+        if (!tt || !tt->to_float)
+            return false;
+        const int64_t n = ggml_nelements(s);
+        raw.resize(ggml_nbytes(s));
+        ggml_backend_tensor_get(s, raw.data(), 0, ggml_nbytes(s));
+        f32.resize((size_t)n);
+        tt->to_float(raw.data(), f32.data(), n);
+        f16.resize((size_t)n);
+        ggml_fp32_to_fp16_row(f32.data(), f16.data(), n);
+        ggml_backend_tensor_set(d, f16.data(), 0, (size_t)n * sizeof(ggml_fp16_t));
+        bytes_q += ggml_nbytes(s);
+        bytes_f16 += ggml_nbytes(d);
+    }
+
+    // Build the parallel F16 block table: copy each layer, swap matmul weights
+    // to their F16 copy (norms keep the original F32 tensors).
+    auto repl = [&](ggml_tensor* w) -> ggml_tensor* {
+        auto it = q2f16.find(w);
+        return it != q2f16.end() ? it->second : w;
+    };
+    c->t3_blocks_f16.resize(nl);
+    for (size_t i = 0; i < nl; i++) {
+        cb_t3_layer f = c->t3.blocks[i];
+        f.attn_q_w = repl(f.attn_q_w);
+        f.attn_k_w = repl(f.attn_k_w);
+        f.attn_v_w = repl(f.attn_v_w);
+        f.attn_output_w = repl(f.attn_output_w);
+        f.ffn_gate_w = repl(f.ffn_gate_w);
+        f.ffn_up_w = repl(f.ffn_up_w);
+        f.ffn_down_w = repl(f.ffn_down_w);
+        c->t3_blocks_f16[i] = f;
+    }
+    c->t3_speech_head_f16 = repl(c->t3.speech_head_w);
+
+    if (c->params.verbosity >= 1) {
+        fprintf(stderr,
+                "chatterbox: T3 CFG B2 on GPU — dequantized %zu T3 matmul weights →F16 GPU-resident "
+                "(%.0f→%.0f MiB; correct mul_mm_f16 batched path)\n",
+                q2f16.size(), bytes_q / 1048576.0, bytes_f16 / 1048576.0);
+    }
+    return true;
+}
+
+// §214: batched classifier-free-guidance (B=2) T3 decode step.
+//
+// Runs the conditioned and unconditioned CFG passes as ONE batch-2 forward so
+// each weight is read once for both passes — halving weight-bandwidth + dispatch
+// on the single-token AR decode, which is the largest synthesis stage (the
+// reference impl gianni-cor/chatterbox.cpp measured −42 % T3 from this change).
+//
+// Reuses the two existing KV caches (kv_k/kv_v cond, kv_k_cfg/kv_v_cfg uncond):
+// the heavy Q/K/V/O/FFN/head GEMMs are batched over ne[2]=2 (ggml_mul_mat
+// broadcasts the 2D weight over the batch dim); the cheap per-token attention
+// (cache write/read + flash) is SPLIT per batch — the two passes use different
+// caches and must not attend across each other. Both batches share the same
+// token embedding and the same position (lockstep n_past == n_past_cfg in the
+// decode loop), so the inputs are trivially replicated.
+//
+// Output `logits` is (speech_vocab, 1, 2): batch 0 = cond, batch 1 = uncond.
+//
+// This MUST stay token-parity-identical to the legacy sequential cond+uncond
+// path. The graph faithfully replicates core_attn::kv_self_attn's chatterbox
+// configuration (NEOX RoPE over the full head_dim, GQA_MANUAL_CONT expansion,
+// F16-cache ggml_cpy write / quant-cache ggml_set_rows write, dequant-on-read)
+// and tags every mul_mat + flash_attn_ext with GGML_PREC_F32 (load-bearing for
+// the T3 multinomial sampler — see build_graph_t3_kv ~§83).
+static ggml_cgraph* build_graph_t3_kv_b2(chatterbox_context* c, int n_past) {
+    const auto& hp = c->hp;
+    const int D = (int)hp.hidden_size;
+    const int n_q = (int)hp.n_heads;
+    const int n_kv = (int)hp.n_kv_heads;
+    const int hd = (int)hp.head_dim;
+    const int grp = n_q / n_kv;
+    const float eps = hp.rms_norm_eps;
+    const float attn_scale = 1.0f / std::sqrt((float)hd);
+    const int Lk = n_past + 1;
+    const int n_ctx_orig = (int)hp.rope_original_max_pos;
+    const float rope_theta = hp.rope_theta;
+
+    GGML_ASSERT(c->kv_k && c->kv_v && c->kv_k_cfg && c->kv_v_cfg && Lk <= c->kv_max_ctx);
+
+    ggml_init_params ip = {c->compute_meta.size(), c->compute_meta.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
+
+    // Shared inputs: same embed for both passes (replicated along batch ne[2]),
+    // same single position. Decode-only (T=1) so no causal mask is needed.
+    ggml_tensor* embeds = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, 1, 2);
+    ggml_set_name(embeds, "inputs_embeds");
+    ggml_set_input(embeds);
+    ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+    ggml_set_name(positions, "positions");
+    ggml_set_input(positions);
+    ggml_tensor* rope_freq_factors = nullptr;
+    if (!c->rope_freq_factors.empty()) {
+        rope_freq_factors = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, (int64_t)c->rope_freq_factors.size());
+        ggml_set_name(rope_freq_factors, "rope_freq_factors");
+        ggml_set_input(rope_freq_factors);
+    }
+
+    ggml_tensor* kv_ks[2] = {c->kv_k, c->kv_k_cfg};
+    ggml_tensor* kv_vs[2] = {c->kv_v, c->kv_v_cfg};
+    const bool quant_kv = ggml_is_quantized(c->kv_k->type);
+    static const bool s_kv_read_f32 = []() {
+        const char* s = std::getenv("CRISPASR_KV_READ_F32");
+        return s && *s && std::strcmp(s, "0") != 0;
+    }();
+    const bool need_dequant = quant_kv || (s_kv_read_f32 && c->kv_k->type != GGML_TYPE_F32);
+
+    // §214: on GPU + quantized weights, the matmuls run against F16 GPU-resident
+    // copies (ensure_t3_b2_f16_weights) so the batched ne[2]=2 path hits the
+    // correct mul_mm_f16 kernel; otherwise the native (CPU / F16-model) weights.
+    const bool use_f16w = !c->t3_blocks_f16.empty();
+    ggml_tensor* speech_head_w = use_f16w ? c->t3_speech_head_f16 : c->t3.speech_head_w;
+
+    ggml_tensor* cur = embeds; // (D, 1, 2)
+    for (uint32_t il = 0; il < hp.n_layers; il++) {
+        const auto& b = use_f16w ? c->t3_blocks_f16[il] : c->t3.blocks[il];
+        ggml_tensor* residual = cur;
+
+        ggml_tensor* x = ggml_rms_norm(ctx0, cur, eps);
+        x = ggml_mul(ctx0, x, b.attn_norm_w); // (D, 1, 2)
+
+        // Batched Q/K/V projections — each weight read once for both passes.
+        ggml_tensor* Q = ggml_mul_mat(ctx0, b.attn_q_w, x); // (n_q*hd, 1, 2)
+        ggml_tensor* K = ggml_mul_mat(ctx0, b.attn_k_w, x); // (n_kv*hd, 1, 2)
+        ggml_tensor* V = ggml_mul_mat(ctx0, b.attn_v_w, x);
+        Q = ggml_reshape_4d(ctx0, Q, hd, n_q, 1, 2);
+        K = ggml_reshape_4d(ctx0, K, hd, n_kv, 1, 2);
+        V = ggml_reshape_4d(ctx0, V, hd, n_kv, 1, 2);
+
+        // RoPE (NEOX, full head_dim). positions (len 1 == ne[2]) is applied
+        // independently to each batch at ne[3]. Matches kv_self_attn exactly:
+        // freq_scale 1, ext_factor 0, attn_factor 1, beta_fast/slow 0.
+        Q = ggml_rope_ext(ctx0, Q, positions, rope_freq_factors, hd, GGML_ROPE_TYPE_NEOX, n_ctx_orig, rope_theta, 1.0f,
+                          0.0f, 1.0f, 0.0f, 0.0f);
+        K = ggml_rope_ext(ctx0, K, positions, rope_freq_factors, hd, GGML_ROPE_TYPE_NEOX, n_ctx_orig, rope_theta, 1.0f,
+                          0.0f, 1.0f, 0.0f, 0.0f);
+
+        ggml_tensor* attn_b[2];
+        for (int bi = 0; bi < 2; bi++) {
+            ggml_tensor* kv_k = kv_ks[bi];
+            ggml_tensor* kv_v = kv_vs[bi];
+            // Per-batch slices (each batch is a contiguous block at ne[3]=bi).
+            ggml_tensor* Qb = ggml_view_3d(ctx0, Q, hd, n_q, 1, Q->nb[1], Q->nb[2], (size_t)bi * Q->nb[3]);
+            ggml_tensor* Kb = ggml_view_3d(ctx0, K, hd, n_kv, 1, K->nb[1], K->nb[2], (size_t)bi * K->nb[3]);
+            ggml_tensor* Vb = ggml_view_3d(ctx0, V, hd, n_kv, 1, V->nb[1], V->nb[2], (size_t)bi * V->nb[3]);
+
+            // Permute new K/V to (hd, 1, n_kv) for the cache write.
+            ggml_tensor* K_new_perm = ggml_permute(ctx0, Kb, 0, 2, 1, 3);
+            ggml_tensor* V_new_perm = ggml_permute(ctx0, Vb, 0, 2, 1, 3);
+
+            // Write into the per-batch cache at [n_past, n_past+1). Quant caches
+            // scatter via ggml_set_rows (positions == row ids); F16 caches use a
+            // strided-view ggml_cpy. Mirrors core_attn::kv_self_attn.
+            if (quant_kv) {
+                ggml_tensor* k_layer =
+                    ggml_view_3d(ctx0, kv_k, hd, kv_k->ne[1], n_kv, kv_k->nb[1], kv_k->nb[2], (size_t)il * kv_k->nb[3]);
+                ggml_tensor* v_layer =
+                    ggml_view_3d(ctx0, kv_v, hd, kv_v->ne[1], n_kv, kv_v->nb[1], kv_v->nb[2], (size_t)il * kv_v->nb[3]);
+                ggml_build_forward_expand(gf, ggml_set_rows(ctx0, k_layer, K_new_perm, positions));
+                ggml_build_forward_expand(gf, ggml_set_rows(ctx0, v_layer, V_new_perm, positions));
+            } else {
+                ggml_tensor* k_view = ggml_view_4d(ctx0, kv_k, hd, 1, n_kv, 1, kv_k->nb[1], kv_k->nb[2], kv_k->nb[3],
+                                                   (size_t)il * kv_k->nb[3] + (size_t)n_past * kv_k->nb[1]);
+                ggml_tensor* v_view = ggml_view_4d(ctx0, kv_v, hd, 1, n_kv, 1, kv_v->nb[1], kv_v->nb[2], kv_v->nb[3],
+                                                   (size_t)il * kv_v->nb[3] + (size_t)n_past * kv_v->nb[1]);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, K_new_perm, k_view));
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, V_new_perm, v_view));
+            }
+
+            // Read the full [0, Lk) history back from the cache.
+            ggml_tensor* k_layer_view =
+                ggml_view_3d(ctx0, kv_k, hd, Lk, n_kv, kv_k->nb[1], kv_k->nb[2], (size_t)il * kv_k->nb[3]);
+            ggml_tensor* v_layer_view =
+                ggml_view_3d(ctx0, kv_v, hd, Lk, n_kv, kv_v->nb[1], kv_v->nb[2], (size_t)il * kv_v->nb[3]);
+            ggml_tensor* Kfull =
+                need_dequant ? ggml_cast(ctx0, k_layer_view, GGML_TYPE_F32) : ggml_cont(ctx0, k_layer_view);
+            ggml_tensor* Vfull =
+                need_dequant ? ggml_cast(ctx0, v_layer_view, GGML_TYPE_F32) : ggml_cont(ctx0, v_layer_view);
+
+            // GQA expansion (no-op for chatterbox default n_kv == n_q, grp == 1).
+            if (grp > 1) {
+                ggml_tensor* K4 = ggml_reshape_4d(ctx0, Kfull, hd, Lk, 1, n_kv);
+                ggml_tensor* V4 = ggml_reshape_4d(ctx0, Vfull, hd, Lk, 1, n_kv);
+                K4 = ggml_repeat_4d(ctx0, K4, hd, Lk, grp, n_kv);
+                V4 = ggml_repeat_4d(ctx0, V4, hd, Lk, grp, n_kv);
+                Kfull = ggml_cont(ctx0, ggml_reshape_3d(ctx0, K4, hd, Lk, n_q));
+                Vfull = ggml_cont(ctx0, ggml_reshape_3d(ctx0, V4, hd, Lk, n_q));
+            }
+
+            ggml_tensor* Qp = ggml_cont(ctx0, ggml_permute(ctx0, Qb, 0, 2, 1, 3)); // (hd, 1, n_q)
+            ggml_tensor* a = ggml_flash_attn_ext(ctx0, Qp, Kfull, Vfull, /*mask*/ nullptr, attn_scale,
+                                                 /*max_bias*/ 0.0f, /*logit_softcap*/ 0.0f);
+            attn_b[bi] = ggml_reshape_2d(ctx0, a, hd * n_q, 1);
+        }
+
+        // Re-batch the two attention outputs and project once.
+        ggml_tensor* attn_cat = ggml_concat(ctx0, attn_b[0], attn_b[1], 2); // (hd*n_q, 1, 2)
+        ggml_tensor* o = ggml_mul_mat(ctx0, b.attn_output_w, attn_cat);     // (D, 1, 2)
+        cur = ggml_add(ctx0, residual, o);
+
+        residual = cur;
+        x = ggml_rms_norm(ctx0, cur, eps);
+        x = ggml_mul(ctx0, x, b.ffn_norm_w);
+        ggml_tensor* mlp = core_ffn::swiglu(ctx0, x, b.ffn_gate_w, b.ffn_up_w, b.ffn_down_w); // (D, 1, 2)
+        cur = ggml_add(ctx0, residual, mlp);
+    }
+
+    cur = ggml_rms_norm(ctx0, cur, eps);
+    cur = ggml_mul(ctx0, cur, c->t3.output_norm_w);
+    cur = ggml_mul_mat(ctx0, speech_head_w, cur); // (speech_vocab, 1, 2)
+    ggml_set_name(cur, "logits");
+    ggml_build_forward_expand(gf, cur);
+
+    // PLAN #83: GGML_PREC_F32 on every mul_mat + flash_attn_ext (sampler parity).
+    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+        ggml_tensor* t = ggml_graph_node(gf, i);
+        if (t->op == GGML_OP_MUL_MAT) {
+            ggml_mul_mat_set_prec(t, GGML_PREC_F32);
+        } else if (t->op == GGML_OP_FLASH_ATTN_EXT) {
+            ggml_flash_attn_ext_set_prec(t, GGML_PREC_F32);
+        }
+    }
+
+    ggml_free(ctx0); // metadata lives in c->compute_meta; gf stays valid (cf. build_graph_t3_kv)
+    return gf;
+}
+
+// §214: run one batched-CFG B=2 decode step. Fills out_cond/out_uncond (each
+// `speech_vocab` floats) with the cond/uncond logit rows. Returns false on
+// failure. n_past must equal the (lockstep) cond/uncond cache length.
+static bool run_t3_kv_b2(chatterbox_context* c, const float* embeds, int n_past, float* out_cond, float* out_uncond) {
+    if (n_past + 1 > c->kv_max_ctx) {
+        fprintf(stderr, "chatterbox: kv overflow b2 (%d+1 > %d)\n", n_past, c->kv_max_ctx);
+        return false;
+    }
+    const int D = (int)c->hp.hidden_size;
+    const int vocab = (int)c->hp.speech_vocab_size;
+
+    if (!c->t3_sched_b2) {
+        ggml_backend_t backends[2] = {c->backend, c->backend_cpu};
+        int n_be = (c->backend && c->backend != c->backend_cpu) ? 2 : 1;
+        c->t3_sched_b2 = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+        if (!c->t3_sched_b2)
+            return false;
+    }
+
+    // §214: optional per-step build+alloc instrumentation (CHATTERBOX_BENCH_B2=1)
+    // to decide whether a cached/bucketed B2 graph is worth it — graph rebuild is
+    // negligible on compute-bound decode (§208), but the per-step Metal sched
+    // re-alloc is unmeasured. Accumulates into static counters, printed by the
+    // caller via chatterbox_b2_alloc_report().
+    static const bool s_bench_b2 = []() {
+        const char* s = crispasr_env::get("CRISPASR_CHATTERBOX_BENCH_B2");
+        return s && *s && std::strcmp(s, "0") != 0;
+    }();
+    int64_t t_ba0 = s_bench_b2 ? ggml_time_us() : 0;
+
+    ggml_cgraph* gf = build_graph_t3_kv_b2(c, n_past);
+    if (!gf)
+        return false;
+
+    ggml_backend_sched_reset(c->t3_sched_b2);
+    if (!ggml_backend_sched_alloc_graph(c->t3_sched_b2, gf)) {
+        fprintf(stderr, "chatterbox: failed to alloc T3 b2 graph\n");
+        return false;
+    }
+    if (s_bench_b2) {
+        c->t3_b2_build_alloc_us += ggml_time_us() - t_ba0;
+        c->t3_b2_steps++;
+    }
+
+    // Same embedding for both passes (batch 0 = cond, batch 1 = uncond).
+    ggml_tensor* emb_t = ggml_graph_get_tensor(gf, "inputs_embeds");
+    ggml_backend_tensor_set(emb_t, embeds, 0, (size_t)D * sizeof(float));
+    ggml_backend_tensor_set(emb_t, embeds, (size_t)D * sizeof(float), (size_t)D * sizeof(float));
+    int32_t pos = n_past;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "positions"), &pos, 0, sizeof(int32_t));
+    if (!c->rope_freq_factors.empty())
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "rope_freq_factors"), c->rope_freq_factors.data(), 0,
+                                c->rope_freq_factors.size() * sizeof(float));
+
+    int64_t t_c0 = s_bench_b2 ? ggml_time_us() : 0;
+    if (ggml_backend_sched_graph_compute(c->t3_sched_b2, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "chatterbox: T3 b2 compute failed\n");
+        return false;
+    }
+    if (s_bench_b2)
+        c->t3_b2_compute_us += ggml_time_us() - t_c0;
+
+    ggml_tensor* out = ggml_graph_get_tensor(gf, "logits"); // (vocab, 1, 2)
+    ggml_backend_tensor_get(out, out_cond, 0, (size_t)vocab * sizeof(float));
+    ggml_backend_tensor_get(out, out_uncond, (size_t)vocab * sizeof(float), (size_t)vocab * sizeof(float));
+    return true;
+}
+
+// §186: returns true if any debug-dump env vars are set (those change graph topology).
+static bool t3_debug_active() {
+    return std::getenv("CRISPASR_CHATTERBOX_DUMP_LOGITS_AT") || std::getenv("CRISPASR_CHATTERBOX_DUMP_NORM_AT") ||
+           std::getenv("CRISPASR_CHATTERBOX_DUMP_KPROJ_AT") || std::getenv("CRISPASR_CHATTERBOX_DUMP_KROPE_AT") ||
+           std::getenv("CRISPASR_CHATTERBOX_DUMP_QPROJ_AT") || std::getenv("CRISPASR_CHATTERBOX_DUMP_VPROJ_AT") ||
+           std::getenv("CRISPASR_CHATTERBOX_DUMP_ATTN_AT") || std::getenv("CRISPASR_CHATTERBOX_DUMP_FFN_AT") ||
+           std::getenv("CRISPASR_CHATTERBOX_DUMP_WK") || std::getenv("CRISPASR_CHATTERBOX_DUMP_KV_AT") ||
+           std::getenv("CRISPASR_CHATTERBOX_NAIVE_ATTN");
+}
+
+// §186: pick smallest bucket whose Lk >= needed_lk and fits in the KV cache.
+static int t3_pick_bucket(chatterbox_context* c, int needed_lk) {
+    for (int i = 0; i < chatterbox_context::kT3NBuckets; i++) {
+        const int bk_lk = chatterbox_context::kT3BucketLks[i];
+        if (bk_lk >= needed_lk && bk_lk <= c->kv_max_ctx)
+            return i;
+    }
+    return -1;
+}
+
+// §186: lazily create the dedicated step scheduler (separate from c->sched so
+// bucket allocations survive sched resets during synthesis).
+static ggml_backend_sched_t t3_step_sched_lazy(chatterbox_context* c, bool cfg = false) {
+    ggml_backend_sched_t& s = cfg ? c->t3_step_sched_cfg : c->t3_step_sched;
+    if (s)
+        return s;
+    ggml_backend_t backends[2] = {c->backend, c->backend_cpu};
+    int n_be = (c->backend && c->backend != c->backend_cpu) ? 2 : 1;
+    s = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+    return s;
+}
+
+// §186: get or build the pre-allocated graph for bucket[idx].
+static ggml_cgraph* t3_get_or_build_bucket(chatterbox_context* c, int idx, bool cfg = false) {
+    auto& bk = cfg ? c->t3_buckets_cfg[idx] : c->t3_buckets[idx];
+    if (bk.gf)
+        return bk.gf;
+    bk.lk = chatterbox_context::kT3BucketLks[idx];
+    bk.meta.assign(c->compute_meta.size(), 0);
+    ggml_init_params ip = {bk.meta.size(), bk.meta.data(), true};
+    bk.ctx = ggml_init(ip);
+    if (!bk.ctx) {
+        fprintf(stderr, "chatterbox: t3_bucket%s[%d] arena init failed\n", cfg ? "_cfg" : "", idx);
+        return nullptr;
+    }
+    // §212: cfg bucket binds the unconditioned KV cache; otherwise default (cond).
+    bk.gf = build_graph_t3_kv(c, /*n_past=*/0, /*n_tokens=*/1,
+                              /*use_kv_k=*/cfg ? c->kv_k_cfg : nullptr,
+                              /*use_kv_v=*/cfg ? c->kv_v_cfg : nullptr,
+                              /*fixed_kv_len=*/bk.lk, /*arena_ctx=*/bk.ctx);
+    if (!bk.gf) {
+        ggml_free(bk.ctx);
+        bk.ctx = nullptr;
+        return nullptr;
+    }
+    return bk.gf;
+}
+
+// §186: fast Lk-bucketed single-step T3 decode (no debug dumps). §212: `cfg`
+// selects the unconditioned-pass bucket cache (bound to kv_k_cfg/kv_v_cfg, own
+// scheduler) so the CFG uncond pass is graph-cached just like the cond pass
+// instead of rebuilding its graph every token.
+static float* run_t3_kv_bucket(chatterbox_context* c, const float* embeds, int n_past, bool cfg = false) {
+    const int idx = t3_pick_bucket(c, n_past + 1);
+    if (idx < 0)
+        return nullptr;
+
+    ggml_cgraph* gf = t3_get_or_build_bucket(c, idx, cfg);
+    if (!gf)
+        return nullptr;
+
+    const auto& bk = cfg ? c->t3_buckets_cfg[idx] : c->t3_buckets[idx];
+    const int D = (int)c->hp.hidden_size;
+    const int Lk = bk.lk;
+    const int vocab = (int)c->hp.speech_vocab_size;
+
+    ggml_backend_sched_t step_sched = t3_step_sched_lazy(c, cfg);
+    if (!step_sched)
+        return nullptr;
+
+        // §220: on a non-Metal GPU backend the pre-built step graph runs through
+        // CUDA-graph capture (Vulkan binds subbuffers similarly). ggml-cuda keys a
+        // captured executable on the split graph's `uid` (ggml-backend.cpp assigns a
+        // fresh uid only inside sched_alloc_graph) and, on a uid match, replays it
+        // verbatim with the device pointers baked in at capture time
+        // (ggml-cuda.cu "CUDA Graph id N reused"). The original §186 fast path
+        // allocated the step sched once per bucket and then only re-ran graph_compute
+        // each step — so the uid never changed and the second decode step replayed a
+        // stale capture, tripping "CUDA error: an illegal memory access" (#220) — the
+        // CUDA analogue of the Vulkan null-subbuffer segfault (#170). Resetting +
+        // re-allocating the sched every step re-splits the graph (new uid →
+        // cudaGraphExecUpdate refreshes the pointers) while the cached cgraph keeps
+        // nodes[0] stable so capture still engages; this is the granite/outetts
+        // CUDA-graph-bucket pattern documented in §210. Metal has no graph capture, so
+        // keep the cheaper alloc-once reuse there (the validated §186 M1 path).
+        // Opt back into the old reuse path for A/B or bisection with
+        // CRISPASR_CHATTERBOX_T3_BUCKET_REUSE=1.
+#if defined(GGML_USE_METAL)
+    const bool realloc_each_step = false;
+#else
+    static const bool s_force_reuse = []() {
+        const char* s = std::getenv("CRISPASR_CHATTERBOX_T3_BUCKET_REUSE");
+        return s && (s[0] == '1' || s[0] == 'y' || s[0] == 'Y');
+    }();
+    const bool realloc_each_step = !s_force_reuse && c->backend && c->backend != c->backend_cpu;
+#endif
+
+    int& active = cfg ? c->t3_active_bucket_cfg : c->t3_active_bucket;
+    if (realloc_each_step || active != idx) {
+        ggml_backend_sched_reset(step_sched);
+        if (!ggml_backend_sched_alloc_graph(step_sched, gf)) {
+            fprintf(stderr, "chatterbox: t3_bucket%s[%d] alloc failed\n", cfg ? "_cfg" : "", idx);
+            return nullptr;
+        }
+        active = idx;
+    }
+
+    int32_t pos = n_past;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "positions"), &pos, 0, sizeof(int32_t));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "inputs_embeds"), embeds, 0, (size_t)D * sizeof(float));
+    if (!c->rope_freq_factors.empty())
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "rope_freq_factors"), c->rope_freq_factors.data(), 0,
+                                c->rope_freq_factors.size() * sizeof(float));
+
+    // Fill causal mask: positions [0..n_past] visible, [n_past+1..Lk-1] = -inf.
+    {
+        std::vector<ggml_fp16_t> mask(Lk, ggml_fp32_to_fp16(0.0f));
+        const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+        for (int k = n_past + 1; k < Lk; k++)
+            mask[k] = neg_inf;
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "causal_mask"), mask.data(), 0,
+                                (size_t)Lk * sizeof(ggml_fp16_t));
+    }
+
+    if (ggml_backend_sched_graph_compute(step_sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "chatterbox: t3_bucket compute failed\n");
+        return nullptr;
+    }
+
+    ggml_tensor* out = ggml_graph_get_tensor(gf, "logits");
+    float* r = (float*)malloc((size_t)vocab * sizeof(float));
+    ggml_backend_tensor_get(out, r, 0, (size_t)vocab * sizeof(float));
+    return r;
 }
 
 // Run the T3 transformer on pre-built embeddings. Returns logits (speech_vocab,).
 static float* run_t3_kv(chatterbox_context* c, const float* embeds, int n_tokens, int n_past,
                         ggml_tensor* use_kv_k = nullptr, ggml_tensor* use_kv_v = nullptr) {
+    // §186: Lk-bucketed fast path for T=1 cond-pass decode (no debug dumps, no custom KV).
+    if (n_tokens == 1 && !use_kv_k && !t3_debug_active()) {
+        if (float* r = run_t3_kv_bucket(c, embeds, n_past))
+            return r;
+        // Fall through if no bucket fits (n_past+1 > max bucket or > kv_max_ctx).
+    }
+    // §212: optional Lk-bucketed fast path for the T=1 CFG *unconditioned* pass
+    // (use_kv_k == kv_k_cfg), so it is graph-cached instead of rebuilt every
+    // token. Bit-identical graph (token-parity verified), just bound to the cfg
+    // KV cache. Opt IN with CRISPASR_CHATTERBOX_T3_CFG_BUCKET=1 (default OFF —
+    // no proven win on contended M1; kept for quiet-machine evaluation).
+    if (n_tokens == 1 && use_kv_k == c->kv_k_cfg && c->kv_k_cfg && !t3_debug_active()) {
+        static const bool s_cfg_bucket = []() {
+            const char* s = std::getenv("CRISPASR_CHATTERBOX_T3_CFG_BUCKET");
+            return s && (s[0] == '1' || s[0] == 'y' || s[0] == 'Y');
+        }();
+        if (s_cfg_bucket) {
+            if (float* r = run_t3_kv_bucket(c, embeds, n_past, /*cfg=*/true))
+                return r;
+        }
+    }
+
     if (n_past + n_tokens > c->kv_max_ctx) {
         fprintf(stderr, "chatterbox: kv overflow (%d+%d > %d)\n", n_past, n_tokens, c->kv_max_ctx);
         return nullptr;
@@ -1566,11 +2281,8 @@ static std::vector<float> build_prefill_embeds(chatterbox_context* c, const std:
         int n_heads = 4;
         int hd = D / n_heads; // 256
 
-        // Read embedding tables
-        std::vector<float> speech_emb_tab(c->hp.speech_vocab_size * D);
-        tensor_get_f32(m.speech_emb_w, speech_emb_tab.data(), speech_emb_tab.size());
-        std::vector<float> speech_pos_tab(c->hp.speech_pos_emb_size * D);
-        tensor_get_f32(m.speech_pos_emb_w, speech_pos_tab.data(), speech_pos_tab.size());
+        const auto& speech_emb_tab = c->speech_emb_cache;
+        const auto& speech_pos_tab = c->speech_pos_emb_cache;
 
         // Read prompt token IDs
         std::vector<int32_t> prompt_ids(n_prompt);
@@ -1772,17 +2484,18 @@ static std::vector<float> build_prefill_embeds(chatterbox_context* c, const std:
 
     // Place text embeddings: text_emb + text_pos_emb
     {
-        std::vector<float> text_emb_table(c->hp.text_vocab_size * D);
-        tensor_get_f32(m.text_emb_w, text_emb_table.data(), text_emb_table.size());
-        std::vector<float> text_pos_table(c->hp.text_pos_emb_size * D);
-        tensor_get_f32(m.text_pos_emb_w, text_pos_table.data(), text_pos_table.size());
-
+        const auto& text_emb_table = c->text_emb_cache;
+        const auto& text_pos_table = c->text_pos_emb_cache;
+        const int pos_max = (int)c->hp.text_pos_emb_size; // #182: positional table rows
         for (int i = 0; i < text_len; i++) {
             int tok = text_tokens[i];
             if (tok < 0 || tok >= (int)c->hp.text_vocab_size)
                 tok = 0;
+            // Defensive: callers cap text length to the table (cap_text_tokens),
+            // but never index the learned position table past its last row.
+            const int pi = i < pos_max ? i : pos_max - 1;
             for (int j = 0; j < D; j++) {
-                embeds[(pos + i) * D + j] = text_emb_table[tok * D + j] + text_pos_table[i * D + j];
+                embeds[(pos + i) * D + j] = text_emb_table[tok * D + j] + text_pos_table[pi * D + j];
             }
         }
         pos += text_len;
@@ -1790,10 +2503,8 @@ static std::vector<float> build_prefill_embeds(chatterbox_context* c, const std:
 
     // Place speech start embedding: speech_emb(start_token) + speech_pos_emb(0)
     {
-        std::vector<float> speech_emb_table(c->hp.speech_vocab_size * D);
-        tensor_get_f32(m.speech_emb_w, speech_emb_table.data(), speech_emb_table.size());
-        std::vector<float> speech_pos_table(c->hp.speech_pos_emb_size * D);
-        tensor_get_f32(m.speech_pos_emb_w, speech_pos_table.data(), speech_pos_table.size());
+        const auto& speech_emb_table = c->speech_emb_cache;
+        const auto& speech_pos_table = c->speech_pos_emb_cache;
 
         int start_tok = (int)c->hp.start_speech_token;
         for (int j = 0; j < D; j++) {
@@ -1810,13 +2521,8 @@ static std::vector<float> build_speech_token_embed(chatterbox_context* c, int32_
 ) {
     const int D = (int)c->hp.hidden_size;
     std::vector<float> embed(D);
-
-    // speech_emb(token) + speech_pos_emb(pos)
-    // Read full tables and index: partial byte-offset reads break on quantized tensors.
-    std::vector<float> emb_tab(c->hp.speech_vocab_size * D);
-    tensor_get_f32(c->t3.speech_emb_w, emb_tab.data(), emb_tab.size());
-    std::vector<float> pos_tab(c->hp.speech_pos_emb_size * D);
-    tensor_get_f32(c->t3.speech_pos_emb_w, pos_tab.data(), pos_tab.size());
+    const auto& emb_tab = c->speech_emb_cache;
+    const auto& pos_tab = c->speech_pos_emb_cache;
     int tid = (token_id >= 0 && token_id < (int)c->hp.speech_vocab_size) ? token_id : 0;
     int pid = (speech_pos >= 0 && speech_pos < (int)c->hp.speech_pos_emb_size) ? speech_pos : 0;
     for (int j = 0; j < D; j++)
@@ -2109,10 +2815,7 @@ static std::vector<float> build_prefill_embeds_gpt2(chatterbox_context* c, const
     const int D = (int)c->hp.hidden_size;
     const auto& m = c->t3;
 
-    // Read WPE table
-    int wpe_size = (int)c->hp.wpe_max_positions;
-    std::vector<float> wpe_table((size_t)wpe_size * D);
-    tensor_get_f32(m.wpe_w, wpe_table.data(), wpe_table.size());
+    const auto& wpe_table = c->wpe_cache;
 
     // 1. Conditioning: speaker_emb projection + speech prompt token embeddings
     // Python: cond_enc(t3_cond) returns [spkr_proj, speech_emb(cond_tokens)]
@@ -2149,9 +2852,7 @@ static std::vector<float> build_prefill_embeds_gpt2(chatterbox_context* c, const
             std::vector<int32_t> prompt_toks(n_prompt);
             ggml_backend_tensor_get(c->conds.speech_prompt_tokens, prompt_toks.data(), 0, n_prompt * sizeof(int32_t));
 
-            std::vector<float> speech_emb_table(c->hp.speech_vocab_size * D);
-            tensor_get_f32(m.speech_emb_w, speech_emb_table.data(), speech_emb_table.size());
-
+            const auto& speech_emb_table = c->speech_emb_cache;
             cond_speech_embs.resize((size_t)n_prompt * D);
             for (int i = 0; i < n_prompt; i++) {
                 int tok = std::max(0, std::min((int)c->hp.speech_vocab_size - 1, (int)prompt_toks[i]));
@@ -2169,11 +2870,8 @@ static std::vector<float> build_prefill_embeds_gpt2(chatterbox_context* c, const
 
     std::vector<float> embeds((size_t)total_len * D, 0.0f);
 
-    // Read embedding tables
-    std::vector<float> text_emb_table(c->hp.text_vocab_size * D);
-    tensor_get_f32(m.text_emb_w, text_emb_table.data(), text_emb_table.size());
-    std::vector<float> speech_emb_table(c->hp.speech_vocab_size * D);
-    tensor_get_f32(m.speech_emb_w, speech_emb_table.data(), speech_emb_table.size());
+    const auto& text_emb_table = c->text_emb_cache;
+    const auto& speech_emb_table = c->speech_emb_cache;
 
     int pos = 0;
     int wpe_pos = 0;
@@ -2227,12 +2925,8 @@ static std::vector<float> build_prefill_embeds_gpt2(chatterbox_context* c, const
 static std::vector<float> build_speech_token_embed_gpt2(chatterbox_context* c, int32_t token_id, int abs_pos) {
     const int D = (int)c->hp.hidden_size;
     std::vector<float> embed(D);
-
-    // Read full tables and index: partial byte-offset reads break on quantized tensors.
-    std::vector<float> emb_tab(c->hp.speech_vocab_size * D);
-    tensor_get_f32(c->t3.speech_emb_w, emb_tab.data(), emb_tab.size());
-    std::vector<float> wpe_tab(c->hp.wpe_max_positions * D);
-    tensor_get_f32(c->t3.wpe_w, wpe_tab.data(), wpe_tab.size());
+    const auto& emb_tab = c->speech_emb_cache;
+    const auto& wpe_tab = c->wpe_cache;
     int tid = (token_id >= 0 && token_id < (int)c->hp.speech_vocab_size) ? token_id : 0;
     int pid = (abs_pos >= 0 && abs_pos < (int)c->hp.wpe_max_positions) ? abs_pos : 0;
     for (int j = 0; j < D; j++)
@@ -2257,7 +2951,15 @@ extern "C" struct chatterbox_context_params chatterbox_context_default_params(vo
     p.top_p = 1.0f;
     p.top_k = 0;
     p.max_speech_tokens = 1000;
-    p.cfm_steps = 10;
+    // S3Gen flow-matching Euler steps. 0 = auto, resolved per-model in s3gen:
+    // standard models → 6, meanflow/turbo distilled models → 2. (Standard:
+    // upstream/reference uses 10; 6 is perceptually identical — log-mel corr
+    // 0.981 vs 10, identical ASR roundtrip — at ~46% less CFM time. Meanflow:
+    // the distilled 2-step schedule; §207's 10→6 standard change previously
+    // broke the meanflow auto-downgrade, leaving turbo at 6 steps.) Override
+    // with --tts-steps N; the crispasr-diff harness pins 10 to match the
+    // reference dump, the "reference-exact" setting.
+    p.cfm_steps = 0;
     // PLAN #89: flash_attn defaults to true (lost in commit ff5536ae;
     // restored 2026-05-11). The compute-graph wiring per backend
     // lands in PLAN #86; until then this is plumbing-only on
@@ -2293,6 +2995,35 @@ extern "C" struct chatterbox_context* chatterbox_init_from_file(const char* path
     }
 
     const bool is_gpt2 = (c->hp.arch == "chatterbox_turbo" || c->hp.arch == "kartoffelbox");
+
+    // Tokenizer ↔ text-embedding consistency. The check is DIRECTIONAL (#181):
+    // the text embedding table has text_vocab_size rows, while the tokenizer
+    // table only governs text→id BPE (which emits ids < tokenizer size); special
+    // text tokens are added by id and bounds-checked against text_vocab_size at
+    // the embed site. So:
+    //   - tokenizer size  >  text_vocab_size  → HARD ERROR: BPE can emit an id
+    //     past the embedding table → out-of-bounds lookup. Genuinely broken.
+    //   - tokenizer size  <  text_vocab_size  → BENIGN: the embedding is a
+    //     superset; the extra rows (reserved / special slots) are simply never
+    //     indexed out of range. chatterbox-turbo ships a stock 50257-token GPT-2
+    //     tokenizer with text_vocab_size=50276 (19 reserved rows); it loaded and
+    //     worked on v0.7.x. v0.8.0's strict `!=` check wrongly rejected it — warn
+    //     and load instead of failing (no re-download needed for users).
+    if (!c->tokenizer.id_to_token.empty() && c->tokenizer.id_to_token.size() > c->hp.text_vocab_size) {
+        fprintf(stderr,
+                "chatterbox: tokenizer/model vocab mismatch: tokenizer has %zu tokens > "
+                "T3 text_vocab_size=%u — the tokenizer can emit ids past the text embedding. "
+                "Re-convert with the tokenizer paired to this T3 checkpoint.\n",
+                c->tokenizer.id_to_token.size(), c->hp.text_vocab_size);
+        delete c;
+        return nullptr;
+    }
+    if (!c->tokenizer.id_to_token.empty() && c->tokenizer.id_to_token.size() < c->hp.text_vocab_size) {
+        fprintf(stderr,
+                "chatterbox: note: tokenizer has %zu tokens, T3 text_vocab_size=%u "
+                "(embedding superset — extra rows reserved/unused; loading normally). #181\n",
+                c->tokenizer.id_to_token.size(), c->hp.text_vocab_size);
+    }
 
     // Issue #94 follow-up: chatterbox-turbo's Python tts_turbo.generate()
     // explicitly disables CFG (cfg_weight=0.0 default, plus a log line
@@ -2344,6 +3075,26 @@ extern "C" struct chatterbox_context* chatterbox_init_from_file(const char* path
         delete c;
         return nullptr;
     }
+    // Wire the CPU backend thread count. Without this, ggml_backend_cpu_init
+    // leaves it at GGML_DEFAULT_N_THREADS (4), so the compute-bound T3 AR
+    // decode ran at 4 threads on every machine regardless of -t. Use up to 8
+    // cores by default (output is bit-identical — ggml matmul splits output
+    // rows per-thread, no cross-thread reduction, so the result is
+    // thread-count-independent). Never drop below the caller's -t. Override
+    // with CRISPASR_CHATTERBOX_THREADS=<n>.
+    {
+        int cb_threads;
+        if (const char* e = std::getenv("CRISPASR_CHATTERBOX_THREADS")) {
+            cb_threads = std::max(1, atoi(e));
+        } else {
+            const int hw = (int)std::thread::hardware_concurrency();
+            cb_threads = std::max(c->n_threads, std::min(8, hw > 0 ? hw : 4));
+        }
+        c->n_threads = cb_threads;
+        ggml_backend_cpu_set_n_threads(c->backend_cpu, cb_threads);
+        if (params.verbosity >= 1)
+            fprintf(stderr, "chatterbox: CPU backend threads=%d\n", cb_threads);
+    }
     // Env knobs (all override the default):
     //   CRISPASR_CHATTERBOX_FORCE_GPU=1       — both T3 and S3Gen on GPU
     //                                           (legacy; S3Gen output is
@@ -2381,6 +3132,7 @@ extern "C" struct chatterbox_context* chatterbox_init_from_file(const char* path
             // residency is the default; this branch is for users who
             // explicitly opt into GPU.
             fprintf(stderr, "chatterbox: T3+s3gen forced to GPU (CRISPASR_CHATTERBOX_FORCE_GPU=1).\n");
+            // Note: T3 GPU on Metal is slower than CPU (kernel-launch overhead).
             if (s3gen_cpu_override) {
                 fprintf(stderr,
                         "chatterbox: s3gen forced to CPU (CRISPASR_CHATTERBOX_S3GEN_CPU=1) — T3 stays on GPU.\n");
@@ -2390,32 +3142,39 @@ extern "C" struct chatterbox_context* chatterbox_init_from_file(const char* path
             fprintf(stderr, "chatterbox: T3 → CPU, s3gen → GPU (CRISPASR_CHATTERBOX_T3_CPU_S3GEN_GPU=1).\n");
             t3_use_gpu = false;
         } else {
-            // Default split. T3 GPU is a real speedup on CUDA/Vulkan/etc but
-            // on Apple Silicon Metal it is *slower* than CPU: 30 layers × 86
-            // sequential AR tokens × batch=1 ≈ 25k small kernel launches,
-            // and Metal pays µs-class launch overhead per dispatch that the
-            // M1 NEON CPU cache-blasts straight through (benchmark on M1:
-            // 50s full CPU vs 75s T3-GPU + S3Gen-CPU for the JFK sentence).
-            // S3Gen is the same on both routes here — it has to be on CPU
-            // until the compound Metal-precision drift in the UNet1D is
-            // fixed (see handover-prompts/chatterbox-gpu-bug-is-s3gen.md).
-            // Opt back into T3-GPU on Metal with CRISPASR_CHATTERBOX_T3_GPU=1;
-            // it stays on by default for non-Metal GPU backends.
-#ifdef GGML_USE_METAL
+            // Default split: T3 stays on CPU on Metal (kernel-launch overhead
+            // across 30L × N_speech sequential AR steps is slower than CPU on
+            // Apple Silicon). S3Gen GPU is now the default: the compound
+            // Metal-precision drift in UNet1D CFM (PLAN #83) is fixed by
+            // GGML_PREC_F32 mul_mat hints (mul_mat_hp()) + parallel=true sched.
+            // Opt back into T3-GPU on Metal with CRISPASR_CHATTERBOX_T3_GPU=1.
+            // S3Gen CPU opt-out: CRISPASR_CHATTERBOX_S3GEN_CPU=1.
+#if defined(GGML_USE_METAL)
             const bool t3_gpu_default = false;
-            const char* t3_default_reason = "Metal kernel-launch overhead × AR steps is slower than CPU on Apple "
-                                            "Silicon (override: CRISPASR_CHATTERBOX_T3_GPU=1)";
+            const char* t3_default_reason =
+                "Metal kernel-launch overhead × AR steps (override: CRISPASR_CHATTERBOX_T3_GPU=1)";
+#elif defined(GGML_USE_VULKAN) && !defined(GGML_USE_CUDA)
+            // Vulkan-only build: the §186 Lk-bucketed T3 step graph is allocated
+            // once and reused across AR steps; on Vulkan that reuse segfaults in
+            // ggml_vk_tensor_subbuffer (null buffer) at the rms_norm of step ~2
+            // (issue #170). S3Gen GPU on Vulkan is fine, so keep T3 on CPU and
+            // s3gen on GPU. Opt into the (crashing) T3-GPU path with
+            // CRISPASR_CHATTERBOX_T3_GPU=1.
+            const bool t3_gpu_default = false;
+            const char* t3_default_reason =
+                "Vulkan T3 step-graph segfault (issue #170; override: CRISPASR_CHATTERBOX_T3_GPU=1)";
 #else
             const bool t3_gpu_default = true;
             const char* t3_default_reason = "non-Metal GPU";
 #endif
             t3_use_gpu = t3_gpu_override ? true : t3_gpu_default;
-            s3gen_use_gpu = false;
+            s3gen_use_gpu = !s3gen_cpu_override;
             fprintf(stderr,
-                    "chatterbox: T3 → %s, s3gen → CPU (default; %s). Overrides: "
-                    "CRISPASR_CHATTERBOX_FORCE_GPU=1 (both GPU, broken), "
-                    "CRISPASR_CHATTERBOX_FULL_CPU=1, CRISPASR_CHATTERBOX_T3_GPU=1.\n",
-                    t3_use_gpu ? "GPU" : "CPU", t3_default_reason);
+                    "chatterbox: T3 → %s, s3gen → %s (%s). "
+                    "Overrides: CRISPASR_CHATTERBOX_FORCE_GPU=1, CRISPASR_CHATTERBOX_FULL_CPU=1, "
+                    "CRISPASR_CHATTERBOX_T3_GPU=1, CRISPASR_CHATTERBOX_S3GEN_CPU=1.\n",
+                    t3_use_gpu ? "GPU" : "CPU", s3gen_use_gpu ? "GPU" : "CPU",
+                    s3gen_use_gpu ? "UNet GGML_PREC_F32" : t3_default_reason);
         }
     }
     // Issue #94: flush so consumers see progress on slow-disk loads — the
@@ -2427,7 +3186,7 @@ extern "C" struct chatterbox_context* chatterbox_init_from_file(const char* path
     // via chatterbox_set_s3gen_path). c->backend is the T3 backend.
     c->params.use_gpu = s3gen_use_gpu;
     bool effective_use_gpu = t3_use_gpu;
-    c->backend = effective_use_gpu ? ggml_backend_init_best() : c->backend_cpu;
+    c->backend = effective_use_gpu ? crispasr_init_gpu_backend() : c->backend_cpu;
     if (!c->backend) {
         if (params.verbosity >= 1 && effective_use_gpu) {
             fprintf(stderr, "chatterbox: GPU backend unavailable, falling back to CPU\n");
@@ -2488,6 +3247,32 @@ extern "C" struct chatterbox_context* chatterbox_init_from_file(const char* path
         c->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
     }
 
+    // §188: cache embedding tables once; eliminates per-step tensor_get_f32.
+    {
+        const int D = (int)c->hp.hidden_size;
+        const auto& m = c->t3;
+        if (m.speech_emb_w) {
+            c->speech_emb_cache.resize((size_t)c->hp.speech_vocab_size * D);
+            tensor_get_f32(m.speech_emb_w, c->speech_emb_cache.data(), c->speech_emb_cache.size());
+        }
+        if (m.speech_pos_emb_w) {
+            c->speech_pos_emb_cache.resize((size_t)c->hp.speech_pos_emb_size * D);
+            tensor_get_f32(m.speech_pos_emb_w, c->speech_pos_emb_cache.data(), c->speech_pos_emb_cache.size());
+        }
+        if (m.text_emb_w) {
+            c->text_emb_cache.resize((size_t)c->hp.text_vocab_size * D);
+            tensor_get_f32(m.text_emb_w, c->text_emb_cache.data(), c->text_emb_cache.size());
+        }
+        if (m.text_pos_emb_w) {
+            c->text_pos_emb_cache.resize((size_t)c->hp.text_pos_emb_size * D);
+            tensor_get_f32(m.text_pos_emb_w, c->text_pos_emb_cache.data(), c->text_pos_emb_cache.size());
+        }
+        if (m.wpe_w) {
+            c->wpe_cache.resize((size_t)c->hp.wpe_max_positions * D);
+            tensor_get_f32(m.wpe_w, c->wpe_cache.data(), c->wpe_cache.size());
+        }
+    }
+
     return c;
 }
 
@@ -2510,6 +3295,34 @@ extern "C" int chatterbox_set_s3gen_path(struct chatterbox_context* ctx, const c
     return 0;
 }
 
+extern "C" int32_t* chatterbox_dump_text_tokens(struct chatterbox_context* ctx, const char* text, int* out_n) {
+    if (!ctx || !text || !out_n)
+        return nullptr;
+    *out_n = 0;
+
+    // Mirror the tokenization block of chatterbox_synthesize_tokens exactly:
+    // normalize (NFKD on the multilingual path, #170) → BPE tokenize →
+    // prepend [lang]. Deterministic — no AR sampling.
+    std::string norm_text = chatterbox_text_prep::normalize(text, !ctx->language.empty());
+    std::vector<int32_t> text_tokens;
+    if (ctx->tokenizer.has_bpe) {
+        text_tokens = ctx->tokenizer.bpe_byte_level ? tokenize_text_bpe(ctx->tokenizer, norm_text)
+                                                    : tokenize_text_hf_bpe(ctx->tokenizer, norm_text);
+    } else {
+        text_tokens = tokenize_text(ctx->tokenizer, norm_text);
+    }
+    prepend_language_token(ctx, text_tokens);
+
+    const int n = (int)text_tokens.size();
+    int32_t* out = (int32_t*)malloc((size_t)(n > 0 ? n : 1) * sizeof(int32_t));
+    if (!out)
+        return nullptr;
+    for (int i = 0; i < n; ++i)
+        out[i] = text_tokens[(size_t)i];
+    *out_n = n;
+    return out;
+}
+
 extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx, const char* text, int* out_n) {
     if (!ctx || !text || !out_n)
         return nullptr;
@@ -2523,7 +3336,9 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
     }
 
     // 1. Normalize and tokenize text
-    std::string norm_text = punc_norm(text);
+    int64_t t_tok0 = ggml_time_us();
+    std::string norm_text = chatterbox_text_prep::normalize(text, !ctx->language.empty());
+
     std::vector<int32_t> text_tokens;
     if (ctx->tokenizer.has_bpe) {
         text_tokens = ctx->tokenizer.bpe_byte_level ? tokenize_text_bpe(ctx->tokenizer, norm_text)
@@ -2531,6 +3346,9 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
     } else {
         text_tokens = tokenize_text(ctx->tokenizer, norm_text);
     }
+    prepend_language_token(ctx, text_tokens);
+    ctx->last_perf.t_tokenize_us = ggml_time_us() - t_tok0;
+    ctx->last_perf.n_text_tokens = (int)text_tokens.size();
 
     if (ctx->params.verbosity >= 1) {
         fprintf(stderr, "chatterbox: text \"%s\" → %zu %s tokens\n", norm_text.c_str(), text_tokens.size(),
@@ -2548,8 +3366,9 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
         text_tokens.insert(text_tokens.begin(), (int32_t)ctx->hp.start_text_token);
         text_tokens.push_back((int32_t)ctx->hp.stop_text_token);
     }
+    cap_text_tokens(ctx, text_tokens, is_gpt2); // #182: bound to positional table
 
-    if (ctx->params.verbosity >= 2 || std::getenv("CHATTERBOX_DEBUG")) {
+    if (ctx->params.verbosity >= 2 || crispasr_env::get("CRISPASR_CHATTERBOX_DEBUG")) {
         fprintf(stderr, "chatterbox: text_tokens(%zu) %s = [", text_tokens.size(),
                 is_gpt2 ? "(no SOT/EOT for turbo)" : "[SOT,...,EOT]");
         for (size_t i = 0; i < text_tokens.size(); ++i) {
@@ -2567,6 +3386,7 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
     }
 
     // 4. Build prefill embeddings on CPU
+    int64_t t_preb0 = ggml_time_us();
     std::vector<float> prefill_embeds;
     if (is_gpt2) {
         prefill_embeds = build_prefill_embeds_gpt2(ctx, text_tokens);
@@ -2582,6 +3402,8 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
         prefill_embeds.insert(prefill_embeds.end(), bos_extra.begin(), bos_extra.end());
     }
     int prefill_len = (int)(prefill_embeds.size() / ctx->hp.hidden_size);
+    ctx->last_perf.t_prefill_build_us = ggml_time_us() - t_preb0;
+    ctx->last_perf.n_prefill_tokens = prefill_len;
 
     if (ctx->params.verbosity >= 1) {
         fprintf(stderr, "chatterbox: prefill %d tokens (max_speech=%d)\n", prefill_len, max_speech);
@@ -2590,6 +3412,33 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
     // 5. CFG setup: build unconditioned prefill if cfg_weight > 0
     const float cfg_w = ctx->params.cfg_weight;
     const bool use_cfg = (!is_gpt2 && cfg_w > 0.0f && ctx->kv_k_cfg);
+    // §214: opt into the batched-CFG B=2 decode (cond+uncond as one B=2 forward).
+    // Default OFF (legacy sequential cond+uncond) until token-parity + a real
+    // quiet-machine speedup are demonstrated. Requires the CFG uncond cache.
+    bool use_b2 = use_cfg && []() {
+        const char* s = std::getenv("CRISPASR_CHATTERBOX_T3_CFG_B2");
+        return s && (s[0] == '1' || s[0] == 'y' || s[0] == 'Y');
+    }();
+    // B2 is bit-identical to the legacy sequential cond+uncond path on CPU (all
+    // weight quants) and on GPU with F16 weights, but DEGENERATES on GPU with
+    // quantized T3 weights: Metal's batched (ne[2]=2) quantized mat-vec does not
+    // hit the PREC_F32 mul_mv_q*_K exact-dot kernel that the single-token legacy
+    // decode uses, so the batched quant matmul drifts and the speech-token loop
+    // collapses into repetition. (Same class as the §211 batched-quant-CFM
+    // garbage.) Fix it the way s3gen's CFM does: dequantize the T3 matmul weights
+    // to F16 GPU-resident once, so the batched matmuls hit the correct mul_mm_f16
+    // path. If the dequant fails, fall back to the legacy sequential path.
+    if (use_b2 && ctx->backend != ctx->backend_cpu && !ctx->t3.blocks.empty() &&
+        ggml_is_quantized(ctx->t3.blocks[0].attn_q_w->type)) {
+        if (!ensure_t3_b2_f16_weights(ctx)) {
+            use_b2 = false;
+            if (ctx->params.verbosity >= 1)
+                fprintf(stderr, "chatterbox: T3 CFG B2 disabled — GPU + quantized T3 weights and F16 "
+                                "dequant failed; use F16 T3 or run T3 on CPU.\n");
+        }
+    }
+    if (use_b2 && ctx->params.verbosity >= 1)
+        fprintf(stderr, "chatterbox: T3 CFG B2 (batched cond+uncond decode) ENABLED\n");
     std::vector<float> uncond_embeds;
     if (use_cfg) {
         // Unconditioned CFG path in Python zeros only text token embeddings
@@ -2599,8 +3448,7 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
         const int D = ctx->hp.hidden_size;
         int text_start = prefill_len - (int)text_tokens.size() - 2; // cond_len
         int text_end = prefill_len - 2;                             // before speech tokens
-        std::vector<float> text_pos_table(ctx->hp.text_pos_emb_size * D);
-        tensor_get_f32(ctx->t3.text_pos_emb_w, text_pos_table.data(), text_pos_table.size());
+        const auto& text_pos_table = ctx->text_pos_emb_cache;
         for (int i = text_start; i < text_end; i++) {
             const int pos_idx = i - text_start;
             std::memcpy(&uncond_embeds[(size_t)i * D], &text_pos_table[(size_t)pos_idx * D], (size_t)D * sizeof(float));
@@ -2610,6 +3458,7 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
     // 6. Prefill: run the full prefix through the transformer
     int n_past = 0;
     float* logits = nullptr;
+    int64_t t_pre0 = ggml_time_us();
     if (is_gpt2) {
         logits = run_t3_gpt2_kv(ctx, prefill_embeds.data(), prefill_len, n_past);
     } else {
@@ -2627,12 +3476,14 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
         n_past_cfg += prefill_len;
     }
     n_past += prefill_len;
+    ctx->last_perf.t_prefill_us = ggml_time_us() - t_pre0;
 
     // 7. AR decode loop with CFG
     std::vector<int32_t> speech_tokens;
     speech_tokens.reserve(max_speech);
     int speech_pos = 1;
 
+    int64_t t_dec0 = ggml_time_us();
     for (int step = 0; step < max_speech; step++) {
         // Blend logits with CFG: logits = cond + cfg * (cond - uncond)
         const int V = (int)ctx->hp.speech_vocab_size;
@@ -2699,31 +3550,61 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
         }
         speech_pos++;
 
-        // Conditioned forward step
-        if (is_gpt2) {
-            logits = run_t3_gpt2_kv(ctx, tok_embed.data(), 1, n_past);
-        } else {
-            logits = run_t3_kv(ctx, tok_embed.data(), 1, n_past);
-        }
-        if (!logits) {
-            fprintf(stderr, "chatterbox: decode step %d failed\n", step);
-            break;
-        }
-        n_past++;
-
-        // Unconditioned forward step for CFG (Llama only)
-        if (use_cfg) {
-            logits_uncond = run_t3_kv(ctx, tok_embed.data(), 1, n_past_cfg, ctx->kv_k_cfg, ctx->kv_v_cfg);
+        if (use_b2) {
+            // §214: run cond + uncond as one batch-2 forward (n_past == n_past_cfg
+            // by construction). One weight read serves both passes.
+            logits = (float*)malloc((size_t)V * sizeof(float));
+            logits_uncond = (float*)malloc((size_t)V * sizeof(float));
+            if (!run_t3_kv_b2(ctx, tok_embed.data(), n_past, logits, logits_uncond)) {
+                fprintf(stderr, "chatterbox: decode step %d (b2) failed\n", step);
+                free(logits);
+                logits = nullptr;
+                free(logits_uncond);
+                logits_uncond = nullptr;
+                break;
+            }
+            n_past++;
             n_past_cfg++;
+        } else {
+            // Conditioned forward step
+            if (is_gpt2) {
+                logits = run_t3_gpt2_kv(ctx, tok_embed.data(), 1, n_past);
+            } else {
+                logits = run_t3_kv(ctx, tok_embed.data(), 1, n_past);
+            }
+            if (!logits) {
+                fprintf(stderr, "chatterbox: decode step %d failed\n", step);
+                break;
+            }
+            n_past++;
+
+            // Unconditioned forward step for CFG (Llama only)
+            if (use_cfg) {
+                logits_uncond = run_t3_kv(ctx, tok_embed.data(), 1, n_past_cfg, ctx->kv_k_cfg, ctx->kv_v_cfg);
+                n_past_cfg++;
+            }
         }
     }
     if (logits)
         free(logits);
     if (logits_uncond)
         free(logits_uncond);
+    ctx->last_perf.t_decode_us = ggml_time_us() - t_dec0;
+    ctx->last_perf.n_speech_tokens = (int)speech_tokens.size();
 
     if (ctx->params.verbosity >= 1) {
         fprintf(stderr, "chatterbox: AR emitted %zu speech tokens\n", speech_tokens.size());
+    }
+    // §214: report the per-step B2 build+alloc vs compute split (CHATTERBOX_BENCH_B2)
+    // — decides whether a cached/bucketed B2 graph is worth it (PLAN §214).
+    if (ctx->t3_b2_steps > 0) {
+        const double ba = ctx->t3_b2_build_alloc_us / 1e3, cp = ctx->t3_b2_compute_us / 1e3;
+        const double tot = ba + cp;
+        fprintf(stderr,
+                "chatterbox: [B2 bench] %d steps — build+alloc %.1f ms (%.2f ms/step, %.1f%%), "
+                "compute %.1f ms (%.2f ms/step). Cached graph helps only if build+alloc is a real fraction.\n",
+                ctx->t3_b2_steps, ba, ba / ctx->t3_b2_steps, tot > 0 ? 100.0 * ba / tot : 0.0, cp,
+                cp / ctx->t3_b2_steps);
     }
 
     // Filter to valid range
@@ -2753,7 +3634,7 @@ extern "C" int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx,
         valid.push_back(S3GEN_SIL);
     }
 
-    if (ctx->params.verbosity >= 2 || std::getenv("CHATTERBOX_DEBUG")) {
+    if (ctx->params.verbosity >= 2 || crispasr_env::get("CRISPASR_CHATTERBOX_DEBUG")) {
         fprintf(stderr, "chatterbox: speech_tokens(%zu) first=[", valid.size());
         for (size_t i = 0; i < valid.size() && i < 12; ++i)
             fprintf(stderr, "%d%s", (int)valid[i], i + 1 == valid.size() || i == 11 ? "" : ",");
@@ -2850,8 +3731,14 @@ extern "C" float* chatterbox_synthesize(struct chatterbox_context* ctx, const ch
     }
 
     // Step 1: T3 → speech tokens
+    int64_t t_t3_0 = ggml_time_us();
     int n_tokens = 0;
-    int32_t* speech_tokens = chatterbox_synthesize_tokens(ctx, text, &n_tokens);
+    int32_t* speech_tokens;
+    {
+        chatterbox_bench_stage _b("t3_ar_decode");
+        speech_tokens = chatterbox_synthesize_tokens(ctx, text, &n_tokens);
+    }
+    int64_t t_t3_us = ggml_time_us() - t_t3_0;
     if (!speech_tokens || n_tokens == 0) {
         fprintf(stderr, "chatterbox: T3 produced no speech tokens\n");
         if (speech_tokens)
@@ -2902,11 +3789,51 @@ extern "C" float* chatterbox_synthesize(struct chatterbox_context* ctx, const ch
         }
     }
 
-    float* pcm =
-        chatterbox_s3gen_synthesize(ctx->s3gen_ctx, speech_tokens, n_tokens, prompt_tokens, n_prompt, prompt_feat,
-                                    prompt_feat_len, spk_emb, ctx->params.cfm_steps, out_n_samples);
+    int64_t t_s3_0 = ggml_time_us();
+    float* pcm;
+    {
+        chatterbox_bench_stage _b("s3gen_vocoder");
+        pcm = chatterbox_s3gen_synthesize(ctx->s3gen_ctx, speech_tokens, n_tokens, prompt_tokens, n_prompt, prompt_feat,
+                                          prompt_feat_len, spk_emb, ctx->params.cfm_steps, out_n_samples);
+    }
+    int64_t t_s3gen_us = ggml_time_us() - t_s3_0;
 
     chatterbox_tokens_free(speech_tokens);
+
+    if (pcm && *out_n_samples > 0) {
+        const char* bench = crispasr_env::get("CRISPASR_CHATTERBOX_BENCH");
+        if (bench && bench[0]) {
+            const auto& tp = ctx->last_perf;
+            chatterbox_s3gen_perf sp{};
+            chatterbox_s3gen_get_perf(ctx->s3gen_ctx, &sp);
+            const double audio_s = (double)*out_n_samples / 24000.0;
+            const double total_s = (t_t3_us + t_s3gen_us) / 1e6;
+            fprintf(stderr, "chatterbox: =========== perf report ===========\n");
+            fprintf(stderr, "chatterbox:  audio duration   %7.2f s  (%d samples @ 24 kHz)\n", audio_s, *out_n_samples);
+            fprintf(stderr, "chatterbox:  text tokens      %7d\n", tp.n_text_tokens);
+            fprintf(stderr, "chatterbox:  prefill tokens   %7d\n", tp.n_prefill_tokens);
+            fprintf(stderr, "chatterbox:  speech tokens    %7d\n", tp.n_speech_tokens);
+            fprintf(stderr, "chatterbox:  mel frames       %7d  (%.2f s @ 80 Hz)\n", sp.T_mel, sp.T_mel / 80.0f);
+            fprintf(stderr, "chatterbox: ------- T3 (AR decode) -------------\n");
+            fprintf(stderr, "chatterbox:   tokenize        %7.1f ms\n", tp.t_tokenize_us / 1e3);
+            fprintf(stderr, "chatterbox:   prefill build   %7.1f ms\n", tp.t_prefill_build_us / 1e3);
+            fprintf(stderr, "chatterbox:   prefill compute %7.1f ms\n", tp.t_prefill_us / 1e3);
+            fprintf(stderr, "chatterbox:   decode loop     %7.1f ms  (%d tokens, %.2f ms/tok)\n", tp.t_decode_us / 1e3,
+                    tp.n_speech_tokens, tp.n_speech_tokens > 0 ? tp.t_decode_us / 1e3 / tp.n_speech_tokens : 0.0);
+            fprintf(stderr, "chatterbox:   T3 total        %7.1f ms\n", t_t3_us / 1e3);
+            fprintf(stderr, "chatterbox: ------- S3Gen (CFM + vocoder) ------\n");
+            fprintf(stderr, "chatterbox:   encoder         %7.1f ms\n", sp.t_encoder_us / 1e3);
+            fprintf(stderr, "chatterbox:   CFM euler       %7.1f ms  (%d steps, %.1f ms/step)\n", sp.t_cfm_us / 1e3,
+                    sp.n_cfm_steps, sp.n_cfm_steps > 0 ? sp.t_cfm_us / 1e3 / sp.n_cfm_steps : 0.0);
+            fprintf(stderr, "chatterbox:   HiFT vocoder    %7.1f ms\n", sp.t_vocoder_us / 1e3);
+            fprintf(stderr, "chatterbox:   S3Gen total     %7.1f ms\n", t_s3gen_us / 1e3);
+            fprintf(stderr, "chatterbox: ------- totals ---------------------------\n");
+            fprintf(stderr, "chatterbox:   wall time       %7.1f ms\n", total_s * 1e3);
+            fprintf(stderr, "chatterbox:   RTF             %7.3f  (%.1fx real-time)\n", total_s / audio_s,
+                    audio_s / total_s);
+        }
+    }
+
     return pcm;
 }
 
@@ -3672,6 +4599,24 @@ extern "C" void chatterbox_set_seed(struct chatterbox_context* ctx, uint32_t see
         chatterbox_s3gen_set_seed(ctx->s3gen_ctx, seed);
 }
 
+extern "C" void chatterbox_set_language(struct chatterbox_context* ctx, const char* lang) {
+    if (!ctx)
+        return;
+    if (!lang || !*lang) {
+        ctx->language.clear();
+        return;
+    }
+    // Validate: check the tokenizer vocab for [lang] token
+    std::string tag = std::string("[") + lang + "]";
+    if (ctx->tokenizer.token_to_id.find(tag) == ctx->tokenizer.token_to_id.end()) {
+        fprintf(stderr,
+                "chatterbox: warning: language token '%s' not in vocab — "
+                "generation may not work as expected\n",
+                tag.c_str());
+    }
+    ctx->language = tag;
+}
+
 extern "C" void chatterbox_tokens_free(int32_t* tokens) {
     free(tokens);
 }
@@ -3831,7 +4776,7 @@ extern "C" float* chatterbox_dump_t3_prefill_emb(struct chatterbox_context* ctx,
     if (!ctx->conds.loaded)
         return nullptr;
 
-    std::string norm_text = punc_norm(text);
+    std::string norm_text = chatterbox_text_prep::normalize(text, !ctx->language.empty());
     std::vector<int32_t> text_tokens;
     if (ctx->tokenizer.has_bpe) {
         text_tokens = ctx->tokenizer.bpe_byte_level ? tokenize_text_bpe(ctx->tokenizer, norm_text)
@@ -3839,8 +4784,10 @@ extern "C" float* chatterbox_dump_t3_prefill_emb(struct chatterbox_context* ctx,
     } else {
         text_tokens = tokenize_text(ctx->tokenizer, norm_text);
     }
+    prepend_language_token(ctx, text_tokens);
     text_tokens.insert(text_tokens.begin(), (int32_t)ctx->hp.start_text_token);
     text_tokens.push_back((int32_t)ctx->hp.stop_text_token);
+    cap_text_tokens(ctx, text_tokens, /*is_gpt2=*/false); // #182
 
     std::vector<float> emb = build_prefill_embeds(ctx, text_tokens);
     if (emb.empty())
@@ -3882,7 +4829,7 @@ extern "C" int chatterbox_dump_t3_next_logits(struct chatterbox_context* ctx, co
         return -3;
     }
 
-    std::string norm_text = punc_norm(text);
+    std::string norm_text = chatterbox_text_prep::normalize(text, !ctx->language.empty());
     std::vector<int32_t> text_tokens;
     if (ctx->tokenizer.has_bpe) {
         text_tokens = ctx->tokenizer.bpe_byte_level ? tokenize_text_bpe(ctx->tokenizer, norm_text)
@@ -3890,8 +4837,10 @@ extern "C" int chatterbox_dump_t3_next_logits(struct chatterbox_context* ctx, co
     } else {
         text_tokens = tokenize_text(ctx->tokenizer, norm_text);
     }
+    prepend_language_token(ctx, text_tokens);
     text_tokens.insert(text_tokens.begin(), (int32_t)ctx->hp.start_text_token);
     text_tokens.push_back((int32_t)ctx->hp.stop_text_token);
+    cap_text_tokens(ctx, text_tokens, /*is_gpt2=*/false); // #182
 
     std::vector<float> prefill_embeds = build_prefill_embeds(ctx, text_tokens);
     if (prefill_embeds.empty()) {
@@ -3916,8 +4865,7 @@ extern "C" int chatterbox_dump_t3_next_logits(struct chatterbox_context* ctx, co
         uncond_embeds = prefill_embeds;
         const int text_start = prefill_len - (int)text_tokens.size() - 2;
         const int text_end = prefill_len - 2;
-        std::vector<float> text_pos_table((size_t)ctx->hp.text_pos_emb_size * D);
-        tensor_get_f32(ctx->t3.text_pos_emb_w, text_pos_table.data(), text_pos_table.size());
+        const auto& text_pos_table = ctx->text_pos_emb_cache;
         for (int i = text_start; i < text_end; ++i) {
             const int pos_idx = i - text_start;
             std::memcpy(&uncond_embeds[(size_t)i * D], &text_pos_table[(size_t)pos_idx * D], (size_t)D * sizeof(float));

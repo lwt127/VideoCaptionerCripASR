@@ -25,6 +25,9 @@
 #include "core/fft.h"
 #include "core/gguf_loader.h"
 #include "core/mel.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/tts_ref_cache.h"
+#include "core/crispasr_env.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -33,6 +36,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -66,6 +70,32 @@
 #endif
 
 namespace {
+
+// ===========================================================================
+// Bench instrumentation — `INDEXTTS_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool indextts_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_INDEXTTS_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct indextts_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit indextts_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~indextts_bench_stage() {
+        if (!indextts_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  indextts_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ── Hyperparameters ──────────────────────────────────────────────
 
@@ -303,7 +333,7 @@ static std::string maybe_external_normalize(const std::string& text) {
 }
 #else
 static std::string maybe_external_normalize(const std::string& text) {
-    const char* cmd = getenv("INDEXTTS_TEXT_NORMALIZER");
+    const char* cmd = crispasr_env::get("CRISPASR_INDEXTTS_TEXT_NORMALIZER");
     if (!cmd || !cmd[0]) {
         return text;
     }
@@ -666,7 +696,11 @@ struct indextts_context {
 
     // Conditioning (ref audio → conditioning latents + speaker embedding)
     std::vector<float> cond_latents; // [perceiver_n_latents * d_model] from Conformer+Perceiver
-    std::vector<float> spk_emb;      // [512] from ECAPA-TDNN
+    std::vector<float> spk_emb;      // [512] from ECAPA-TDNN (also the get/set cache slot)
+    // Reference cache: when true, cond_latents + spk_emb are pre-set (e.g. from
+    // an on-disk cache) and the per-run Conformer/Perceiver + ECAPA passes are
+    // skipped. See indextts_set/get/clear_reference_cache.
+    bool ref_cached = false;
 
     // Compute metadata for conditioning graph (separate from GPT graph)
     std::vector<uint8_t> cond_compute_meta;
@@ -884,7 +918,7 @@ static std::vector<float> compute_ref_mel(const float* pcm, int n_samples, int i
     }
 
     // Debug: override resampled audio from file if INDEXTTS_AUDIO24K_FILE is set
-    const char* a24k_file = getenv("INDEXTTS_AUDIO24K_FILE");
+    const char* a24k_file = crispasr_env::get("CRISPASR_INDEXTTS_AUDIO24K_FILE");
     if (a24k_file && a24k_file[0]) {
         FILE* f = fopen(a24k_file, "rb");
         if (f) {
@@ -1108,8 +1142,10 @@ static ggml_cgraph* build_cond_enc_graph(indextts_context* c, int T_mel) {
         ggml_tensor* pw1_b = core_gguf::try_get(ts, fmt("conv.pw1.bias").c_str());
         ggml_tensor* pw1_w2d = ggml_reshape_2d(ctx0, pw1_w, d, 2 * d);
         ggml_tensor* cnv = mm_bias(pw1_w2d, x, pw1_b);
-        ggml_tensor* cnv_gate = ggml_view_2d(ctx0, cnv, d, T_enc, cnv->nb[1], d * sizeof(float));
-        cnv = ggml_mul(ctx0, ggml_view_2d(ctx0, cnv, d, T_enc, cnv->nb[1], 0), ggml_sigmoid(ctx0, cnv_gate));
+        // ggml_cont: non-contiguous views segfault on Vulkan/RDNA4 (issue #184).
+        ggml_tensor* cnv_gate = ggml_cont(ctx0, ggml_view_2d(ctx0, cnv, d, T_enc, cnv->nb[1], d * sizeof(float)));
+        cnv = ggml_mul(ctx0, ggml_cont(ctx0, ggml_view_2d(ctx0, cnv, d, T_enc, cnv->nb[1], 0)),
+                       ggml_sigmoid(ctx0, cnv_gate));
 
         // dw conv (k=15, padding=7)
         const int K_conv = 15;
@@ -1361,7 +1397,7 @@ static bool run_conditioning(indextts_context* c, const float* ref_pcm, int ref_
     auto mel = compute_ref_mel(ref_pcm, ref_n_samples, ref_sr, &T_mel);
 
     // Debug: override mel from file if INDEXTTS_MEL_FILE is set (MelsTime format)
-    const char* mel_file = getenv("INDEXTTS_MEL_FILE");
+    const char* mel_file = crispasr_env::get("CRISPASR_INDEXTTS_MEL_FILE");
     if (mel_file && mel_file[0]) {
         FILE* f = fopen(mel_file, "rb");
         if (f) {
@@ -1382,14 +1418,39 @@ static bool run_conditioning(indextts_context* c, const float* ref_pcm, int ref_
         return true;
     }
 
-    // Limit mel to ~5s reference for ggml_conv_2d stability
-    // No mel truncation needed — full reference audio is used for conditioning.
+    // Cap the reference length to the Conformer's positional-encoding table.
+    // The conditioning encoder subsamples mel by ~2 (Conv2dSubsampling k=3 s=2)
+    // → T_enc = (T_mel-3)/2 + 1, then views T_enc rows out of the fixed-length
+    // `pe` table. A long reference (e.g. a 164 s clip → 15408 mel frames →
+    // T_enc≈7703) overruns the 5000-row `pe` and aborts in ggml_view_2d
+    // ("data_size + view_offs <= ggml_nbytes" — reported on cstr/indextts-1.5-GGUF).
+    // Truncate to the longest reference the table supports (keeps refs that
+    // already worked unchanged; only over-long ones are clipped, from the
+    // start, which is representative for speaker conditioning).
+    if (ggml_tensor* pe = core_gguf::try_get(c->tensors, "cond_enc.embed.pos_enc.pe")) {
+        const int pe_len = (int)pe->ne[1];
+        if (pe_len > 1 && ((T_mel - 3) / 2 + 1) > pe_len) {
+            const int T2 = 2 * (pe_len - 1) + 3; // → T_enc == pe_len
+            std::vector<float> mel2((size_t)100 * T2);
+            for (int b = 0; b < 100; b++)
+                for (int t = 0; t < T2; t++)
+                    mel2[t + (size_t)b * T2] = mel[t + (size_t)b * T_mel]; // band-major
+            mel.swap(mel2);
+            if (c->params.verbosity >= 1) {
+                fprintf(stderr,
+                        "indextts: reference too long (%d mel frames, T_enc=%d > pe=%d); "
+                        "truncating to %d frames (~%.0fs) for conditioning\n",
+                        T_mel, (T_mel - 3) / 2 + 1, pe_len, T2, (double)T2 * 256 / 24000);
+            }
+            T_mel = T2;
+        }
+    }
 
     if (c->params.verbosity >= 1) {
         fprintf(stderr, "indextts: ref mel: %d frames x 100 bands\n", T_mel);
     }
 
-    const bool dbg = getenv("INDEXTTS_DEBUG") != nullptr;
+    const bool dbg = crispasr_env::get("CRISPASR_INDEXTTS_DEBUG") != nullptr;
 
     // Debug: check mel values
     {
@@ -1594,7 +1655,7 @@ static bool run_conditioning(indextts_context* c, const float* ref_pcm, int ref_
     }
 
     // Debug: override conditioning from file
-    const char* cond_file = getenv("INDEXTTS_COND_FILE");
+    const char* cond_file = crispasr_env::get("CRISPASR_INDEXTTS_COND_FILE");
     if (cond_file && cond_file[0]) {
         FILE* f = fopen(cond_file, "rb");
         if (f) {
@@ -2271,7 +2332,7 @@ extern "C" struct indextts_context* indextts_init_from_file(const char* path_mod
         delete c;
         return nullptr;
     }
-    c->backend = params.use_gpu ? ggml_backend_init_best() : c->backend_cpu;
+    c->backend = params.use_gpu ? crispasr_init_gpu_backend() : c->backend_cpu;
     if (!c->backend) {
         if (params.verbosity >= 1 && params.use_gpu) {
             fprintf(stderr, "indextts: GPU backend unavailable, falling back to CPU\n");
@@ -2313,6 +2374,54 @@ extern "C" struct indextts_context* indextts_init_from_file(const char* path_mod
     return c;
 }
 
+// ── Reference cache (voice cloning) ─────────────────────────────────
+// The Conformer/Perceiver conditioning and the ECAPA speaker embedding both
+// scale with reference length and are recomputed every run. These let a caller
+// cache them on disk and restore them, skipping the reference encode entirely.
+
+extern "C" int indextts_conditioning_dim(const struct indextts_context* ctx) {
+    return ctx ? (int)(ctx->hp.perceiver_n_latents * ctx->hp.d_model) : 0;
+}
+
+extern "C" void indextts_set_reference_cache(struct indextts_context* ctx, const float* cond, int cond_count,
+                                             const float* spk, int spk_count) {
+    if (!ctx || !cond || cond_count <= 0)
+        return;
+    ctx->cond_latents.assign(cond, cond + cond_count);
+    if (spk && spk_count == 512)
+        ctx->spk_emb.assign(spk, spk + 512);
+    else
+        ctx->spk_emb.clear();
+    ctx->ref_cached = true;
+}
+
+extern "C" int indextts_get_reference_cache(const struct indextts_context* ctx, const float** cond, int* cond_count,
+                                            const float** spk, int* spk_count) {
+    if (!ctx || ctx->cond_latents.empty())
+        return -1;
+    if (cond)
+        *cond = ctx->cond_latents.data();
+    if (cond_count)
+        *cond_count = (int)ctx->cond_latents.size();
+    if (spk)
+        *spk = ctx->spk_emb.empty() ? nullptr : ctx->spk_emb.data();
+    if (spk_count)
+        *spk_count = (int)ctx->spk_emb.size();
+    return 0;
+}
+
+extern "C" void indextts_clear_reference_cache(struct indextts_context* ctx) {
+    if (ctx)
+        ctx->ref_cached = false;
+}
+
+// Freeze the conditioning + speaker embedding computed by the last synthesize
+// so later calls (e.g. per text chunk) reuse them instead of re-encoding.
+extern "C" void indextts_mark_reference_cached(struct indextts_context* ctx) {
+    if (ctx && !ctx->cond_latents.empty())
+        ctx->ref_cached = true;
+}
+
 extern "C" int indextts_set_vocoder_path(struct indextts_context* ctx, const char* path) {
     if (!ctx || !path) {
         return -1;
@@ -2344,8 +2453,13 @@ extern "C" int32_t* indextts_generate_mel_codes(struct indextts_context* ctx, co
     }
     *out_n = 0;
 
-    // Run conditioning pipeline if reference audio is provided
-    if (ref_pcm && ref_n_samples > 0) {
+    indextts_bench_stage _bs_total("generate_mel_codes");
+
+    // Run conditioning pipeline if reference audio is provided. Skipped when a
+    // reference cache is loaded (cond_latents already populated).
+    if (ctx->ref_cached && !ctx->cond_latents.empty()) {
+        // use cached cond_latents as-is
+    } else if (ref_pcm && ref_n_samples > 0) {
         if (!run_conditioning(ctx, ref_pcm, ref_n_samples)) {
             fprintf(stderr, "indextts: conditioning pipeline failed\n");
         }
@@ -2357,7 +2471,7 @@ extern "C" int32_t* indextts_generate_mel_codes(struct indextts_context* ctx, co
     }
 
     // Debug: override conditioning from file (works even without reference audio)
-    const char* cond_file = getenv("INDEXTTS_COND_FILE");
+    const char* cond_file = crispasr_env::get("CRISPASR_INDEXTTS_COND_FILE");
     if (cond_file && cond_file[0]) {
         FILE* f = fopen(cond_file, "rb");
         if (f) {
@@ -2461,7 +2575,7 @@ extern "C" int32_t* indextts_generate_mel_codes(struct indextts_context* ctx, co
     // full ~158 MiB KV cache per beam. INDEXTTS_BEAM_SIZE=1 skips the swap
     // entirely (greedy, ~2× faster).
     int B = 3;
-    if (const char* bs = getenv("INDEXTTS_BEAM_SIZE")) {
+    if (const char* bs = crispasr_env::get("CRISPASR_INDEXTTS_BEAM_SIZE")) {
         int v = atoi(bs);
         if (v >= 1 && v <= 16) {
             B = v;
@@ -2481,7 +2595,7 @@ extern "C" int32_t* indextts_generate_mel_codes(struct indextts_context* ctx, co
     //     a parent (children inherit parent's KV, only spend a copy when
     //     siblings split off the same parent).
     bool use_device_kv = false;
-    if (const char* e = getenv("INDEXTTS_KV_DEVICE_COPY")) {
+    if (const char* e = crispasr_env::get("CRISPASR_INDEXTTS_KV_DEVICE_COPY")) {
         use_device_kv = (atoi(e) != 0);
     }
 
@@ -2802,15 +2916,48 @@ extern "C" float* indextts_synthesize(struct indextts_context* ctx, const char* 
     }
     *out_n_samples = 0;
 
+    indextts_bench_stage _bs_synth("synthesize");
+
+    // Content-addressed reference cache (runtime, so every consumer — CLI, C
+    // ABI, server, wrappers — benefits). Key = hash of the reference PCM; a hit
+    // restores the Conformer/Perceiver conditioning + ECAPA embedding, skipping
+    // the expensive per-run encode. Blob = [cond_dim floats][512 ECAPA floats?].
+    uint64_t ref_key = 0;
+    bool ref_cache_miss = false;
+    if (ref_pcm && ref_n_samples > 0 && !ctx->ref_cached && !crispasr_ref_cache::disabled()) {
+        ref_key = crispasr_ref_cache::fnv1a(ref_pcm, (size_t)ref_n_samples * sizeof(float));
+        const int cond_dim = (int)(ctx->hp.perceiver_n_latents * ctx->hp.d_model);
+        std::vector<uint32_t> shape;
+        std::vector<float> blob;
+        if (crispasr_ref_cache::get_floats("indextts-cond", &ref_key, sizeof(ref_key), shape, blob) &&
+            shape.size() == 2 && (int)shape[0] == cond_dim && (shape[1] == 0 || shape[1] == 512) &&
+            blob.size() == (size_t)shape[0] + shape[1]) {
+            ctx->cond_latents.assign(blob.begin(), blob.begin() + cond_dim);
+            if (shape[1] == 512)
+                ctx->spk_emb.assign(blob.begin() + cond_dim, blob.end());
+            else
+                ctx->spk_emb.clear();
+            ctx->ref_cached = true; // generate_mel_codes + the ECAPA step now reuse these
+            if (ctx->params.verbosity >= 1)
+                fprintf(stderr, "indextts: reference conditioning from cache\n");
+        } else {
+            ref_cache_miss = true;
+        }
+    }
+
     // Step 1: Generate mel codes via AR decode
     int n_codes = 0;
-    int32_t* codes = indextts_generate_mel_codes(ctx, text, ref_pcm, ref_n_samples, &n_codes);
+    int32_t* codes;
+    {
+        indextts_bench_stage _bs("ar_decode");
+        codes = indextts_generate_mel_codes(ctx, text, ref_pcm, ref_n_samples, &n_codes);
+    }
     if (!codes || n_codes == 0) {
         return nullptr;
     }
 
     // Debug: override mel codes from file if INDEXTTS_MEL_CODES_FILE is set
-    const char* mc_file = getenv("INDEXTTS_MEL_CODES_FILE");
+    const char* mc_file = crispasr_env::get("CRISPASR_INDEXTTS_MEL_CODES_FILE");
     if (mc_file && mc_file[0]) {
         FILE* f = fopen(mc_file, "rb");
         if (f) {
@@ -2853,7 +3000,11 @@ extern "C" float* indextts_synthesize(struct indextts_context* ctx, const char* 
 
     // Step 3: Run GPT latent extraction (second forward pass)
     // Latent has (n_codes + 1) positions: [start_mel, m1, ..., mk]
-    float* latent = run_gpt_latent(ctx, text_tokens, mel_codes_vec);
+    float* latent;
+    {
+        indextts_bench_stage _bs("latent_extraction");
+        latent = run_gpt_latent(ctx, text_tokens, mel_codes_vec);
+    }
     int n_latent = n_codes + 1; // matches Python's mel_logits[:, :-2]
     if (!latent) {
         fprintf(stderr, "indextts: latent extraction failed\n");
@@ -2863,7 +3014,12 @@ extern "C" float* indextts_synthesize(struct indextts_context* ctx, const char* 
     // Step 4: Compute speaker embedding from reference audio via ECAPA-TDNN
     // ECAPA-TDNN speaker embedding for vocoder conditioning.
     float* spk_emb = nullptr;
-    if (ref_pcm && ref_n_samples > 0 && ctx->voc) {
+    if (ctx->ref_cached && ctx->spk_emb.size() == 512) {
+        // Reuse the cached ECAPA embedding (skip the per-run pass).
+        spk_emb = (float*)malloc(512 * sizeof(float));
+        if (spk_emb)
+            memcpy(spk_emb, ctx->spk_emb.data(), 512 * sizeof(float));
+    } else if (ref_pcm && ref_n_samples > 0 && ctx->voc) {
         spk_emb = indextts_voc_speaker_embed(ctx->voc, ref_pcm, ref_n_samples);
         if (spk_emb) {
             float raw_norm = 0.0f;
@@ -2877,7 +3033,7 @@ extern "C" float* indextts_synthesize(struct indextts_context* ctx, const char* 
             // conditioning energy. INDEXTTS_SPK_NORM controls the behaviour:
             //   unset / "raw"   → pass through unchanged (matches upstream)
             //   "0.9" / "1.0" …→ rescale to that L2 norm (old behaviour)
-            const char* spk_norm_env = getenv("INDEXTTS_SPK_NORM");
+            const char* spk_norm_env = crispasr_env::get("CRISPASR_INDEXTTS_SPK_NORM");
             float target_norm = 0.0f;
             if (spk_norm_env && spk_norm_env[0] && strcmp(spk_norm_env, "raw") != 0) {
                 target_norm = (float)atof(spk_norm_env);
@@ -2887,6 +3043,8 @@ extern "C" float* indextts_synthesize(struct indextts_context* ctx, const char* 
                 for (int i = 0; i < 512; i++)
                     spk_emb[i] *= scale;
             }
+            // Stash the final (post-rescale) embedding for indextts_get_reference_cache.
+            ctx->spk_emb.assign(spk_emb, spk_emb + 512);
             if (ctx->params.verbosity >= 1) {
                 float n2 = 0;
                 for (int i = 0; i < 512; i++)
@@ -2897,8 +3055,21 @@ extern "C" float* indextts_synthesize(struct indextts_context* ctx, const char* 
         }
     }
 
+    // On a cache miss, persist the freshly-computed conditioning + ECAPA
+    // embedding, and freeze them so later chunks in this run reuse them too.
+    if (ref_cache_miss && !ctx->cond_latents.empty()) {
+        ctx->ref_cached = true;
+        std::vector<float> blob(ctx->cond_latents);
+        const bool has_spk = ctx->spk_emb.size() == 512;
+        if (has_spk)
+            blob.insert(blob.end(), ctx->spk_emb.begin(), ctx->spk_emb.end());
+        crispasr_ref_cache::put_floats("indextts-cond", &ref_key, sizeof(ref_key),
+                                       {(uint32_t)ctx->cond_latents.size(), (uint32_t)(has_spk ? 512 : 0)}, blob.data(),
+                                       blob.size());
+    }
+
     // Debug: override latent from file if INDEXTTS_LATENT_FILE is set
-    const char* lat_file = getenv("INDEXTTS_LATENT_FILE");
+    const char* lat_file = crispasr_env::get("CRISPASR_INDEXTTS_LATENT_FILE");
     if (lat_file && lat_file[0]) {
         FILE* f = fopen(lat_file, "rb");
         if (f) {
@@ -2920,7 +3091,11 @@ extern "C" float* indextts_synthesize(struct indextts_context* ctx, const char* 
     // Step 5: Run BigVGAN vocoder
     // latent is [n_latent, 1280] — includes start_mel + all generated mel codes.
     int n_audio = 0;
-    float* pcm = indextts_voc_generate(ctx->voc, latent, n_latent, spk_emb, &n_audio);
+    float* pcm;
+    {
+        indextts_bench_stage _bs("vocoder");
+        pcm = indextts_voc_generate(ctx->voc, latent, n_latent, spk_emb, &n_audio);
+    }
     free(latent);
     free(spk_emb);
 

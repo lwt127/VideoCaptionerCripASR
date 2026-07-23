@@ -1,9 +1,19 @@
-"""Smoke test: every CA_EXPORT symbol from crispasr_c_api.cpp is reachable
-from the Python ctypes binding.
+"""Smoke test: the maintained shared C-ABI symbol set is reachable from
+the Python ctypes binding.
 
 Does NOT instantiate models or run inference — purely checks that the
-binding declares (and can look up) all 149 exported C-ABI functions.
+binding declares (and can look up) all 152 symbols in this smoke-test set.
 Requires CRISPASR_LIB_PATH pointing at a built libcrispasr.{so,dylib}.
+
+KNOWN GAP: this list is a curated subset, NOT the full export surface.
+src/crispasr_c_api.cpp currently declares 199 distinct CA_EXPORT symbols, so
+~47 are unlisted and this test would not notice if a binding stopped exposing
+one of them. Treat a green run as "the listed symbols are reachable", not as
+"the ABI is fully covered". When adding symbols here, prefer closing the gap
+over matching the existing count. Regenerate the true export list with:
+
+    grep -oE 'CA_EXPORT[[:space:]]+[A-Za-z_]+[[:space:]*]+crispasr_[A-Za-z0-9_]+' \\
+        src/crispasr_c_api.cpp | grep -oE 'crispasr_[A-Za-z0-9_]+' | sort -u
 
     CRISPASR_LIB_PATH=build/src/libcrispasr.so python -m pytest tests/test_binding_parity.py -v
 """
@@ -14,7 +24,7 @@ import sys
 
 import pytest
 
-# All 149 CA_EXPORT symbols (sorted, from:
+# Maintained shared C-ABI smoke-test symbols (sorted; additions can be found with:
 #   grep -oP 'CA_EXPORT\s+\w+[\s*]+\K(crispasr_\w+)' src/crispasr_c_api.cpp | sort -u
 # )
 ALL_SYMBOLS = [
@@ -78,6 +88,8 @@ ALL_SYMBOLS = [
     "crispasr_pyannote_cache_apply_abi",
     "crispasr_pyannote_cache_compute_abi",
     "crispasr_pyannote_cache_free_abi",
+    "crispasr_registry_default_bundle_artifact_abi",
+    "crispasr_registry_default_bundle_info_abi",
     "crispasr_registry_list_backends_abi",
     "crispasr_registry_lookup_abi",
     "crispasr_registry_lookup_by_filename_abi",
@@ -116,6 +128,7 @@ ALL_SYMBOLS = [
     "crispasr_session_set_max_new_tokens",
     "crispasr_session_set_max_speech_tokens",
     "crispasr_session_set_min_p",
+    "crispasr_session_set_punc_model",
     "crispasr_session_set_punctuation",
     "crispasr_session_set_repetition_penalty",
     "crispasr_session_set_source_language",
@@ -138,10 +151,10 @@ ALL_SYMBOLS = [
     "crispasr_session_translate_text_free",
     "crispasr_speaker_cluster_abi",
     "crispasr_speaker_db_count",
-    "crispasr_speaker_db_enroll",
+    "crispasr_speaker_db_enroll2",
     "crispasr_speaker_db_free",
-    "crispasr_speaker_db_load",
     "crispasr_speaker_db_match",
+    "crispasr_speaker_db_open",
     "crispasr_speaker_embedder_dim_abi",
     "crispasr_speaker_embedder_embed_abi",
     "crispasr_speaker_embedder_free_abi",
@@ -195,8 +208,8 @@ def test_symbol_resolves(lib, symbol):
 
 
 def test_symbol_count(lib):
-    """Sanity: we expect exactly 149 crispasr_* symbols."""
-    assert len(ALL_SYMBOLS) == 149, f"expected 149 symbols, got {len(ALL_SYMBOLS)}"
+    """Sanity-check accidental edits to the maintained symbol set."""
+    assert len(ALL_SYMBOLS) == 152, f"expected 152 symbols, got {len(ALL_SYMBOLS)}"
 
 
 def test_python_binding_imports():

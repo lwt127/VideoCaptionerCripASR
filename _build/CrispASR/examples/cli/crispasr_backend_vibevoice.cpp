@@ -17,6 +17,7 @@
 #include <utility>
 #include <sys/stat.h>
 #include <vector>
+#include "core/crispasr_env.h"
 
 namespace {
 
@@ -83,6 +84,9 @@ public:
         return caps;
     }
 
+    // VibeVoice operates at 24 kHz internally.
+    int input_sample_rate() const override { return 24000; }
+
     bool init(const whisper_params& p) override {
         vibevoice_context_params cp = vibevoice_context_default_params();
         cp.n_threads = p.n_threads;
@@ -90,6 +94,7 @@ public:
         cp.verbosity = p.no_prints ? 0 : 1;
         cp.use_gpu = crispasr_backend_should_use_gpu(p);
         cp.tts_steps = p.tts_steps;
+        cp.cfg_scale = p.tts_cfg_scale;
         ctx_ = vibevoice_init_from_file(p.model.c_str(), cp);
         if (!ctx_) {
             fprintf(stderr, "crispasr[vibevoice]: failed to load model '%s'\n", p.model.c_str());
@@ -113,20 +118,31 @@ public:
     }
 
     std::vector<crispasr_segment> transcribe(const float* samples, int n_samples, int64_t t_offset_cs,
-                                             const whisper_params& /*params*/) override {
+                                             const whisper_params& params) override {
         std::vector<crispasr_segment> out;
         if (!ctx_ || !samples || n_samples <= 0)
             return out;
 
-        const std::vector<float> pcm24 = resample_16k_to_24k(samples, n_samples);
-        char* text = vibevoice_transcribe(ctx_, pcm24.data(), (int)pcm24.size());
+        // When the CLI already loaded at 24 kHz (via input_sample_rate()),
+        // pass through directly — no lossy resample needed.
+        const int sr = input_sample_rate();
+        const float* vv_pcm = samples;
+        int vv_n = n_samples;
+        std::vector<float> pcm24_buf;
+        if (sr != 24000) {
+            pcm24_buf = resample_16k_to_24k(samples, n_samples);
+            vv_pcm = pcm24_buf.data();
+            vv_n = (int)pcm24_buf.size();
+        }
+        const char* context = params.context.empty() ? nullptr : params.context.c_str();
+        char* text = vibevoice_transcribe_with_context(ctx_, vv_pcm, vv_n, context);
         if (!text)
             return out;
 
         crispasr_segment seg;
         seg.text = text;
         seg.t0 = t_offset_cs;
-        seg.t1 = t_offset_cs + (int64_t)((double)n_samples * 100.0 / 16000.0);
+        seg.t1 = t_offset_cs + (int64_t)((double)n_samples * 100.0 / (double)sr);
         out.push_back(std::move(seg));
         std::free(text);
         return out;
@@ -136,6 +152,7 @@ public:
         if (ctx_) {
             vibevoice_set_tts_steps(ctx_, params.tts_steps);
             vibevoice_set_seed(ctx_, (uint32_t)params.seed);
+            vibevoice_set_cfg_scale(ctx_, params.tts_cfg_scale);
         }
         // Voice resolution order:
         //   1. Bare-name in --voice-dir: <voice-dir>/<name>.gguf
@@ -221,7 +238,7 @@ public:
         // Gate: the realtime model requires a prompt voice. The 1.5B base
         // model can run without one and generate its generic prior voice.
         if (!allow_generic_no_voice_ && last_voice_key_.empty() && wav_ref_path_.empty()) {
-            const char* voice_wav_env = getenv("VIBEVOICE_VOICE_AUDIO");
+            const char* voice_wav_env = crispasr_env::get("CRISPASR_VIBEVOICE_VOICE_AUDIO");
             if (!voice_wav_env || !voice_wav_env[0]) {
                 fprintf(stderr,
                         "crispasr[%s]: no voice prompt resolved (pass --voice <path.gguf>, --voice <path.wav>, "

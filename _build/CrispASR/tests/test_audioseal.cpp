@@ -5,6 +5,7 @@
 // AUDIOSEAL_GGUF environment variable pointing at an audioseal.gguf.
 
 #include "audioseal.h"
+#include "core/crispasr_env.h"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -61,7 +62,7 @@ TEST_CASE("audioseal_nbits with null returns 16", "[unit][audioseal]") {
 
 namespace {
 const char* get_gguf_path() {
-    return std::getenv("AUDIOSEAL_GGUF");
+    return crispasr_env::get("CRISPASR_AUDIOSEAL_GGUF");
 }
 
 std::vector<float> make_sine_16k(int n_samples, float freq = 440.0f, float amp = 0.3f) {
@@ -145,10 +146,27 @@ TEST_CASE("audioseal embed+detect round-trip", "[audioseal][live]") {
         for (int i = 0; i < n_det; i++)
             avg_prob += probs[i];
         avg_prob /= (double)n_det;
-        // With correct LSTM, this should be >> 0.5
-        // With approximation, we at least check it doesn't crash
-        INFO("average detection probability: " << avg_prob);
+        // A correctly-ported generator+detector recovers its own watermark with
+        // high confidence — well above chance. (Not merely "doesn't crash".)
+        printf("audioseal round-trip: avg detection probability = %.4f over %d frames\n", avg_prob, n_det);
+        REQUIRE(avg_prob > 0.9);
         std::free(probs);
+    } else {
+        FAIL("audioseal_detect returned null — detector did not run");
+    }
+
+    // The detector must DISCRIMINATE: the un-watermarked input must score low.
+    // (Guards against a degenerate "always ~1" or "always ~0.5" detector.)
+    int n_clean = 0;
+    float* clean_probs = audioseal_detect(ctx, pcm.data(), (int)pcm.size(), &n_clean, nullptr);
+    if (clean_probs) {
+        double avg_clean = 0.0;
+        for (int i = 0; i < n_clean; i++)
+            avg_clean += clean_probs[i];
+        avg_clean /= (double)n_clean;
+        printf("audioseal clean (unwatermarked): avg detection probability = %.4f\n", avg_clean);
+        REQUIRE(avg_clean < 0.5);
+        std::free(clean_probs);
     }
 
     std::free(watermarked);

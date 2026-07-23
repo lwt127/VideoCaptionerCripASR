@@ -6,24 +6,54 @@
 
 #include "pyannote_seg.h"
 #include "core/gguf_loader.h"
+#include "core/crispasr_env.h"
 
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+// ===========================================================================
+// Bench instrumentation — `PYANNOTE_SEG_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool pyannote_seg_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_PYANNOTE_SEG_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct pyannote_seg_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit pyannote_seg_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~pyannote_seg_bench_stage() {
+        if (!pyannote_seg_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  pyannote_seg_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ===========================================================================
 // Model
@@ -135,6 +165,265 @@ static bool pyannote_load(pyannote_model& m, const char* path) {
 }
 
 // ===========================================================================
+// ggml forward (default) — threaded SIMD convs/matmuls on the CPU backend.
+// Only the inherently sequential LSTM recurrence stays as plain loops
+// (contiguous dot products, one thread per direction); the per-timestep
+// input projections W@x — 2/3 of the LSTM FLOPs — are batched into one
+// mul_mat over the whole sequence per layer/direction.
+// CRISPASR_PYANNOTE_LEGACY=1 selects the original scalar path (A/B ground
+// truth; the ggml path is validated frame-for-frame against it).
+// ===========================================================================
+
+static bool pyannote_use_legacy() {
+    static const bool v = [] {
+        const char* e = std::getenv("CRISPASR_PYANNOTE_LEGACY");
+        return e && *e && *e != '0';
+    }();
+    return v;
+}
+
+// PYANNOTE_SEG_DUMP=<path>: write the (T,7) log-prob output as raw F32 for
+// A/B comparison between the ggml and legacy paths.
+static void pyannote_seg_dump(const float* logp, int T) {
+    const char* p = crispasr_env::get("CRISPASR_PYANNOTE_SEG_DUMP");
+    if (!p || !logp)
+        return;
+    if (FILE* f = fopen(p, "wb")) {
+        fwrite(logp, sizeof(float), (size_t)T * 7, f);
+        fclose(f);
+    }
+}
+
+// Run a small CPU-backend graph: alloc, set inputs, compute. Caller builds
+// the graph in `ctx0` and passes the inputs to set.
+struct pyannote_graph_run {
+    ggml_context* ctx0 = nullptr;
+    ggml_cgraph* gf = nullptr;
+    ggml_gallocr_t ga = nullptr;
+
+    explicit pyannote_graph_run(size_t n_nodes) {
+        ggml_init_params ip = {n_nodes * ggml_tensor_overhead() + ggml_graph_overhead_custom(n_nodes, false), nullptr,
+                               true};
+        ctx0 = ggml_init(ip);
+        if (ctx0)
+            gf = ggml_new_graph_custom(ctx0, n_nodes, false);
+    }
+    ~pyannote_graph_run() {
+        if (ga)
+            ggml_gallocr_free(ga);
+        if (ctx0)
+            ggml_free(ctx0);
+    }
+    bool compute(ggml_backend_t backend, ggml_tensor* out) {
+        ggml_set_output(out);
+        ggml_build_forward_expand(gf, out);
+        ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        if (!ggml_gallocr_alloc_graph(ga, gf))
+            return false;
+        return true; // caller sets inputs, then calls ggml_backend_graph_compute
+    }
+};
+
+// SincNet front-end: conv(1→80,k=251,s=10) → |·| → IN+LeakyReLU → pool3 →
+// [conv(k=5,p=2) → IN+LeakyReLU → pool3] ×2. Returns row-major (T_out, 60).
+static bool pyannote_sincnet_ggml(pyannote_seg_context* ctx, const float* samples, int n_samples,
+                                  std::vector<float>& out, int& T_out) {
+    pyannote_seg_bench_stage _bs("sincnet_ggml");
+    const auto& m = ctx->model;
+
+    pyannote_graph_run run(96);
+    if (!run.ctx0)
+        return false;
+    ggml_context* c = run.ctx0;
+
+    ggml_tensor* audio = ggml_new_tensor_2d(c, GGML_TYPE_F32, n_samples, 1);
+    ggml_set_input(audio);
+
+    auto inorm_lrelu = [&](ggml_tensor* x, ggml_tensor* w, ggml_tensor* b) {
+        // x is (T, C): ggml_norm normalizes over ne[0]=T → InstanceNorm.
+        if (w && b) {
+            const int64_t C = x->ne[1];
+            x = ggml_norm(c, x, 1e-5f);
+            x = ggml_add(c, ggml_mul(c, x, ggml_reshape_2d(c, w, 1, C)), ggml_reshape_2d(c, b, 1, C));
+        }
+        return ggml_leaky_relu(c, x, 0.01f, false);
+    };
+
+    ggml_tensor* x = ggml_conv_1d(c, m.sinc_filters, audio, 10, 0, 1); // (T, 80)
+    x = ggml_abs(c, x);                                                // SincNet uses |conv|
+    x = inorm_lrelu(x, m.norm0_w, m.norm0_b);
+    x = ggml_pool_1d(c, x, GGML_OP_POOL_MAX, 3, 3, 0); // (T/3, 80)
+
+    x = ggml_conv_1d(c, m.conv1_w, x, 1, 2, 1); // (T1, 60)
+    x = ggml_add(c, x, ggml_reshape_2d(c, m.conv1_b, 1, 60));
+    x = inorm_lrelu(x, m.norm1_w, m.norm1_b);
+    x = ggml_pool_1d(c, x, GGML_OP_POOL_MAX, 3, 3, 0);
+
+    x = ggml_conv_1d(c, m.conv2_w, x, 1, 2, 1); // (T2, 60)
+    x = ggml_add(c, x, ggml_reshape_2d(c, m.conv2_b, 1, 60));
+    x = inorm_lrelu(x, m.norm2_w, m.norm2_b);
+    x = ggml_pool_1d(c, x, GGML_OP_POOL_MAX, 3, 3, 0); // (T3, 60)
+
+    ggml_tensor* res = ggml_cont(c, ggml_transpose(c, x)); // (60, T3) → row-major (T3, 60)
+    if (!run.compute(ctx->model.backend, res))
+        return false;
+    ggml_backend_tensor_set(audio, samples, 0, (size_t)n_samples * sizeof(float));
+    if (ggml_backend_graph_compute(ctx->model.backend, run.gf) != GGML_STATUS_SUCCESS)
+        return false;
+
+    T_out = (int)res->ne[1];
+    out.resize((size_t)T_out * 60);
+    ggml_backend_tensor_get(res, out.data(), 0, out.size() * sizeof(float));
+    return true;
+}
+
+// One bidirectional LSTM layer. Input/output row-major (T, C_in) / (T, 2H).
+// Input projections batched as one mul_mat per direction; recurrence in
+// plain contiguous loops, one thread per direction.
+static bool bilstm_forward_ggml(pyannote_seg_context* ctx, const float* input, int T, int C_in,
+                                const pyannote_lstm& lstm, float* output) {
+    const int H = lstm.hidden_size;
+
+    // XW[dir] = W_dir @ x_t + Bi + Bh for all t: (4H, T) row-major (T, 4H).
+    std::vector<float> xw[2];
+    {
+        pyannote_graph_run run(24);
+        if (!run.ctx0)
+            return false;
+        ggml_context* c = run.ctx0;
+        ggml_tensor* X = ggml_new_tensor_2d(c, GGML_TYPE_F32, C_in, T); // row-major (T, C_in)
+        ggml_set_input(X);
+        ggml_tensor* outs[2];
+        for (int dir = 0; dir < 2; dir++) {
+            // W ne=(C_in, 4H, 2) → dir slice (C_in, 4H); B ne=(8H, 2).
+            ggml_tensor* Wd = ggml_view_2d(c, lstm.W, C_in, 4 * H, lstm.W->nb[1], (size_t)dir * lstm.W->nb[2]);
+            ggml_tensor* Bi =
+                ggml_cont(c, ggml_view_2d(c, lstm.B, 4 * H, 1, lstm.B->nb[1], (size_t)dir * lstm.B->nb[1]));
+            ggml_tensor* Bh = ggml_cont(c, ggml_view_2d(c, lstm.B, 4 * H, 1, lstm.B->nb[1],
+                                                        (size_t)dir * lstm.B->nb[1] + 4 * H * lstm.B->nb[0]));
+            ggml_tensor* mm = ggml_mul_mat(c, ggml_cont(c, Wd), X); // (4H, T)
+            outs[dir] = ggml_add(c, ggml_add(c, mm, Bi), Bh);
+            ggml_set_output(outs[dir]);
+            ggml_build_forward_expand(run.gf, outs[dir]);
+        }
+        run.ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->model.backend));
+        if (!ggml_gallocr_alloc_graph(run.ga, run.gf))
+            return false;
+        ggml_backend_tensor_set(X, input, 0, (size_t)T * C_in * sizeof(float));
+        if (ggml_backend_graph_compute(ctx->model.backend, run.gf) != GGML_STATUS_SUCCESS)
+            return false;
+        for (int dir = 0; dir < 2; dir++) {
+            xw[dir].resize((size_t)T * 4 * H);
+            ggml_backend_tensor_get(outs[dir], xw[dir].data(), 0, xw[dir].size() * sizeof(float));
+        }
+    }
+
+    // Sequential recurrence — contiguous dots over H (autovectorized).
+    auto run_dir = [&](int dir) {
+        const float* R_dir = (const float*)lstm.R->data + (size_t)dir * 4 * H * H;
+        std::vector<float> h(H, 0.f), cc(H, 0.f), gates(4 * H);
+        auto sigmoid = [](float x) { return 1.f / (1.f + expf(-x)); };
+        for (int step = 0; step < T; step++) {
+            int t = (dir == 0) ? step : (T - 1 - step);
+            const float* xwt = xw[dir].data() + (size_t)t * 4 * H;
+            for (int g = 0; g < 4 * H; g++) {
+                const float* r = R_dir + (size_t)g * H;
+                float sum = xwt[g];
+                for (int j = 0; j < H; j++)
+                    sum += r[j] * h[j];
+                gates[g] = sum;
+            }
+            // ONNX gate order: i, o, f, c
+            for (int j = 0; j < H; j++) {
+                float i_g = sigmoid(gates[0 * H + j]);
+                float o_g = sigmoid(gates[1 * H + j]);
+                float f_g = sigmoid(gates[2 * H + j]);
+                float c_g = tanhf(gates[3 * H + j]);
+                cc[j] = f_g * cc[j] + i_g * c_g;
+                h[j] = o_g * tanhf(cc[j]);
+            }
+            float* out_t = output + (size_t)t * 2 * H;
+            for (int j = 0; j < H; j++)
+                out_t[dir * H + j] = h[j];
+        }
+    };
+    std::thread bwd(run_dir, 1);
+    run_dir(0);
+    bwd.join();
+    return true;
+}
+
+// 3× Linear (+LeakyReLU) + LogSoftmax over the 7 classes.
+// Input row-major (T, 256); output row-major (T, 7).
+static bool pyannote_classifier_ggml(pyannote_seg_context* ctx, const float* input, int T, std::vector<float>& out) {
+    pyannote_seg_bench_stage _bs("classifier_ggml");
+    const auto& m = ctx->model;
+
+    pyannote_graph_run run(32);
+    if (!run.ctx0)
+        return false;
+    ggml_context* c = run.ctx0;
+
+    ggml_tensor* X = ggml_new_tensor_2d(c, GGML_TYPE_F32, 256, T);
+    ggml_set_input(X);
+    // matmul weights stored ne=(C_out, C_in) — transpose for mul_mat's (k, n).
+    auto lin = [&](ggml_tensor* x, ggml_tensor* w, ggml_tensor* b, bool lrelu) {
+        ggml_tensor* wt = ggml_cont(c, ggml_transpose(c, w));
+        x = ggml_mul_mat(c, wt, x); // (C_out, T)
+        if (b)
+            x = ggml_add(c, x, b);
+        return lrelu ? ggml_leaky_relu(c, x, 0.01f, false) : x;
+    };
+    ggml_tensor* x = lin(X, m.matmul0_w, m.linear0_b, true);
+    x = lin(x, m.matmul1_w, m.linear1_b, true);
+    x = lin(x, m.matmul2_w, m.linear2_b, false); // (7, T)
+    x = ggml_log(c, ggml_soft_max(c, x));        // LogSoftmax over ne[0]=7
+
+    if (!run.compute(ctx->model.backend, x))
+        return false;
+    ggml_backend_tensor_set(X, input, 0, (size_t)T * 256 * sizeof(float));
+    if (ggml_backend_graph_compute(ctx->model.backend, run.gf) != GGML_STATUS_SUCCESS)
+        return false;
+
+    out.resize((size_t)T * 7);
+    ggml_backend_tensor_get(x, out.data(), 0, out.size() * sizeof(float)); // (7,T) flat = row-major (T,7)
+    return true;
+}
+
+static float* pyannote_seg_run_ggml(pyannote_seg_context* ctx, const float* samples, int n_samples, int* out_T) {
+    const auto& m = ctx->model;
+
+    std::vector<float> feats;
+    int T = 0;
+    if (!pyannote_sincnet_ggml(ctx, samples, n_samples, feats, T) || T <= 0)
+        return nullptr;
+
+    std::vector<float> lstm_out((size_t)T * 256);
+    {
+        pyannote_seg_bench_stage _bs("lstm_ggml");
+        std::vector<float> lstm_in = std::move(feats);
+        for (int li = 0; li < 4; li++) {
+            int C_in = (li == 0) ? 60 : 256;
+            if (!bilstm_forward_ggml(ctx, lstm_in.data(), T, C_in, m.lstm[li], lstm_out.data()))
+                return nullptr;
+            lstm_in = lstm_out;
+        }
+    }
+
+    std::vector<float> logp;
+    if (!pyannote_classifier_ggml(ctx, lstm_out.data(), T, logp))
+        return nullptr;
+
+    if (out_T)
+        *out_T = T;
+    float* result = (float*)malloc((size_t)T * 7 * sizeof(float));
+    if (result)
+        memcpy(result, logp.data(), (size_t)T * 7 * sizeof(float));
+    pyannote_seg_dump(result, T);
+    return result;
+}
+
+// ===========================================================================
 // LSTM forward (bidirectional)
 // ===========================================================================
 
@@ -202,6 +491,7 @@ extern "C" struct pyannote_seg_context* pyannote_seg_init(const char* gguf_path,
         delete ctx;
         return nullptr;
     }
+    ggml_backend_cpu_set_n_threads(ctx->model.backend, ctx->n_threads);
     fprintf(stderr, "pyannote_seg: loaded (%d LSTM layers, hidden=%d)\n", 4, ctx->model.lstm[0].hidden_size);
     return ctx;
 }
@@ -221,6 +511,9 @@ extern "C" void pyannote_seg_free(struct pyannote_seg_context* ctx) {
 extern "C" float* pyannote_seg_run(struct pyannote_seg_context* ctx, const float* samples, int n_samples, int* out_T) {
     if (!ctx || !samples || n_samples <= 0)
         return nullptr;
+    pyannote_seg_bench_stage _bs_total("run_total");
+    if (!pyannote_use_legacy())
+        return pyannote_seg_run_ggml(ctx, samples, n_samples, out_T);
     const auto& m = ctx->model;
 
     // ---- SincNet front-end ----
@@ -398,5 +691,6 @@ extern "C" float* pyannote_seg_run(struct pyannote_seg_context* ctx, const float
     float* result = (float*)malloc(T_lstm * 7 * sizeof(float));
     if (result)
         memcpy(result, lin2.data(), T_lstm * 7 * sizeof(float));
+    pyannote_seg_dump(result, T_lstm);
     return result;
 }

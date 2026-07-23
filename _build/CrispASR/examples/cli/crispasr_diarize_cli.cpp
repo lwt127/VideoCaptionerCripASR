@@ -12,6 +12,7 @@
 #include "crispasr_speaker_cluster.h"
 #include "crispasr_speaker_embedder.h"
 #include "pyannote_seg.h"
+#include "speaker_db.h"
 #include "whisper_params.h"
 
 #include <algorithm>
@@ -467,81 +468,34 @@ void split_segments_on_pyannote_turns(std::vector<crispasr_segment>& segs, const
             }
         }
 
-        // Stability filter: pyannote-seg without speaker embeddings
-        // can flip its local track index mid-phrase, producing one-word
-        // "(speaker 2)" stubs inside a contiguous "(speaker 1)" run.
-        // We collapse any run shorter than MIN_RUN_CS into the longer
-        // adjacent run before emitting sub-segments. Tuned at 50 cs
-        // (0.5 s) — long enough to suppress per-word flips, short enough
-        // to keep genuine turns in fast back-and-forth conversation.
+        // Stability filter (#107/#267): pyannote-seg without speaker
+        // embeddings can flip its local track index mid-phrase, producing
+        // one-word "(speaker 2)" stubs inside a contiguous "(speaker 1)"
+        // run. group_words_into_speaker_runs folds any run shorter than
+        // MIN_RUN_CS (0.5 s) into the longer adjacent run — long enough to
+        // suppress per-word flips, short enough to keep genuine turns in
+        // fast back-and-forth conversation.
         constexpr int64_t MIN_RUN_CS = 50;
-        auto word_duration_cs = [&](size_t a, size_t b /*exclusive*/) -> int64_t {
-            if (b <= a || b > word_spk.size())
-                return 0;
-            int64_t t0 = seg.words[a].t0;
-            int64_t t1 = seg.words[b - 1].t1;
-            if (t0 <= 0)
-                t0 = seg.t0;
-            if (t1 <= 0)
-                t1 = seg.t1;
-            return std::max<int64_t>(0, t1 - t0);
-        };
-        // Build initial runs as [start, end_exclusive, speaker] triples.
-        struct Run {
-            size_t s, e;
-            int spk;
-        };
-        std::vector<Run> runs;
-        {
-            size_t rs = 0;
-            while (rs < word_spk.size()) {
-                const int rspk = word_spk[rs];
-                size_t re = rs + 1;
-                while (re < word_spk.size() && word_spk[re] == rspk)
-                    re++;
-                runs.push_back({rs, re, rspk});
-                rs = re;
-            }
+        // Sanitize per-word bounds (fall back to segment bounds for missing
+        // word timestamps) so each run's span is well-defined.
+        std::vector<int64_t> word_t0(seg.words.size()), word_t1(seg.words.size());
+        for (size_t i = 0; i < seg.words.size(); i++) {
+            word_t0[i] = seg.words[i].t0 > 0 ? seg.words[i].t0 : seg.t0;
+            word_t1[i] = seg.words[i].t1 > 0 ? seg.words[i].t1 : seg.t1;
         }
-        // Iterate: fold every run shorter than MIN_RUN_CS into the
-        // longer neighbour. Repeat until stable.
-        bool changed = true;
-        while (changed && runs.size() >= 2) {
-            changed = false;
-            for (size_t i = 0; i < runs.size(); i++) {
-                if (word_duration_cs(runs[i].s, runs[i].e) >= MIN_RUN_CS)
-                    continue;
-                int merge_into = -1;
-                if (i == 0)
-                    merge_into = (int)i + 1;
-                else if (i == runs.size() - 1)
-                    merge_into = (int)i - 1;
-                else {
-                    int64_t prev_dur = word_duration_cs(runs[i - 1].s, runs[i - 1].e);
-                    int64_t next_dur = word_duration_cs(runs[i + 1].s, runs[i + 1].e);
-                    merge_into = (prev_dur >= next_dur) ? (int)i - 1 : (int)i + 1;
-                }
-                if (merge_into == (int)i + 1) {
-                    runs[i + 1].s = runs[i].s;
-                } else if (merge_into == (int)i - 1) {
-                    runs[i - 1].e = runs[i].e;
-                }
-                runs.erase(runs.begin() + i);
-                changed = true;
-                break;
-            }
-        }
+        const auto runs =
+            crispasr_diarize_internal::group_words_into_speaker_runs(word_spk, word_t0, word_t1, MIN_RUN_CS);
 
         // Collect distinct speakers across the (now-filtered) runs to
         // decide whether to actually split.
         int first_spk = -1;
         bool multi = false;
         for (const auto& r : runs) {
-            if (r.spk < 0)
+            if (r.speaker < 0)
                 continue;
             if (first_spk < 0) {
-                first_spk = r.spk;
-            } else if (r.spk != first_spk) {
+                first_spk = r.speaker;
+            } else if (r.speaker != first_spk) {
                 multi = true;
                 break;
             }
@@ -554,9 +508,9 @@ void split_segments_on_pyannote_turns(std::vector<crispasr_segment>& segs, const
 
         // Emit one sub-segment per run.
         for (size_t ri = 0; ri < runs.size(); ri++) {
-            const size_t run_start = runs[ri].s;
-            const size_t run_end = runs[ri].e;
-            const int run_spk = runs[ri].spk;
+            const size_t run_start = runs[ri].start;
+            const size_t run_end = runs[ri].end;
+            const int run_spk = runs[ri].speaker;
 
             crispasr_segment sub;
             sub.t0 = seg.words[run_start].t0 > 0 ? seg.words[run_start].t0 : seg.t0;
@@ -783,23 +737,15 @@ bool crispasr_apply_diarize(const std::vector<float>& left, const std::vector<fl
     return false;
 }
 
-void crispasr_remap_speakers_via_embeddings(std::vector<crispasr_segment>& segs, const float* full_audio, int n_samples,
-                                            CrispasrSpeakerEmbedder* embedder, const whisper_params& params) {
-    if (!embedder || segs.empty() || !full_audio || n_samples <= 0)
-        return;
-
-    // Skip very short segments — TitaNet (and similar) need ~250 ms+
-    // of speech to produce a reliable embedding. Shorter segments
-    // keep their existing pyannote-local label; clustering then
-    // ignores them.
+// Embed every segment long enough for a reliable speaker embedding
+// (~250 ms+; shorter clips give noisy vectors on TitaNet and similar).
+// Fills `embed_idx` with the segs indices that produced an embedding
+// and `embeddings` with embed_idx.size()*dim floats, row-major.
+static void crispasr_embed_segments(const std::vector<crispasr_segment>& segs, const float* full_audio, int n_samples,
+                                    CrispasrSpeakerEmbedder* embedder, int d, std::vector<size_t>& embed_idx,
+                                    std::vector<float>& embeddings) {
     constexpr int64_t MIN_EMBED_CS = 25; // 0.25 s
 
-    const int d = embedder->dim();
-    if (d <= 0)
-        return;
-
-    std::vector<size_t> embed_idx;
-    std::vector<float> embeddings;
     embed_idx.reserve(segs.size());
     embeddings.reserve((size_t)segs.size() * (size_t)d);
 
@@ -818,12 +764,35 @@ void crispasr_remap_speakers_via_embeddings(std::vector<crispasr_segment>& segs,
         embed_idx.push_back(i);
         embeddings.insert(embeddings.end(), tmp.begin(), tmp.end());
     }
+}
+
+void crispasr_remap_speakers_via_embeddings(std::vector<crispasr_segment>& segs, const float* full_audio, int n_samples,
+                                            CrispasrSpeakerEmbedder* embedder, const whisper_params& params,
+                                            CrispasrClusterEmbeddings* out_clusters) {
+    if (!embedder || segs.empty() || !full_audio || n_samples <= 0)
+        return;
+
+    const int d = embedder->dim();
+    if (d <= 0)
+        return;
+
+    std::vector<size_t> embed_idx;
+    std::vector<float> embeddings;
+    crispasr_embed_segments(segs, full_audio, n_samples, embedder, d, embed_idx, embeddings);
+
     if (embed_idx.size() < 2) {
         // Nothing to cluster — either zero or one usable segment.
         if (embed_idx.size() == 1) {
             // Force the one embeddable segment to (speaker 0) so the
             // global label exists even on single-speaker inputs.
             segs[embed_idx[0]].speaker = "(speaker 0) ";
+            if (out_clusters) {
+                out_clusters->seg_idx = std::move(embed_idx);
+                out_clusters->embeddings = std::move(embeddings);
+                out_clusters->labels = {0};
+                out_clusters->dim = d;
+                out_clusters->n_clusters = 1;
+            }
         }
         return;
     }
@@ -835,10 +804,91 @@ void crispasr_remap_speakers_via_embeddings(std::vector<crispasr_segment>& segs,
     // Rewrite segment speakers from clustering output. Segments that
     // couldn't be embedded (too short) keep their existing pyannote-
     // local label as a best-effort fallback.
+    int n_clusters = 0;
     for (size_t k = 0; k < embed_idx.size(); k++) {
         const int spk = labels[k];
         if (spk < 0)
             continue;
+        n_clusters = std::max(n_clusters, spk + 1);
         segs[embed_idx[k]].speaker = "(speaker " + std::to_string(spk) + ") ";
     }
+
+    if (out_clusters) {
+        out_clusters->seg_idx = std::move(embed_idx);
+        out_clusters->embeddings = std::move(embeddings);
+        out_clusters->labels = std::move(labels);
+        out_clusters->dim = d;
+        out_clusters->n_clusters = n_clusters;
+    }
+}
+
+int crispasr_identify_speaker_clusters(std::vector<crispasr_segment>& segs, const CrispasrClusterEmbeddings& ce,
+                                       const struct speaker_db* db, float threshold, bool no_prints) {
+    if (!ce.valid() || !db || speaker_db_count(db) <= 0)
+        return 0;
+
+    const auto centroids = crispasr_cluster_centroids(ce.embeddings, ce.labels, (int)ce.seg_idx.size(), ce.dim);
+    if ((int)centroids.size() < ce.n_clusters * ce.dim)
+        return 0;
+
+    int n_named = 0;
+    for (int c = 0; c < ce.n_clusters; c++) {
+        float score = 0.0f;
+        const char* name = speaker_db_match(db, centroids.data() + (size_t)c * ce.dim, ce.dim, threshold, &score);
+        if (!name) {
+            if (!no_prints)
+                fprintf(stderr, "crispasr: speaker-db: cluster %d -> unmatched, keeps (speaker %d) (best cos %.2f)\n",
+                        c, c, score);
+            continue;
+        }
+        const std::string label = std::string("(") + name + ") ";
+        for (size_t k = 0; k < ce.seg_idx.size(); k++) {
+            if (ce.labels[k] == c)
+                segs[ce.seg_idx[k]].speaker = label;
+        }
+        if (!no_prints)
+            fprintf(stderr, "crispasr: speaker-db: cluster %d -> '%s' (cos %.2f)\n", c, name, score);
+        n_named++;
+    }
+    return n_named;
+}
+
+bool crispasr_identify_single_speaker(std::vector<crispasr_segment>& segs, const float* full_audio, int n_samples,
+                                      CrispasrSpeakerEmbedder* embedder, const struct speaker_db* db, float threshold,
+                                      bool no_prints) {
+    if (!embedder || segs.empty() || !full_audio || n_samples <= 0 || !db || speaker_db_count(db) <= 0)
+        return false;
+
+    const int d = embedder->dim();
+    if (d <= 0)
+        return false;
+
+    std::vector<size_t> embed_idx;
+    std::vector<float> embeddings;
+    crispasr_embed_segments(segs, full_audio, n_samples, embedder, d, embed_idx, embeddings);
+    if (embed_idx.empty())
+        return false;
+
+    const std::vector<int> labels(embed_idx.size(), 0);
+    const auto centroid = crispasr_cluster_centroids(embeddings, labels, (int)embed_idx.size(), d);
+    if ((int)centroid.size() < d)
+        return false;
+
+    float score = 0.0f;
+    const char* name = speaker_db_match(db, centroid.data(), d, threshold, &score);
+    if (!name) {
+        if (!no_prints)
+            fprintf(stderr, "crispasr: speaker-db: recording unmatched, labels stay anonymous (best cos %.2f)\n",
+                    score);
+        return false;
+    }
+
+    // No diarization ran, so the recording is asserted single-speaker:
+    // the one matched identity labels every segment, short ones included.
+    const std::string label = std::string("(") + name + ") ";
+    for (auto& seg : segs)
+        seg.speaker = label;
+    if (!no_prints)
+        fprintf(stderr, "crispasr: speaker-db: recording -> '%s' (cos %.2f)\n", name, score);
+    return true;
 }

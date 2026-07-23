@@ -47,6 +47,10 @@ public:
             return out;
 
         funasr_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1);
+        // #292: forward --max-new-tokens only when explicit; 0 keeps the backend default.
+        funasr_set_max_new_tokens(ctx_, params.max_new_tokens_explicit ? params.max_new_tokens : 0);
+        if (!params.language.empty() && params.language != "auto")
+            funasr_set_language(ctx_, params.language.c_str());
         funasr_result* r = funasr_transcribe_with_probs(ctx_, samples, n_samples);
         if (!r || !r->text) {
             funasr_result_free(r);

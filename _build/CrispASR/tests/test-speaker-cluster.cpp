@@ -177,3 +177,50 @@ TEST_CASE("cluster: invalid inputs are no-ops", "[unit][diarize][cluster]") {
     for (int l : labels3)
         REQUIRE(l == -1);
 }
+
+// ── Issue #266: per-cluster centroids for speaker-db identification ─────────
+
+TEST_CASE("centroids: mean of members, L2-normalized, K x dim", "[unit][diarize][cluster]") {
+    // Two clusters along different axes; centroid of each must point at
+    // its axis with unit norm.
+    std::vector<float> emb;
+    auto push = [&](std::vector<float> v) {
+        l2norm(v);
+        emb.insert(emb.end(), v.begin(), v.end());
+    };
+    push({1, 0.1f, 0, 0, 0, 0, 0, 0});  // cluster 0
+    push({1, -0.1f, 0, 0, 0, 0, 0, 0}); // cluster 0
+    push({0, 0, 1, 0.1f, 0, 0, 0, 0});  // cluster 1
+    const std::vector<int> labels = {0, 0, 1};
+
+    auto c = crispasr_cluster_centroids(emb, labels, 3, DIM);
+    REQUIRE(c.size() == (size_t)2 * DIM);
+
+    // Unit norm per centroid.
+    for (int k = 0; k < 2; k++) {
+        double n = 0.0;
+        for (int d = 0; d < DIM; d++)
+            n += (double)c[k * DIM + d] * c[k * DIM + d];
+        REQUIRE(std::abs(n - 1.0) < 1e-5);
+    }
+    // Cluster 0 centroid ≈ x-axis (the ±0.1 second component cancels).
+    REQUIRE(c[0] > 0.99f);
+    REQUIRE(std::abs(c[1]) < 1e-5);
+    // Cluster 1 centroid dominated by dim 2.
+    REQUIRE(c[DIM + 2] > 0.9f);
+}
+
+TEST_CASE("centroids: negative labels are skipped, invalid inputs empty", "[unit][diarize][cluster]") {
+    std::vector<float> emb((size_t)2 * DIM, 0.0f);
+    emb[0] = 1.0f;       // member of cluster 0
+    emb[DIM + 1] = 1.0f; // labeled -1: must not contribute
+    const std::vector<int> labels = {0, -1};
+
+    auto c = crispasr_cluster_centroids(emb, labels, 2, DIM);
+    REQUIRE(c.size() == (size_t)DIM);
+    REQUIRE(c[0] == 1.0f);
+    REQUIRE(c[1] == 0.0f);
+
+    REQUIRE(crispasr_cluster_centroids({}, {}, 0, DIM).empty());
+    REQUIRE(crispasr_cluster_centroids(emb, labels, 2, 0).empty());
+}

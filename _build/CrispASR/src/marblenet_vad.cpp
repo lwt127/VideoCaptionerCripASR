@@ -14,16 +14,44 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
+#include "core/crispasr_env.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+// ===========================================================================
+// Bench instrumentation — `MARBLENET_VAD_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool marblenet_vad_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_MARBLENET_VAD_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct marblenet_vad_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit marblenet_vad_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~marblenet_vad_bench_stage() {
+        if (!marblenet_vad_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  marblenet_vad_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ── Model ──────────────────────────────────────────────────────────────────
 
@@ -399,6 +427,8 @@ extern "C" int marblenet_vad_detect(struct marblenet_vad_context* ctx, const flo
     if (!ctx || !samples || n_samples <= 0)
         return -1;
     auto& m = ctx->model;
+
+    marblenet_vad_bench_stage _bs_total("detect_total");
 
     // Compute mel
     std::vector<float> hann(m.win_length), fb((size_t)m.n_mels * (m.n_fft / 2 + 1));

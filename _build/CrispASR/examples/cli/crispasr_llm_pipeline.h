@@ -501,3 +501,140 @@ std::vector<crispasr_segment> crispasr_run_voxtral_style_pipeline_streamed(typen
     out.push_back(std::move(seg));
     return out;
 }
+
+template <typename Ops>
+void crispasr_run_voxtral_style_pipeline_streamed_cb(typename Ops::CtxT* ctx, const float* samples, int n_samples,
+                                                     const whisper_params& params,
+                                                     CrispasrBackend::crispasr_stream_callback on_text) {
+    if (!ctx)
+        return;
+
+    const char* BE = Ops::name();
+    constexpr int kSampleRate = 16000;
+
+    // ---- Mel spectrogram ----
+    int n_mels = 0, T_mel = 0;
+    float* mel = Ops::compute_mel(ctx, samples, n_samples, &n_mels, &T_mel);
+    if (!mel) {
+        fprintf(stderr, "crispasr[%s]: mel failed\n", BE);
+        return;
+    }
+
+    // ---- Audio encoder (+ projector) ----
+    int N_enc = 0, pdim = 0;
+    float* audio_embeds = Ops::run_encoder(ctx, mel, n_mels, T_mel, &N_enc, &pdim);
+    free(mel);
+    if (!audio_embeds) {
+        fprintf(stderr, "crispasr[%s]: encoder failed\n", BE);
+        return;
+    }
+
+    // ---- Build prompt via the backend's tokenizer ----
+    const std::string prefix = Ops::build_prefix(params);
+    const std::string suffix = Ops::build_suffix(params);
+
+    int n_prefix = 0, n_suffix = 0;
+    int32_t* pid = Ops::tokenize(ctx, prefix.c_str(), &n_prefix);
+    int32_t* sid = Ops::tokenize(ctx, suffix.c_str(), &n_suffix);
+    if (!pid || !sid) {
+        fprintf(stderr, "crispasr[%s]: tokenize failed\n", BE);
+        free(pid);
+        free(sid);
+        free(audio_embeds);
+        return;
+    }
+
+    std::vector<int32_t> ids;
+    ids.reserve((size_t)n_prefix + N_enc + n_suffix);
+    ids.insert(ids.end(), pid, pid + n_prefix);
+    for (int i = 0; i < N_enc; i++)
+        ids.push_back(Ops::audio_pad_id);
+    ids.insert(ids.end(), sid, sid + n_suffix);
+    free(pid);
+    free(sid);
+
+    const int T_prompt = (int)ids.size();
+
+    // ---- Embed and splice audio frames into audio_pad positions ----
+    float* text_embeds = Ops::embed_tokens(ctx, ids.data(), T_prompt);
+    if (!text_embeds) {
+        fprintf(stderr, "crispasr[%s]: embed failed\n", BE);
+        free(audio_embeds);
+        return;
+    }
+
+    int spliced = 0;
+    for (int i = 0; i < T_prompt && spliced < N_enc; i++) {
+        if (ids[i] == Ops::audio_pad_id) {
+            std::memcpy(text_embeds + (size_t)i * pdim, audio_embeds + (size_t)spliced * pdim, pdim * sizeof(float));
+            spliced++;
+        }
+    }
+    free(audio_embeds);
+
+    const int audio_seconds = (n_samples + kSampleRate - 1) / kSampleRate;
+    const int max_new_scaled = std::max(512, audio_seconds * 8);
+    const int max_new = std::max(params.max_new_tokens, max_new_scaled);
+    const int kv_budget = T_prompt + max_new + 64;
+
+    if (!Ops::kv_init(ctx, kv_budget)) {
+        free(text_embeds);
+        fprintf(stderr, "crispasr[%s]: kv_init failed\n", BE);
+        return;
+    }
+    Ops::kv_reset(ctx);
+
+    int n_tokens_out = 0, vocab = 0;
+    float* logits = Ops::run_llm_kv(ctx, text_embeds, T_prompt, 0, &n_tokens_out, &vocab);
+    if (!logits) {
+        fprintf(stderr, "crispasr[%s]: prefill failed\n", BE);
+        free(text_embeds);
+        return;
+    }
+
+    core_greedy_decode::Config dec_cfg;
+    dec_cfg.max_new_tokens = max_new;
+    dec_cfg.eos_id = Ops::eos_id;
+    dec_cfg.vocab_size = vocab;
+    dec_cfg.temperature = params.temperature;
+    dec_cfg.frequency_penalty = params.frequency_penalty;
+    dec_cfg.seed = params.seed;
+
+    int next = 0;
+    float next_p = 1.0f;
+    if (dec_cfg.temperature > 0.0f) {
+        std::mt19937_64 rng(dec_cfg.seed != 0 ? dec_cfg.seed : (uint64_t)std::random_device{}());
+        next = core_greedy_decode::sample_temp(logits, vocab, dec_cfg.temperature, rng);
+    } else {
+        next = core_greedy_decode::argmax(logits, vocab);
+    }
+    next_p = core_greedy_decode::softmax_of(logits, vocab, next, logits[next]);
+    free(logits);
+
+    std::string accumulated_text;
+    auto token_cb = [&](int32_t id, float prob) {
+        (void)prob;
+        if (id == Ops::eos_id)
+            return;
+        int len = 0;
+        const uint8_t* bytes = Ops::token_text(ctx, id, &len);
+        if (bytes && len > 0) {
+            std::string txt((const char*)bytes, (size_t)len);
+            accumulated_text += txt;
+            if (!accumulated_text.empty()) {
+                on_text(accumulated_text, false);
+            }
+        }
+    };
+
+    core_greedy_decode::run_with_probs_cb(ctx, next, next_p, T_prompt, Ops::embed_tokens, Ops::run_llm_kv, token_cb,
+                                          dec_cfg);
+
+    if (!accumulated_text.empty()) {
+        on_text(accumulated_text, true);
+    } else {
+        on_text("", true);
+    }
+
+    free(text_embeds);
+}

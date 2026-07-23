@@ -13,12 +13,14 @@
 #include "pcs.h"
 
 #include "core/gguf_loader.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -37,7 +39,9 @@ namespace {
 
 struct SPTokenizer {
     std::vector<std::string> id_to_token;
+    std::vector<float> scores; // Unigram log-probs (empty => greedy fallback)
     std::map<std::string, int> token_to_id;
+    size_t max_piece_len = 0;
     int unk_id = 3;
     int cls_id = 0; // <s>
     int sep_id = 2; // </s>
@@ -45,8 +49,11 @@ struct SPTokenizer {
 
     void build_map() {
         token_to_id.clear();
-        for (int i = 0; i < (int)id_to_token.size(); i++)
+        max_piece_len = 0;
+        for (int i = 0; i < (int)id_to_token.size(); i++) {
             token_to_id[id_to_token[i]] = i;
+            max_piece_len = std::max(max_piece_len, id_to_token[i].size());
+        }
     }
 
     int lookup(const std::string& tok) const {
@@ -55,46 +62,114 @@ struct SPTokenizer {
     }
 
     std::vector<int> tokenize(const std::string& text) const {
-        std::vector<int> ids;
-        std::vector<std::string> words;
-        std::string cur;
-        for (char c : text) {
-            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+        // Build the SentencePiece-normalised string: whitespace-split words each
+        // prefixed with ▁ (U+2581) and concatenated (add_dummy_prefix semantics).
+        std::string s;
+        {
+            std::string cur;
+            auto flush = [&]() {
                 if (!cur.empty()) {
-                    words.push_back(cur);
+                    s += "\xE2\x96\x81";
+                    s += cur;
                     cur.clear();
                 }
-            } else {
-                cur += c;
+            };
+            for (char c : text) {
+                if (c == ' ' || c == '\t' || c == '\n' || c == '\r')
+                    flush();
+                else
+                    cur += c;
+            }
+            flush();
+        }
+        if (s.empty())
+            return {};
+
+        // XLM-RoBERTa's SP model is Unigram: the correct segmentation MAXIMISES the
+        // sum of piece log-probs (Viterbi), not greedy longest-match — greedy
+        // mis-splits multi-subword words (e.g. "delayed"). Fall back to greedy when
+        // the GGUF carries no scores (older builds / non-Unigram tokenizers).
+        if (scores.empty())
+            return tokenize_greedy(s);
+        return tokenize_viterbi(s);
+    }
+
+    std::vector<int> tokenize_viterbi(const std::string& s) const {
+        const int n = (int)s.size();
+        auto is_boundary = [&](int i) { return i == 0 || i == n || ((unsigned char)s[i] & 0xC0) != 0x80; };
+        const double NEG = -1e30;
+        std::vector<double> dp(n + 1, NEG);
+        std::vector<int> back_pos(n + 1, -1), back_id(n + 1, -1);
+        dp[0] = 0.0;
+        for (int i = 1; i <= n; i++) {
+            if (!is_boundary(i))
+                continue;
+            int jmin = (max_piece_len && i > (int)max_piece_len) ? i - (int)max_piece_len : 0;
+            for (int j = i - 1; j >= jmin; j--) {
+                if (!is_boundary(j) || dp[j] <= NEG / 2)
+                    continue;
+                auto it = token_to_id.find(s.substr(j, i - j));
+                if (it == token_to_id.end())
+                    continue;
+                double sc = dp[j] + scores[it->second];
+                if (sc > dp[i]) {
+                    dp[i] = sc;
+                    back_pos[i] = j;
+                    back_id[i] = it->second;
+                }
+            }
+            // Unknown fallback: one-character <unk> step so the lattice stays connected.
+            if (dp[i] <= NEG / 2) {
+                int j = i - 1;
+                while (j > 0 && !is_boundary(j))
+                    j--;
+                if (dp[j] > NEG / 2) {
+                    dp[i] = dp[j] - 1e4;
+                    back_pos[i] = j;
+                    back_id[i] = unk_id;
+                }
             }
         }
-        if (!cur.empty())
-            words.push_back(cur);
+        std::vector<int> ids;
+        for (int i = n; i > 0;) {
+            if (back_pos[i] < 0) { // unreachable (shouldn't happen) — bail out
+                ids.clear();
+                return tokenize_greedy(s);
+            }
+            ids.push_back(back_id[i]);
+            i = back_pos[i];
+        }
+        std::reverse(ids.begin(), ids.end());
+        return ids;
+    }
 
-        for (const auto& word : words) {
-            std::string w = "\xE2\x96\x81" + word; // ▁ prefix
-            size_t start = 0;
-            while (start < w.size()) {
-                size_t end = w.size();
-                int best_id = -1;
-                while (end > start) {
-                    std::string sub = w.substr(start, end - start);
-                    auto it = token_to_id.find(sub);
-                    if (it != token_to_id.end()) {
-                        best_id = it->second;
-                        break;
-                    }
-                    end--;
-                    while (end > start && (w[end] & 0xC0) == 0x80)
-                        end--;
-                }
-                if (best_id < 0) {
-                    ids.push_back(unk_id);
+    std::vector<int> tokenize_greedy(const std::string& s) const {
+        std::vector<int> ids;
+        size_t start = 0;
+        while (start < s.size()) {
+            size_t end = s.size();
+            int best_id = -1;
+            while (end > start) {
+                auto it = token_to_id.find(s.substr(start, end - start));
+                if (it != token_to_id.end()) {
+                    best_id = it->second;
                     break;
                 }
-                ids.push_back(best_id);
-                start = end;
+                end--;
+                while (end > start && (s[end] & 0xC0) == 0x80)
+                    end--;
             }
+            if (best_id < 0) {
+                ids.push_back(unk_id);
+                // advance one UTF-8 char to stay connected
+                size_t nx = start + 1;
+                while (nx < s.size() && (s[nx] & 0xC0) == 0x80)
+                    nx++;
+                start = nx;
+                continue;
+            }
+            ids.push_back(best_id);
+            start = end;
         }
         return ids;
     }
@@ -207,6 +282,7 @@ static bool pcs_load(pcs_context& ctx, const char* path) {
     ctx.cls_id = (int)core_gguf::kv_u32(meta, "pcs.cls_id", 0);
 
     ctx.tokenizer.id_to_token = core_gguf::kv_str_array(meta, "tokenizer.ggml.tokens");
+    ctx.tokenizer.scores = core_gguf::kv_f32_array(meta, "tokenizer.ggml.scores");
     ctx.tokenizer.cls_id = ctx.cls_id;
     ctx.tokenizer.pad_id = ctx.pad_id;
     ctx.tokenizer.build_map();
@@ -219,8 +295,9 @@ static bool pcs_load(pcs_context& ctx, const char* path) {
     fprintf(stderr, "pcs: %dL, d=%d, ffn=%d, heads=%d, vocab=%d, post=%d, pre=%d\n", ctx.n_layers, ctx.d_model,
             ctx.d_ffn, ctx.n_heads, ctx.vocab_size, ctx.n_post_labels, ctx.n_pre_labels);
 
-    // Load weights
-    ctx.backend = ggml_backend_init_best();
+    // Load weights. PCS_FORCE_CPU pins the CPU backend (diff-harness parity: match
+    // the ONNX/onnxruntime CPU reference without GPU float-noise on borderline logits).
+    ctx.backend = std::getenv("PCS_FORCE_CPU") ? nullptr : crispasr_init_gpu_backend();
     if (!ctx.backend)
         ctx.backend = ggml_backend_cpu_init();
     ctx.backend_cpu = ggml_backend_cpu_init();
@@ -310,6 +387,39 @@ struct PCSResult {
     std::vector<std::vector<bool>> cap_preds; // [N][max_chars] — per-char upper/lower
 };
 
+// Read a weight/bias tensor into an F32 buffer, dequantizing if needed.
+//
+// The CPU-side SBD/truecase heads (and post_emb) below run in plain C++, so we
+// must pull their weights out of the GGUF as F32. A raw
+// `ggml_backend_tensor_get(t, buf, 0, n_elem*sizeof(float))` only works when the
+// tensor is stored F32 — but the q4_k/q4_0 converter quantizes these head
+// matrices (head.{post,pre,sbd,tc}.fc*.weight). For a quantized tensor
+// `ggml_nbytes(t)` is far smaller than `n_elem*4`, so the raw read asserts
+// "tensor read out of bounds" and aborts (the shipped-default q4_k crash).
+//
+// This helper reads the tensor's *native* bytes (sized by ggml_nbytes) and
+// dequantizes per row via the type's `to_float` trait, so it is correct for
+// F32, F16, and any block-quantized type. Rows are ne[0]-long and each is
+// block-quantized independently in GGUF, so we dequantize row-by-row using
+// ggml_row_size() for the stride (never t->nb[], which is wrong for quantized
+// tensors).
+static void pcs_read_tensor_f32(ggml_tensor* t, std::vector<float>& out) {
+    const int64_t n_elem = ggml_nelements(t);
+    out.resize((size_t)n_elem);
+    if (t->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(t, out.data(), 0, (size_t)n_elem * sizeof(float));
+        return;
+    }
+    const int64_t ne0 = t->ne[0];
+    const int64_t n_rows = ne0 > 0 ? n_elem / ne0 : 0;
+    const size_t row_size = ggml_row_size(t->type, ne0);
+    std::vector<uint8_t> raw(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+    const ggml_type_traits* tr = ggml_get_type_traits(t->type);
+    for (int64_t r = 0; r < n_rows; r++)
+        tr->to_float(raw.data() + (size_t)r * row_size, out.data() + (size_t)r * ne0, ne0);
+}
+
 static PCSResult pcs_run(pcs_context& ctx, const std::vector<int>& token_ids) {
     const int N = (int)token_ids.size();
     const int seq_len = N + 2; // CLS + tokens + SEP
@@ -340,8 +450,17 @@ static PCSResult pcs_run(pcs_context& ctx, const std::vector<int>& token_ids) {
     ggml_tensor* type_emb = ggml_get_rows(ctx0, ctx.type_emb_w, type_ids);
 
     ggml_tensor* emb = ggml_add(ctx0, ggml_add(ctx0, tok_emb, pos_emb), type_emb);
-    emb = ggml_norm(ctx0, emb, 1e-12f);
+    emb = ggml_norm(ctx0, emb, 1e-5f);
     emb = ggml_add(ctx0, ggml_mul(ctx0, emb, ctx.emb_ln_w), ctx.emb_ln_b);
+
+    // Diff-harness: PCS_DUMP_LAYER=n dumps the encoder output after layer n
+    // (-1 = embedding output) to PCS_DUMP_HIDDEN, for per-layer parity vs ONNX.
+    int dump_layer = -2;
+    if (const char* dl = std::getenv("PCS_DUMP_LAYER"))
+        dump_layer = atoi(dl);
+    ggml_tensor* dbg_layer = nullptr;
+    if (dump_layer == -1)
+        dbg_layer = emb;
 
     // Encoder
     ggml_tensor* cur = emb;
@@ -362,22 +481,45 @@ static PCSResult pcs_run(pcs_context& ctx, const std::vector<int>& token_ids) {
         V = ggml_permute(ctx0, V, 0, 2, 1, 3);
 
         const float scale = 1.0f / sqrtf((float)head_dim);
-        ggml_tensor* KQV = ggml_flash_attn_ext(ctx0, Q, K, V, nullptr, scale, 0.0f, 0.0f);
-        KQV = ggml_reshape_2d(ctx0, KQV, d, seq_len);
+        // Manual F32 attention to match the ONNX reference's standard softmax.
+        // ggml_flash_attn_ext uses an F16 online-softmax internally; over 12 layers
+        // its drift drops encoder cosine vs the reference to ~0.99 and flips
+        // borderline punctuation argmaxes. F32 mul_mat + soft_max_ext is exact.
+        // (Set PCS_FLASH_ATTN=1 to A/B the old flash path.)
+        ggml_tensor* KQV;
+        if (std::getenv("PCS_FLASH_ATTN")) {
+            KQV = ggml_flash_attn_ext(ctx0, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+            KQV = ggml_reshape_2d(ctx0, KQV, d, seq_len);
+        } else {
+            ggml_tensor* Qc = ggml_cont(ctx0, Q);             // [hd, T, nh]
+            ggml_tensor* Kc = ggml_cont(ctx0, K);             // [hd, T, nh]
+            ggml_tensor* scores = ggml_mul_mat(ctx0, Kc, Qc); // [T, T, nh]
+            scores = ggml_soft_max_ext(ctx0, scores, nullptr, scale, 0.0f);
+            ggml_tensor* Vp = ggml_cont(ctx0, ggml_permute(ctx0, V, 1, 0, 2, 3)); // [T, hd, nh]
+            ggml_tensor* out = ggml_mul_mat(ctx0, Vp, scores);                    // [hd, T, nh]
+            out = ggml_cont(ctx0, ggml_permute(ctx0, out, 0, 2, 1, 3));           // [hd, nh, T]
+            KQV = ggml_reshape_2d(ctx0, out, d, seq_len);
+        }
 
         cur = ggml_add(ctx0, ggml_mul_mat(ctx0, L.attn_out_w, KQV), L.attn_out_b);
         cur = ggml_add(ctx0, cur, residual);
-        cur = ggml_norm(ctx0, cur, 1e-12f);
+        cur = ggml_norm(ctx0, cur, 1e-5f);
         cur = ggml_add(ctx0, ggml_mul(ctx0, cur, L.attn_ln_w), L.attn_ln_b);
 
         residual = cur;
         ggml_tensor* ffn = ggml_add(ctx0, ggml_mul_mat(ctx0, L.ffn_up_w, cur), L.ffn_up_b);
-        ffn = ggml_gelu(ctx0, ffn);
+        // XLM-RoBERTa uses exact (erf) GELU, matching the ONNX source (Erf op).
+        // ggml_gelu is the tanh approximation; over 12 layers its drift flips
+        // borderline punctuation argmaxes vs the reference. Use the exact form.
+        ffn = ggml_gelu_erf(ctx0, ffn);
         ffn = ggml_add(ctx0, ggml_mul_mat(ctx0, L.ffn_down_w, ffn), L.ffn_down_b);
 
         cur = ggml_add(ctx0, ffn, residual);
-        cur = ggml_norm(ctx0, cur, 1e-12f);
+        cur = ggml_norm(ctx0, cur, 1e-5f);
         cur = ggml_add(ctx0, ggml_mul(ctx0, cur, L.ffn_ln_w), L.ffn_ln_b);
+
+        if (i == dump_layer)
+            dbg_layer = cur;
     }
 
     // Remove CLS: [d, seq_len] → [d, N] starting at position 1
@@ -421,6 +563,11 @@ static PCSResult pcs_run(pcs_context& ctx, const std::vector<int>& token_ids) {
     ggml_build_forward_expand(gf, post_logits);
     ggml_build_forward_expand(gf, pre_logits);
     ggml_build_forward_expand(gf, hidden);
+    if (dbg_layer) {
+        ggml_set_name(dbg_layer, "dbg_layer");
+        ggml_set_output(dbg_layer);
+        ggml_build_forward_expand(gf, dbg_layer);
+    }
 
     ggml_backend_sched_reset(ctx.sched);
     if (!ggml_backend_sched_alloc_graph(ctx.sched, gf)) {
@@ -488,6 +635,22 @@ static PCSResult pcs_run(pcs_context& ctx, const std::vector<int>& token_ids) {
     std::vector<float> hidden_buf(d * N);
     ggml_backend_tensor_get(hidden, hidden_buf.data(), 0, hidden_buf.size() * sizeof(float));
 
+    // Diff-harness: dump encoder hidden (row-major [N, d]) for cosine parity vs ONNX.
+    // With PCS_DUMP_LAYER set, dump that layer's full [seq_len, d] output instead.
+    if (const char* hp = std::getenv("PCS_DUMP_HIDDEN")) {
+        FILE* hf = fopen(hp, "wb");
+        if (hf) {
+            if (dbg_layer) {
+                std::vector<float> dbg_buf(d * seq_len);
+                ggml_backend_tensor_get(dbg_layer, dbg_buf.data(), 0, dbg_buf.size() * sizeof(float));
+                fwrite(dbg_buf.data(), sizeof(float), dbg_buf.size(), hf);
+            } else {
+                fwrite(hidden_buf.data(), sizeof(float), hidden_buf.size(), hf);
+            }
+            fclose(hf);
+        }
+    }
+
     // Read post_emb weights for SBD conditioning
     std::vector<float> post_emb_data;
     int post_emb_dim = 0;
@@ -495,9 +658,13 @@ static PCSResult pcs_run(pcs_context& ctx, const std::vector<int>& token_ids) {
         post_emb_dim = (int)ctx.post_emb_w->ne[0]; // ne[0] = embedding_dim (4)
         int n_emb = (int)ctx.post_emb_w->ne[1];    // ne[1] = n_labels (17)
         post_emb_data.resize(n_emb * post_emb_dim);
-        ggml_backend_tensor_get(ctx.post_emb_w, post_emb_data.data(), 0, post_emb_data.size() * sizeof(float));
+        pcs_read_tensor_f32(ctx.post_emb_w, post_emb_data);
     }
 
+
+    // Hard-argmax sentence boundary per token, used (shifted +1) as the truecase
+    // "is-sentence-initial" conditioning — see the truecase block below.
+    std::vector<uint8_t> seg_argmax(N, 0);
 
     // CPU forward for SBD and truecase heads
     // SBD: cat(hidden[768], post_emb[4]) → fc1(772→128, ReLU) → fc2(128→2)
@@ -505,18 +672,18 @@ static PCSResult pcs_run(pcs_context& ctx, const std::vector<int>& token_ids) {
         int sbd_in = d + post_emb_dim;           // 768 + 4 = 772
         int sbd_mid = (int)ctx.sbd_fc1_w->ne[1]; // ne[1]=128 (ne[0]=772=input)
 
-        std::vector<float> sbd_fc1_w_data(sbd_in * sbd_mid);
-        ggml_backend_tensor_get(ctx.sbd_fc1_w, sbd_fc1_w_data.data(), 0, sbd_fc1_w_data.size() * sizeof(float));
+        std::vector<float> sbd_fc1_w_data;
+        pcs_read_tensor_f32(ctx.sbd_fc1_w, sbd_fc1_w_data);
         std::vector<float> sbd_fc1_b_data(sbd_mid, 0.0f);
         if (ctx.sbd_fc1_b)
-            ggml_backend_tensor_get(ctx.sbd_fc1_b, sbd_fc1_b_data.data(), 0, sbd_fc1_b_data.size() * sizeof(float));
+            pcs_read_tensor_f32(ctx.sbd_fc1_b, sbd_fc1_b_data);
 
         int sbd_out = 2;
-        std::vector<float> sbd_fc2_w_data(sbd_mid * sbd_out);
-        ggml_backend_tensor_get(ctx.sbd_fc2_w, sbd_fc2_w_data.data(), 0, sbd_fc2_w_data.size() * sizeof(float));
+        std::vector<float> sbd_fc2_w_data;
+        pcs_read_tensor_f32(ctx.sbd_fc2_w, sbd_fc2_w_data);
         std::vector<float> sbd_fc2_b_data(sbd_out, 0.0f);
         if (ctx.sbd_fc2_b)
-            ggml_backend_tensor_get(ctx.sbd_fc2_b, sbd_fc2_b_data.data(), 0, sbd_fc2_b_data.size() * sizeof(float));
+            pcs_read_tensor_f32(ctx.sbd_fc2_b, sbd_fc2_b_data);
 
         for (int t = 0; t < N; t++) {
             // Build input: [hidden[t], post_emb[post_pred[t]]]
@@ -544,33 +711,44 @@ static PCSResult pcs_run(pcs_context& ctx, const std::vector<int>& token_ids) {
                 logit0 += mid[k] * sbd_fc2_w_data[0 * sbd_mid + k];
                 logit1 += mid[k] * sbd_fc2_w_data[1 * sbd_mid + k];
             }
-            result.sbd_preds[t] = logit1 > logit0;
+            // The ONNX model derives two different quantities from these seg logits:
+            //  - seg_preds output: softmax(logits)[boundary] > 0.05 (a low, tuned
+            //    threshold — NOT argmax, which is why plain logit1>logit0 misses
+            //    low-probability boundaries).
+            //  - truecase conditioning: the HARD argmax, shifted +1 (below).
+            float p_boundary = 1.0f / (1.0f + expf(logit0 - logit1)); // = softmax[boundary]
+            result.sbd_preds[t] = p_boundary > 0.05f;
+            seg_argmax[t] = (logit1 > logit0) ? 1 : 0;
         }
     }
 
-    // Truecase: cat(hidden[768], sbd[1]) → fc1(769→128, ReLU) → fc2(128→16)
+    // Truecase: cat(hidden[768], is_sentence_initial[1]) → fc1(769→128, ReLU) → fc2(128→16)
+    // The conditioning bit is "does this token START a sentence" = the seg-head hard
+    // argmax of the PREVIOUS token (token 0 is always sentence-initial). This is NOT the
+    // current token's sbd (a token that ENDS a sentence, e.g. "thanks.", is not itself
+    // sentence-initial) — feeding the current sbd wrongly capitalises sentence-final words.
     {
         int tc_in = d + 1;                     // 769
         int tc_mid = (int)ctx.tc_fc1_w->ne[1]; // ne[1]=128 (ne[0]=769=input)
         int tc_out = 16;
 
-        std::vector<float> tc_fc1_w_data(tc_in * tc_mid);
-        ggml_backend_tensor_get(ctx.tc_fc1_w, tc_fc1_w_data.data(), 0, tc_fc1_w_data.size() * sizeof(float));
+        std::vector<float> tc_fc1_w_data;
+        pcs_read_tensor_f32(ctx.tc_fc1_w, tc_fc1_w_data);
         std::vector<float> tc_fc1_b_data(tc_mid, 0.0f);
         if (ctx.tc_fc1_b)
-            ggml_backend_tensor_get(ctx.tc_fc1_b, tc_fc1_b_data.data(), 0, tc_fc1_b_data.size() * sizeof(float));
+            pcs_read_tensor_f32(ctx.tc_fc1_b, tc_fc1_b_data);
 
-        std::vector<float> tc_fc2_w_data(tc_mid * tc_out);
-        ggml_backend_tensor_get(ctx.tc_fc2_w, tc_fc2_w_data.data(), 0, tc_fc2_w_data.size() * sizeof(float));
+        std::vector<float> tc_fc2_w_data;
+        pcs_read_tensor_f32(ctx.tc_fc2_w, tc_fc2_w_data);
         std::vector<float> tc_fc2_b_data(tc_out, 0.0f);
         if (ctx.tc_fc2_b)
-            ggml_backend_tensor_get(ctx.tc_fc2_b, tc_fc2_b_data.data(), 0, tc_fc2_b_data.size() * sizeof(float));
+            pcs_read_tensor_f32(ctx.tc_fc2_b, tc_fc2_b_data);
 
         for (int t = 0; t < N; t++) {
             std::vector<float> inp(tc_in);
             for (int j = 0; j < d; j++)
                 inp[j] = hidden_buf[t * d + j];
-            inp[d] = result.sbd_preds[t] ? 1.0f : 0.0f;
+            inp[d] = (t == 0 || seg_argmax[t - 1]) ? 1.0f : 0.0f;
 
             std::vector<float> mid(tc_mid);
             for (int j = 0; j < tc_mid; j++) {
@@ -633,6 +811,23 @@ char* pcs_process(pcs_context* ctx, const char* text) {
         all_result.cap_preds.insert(all_result.cap_preds.end(), r.cap_preds.begin(), r.cap_preds.end());
     }
 
+    // Diff-harness dump: PCS_DEBUG=1 prints tokenization + per-token head predictions
+    // so they can be compared against the ONNX reference (tools/dump_pcs_reference.py).
+    if (std::getenv("PCS_DEBUG")) {
+        fprintf(stderr, "[pcs-debug] %zu tokens\n", token_ids.size());
+        fprintf(stderr, "[pcs-debug] token_ids:");
+        for (int id : token_ids)
+            fprintf(stderr, " %d", id);
+        fprintf(stderr, "\n[pcs-debug] idx tok_id post pre sbd cap[0:6]\n");
+        for (size_t t = 0; t < token_ids.size(); t++) {
+            fprintf(stderr, "[pcs-debug] %2zu %6d %4d %3d %3d  ", t, token_ids[t], all_result.post_preds[t],
+                    all_result.pre_preds[t], (int)all_result.sbd_preds[t]);
+            for (int c = 0; c < 6 && c < (int)all_result.cap_preds[t].size(); c++)
+                fprintf(stderr, "%d", (int)all_result.cap_preds[t][c]);
+            fprintf(stderr, "\n");
+        }
+    }
+
     // Reconstruct text: map subtokens back to words, apply punc + case
     std::vector<std::string> words;
     {
@@ -651,37 +846,28 @@ char* pcs_process(pcs_context* ctx, const char* text) {
             words.push_back(cur);
     }
 
+    // Partition the ACTUAL tokenization into per-word subtoken counts by ▁
+    // (word-start) boundaries. The decode must use the same segmentation the
+    // model saw — re-counting greedily here drifts tok_idx on multi-subword
+    // words (e.g. Viterbi-split "skyrocketed"), misapplying/dropping punctuation.
+    std::vector<int> word_ntok;
+    for (size_t i = 0; i < token_ids.size(); i++) {
+        const std::string& piece = ctx->tokenizer.id_to_token[token_ids[i]];
+        bool starts_word = piece.rfind("\xE2\x96\x81", 0) == 0; // begins with ▁
+        if (starts_word || word_ntok.empty())
+            word_ntok.push_back(1);
+        else
+            word_ntok.back()++;
+    }
+
     // Map subtokens to words and apply truecasing + punctuation
     std::string result;
     int tok_idx = 0;
 
     for (size_t w = 0; w < words.size(); w++) {
-        // Count subtokens for this word
+        // Subtoken count for this word, from the actual tokenization (see word_ntok).
         std::string sp_word = "\xE2\x96\x81" + words[w];
-        int n_subtokens = 0;
-        {
-            size_t start = 0;
-            while (start < sp_word.size()) {
-                size_t end = sp_word.size();
-                bool found = false;
-                while (end > start) {
-                    std::string sub = sp_word.substr(start, end - start);
-                    if (ctx->tokenizer.token_to_id.count(sub)) {
-                        found = true;
-                        start = end;
-                        n_subtokens++;
-                        break;
-                    }
-                    end--;
-                    while (end > start && (sp_word[end] & 0xC0) == 0x80)
-                        end--;
-                }
-                if (!found) {
-                    n_subtokens++;
-                    break;
-                }
-            }
-        }
+        int n_subtokens = (w < word_ntok.size()) ? word_ntok[w] : 0;
 
         // Apply pre-punctuation from first subtoken
         if (tok_idx < (int)all_result.pre_preds.size()) {

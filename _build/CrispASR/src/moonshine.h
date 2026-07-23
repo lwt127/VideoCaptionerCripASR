@@ -45,6 +45,8 @@ void moonshine_set_seed(struct moonshine_context* ctx, uint64_t seed);
 // Beam search is mutually exclusive with temperature sampling — the beam
 // path always picks deterministically by cumulative log-prob.
 void moonshine_set_beam_size(struct moonshine_context* ctx, int beam_size);
+// #292: forward --max-new-tokens (<= 0 keeps the 194 short-form default).
+void moonshine_set_max_new_tokens(struct moonshine_context* ctx, int max_new_tokens);
 
 // Single-token piece lookup. The returned pointer is owned by the context
 // and stable until the next call to this function. Returns empty string

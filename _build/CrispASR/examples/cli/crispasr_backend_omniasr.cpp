@@ -9,10 +9,14 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "core/crispasr_env.h"
 
 class OmniasrBackend : public CrispasrBackend {
 public:
     OmniasrBackend() = default;
+    // RAII cleanup so resources are freed on destruction even when a return path
+    // skips the explicit backend->shutdown() (matches PocketTTSBackend).
+    ~OmniasrBackend() override { OmniasrBackend::shutdown(); }
 
     const char* name() const override { return "omniasr"; }
     uint32_t capabilities() const override {
@@ -36,7 +40,7 @@ public:
         cp.temperature = params.temperature;
         cp.beam_size = params.beam_size > 0 ? params.beam_size : 1;
         cp.use_gpu = crispasr_backend_should_use_gpu(params);
-        if (getenv("OMNIASR_DEBUG"))
+        if (crispasr_env::get("CRISPASR_OMNIASR_DEBUG"))
             cp.verbosity = 2;
         // Pass language for LLM variant (e.g. "eng_Latn" from -l en)
         // The LLM model uses this for language conditioning
@@ -51,6 +55,7 @@ public:
     std::vector<crispasr_segment> transcribe(const float* samples, int n_samples, int64_t t_offset_cs,
                                              const whisper_params& params) override {
         std::vector<crispasr_segment> out;
+        last_logits_ = {};
         if (!ctx_)
             return out;
 
@@ -61,6 +66,7 @@ public:
         constexpr int SR = 16000;
         constexpr int kCtcMaxSamples = 7 * SR; // 7 seconds safe window
         if (is_ctc && n_samples > kCtcMaxSamples) {
+            crispasr_ctc_logits merged_logits;
             const int chunk_samples = 5 * SR; // 5s chunks with 0.5s overlap
             const int overlap = SR / 2;
             int offset = 0;
@@ -69,10 +75,23 @@ public:
                 int chunk_n = end - offset;
                 int64_t chunk_offset_cs = t_offset_cs + (int64_t)(offset * 100 / SR);
                 auto chunk_segs = transcribe(samples + offset, chunk_n, chunk_offset_cs, params);
+                if (params.return_logits && last_ctc_logits()) {
+                    const auto* lg = last_ctc_logits();
+                    if (merged_logits.n_vocab == 0) {
+                        merged_logits.n_vocab = lg->n_vocab;
+                        merged_logits.normalization = lg->normalization;
+                        merged_logits.vocab = lg->vocab;
+                    }
+                    if (merged_logits.n_vocab == lg->n_vocab) {
+                        merged_logits.data.insert(merged_logits.data.end(), lg->data.begin(), lg->data.end());
+                        merged_logits.n_frames += lg->n_frames;
+                    }
+                }
                 for (auto& s : chunk_segs)
                     out.push_back(std::move(s));
                 offset += chunk_samples - overlap;
             }
+            last_logits_ = std::move(merged_logits);
             return out;
         }
 
@@ -136,12 +155,29 @@ public:
             }
             omniasr_result_free(r);
         } else {
-            // CTC variant: text only.
-            char* text = omniasr_transcribe(ctx_, samples, n_samples);
+            // CTC variant: text only, with optional raw logits.
+            float* logits = nullptr;
+            int n_vocab = 0;
+            int n_frames = 0;
+            char* text = params.return_logits
+                             ? omniasr_transcribe_with_logits(ctx_, samples, n_samples, &logits, &n_vocab, &n_frames)
+                             : omniasr_transcribe(ctx_, samples, n_samples);
             if (!text)
                 return out;
             seg.text = text;
             free(text);
+            if (params.return_logits && logits && n_vocab > 0 && n_frames > 0) {
+                last_logits_.n_frames = n_frames;
+                last_logits_.n_vocab = n_vocab;
+                last_logits_.data.assign(logits, logits + (size_t)n_frames * n_vocab);
+                last_logits_.normalization = "logits";
+                last_logits_.vocab.reserve((size_t)n_vocab);
+                for (int i = 0; i < n_vocab; i++) {
+                    const char* piece = omniasr_token_text(ctx_, i);
+                    last_logits_.vocab.emplace_back(piece ? piece : "");
+                }
+            }
+            free(logits);
         }
         // --no-punctuation: post-strip ASCII punctuation + lowercase. The
         // omniasr-llm variant emits mixed-case punctuated text; CTC variant
@@ -167,9 +203,14 @@ public:
         }
     }
 
+    const crispasr_ctc_logits* last_ctc_logits() const override {
+        return last_logits_.data.empty() ? nullptr : &last_logits_;
+    }
+
 private:
     omniasr_context* ctx_ = nullptr;
     std::string lang_str_;
+    crispasr_ctc_logits last_logits_;
 };
 
 std::unique_ptr<CrispasrBackend> crispasr_make_omniasr_backend() {

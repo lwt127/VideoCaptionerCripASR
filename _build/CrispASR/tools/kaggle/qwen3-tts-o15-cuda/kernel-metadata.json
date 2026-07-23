@@ -1,13 +1,13 @@
 {
-  "id": "chr1str/crispasr-qwen3-tts-o15-cuda",
-  "title": "crispasr-qwen3-tts-o15-cuda",
+  "id": "chr1s4/crispasr-qwen3-o15-fix",
+  "title": "crispasr-qwen3-o15-fix",
   "code_file": "crispasr-qwen3-tts-o15-cuda.py",
   "language": "python",
   "kernel_type": "script",
   "is_private": "true",
   "enable_gpu": "true",
   "enable_internet": "true",
-  "dataset_sources": ["chr1str/crispasr-hf-token"],
+  "dataset_sources": ["chr1s4/crispasr-hf-token", "chr1s4/crispasr-ccache"],
   "competition_sources": [],
   "kernel_sources": [],
   "model_sources": []

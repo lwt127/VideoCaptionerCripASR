@@ -111,5 +111,39 @@ bool crispasr_apply_diarize(const std::vector<float>& left, const std::vector<fl
 /// empty / too short — the pyannote-only labels survive unchanged in
 /// those cases, which is what makes the system "work sufficiently
 /// well without an embedder" (#107 P3).
+///
+/// When `out_clusters` is non-null it receives the per-segment
+/// embeddings and cluster assignment so a later identification stage
+/// (issue #266) can reuse them without re-running the embedder.
+struct CrispasrClusterEmbeddings {
+    std::vector<size_t> seg_idx;   // indices into segs that were embedded
+    std::vector<float> embeddings; // seg_idx.size() * dim, row-major
+    std::vector<int> labels;       // cluster ID per embedded segment
+    int dim = 0;
+    int n_clusters = 0;
+    bool valid() const { return dim > 0 && n_clusters > 0 && !seg_idx.empty() && labels.size() == seg_idx.size(); }
+};
+
 void crispasr_remap_speakers_via_embeddings(std::vector<crispasr_segment>& segs, const float* full_audio, int n_samples,
-                                            CrispasrSpeakerEmbedder* embedder, const whisper_params& params);
+                                            CrispasrSpeakerEmbedder* embedder, const whisper_params& params,
+                                            CrispasrClusterEmbeddings* out_clusters = nullptr);
+
+/// Cluster-level speaker identification (issue #266). For each global
+/// speaker cluster in `ce`, match the L2-normalized centroid of the
+/// cluster's member embeddings against `db` — which the caller MUST
+/// already have narrowed to the claimed roster via speaker_db_retain().
+/// A matched cluster's member segments get "(Name) " labels; unmatched
+/// clusters keep their anonymous "(speaker N) " labels. One identity
+/// per cluster; a mixed slice can never inherit a single name.
+/// Returns the number of clusters identified.
+int crispasr_identify_speaker_clusters(std::vector<crispasr_segment>& segs, const CrispasrClusterEmbeddings& ce,
+                                       const struct speaker_db* db, float threshold, bool no_prints);
+
+/// Standalone identification without diarization (issue #266): the whole
+/// recording is treated as ONE speaker cluster. Embeds all eligible
+/// segments, centroid-matches against the (already claimed-roster-
+/// narrowed) db, and on success labels EVERY segment with the name.
+/// Returns true when a name was assigned.
+bool crispasr_identify_single_speaker(std::vector<crispasr_segment>& segs, const float* full_audio, int n_samples,
+                                      CrispasrSpeakerEmbedder* embedder, const struct speaker_db* db, float threshold,
+                                      bool no_prints);

@@ -19,6 +19,10 @@ Redacted descriptions in own voice.
 | 14 | `CUDA: support F16 weights in conv_transpose_1d` | yours (555deb98) — fixes issue #126 SNAC + orpheus CUDA segfault; templates kernel on src0 type, relaxes F32-only assert + supports_op | validated on RunPod A40 sm_86 2026-05-26, not yet filed |
 | 16 | `ggml-cuda : add k-quant support to GET_ROWS (Q2_K–Q6_K)` | ours (3bf9a599) — uses `ggml_get_to_fp32_cuda()` row-dequant, copies indices to host, sequential kernel launch per row; also adds Q2_K–Q6_K to `supports_op` | ✅ validated on RunPod RTX 3090 sm_86 2026-06-05 (mimo-asr Q4_K embed, 2.0× RT, correct JFK); `16-sched-small-graph-cross-backend.md` also documents the scheduler cross-backend routing bug for small graphs |
 | 17 | `CUDA: tighten input-position loop in conv_transpose_1d` | ours (f8fc8b8e) — CUDA analog of merged Metal PR #04; i_min/i_max analytical bounds eliminate O(IL) naive loop (was ~200× wasted iterations at TTS codec scale, causing TDR on AMD RX 7900 XTX + NVIDIA RTX 5060 Ti; see #155); bit-identical output | validated locally; CUDA hardware test pending; gated on PR #14 (applies on top of F16 template) — not yet filed |
+| 18 | `metal : implement cpy_tensor for shared buffers (avoid host-staging copy)` | ours — found via #161 KV-snapshot work; Metal shared `cpy_tensor` returns false unconditionally, so a same-backend `ggml_backend_tensor_copy` on unified memory malloc-bounces through host instead of a 1-line `memcpy`; ~10 LOC + reference `.patch` | drafted on M1 2026-06-10, not yet filed |
+| 19 | `vulkan: flash_attn_ext coopmat2 path produces wrong output on AMD RDNA4 (RX 9700 XT)` | bug report, no patch — bisected from issue #171 VibeVoice TTS garbage; same graph is verbatim on Metal + Vulkan/MoltenVK (`FA_SCALAR`, `matrix cores: none`), garbles only on RDNA4 (`FA_COOPMAT2`). EOS classifier amplifies the attention drift into over-generation | **draft — awaiting hardware confirmation** (`GGML_VK_DISABLE_COOPMAT2=1`) from #171 reporter; then file at ggml-org/llama.cpp (vulkan) or escalate to Mesa/RADV |
+| 20 | `ggml : add col2im_1d — composable building block for ConvTranspose1d` | ours (PR #160) — new op; inverse-of-`im2col` gather that completes a decomposed `mul_mat`+`col2im_1d` transposed conv (the path behind #04/#14/#17). Upstream has no forward `col2im_1d`. Recommend collapsing to F32-in/F32-out before filing (F16/BF16 input was speculative + shipped the dst-type bug fixed 2026-06-19) | RFC / new op — file after #07; ggml-org/ggml (core + all backends) |
+| 21 | `vulkan: vkResetCommandPool faults on native RADV/NVIDIA under a many-small-graph workload` | bug report, no patch — issue #215 moss-transcribe segfault. The queue-drain hypothesis (`waitIdle` before `resetCommandPool`) was **DISPROVEN** on the reporter's RADV hardware: the guard ran on a valid queue and `resetCommandPool` still faulted, so it is not "reset with pending buffers" — looks like graph-scale state corruption (TADA-#192 signature, native-only, unreproducible on MoltenVK). App-level fix is device-scoped CPU fallback for native Vulkan | **bug report — disproven patch removed; awaiting native-HW isolation before filing** at ggml-org/llama.cpp (vulkan) |
 
 The `.patch` files are clean diffs; they are reference shape, not
 literal `git am` payloads — line numbers are relative to our vendored
@@ -62,15 +66,19 @@ explicitly in the Requirements section.
 
 ## Sending
 
-Send sequentially, not concurrent (new-contributor cap = 1 open PR per
-repo). Order — easiest reviewer call first:
+We are **not** a first-time contributor — PR **04** is merged at
+ggml-org/ggml (#1477) and **02** is filed at ggml-org/llama.cpp (#22944),
+so the new-contributor "1 open PR per repo" cap does not gate us at
+ggml-org/ggml. Still send sequentially per repo as a courtesy and to keep
+reviewer load sane. Order — easiest reviewer call first:
 
 1. ✅ **04** Metal perf → merged at ggml-org/ggml as [#1477](https://github.com/ggml-org/ggml/pull/1477) 2026-05-10
 2. 📤 **02** CUDA im2col → filed at ggml-org/llama.cpp as [#22944](https://github.com/ggml-org/llama.cpp/pull/22944) 2026-05-11 (after ggml#1485 was redirected)
 3. **03** CUDA cpy → file at ggml-org/llama.cpp after #22944 merges; re-derive the kernel-tiling code yourself first
 4. **14** CUDA conv_transpose_1d F16 → file at ggml-org/llama.cpp; small (2 files, ~25 LOC), pure-perf no-regression for existing F32 callers — should be an easy reviewer call
 5. **17** CUDA conv_transpose_1d loop → file at ggml-org/llama.cpp after #14 merges; 1 file, +14/−22 on top of #14; CUDA analog of ggml#1477 — reviewer will recognise the pattern
-6. **01** CPU F16 → file at ggml-org/ggml (touches ggml-cpu/ + ggml.c); design-discussion expected, consider opening an issue first
+6. **18** Metal cpy_tensor → file at ggml-org/ggml (touches `ggml-metal/` only, same path as merged #04); ~10 LOC, no-regression fast path with clean fallback — easy reviewer call, and we have standing there from #1477
+7. **01** CPU F16 → file at ggml-org/ggml (touches ggml-cpu/ + ggml.c); design-discussion expected, consider opening an issue first
 
 Per upstream:
 

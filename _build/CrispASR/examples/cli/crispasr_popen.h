@@ -14,6 +14,11 @@
 // with the wide string. POSIX paths are unchanged; UTF-8 is already
 // the wire format.
 //
+// Issue #239: POSIX popen() only accepts "r" or "w"; passing "rb"
+// returns NULL with errno=EINVAL (glibc) and silently breaks the
+// ffmpeg subprocess fallback on Linux. Strip 'b' on the POSIX path —
+// all pipe I/O is binary anyway, the 'b' flag is a no-op there.
+//
 // Header-only so any CLI translation unit can drop it in without a
 // CMake change. Be sure to define NOMINMAX before including this
 // header so windows.h doesn't shadow std::min / std::max — the
@@ -34,7 +39,8 @@
 namespace crispasr {
 
 // Open a subprocess pipe. `cmd` is UTF-8; `mode` is "rb"/"wb"/"r"/"w"
-// (the same alphabet `_popen` / `popen` accepts).
+// (Windows _wpopen accepts "rb"/"wb"; POSIX popen only accepts "r"/"w" —
+// see issue #239; the 'b' is stripped on non-Windows platforms).
 //
 // Returns nullptr on failure. The caller closes via `crispasr_pclose`.
 inline FILE* crispasr_popen(const std::string& cmd, const char* mode) {
@@ -68,7 +74,15 @@ inline FILE* crispasr_popen(const std::string& cmd, const char* mode) {
         wmode.push_back(static_cast<wchar_t>(*p));
     return _wpopen(wcmd.c_str(), wmode.c_str());
 #else
-    return ::popen(cmd.c_str(), mode);
+    // POSIX popen() only accepts "r" or "w". Strip 'b' (binary flag)
+    // which glibc rejects with EINVAL (#239). Pipe I/O is always binary
+    // on POSIX regardless; the flag is purely a Windows/C-runtime concept.
+    std::string posix_mode;
+    for (const char* p = mode; *p; ++p) {
+        if (*p != 'b')
+            posix_mode += *p;
+    }
+    return ::popen(cmd.c_str(), posix_mode.c_str());
 #endif
 }
 

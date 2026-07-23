@@ -110,7 +110,11 @@ static std::string base64_encode(const uint8_t* d, int n) {
 
 // WebSocket accept key: SHA1(client_key + magic) → base64
 static std::string ws_accept_key(const std::string& client_key) {
-    std::string cat = client_key + "258EAFA5-E914-47DA-95CA-5AB5DC11D585";
+    // RFC 6455 §1.3 magic GUID. (Was previously mistyped as
+    // ...5AB5DC11D585, which produced a wrong Sec-WebSocket-Accept and made
+    // every spec-compliant client — browsers, the `websockets` lib — reject
+    // the handshake. The streaming server never actually worked until this fix.)
+    std::string cat = client_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     sha1_ctx c; sha1_init(c);
     sha1_update(c, cat.data(), cat.size());
     uint8_t hash[20]; sha1_final(c, hash);
@@ -209,9 +213,19 @@ static int g_n_threads = 4;
 
 // Per-connection handler
 static void ws_handle_connection(socket_t client_fd) {
-    // 1. Read HTTP upgrade request
-    char req_buf[4096];
-    int req_len = recv(client_fd, req_buf, sizeof(req_buf) - 1, 0);
+    // 1. Read HTTP upgrade request. Loop until end-of-headers (\r\n\r\n): a
+    // spec-compliant client's handshake can span multiple TCP segments, and a
+    // single recv() may return a truncated request — yielding a wrong/empty
+    // Sec-WebSocket-Key and a rejected Sec-WebSocket-Accept.
+    char req_buf[8192];
+    int req_len = 0;
+    while (req_len < (int)sizeof(req_buf) - 1) {
+        int n = recv(client_fd, req_buf + req_len, sizeof(req_buf) - 1 - req_len, 0);
+        if (n <= 0) break;
+        req_len += n;
+        req_buf[req_len] = '\0';
+        if (strstr(req_buf, "\r\n\r\n")) break; // headers complete
+    }
     if (req_len <= 0) { CLOSE_SOCKET(client_fd); return; }
     req_buf[req_len] = '\0';
 

@@ -122,11 +122,15 @@ struct moonshine_model {
 
     // ggml state
     ggml_backend_buffer_t buf_w = nullptr;
+    // §232: hybrid placement — CPU partition holding the decoder weights when
+    // the encoder runs on GPU (load_weights_split). Non-null only in that mode.
+    ggml_backend_buffer_t buf_w_cpu = nullptr;
     struct ggml_context* ctx_w = nullptr;
 
     moonshine_model() = default;
     ~moonshine_model() {
         ggml_backend_buffer_free(buf_w);
+        ggml_backend_buffer_free(buf_w_cpu);
         ggml_free(ctx_w);
     }
 

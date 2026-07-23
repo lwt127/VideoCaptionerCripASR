@@ -20,7 +20,8 @@ namespace crispasr_cache {
 // Return the cache directory (creating it if missing).
 //   • If cache_dir_override is non-empty, use it directly (creating the leaf
 //     directory if it does not exist; parents must already exist).
-//   • Otherwise use the platform default:
+//   • Otherwise honor CRISPASR_CACHE_DIR, then CRISPASR_MODELS_DIR.
+//   • If neither environment variable is set, use the platform default:
 //       - POSIX : $HOME/.cache/crispasr
 //       - Windows: %USERPROFILE%/.cache/crispasr
 //                  (%HOME% / %LOCALAPPDATA% as fallbacks if USERPROFILE unset)
@@ -47,10 +48,21 @@ bool fetch(const std::string& url, const std::string& dest, bool quiet);
 // ensure_cached_file() would report at runtime.
 std::string probe_cached_file(const std::string& filename, const std::string& cache_dir_override = "");
 
-// Composite helper: if `dest` (= dir(cache_dir_override) + "/" + filename)
-// already satisfies file_present(), return its path immediately. Otherwise
-// invoke fetch() to populate it. Returns the absolute path on success or an
-// empty string on failure.
+// Composite helper: resolve `filename` for `url`, downloading on first use.
+// Cache layout stays FLAT (`<dir>/<filename>`) so existing loaders that find a
+// companion next to the model, in the flat cache dir, or via a returned path all
+// keep working. Source integrity (issue #250 — a flat basename cache silently
+// returning one repo's `tokenizer.bin`/codec/ref GGUF for another repo's
+// request) is enforced with a `<file>.src` sidecar recording the origin url:
+//   • a cache hit whose sidecar names a DIFFERENT url is a same-basename file
+//     from another source — it is NOT reused. In the canonical cache dir the
+//     correct file is re-downloaded (overwriting it); a wrong-source file in a
+//     user-managed dir is left untouched and skipped.
+//   • a hit whose sidecar matches, or that has no sidecar at all (a pre-#250
+//     cache or a hand-managed model dir), is trusted as-is (backward compat).
+// Downloads are atomic (temp file + rename) so an interrupted transfer never
+// leaves a partial file at the returned path (issue #250 Q10). Returns the
+// absolute path on success or an empty string on failure.
 std::string ensure_cached_file(const std::string& filename, const std::string& url, bool quiet,
                                const char* pretty_label = "crispasr", const std::string& cache_dir_override = "");
 

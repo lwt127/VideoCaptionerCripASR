@@ -23,7 +23,8 @@ DynamicLibrary _openLib() {
   final path = Platform.environment['CRISPASR_LIB'];
   if (path != null && path.isNotEmpty) return DynamicLibrary.open(path);
   if (Platform.isMacOS || Platform.isIOS) {
-    return DynamicLibrary.open('../../build-ninja-compile/src/libcrispasr.dylib');
+    return DynamicLibrary.open(
+        '../../build-ninja-compile/src/libcrispasr.dylib');
   }
   return DynamicLibrary.open('../../build-ninja-compile/src/libcrispasr.so');
 }
@@ -50,7 +51,8 @@ void main() {
       'crispasr_chat_generate_params_default',
     ];
     for (final s in symbols) {
-      expect(lib.providesSymbol(s), isTrue, reason: 'missing $s in libcrispasr');
+      expect(lib.providesSymbol(s), isTrue,
+          reason: 'missing $s in libcrispasr');
     }
   });
 
@@ -74,8 +76,10 @@ void main() {
     expect(session.templateName, isNotEmpty);
 
     const messages = [
-      ChatMessage(role: 'system', content: 'You are a terse assistant. Answer in one word.'),
-      ChatMessage(role: 'user',   content: 'Say hello.'),
+      ChatMessage(
+          role: 'system',
+          content: 'You are a terse assistant. Answer in one word.'),
+      ChatMessage(role: 'user', content: 'Say hello.'),
     ];
 
     // Greedy + seeded → reproducible across runs.

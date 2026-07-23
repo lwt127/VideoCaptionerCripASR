@@ -8,6 +8,7 @@
 
 #include "crispasr_diarize.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -64,5 +65,33 @@ int score_speaker_for_range(const float* log_probs, int T, double frame_dur_s, i
 //     silence should pre-filter with VAD.
 void assign_speakers_from_log_posteriors(const float* log_probs, int T, double frame_dur_s, int64_t slice_t0_cs,
                                          std::vector<CrispasrDiarizeSegment>& segs);
+
+// A maximal run of consecutive words assigned to one speaker. Half-open
+// word-index range [start, end); `speaker` is the run's speaker id (>=0),
+// or -1 when unknown.
+struct SpeakerRun {
+    std::size_t start; // first word index (inclusive)
+    std::size_t end;   // one-past-last word index (exclusive)
+    int speaker;       // speaker id, or -1
+};
+
+// Group per-word speaker labels into maximal same-speaker runs, then fold
+// any run whose word span is shorter than `min_run_cs` into its longer
+// neighbour. The fold suppresses single-word track-index flips that
+// pyannote-seg (no speaker embeddings) produces mid-phrase — e.g. a lone
+// "(speaker 2)" word inside a contiguous "(speaker 1)" run — which would
+// otherwise fragment a segment into spurious sub-segments (#107 / #267).
+//
+// word_spk[i] is word i's speaker (>=0, or -1 for "unknown"). word_t0_cs[i]
+// / word_t1_cs[i] are word i's absolute start/end centiseconds; the caller
+// substitutes segment bounds for non-positive values so a run's span is
+// well-defined. Pass `min_run_cs <= 0` to disable folding (split on every
+// speaker change). All three vectors must be the same length.
+//
+// Pure and model-free so unit tests can drive it directly. Returns an empty
+// vector when `word_spk` is empty.
+std::vector<SpeakerRun> group_words_into_speaker_runs(const std::vector<int>& word_spk,
+                                                      const std::vector<int64_t>& word_t0_cs,
+                                                      const std::vector<int64_t>& word_t1_cs, int64_t min_run_cs);
 
 } // namespace crispasr_diarize_internal

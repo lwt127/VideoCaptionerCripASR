@@ -92,7 +92,20 @@ import numpy as np
 #   1. tools/reference_backends/<name>.py  with dump() + DEFAULT_STAGES
 #   2. one line here.
 REGISTERED_BACKENDS: Dict[str, str] = {
+    # dots.tts (rednote-hilab/dots.tts-soar) TTS: Qwen2.5-1.5B LLM +
+    # 18L DiT flow-matching head + 24L VAESemanticEncoder (PatchEncoder)
+    # + BigVGAN vocoder. The C++ diff branch ("dots-tts") validates the
+    # PatchEncoder decode_patch in isolation (penc_in_patch0 -> penc_out_patch0).
+    # Text comes from $DOTS_TEXT; the --audio arg is ignored (TTS).
+    "dots-tts":   "reference_backends.dots_tts_reference",
+    # MOSS-TTS-v1.5 (MossTTSDelay) TTS: Qwen3-8B backbone + 32 RVQ codebooks
+    # under a delay pattern + 1.6B transformer codec. The greedy code grid
+    # ("codes") is the Phase-3 byte-parity target; "waveform" (needs the codec)
+    # is the Phase-4 decoded reference. Text from $MOSS_TTS_TEXT; --audio ignored.
+    "miotts":     "reference_backends.miotts",
+    "moss-tts":   "reference_backends.moss_tts",
     "qwen3":      "reference_backends.qwen3",
+    "higgs-stt":  "reference_backends.higgs_stt",
     "voxtral":    "reference_backends.voxtral",
     "voxtral4b":  "reference_backends.voxtral4b",
     "granite":    "reference_backends.granite",
@@ -117,6 +130,7 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # branch ("canary") compares mel_spectrogram + encoder_output; the
     # per-layer captures listed in DEFAULT_STAGES are diagnostic-only.
     "canary":     "reference_backends.canary",
+    "canary-qwen": "reference_backends.canary_qwen",
     "gemma4":     "reference_backends.gemma4",
     # Qwen3-TTS-12Hz Base. The audio arg is the voice-clone reference WAV
     # (16 kHz mono); synth text + ref text come from env vars. See
@@ -131,6 +145,10 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # Qwen3-TTS-Tokenizer-12Hz codec ENCODER (audio → codes).
     # model_dir = the Tokenizer-12Hz HF snapshot. audio is unused.
     "qwen3-tts-cenc":  "reference_backends.qwen3_tts_cenc",
+    # OmniVoice: k2-fsa/OmniVoice — Qwen3 + masked iterative TTS.
+    # model_dir = k2-fsa/OmniVoice (HF id) or local snapshot.
+    # audio arg is unused (TTS). Text from OMNIVOICE_SYN_TEXT env.
+    "omnivoice":  "reference_backends.omnivoice",
     # VibeVoice-ASR 7B: two σ-VAE encoders + connectors + Qwen2 decoder.
     # NOTE: audio must be 16 kHz on entry (shared loader); the backend
     # resamples to 24 kHz internally.
@@ -147,6 +165,9 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # model_dir = the MiMo-V2.5-ASR HF snapshot. The audio-tokenizer path
     # is read from MIMO_TOKENIZER_DIR (or auto-derived from a sibling dir).
     "mimo-asr":   "reference_backends.mimo_asr",
+    # ARK-ASR-3B: Whisper-RoPE encoder + MLP adapter + Qwen2.5-3B decoder.
+    "arkasr":     "reference_backends.arkasr",
+    "ark-asr":    "reference_backends.arkasr",
     # Kokoro / StyleTTS2 (iSTFTNet). Text-driven; the audio arg is a
     # placeholder. Phonemes + voice come from KOKORO_PHONEMES / KOKORO_VOICE
     # env vars (see reference_backends/kokoro.py for the full list).
@@ -156,6 +177,11 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # Driven by ORPHEUS_SNAC_T_SUPER (default 4) + ORPHEUS_SNAC_CODE
     # (default 0); see reference_backends/orpheus_snac.py.
     "orpheus":    "reference_backends.orpheus_snac",
+    # Orpheus talker (Llama-3.2-3B-FT): greedy codec-token stream for the
+    # AR-decode diff (§176b bucket). model_dir = the talker LM HF snapshot
+    # (e.g. unsloth/orpheus-3b-0.1-ft); audio arg unused. Driven by
+    # ORPHEUS_TEXT / ORPHEUS_SPEAKER; see reference_backends/orpheus_talker.py.
+    "orpheus-talker": "reference_backends.orpheus_talker",
     # Chatterbox TTS: T3 (Llama AR) → S3Gen (CFM) → HiFTGenerator.
     # model_dir = ResembleAI/chatterbox snapshot (or local with
     # t3_cfg.safetensors + s3gen.safetensors + ve.safetensors + conds.pt).
@@ -219,6 +245,9 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # model_dir = openbmb/VoxCPM2 HF snapshot. Audio arg = reference WAV
     # for voice cloning (optional). Synth text from VOXCPM2_SYN_TEXT env.
     "voxcpm2-tts": "reference_backends.voxcpm2_tts",
+    # AudioVAE-only 16 kHz -> 48 kHz S2S upscaler. Mirrors the official
+    # VoxCPM2 encode padding/layout and audio_vae decode round trip.
+    "voxcpm2-vae": "reference_backends.voxcpm2_vae",
     # CosyVoice3 TTS — Phase 3b: single-DiT-block stages only (flow
     # model is the only thing wired through extract_stage so far).
     # model_dir = FunAudioLLM/Fun-CosyVoice3-0.5B-2512 HF snapshot.
@@ -240,10 +269,18 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # dir. GitHub source (modeling code) expected at ref/moss_audio/github/
     # or via MOSS_AUDIO_GITHUB env. Prompt from MOSS_AUDIO_PROMPT env.
     "moss-audio":  "reference_backends.moss_audio",
+    # MOSS-Transcribe-preview-2B: Qwen3-Omni audio encoder + GatedMLP adapter +
+    # Qwen3-1.7B LM. Ships modeling+processing code (no GitHub clone needed).
+    # model_dir = OpenMOSS-Team/MOSS-Transcribe-preview-2B HF id or local dir.
+    "moss-transcribe": "reference_backends.moss_transcribe",
     # TADA-3B-ML TTS: Llama-3.2-3B + per-token flow matching + TADA codec.
     # model_dir = HumeAI/tada-3b-ml HF id or local snapshot.
     # Audio arg is unused (text-driven). Text from TADA_SYN_TEXT env var.
     "tada-tts":   "reference_backends.tada_tts",
+    # TADA encoder: Aligner + WavEncoder + LocalAttentionEncoder → voice reference.
+    # model_dir = HumeAI/tada-codec or local path. Audio arg is the reference audio.
+    # Text from TADA_ENCODER_TEXT, language from TADA_ENCODER_LANG env vars.
+    "tada-encoder": "reference_backends.tada_encoder",
     # Zyphra/Zonos-v0.1-transformer: GPT-style AR TTS with 9-codebook DAC.
     # model_dir = Zyphra/Zonos-v0.1-transformer HF id or local snapshot.
     # Audio arg is unused (text-driven). Text + seed from env vars:
@@ -253,6 +290,69 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     #   ZONOS_TTS_LANGUAGE (default "en-us")
     # Stages: conditioning_prefix, phoneme_ids, prefill_logits, output_codes.
     "zonos-tts":  "reference_backends.zonos_tts_reference",
+    # LiquidAI LFM2.5-Audio-1.5B-JP: FastConformer encoder + LFM2 hybrid
+    # conv+attention backbone + depthformer. ASR+TTS in one model.
+    # model_dir = LiquidAI/LFM2.5-Audio-1.5B-JP HF id or local snapshot.
+    # Prompt from LFM2_PROMPT env var (default "Perform ASR in japanese.").
+    "lfm2-audio": "reference_backends.lfm2_audio",
+    # Nemotron-3.5-ASR-Streaming: Cache-Aware FastConformer + RNN-T.
+    # model_dir = nvidia/nemotron-3.5-asr-streaming-0.6b HF id or local .nemo.
+    # Captures mel, pre-encode, and full encoder output for diff regression.
+    "nemotron":   "reference_backends.nemotron",
+    # gpt-omni/mini-omni2: Whisper-small encoder + SwiGLU adapter +
+    # Qwen2-0.5B LLM. Custom litgpt framework (not HF). model_dir = cloned
+    # repo with lit_model.pth + small.pt + model_config.yaml. Needs the
+    # litgpt package on sys.path (set MINI_OMNI2_REPO or put it in model_dir).
+    "mini-omni2": "reference_backends.mini_omni2",
+    # Irodori-TTS (Aratako/Irodori-TTS-500M-v3): RF-DiT flow matching TTS.
+    # model_dir = HF id or local .safetensors. Audio arg is unused (TTS).
+    # Text from IRODORI_TEST_TEXT env (default "こんにちは、世界。").
+    # Captures text_state, cond_embed, dit_block_0, v_pred_step0.
+    "irodori-tts": "reference_backends.irodori_tts",
+    # kyutai/stt-1b-en_fr and kyutai/stt-2.6b-en.
+    # Captures: pcm_24k, seanet_output, enc_tfm_output, downsampled,
+    # rvq_codes, lm_frame0_logits, generated_text.
+    # Requires: safetensors sentencepiece scipy moshi
+    "kyutai-stt":  "reference_backends.kyutai_stt",
+    # mistralai/Voxtral-4B-TTS-2603. Three-component TTS:
+    # Ministral-3B AR + 3L FM transformer + codec decoder → 24 kHz PCM.
+    # Text from VOXTRAL_TTS_TEXT env, voice from VOXTRAL_TTS_VOICE env.
+    "voxtral-tts": "reference_backends.voxtral_tts",
+    # MOSS-Transcribe-Diarize: Whisper-Medium encoder + VQAdaptor + Qwen3-0.6B.
+    # Joint ASR + diarization + timestamps. model_dir = OpenMOSS-Team/MOSS-Transcribe-Diarize.
+    "moss-diarize": "reference_backends.moss_diarize",
+    # HTDemucs (Meta Demucs v4): hybrid transformer source separation.
+    # 4-stem (drums, bass, other, vocals). model_dir = pretrained name
+    # ("htdemucs", "htdemucs_ft") or local checkpoint. Audio arg = mixed
+    # music WAV (any sample rate; resampled to 44100 Hz stereo internally).
+    "htdemucs":    "reference_backends.htdemucs",
+    # Mel-Band RoFormer (§248): frequency-band source separation, vocal/
+    # instrumental. model_dir = a directory (or .ckpt path) holding the
+    # checkpoint AND its YAML config — the band layout (num_bands / n_fft /
+    # hop) is not recoverable from the weights alone. Audio arg = mixed music
+    # WAV (any rate; resampled to the config's rate, stereo, internally).
+    "mel-band-roformer": "reference_backends.mel_band_roformer",
+    # MioCodec v2 (§249): neural audio codec. model_dir = HF repo ID
+    # ("Aratako/MioCodec-25Hz-44.1kHz-v2") or local snapshot dir.
+    # Audio arg = mono WAV at 44100 Hz. Captures decode path intermediates
+    # (FSQ→prenet→decoder→upsampler→ISTFT) for per-stage parity testing.
+    "miocodec": "reference_backends.miocodec",
+    # CREPE (Kim et al. 2018, MIT) monophonic F0 / pitch. NOT ASR and NOT TTS —
+    # it emits a 360-bin pitch activation per 10 ms frame. `model_dir` is the
+    # CAPACITY, not a directory: pass "tiny" or "full" (weights ship inside the
+    # torchcrepe package). Audio arg = any 16 kHz mono WAV.
+    # ⚠️ Only the raw activation is dumped: torchcrepe.convert.bins_to_cents
+    # dithers, so any decoded Hz would be non-deterministic.
+    "crepe": "reference_backends.crepe",
+    # TabCNN (Wiggins & Kim 2019) guitar tablature: six per-string softmaxes
+    # over 21 fret classes per frame. `model_dir` is the CHECKPOINT FILE from
+    # the EGSet12 Zenodo record (CC BY 4.0); the reference implementation is
+    # amt-tools (MIT), `pip install amt-tools`.
+    # ⚠️ The model's own `frontend` is an EMPTY Sequential — the CQT lives
+    # outside it — so this dumper emits `audio` and `cqt_db` too. Diff from the
+    # waveform, not from replayed features, or the front end is never tested
+    # (the BTC/piano blind spot).
+    "tabcnn": "reference_backends.tabcnn",
 }
 
 DEFAULT_STAGES_BY_BACKEND: Dict[str, List[str]] = {}  # populated at import
@@ -467,7 +567,7 @@ def main() -> None:
                     "VOXCPM2_SYN_TEXT", "VOXCPM2_USE_REF",
                     "F5_TTS_SYN_TEXT", "F5_TTS_REF_TEXT", "F5_TTS_SEED",
                     "F5_TTS_STEPS", "F5_TTS_CFG", "F5_TTS_SWAY",
-                    "LID_TEXT", "CLD3_TEXT"):
+                    "LID_TEXT", "CLD3_TEXT", "LFM2_PROMPT"):
         val = os.environ.get(env_key)
         if val is not None:
             meta[env_key.lower()] = val

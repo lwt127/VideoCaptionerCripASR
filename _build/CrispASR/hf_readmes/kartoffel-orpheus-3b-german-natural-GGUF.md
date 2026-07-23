@@ -100,7 +100,7 @@ crispasr --backend parakeet -m parakeet-tdt-0.6b-v3-q4_k.gguf -l de \
 
 ## Architecture
 
-Identical to Orpheus 3B — see [`cstr/orpheus-3b-base-GGUF`](https://huggingface.co/cstr/orpheus-3b-base-GGUF) for the full architecture writeup. The CrispASR `orpheus` runtime is checkpoint-agnostic; this GGUF is loaded by the same `orpheus_init_from_file` path with no source-code changes.
+Identical to Orpheus 3B — see [`cstr/orpheus-3b-0.1-ft-GGUF`](https://huggingface.co/cstr/orpheus-3b-0.1-ft-GGUF) for the full architecture writeup. The CrispASR `orpheus` runtime is checkpoint-agnostic; this GGUF is loaded by the same `orpheus_init_from_file` path with no source-code changes.
 
 Prompt format (verbatim from the upstream): the LM sees `[audio_start=128259, BOS=128000, ...tokenize("{name}: {text}")..., eot_id=128009, audio_eot=128260, audio_eom=128261, audio_end=128257]`. The runtime handles this for you; just pass `--voice <Name>`.
 

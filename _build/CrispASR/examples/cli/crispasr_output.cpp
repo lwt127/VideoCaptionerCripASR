@@ -266,6 +266,87 @@ static bool words_carry_sentence_ends(const std::vector<crispasr_word>& words) {
     return false;
 }
 
+// Split `text` on ASCII whitespace into tokens (no empty tokens).
+static std::vector<std::string> split_ws_words(const std::string& s) {
+    std::vector<std::string> w;
+    std::string cur;
+    for (char c : s) {
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            if (!cur.empty()) {
+                w.push_back(cur);
+                cur.clear();
+            }
+        } else {
+            cur += c;
+        }
+    }
+    if (!cur.empty())
+        w.push_back(cur);
+    return w;
+}
+
+// Append `tok` to `out`, broken at UTF-8 codepoint boundaries into pieces of
+// at most `max_len` bytes. Used for a single token longer than max_len and for
+// space-less scripts (CJK), where word packing can't break the text.
+static void split_long_token(const std::string& tok, int max_len, std::vector<std::string>& out) {
+    std::string cur;
+    for (size_t i = 0; i < tok.size();) {
+        size_t cp = 1;
+        unsigned char b = (unsigned char)tok[i];
+        if (b >= 0xF0)
+            cp = 4;
+        else if (b >= 0xE0)
+            cp = 3;
+        else if (b >= 0xC0)
+            cp = 2;
+        if (i + cp > tok.size())
+            cp = tok.size() - i;
+        if (!cur.empty() && (int)(cur.size() + cp) > max_len) {
+            out.push_back(cur);
+            cur.clear();
+        }
+        cur.append(tok, i, cp);
+        i += cp;
+    }
+    if (!cur.empty())
+        out.push_back(cur);
+}
+
+// Greedily pack `text` into lines of at most `max_len` bytes on whitespace word
+// boundaries (over-long tokens are split at codepoint boundaries). For text-only
+// backends that carry no word timings this is how --max-len is honoured (#205).
+static std::vector<std::string> pack_text_to_maxlen(const std::string& text, int max_len) {
+    std::vector<std::string> out;
+    auto words = split_ws_words(text);
+    if (words.empty()) {
+        if (!text.empty())
+            split_long_token(text, max_len, out);
+        return out;
+    }
+    std::string cur;
+    for (const auto& w : words) {
+        if ((int)w.size() > max_len) {
+            if (!cur.empty()) {
+                out.push_back(cur);
+                cur.clear();
+            }
+            split_long_token(w, max_len, out);
+            continue;
+        }
+        const size_t sep = cur.empty() ? 0 : 1;
+        if (!cur.empty() && (int)(cur.size() + sep + w.size()) > max_len) {
+            out.push_back(cur);
+            cur.clear();
+        }
+        if (!cur.empty())
+            cur += ' ';
+        cur += w;
+    }
+    if (!cur.empty())
+        out.push_back(cur);
+    return out;
+}
+
 std::vector<crispasr_disp_segment> crispasr_make_disp_segments(const std::vector<crispasr_segment>& segments,
                                                                int max_len, bool split_on_punct) {
     std::vector<crispasr_disp_segment> out;
@@ -279,9 +360,13 @@ std::vector<crispasr_disp_segment> crispasr_make_disp_segments(const std::vector
         const bool punct_in_text = split_on_punct && count_sentence_ends(seg.text) >= 2;
         const bool words_unhelpful = punct_in_text && !words_carry_sentence_ends(seg.words);
         if (seg.words.empty() || words_unhelpful || (max_len == 0 && !split_on_punct)) {
-            if (!seg.text.empty()) {
-                // If split_on_punct is enabled, split the text at sentence boundaries
-                // and interpolate timestamps proportionally.
+            if (seg.text.empty())
+                continue;
+
+            // No usable word timings. When max_len <= 0, keep the historical
+            // behaviour (split_on_punct splits sentences with frac-accurate
+            // timing; otherwise emit the whole text as one segment).
+            if (max_len <= 0) {
                 if (split_on_punct) {
                     auto sentences = split_text_at_punct(seg.text);
                     if (sentences.size() <= 1) {
@@ -299,6 +384,49 @@ std::vector<crispasr_disp_segment> crispasr_make_disp_segments(const std::vector
                 } else {
                     out.push_back({seg.t0, seg.t1, seg.text, seg.speaker});
                 }
+                continue;
+            }
+
+            // max_len > 0 but no word timings (#205: granite/qwen3 non-plus
+            // return text-only segments — --max-len used to be a no-op). Split
+            // the TEXT instead: optionally at sentence boundaries first, then
+            // pack to <= max_len bytes (max_len == 1 → one line per word), and
+            // interpolate timestamps by cumulative character length.
+            std::vector<std::string> sentences;
+            if (split_on_punct) {
+                for (const auto& sf : split_text_at_punct(seg.text))
+                    sentences.push_back(sf.first);
+            }
+            if (sentences.empty())
+                sentences.push_back(seg.text);
+
+            std::vector<std::string> pieces;
+            for (const auto& sent : sentences) {
+                if (max_len == 1) {
+                    for (const auto& wd : split_ws_words(sent))
+                        pieces.push_back(wd);
+                } else {
+                    for (auto& chunk : pack_text_to_maxlen(sent, max_len))
+                        pieces.push_back(std::move(chunk));
+                }
+            }
+            if (pieces.empty()) {
+                out.push_back({seg.t0, seg.t1, seg.text, seg.speaker});
+                continue;
+            }
+
+            const int64_t duration = seg.t1 - seg.t0;
+            size_t total = 0;
+            for (const auto& p : pieces)
+                total += p.size();
+            if (total == 0)
+                total = 1;
+            size_t acc = 0;
+            for (auto& p : pieces) {
+                int64_t s_t0 = seg.t0 + (int64_t)((double)acc / (double)total * (double)duration);
+                acc += p.size();
+                int64_t s_t1 = seg.t0 + (int64_t)((double)acc / (double)total * (double)duration);
+                out.push_back({s_t0, s_t1, std::move(p), seg.speaker});
             }
             continue;
         }
@@ -538,12 +666,25 @@ bool crispasr_write_json(const std::string& path, const std::vector<crispasr_seg
             f << ",\n      \"emotion\":    \"" << json_escape(s.emotion) << "\"";
         if (!s.itn_flag.empty())
             f << ",\n      \"itn_flag\":   \"" << json_escape(s.itn_flag) << "\"";
+        // #292: chunk scope. Only present on multi-chunk runs (single-pass leaves
+        // chunk_id at -1). Diarize "(speaker N)" labels are chunk-local, so a
+        // consumer must not assume "speaker 1" in different chunk_ids is the same
+        // person — segments sharing a chunk_id share a speaker numbering.
+        if (s.chunk_id >= 0)
+            f << ",\n      \"chunk_id\":   " << s.chunk_id;
+        // NOTE ON UNITS (issue #228): segment `offsets` above are in milliseconds
+        // (t0/t1 are the internal centisecond timebase * 10). For back-compat the
+        // per-word / per-token `t0`/`t1` fields are kept in their original
+        // centisecond units, and each entry additionally carries an `offsets`
+        // object in milliseconds so every timed object in this document exposes a
+        // consistent ms field matching the segment shape.
         if (full && !s.words.empty()) {
             f << ",\n      \"words\": [\n";
             for (size_t j = 0; j < s.words.size(); j++) {
                 const auto& w = s.words[j];
                 f << "        { \"text\": \"" << json_escape(w.text) << "\", \"t0\": " << w.t0 << ", \"t1\": " << w.t1
-                  << " }" << (j + 1 < s.words.size() ? "," : "") << "\n";
+                  << ", \"offsets\": { \"from\": " << (w.t0 * 10) << ", \"to\": " << (w.t1 * 10) << " } }"
+                  << (j + 1 < s.words.size() ? "," : "") << "\n";
             }
             f << "      ]";
         }
@@ -552,8 +693,8 @@ bool crispasr_write_json(const std::string& path, const std::vector<crispasr_seg
             for (size_t j = 0; j < s.tokens.size(); j++) {
                 const auto& t = s.tokens[j];
                 f << "        { \"text\": \"" << json_escape(t.text) << "\", \"p\": " << t.confidence
-                  << ", \"t0\": " << t.t0 << ", \"t1\": " << t.t1 << " }" << (j + 1 < s.tokens.size() ? "," : "")
-                  << "\n";
+                  << ", \"t0\": " << t.t0 << ", \"t1\": " << t.t1 << ", \"offsets\": { \"from\": " << (t.t0 * 10)
+                  << ", \"to\": " << (t.t1 * 10) << " } }" << (j + 1 < s.tokens.size() ? "," : "") << "\n";
             }
             f << "      ]";
         }
@@ -581,6 +722,46 @@ bool crispasr_write_lrc(const std::string& path, const std::vector<crispasr_disp
         snprintf(buf, sizeof(buf), "[%02d:%02d.%02d]", mm, ss, xx);
         f << buf << prefix_speaker(s.speaker) << s.text << "\n";
     }
+    return true;
+}
+
+std::string crispasr_ctc_logits_to_json(const crispasr_ctc_logits& logits) {
+    std::ostringstream js;
+    js << "{";
+    js << "\"n_frames\":" << logits.n_frames << ",";
+    js << "\"n_vocab\":" << logits.n_vocab << ",";
+    js << "\"layout\":\"frame_major\",";
+    js << "\"normalization\":\"" << json_escape(logits.normalization) << "\",";
+    if (!logits.vocab.empty()) {
+        js << "\"vocab\":[";
+        for (size_t i = 0; i < logits.vocab.size(); i++) {
+            if (i)
+                js << ",";
+            js << "\"" << json_escape(logits.vocab[i]) << "\"";
+        }
+        js << "],";
+    }
+    js << "\"data\":[";
+    for (size_t i = 0; i < logits.data.size(); i++) {
+        if (i)
+            js << ",";
+        js << logits.data[i];
+    }
+    js << "]}";
+    return js.str();
+}
+
+bool crispasr_write_ctc_logits_json(const std::string& path, const crispasr_ctc_logits& logits,
+                                    const std::string& backend_name) {
+    std::ofstream f(path);
+    if (!f) {
+        fprintf(stderr, "crispasr: warning: cannot write CTC logits JSON '%s'\n", path.c_str());
+        return false;
+    }
+    f << "{\n";
+    f << "  \"backend\": \"" << json_escape(backend_name) << "\",\n";
+    f << "  \"ctc_logits\": " << crispasr_ctc_logits_to_json(logits) << "\n";
+    f << "}\n";
     return true;
 }
 
@@ -743,6 +924,43 @@ void crispasr_print_alternatives(const std::vector<crispasr_segment>& segs, int 
     fflush(stdout);
 }
 
+void crispasr_print_confidence(const std::vector<crispasr_segment>& segs) {
+    for (const auto& seg : segs) {
+        // No token-level confidence (backend didn't emit tokens) — fall back to
+        // the plain segment text so the flag still yields readable output.
+        bool any_tok = false;
+        for (const auto& tok : seg.tokens) {
+            if (!tok.is_special) {
+                any_tok = true;
+                break;
+            }
+        }
+        if (!any_tok) {
+            if (!seg.text.empty())
+                printf("%s\n", seg.text.c_str());
+            continue;
+        }
+        bool first = true;
+        for (const auto& tok : seg.tokens) {
+            if (tok.is_special)
+                continue;
+            // Tokens carry the leading-space word-boundary convention; strip it
+            // so the annotation attaches to the word, not a stray gap.
+            const char* t = tok.text.c_str();
+            while (*t == ' ')
+                ++t;
+            if (!*t)
+                continue;
+            printf("%s%s", first ? "" : " ", t);
+            first = false;
+            if (tok.confidence >= 0.0f)
+                printf("[%.0f%%]", tok.confidence * 100.0f);
+        }
+        printf("\n");
+    }
+    fflush(stdout);
+}
+
 void crispasr_print_stdout(const std::vector<crispasr_disp_segment>& segs, bool show_timestamps) {
     if (show_timestamps) {
         for (const auto& s : segs) {
@@ -891,6 +1109,90 @@ std::string crispasr_segments_to_openai_verbose_json(const std::vector<crispasr_
     return js.str();
 }
 
+// ---------------------------------------------------------------------------
+// Normalise speaker labels: "(speaker 0) " → "A", "(speaker 1) " → "B", etc.
+// Falls through to the raw string (trimmed) for non-standard labels.
+// ---------------------------------------------------------------------------
+static std::string normalise_speaker(const std::string& raw) {
+    // Trim trailing whitespace.
+    std::string s = raw;
+    while (!s.empty() && (s.back() == ' ' || s.back() == ')'))
+        s.pop_back();
+    // Extract number from "(speaker N" pattern.
+    const char prefix[] = "(speaker ";
+    if (s.size() > sizeof(prefix) - 1 && s.compare(0, sizeof(prefix) - 1, prefix) == 0) {
+        int n = std::atoi(s.c_str() + sizeof(prefix) - 1);
+        if (n >= 0 && n < 26)
+            return std::string(1, (char)('A' + n));
+        // More than 26 speakers: "AA", "AB", …
+        return std::string(1, (char)('A' + n / 26)) + (char)('A' + n % 26);
+    }
+    // Already a clean label — return trimmed.
+    if (!s.empty() && s.front() == '(')
+        s.erase(s.begin());
+    return s.empty() ? "A" : s;
+}
+
+std::string crispasr_segments_to_diarized_json(const std::vector<crispasr_segment>& segs, double duration_s,
+                                               const std::string& language, const std::string& task,
+                                               float temperature) {
+    std::string full_text = crispasr_segments_to_text(segs);
+
+    std::ostringstream js;
+    js << std::fixed;
+    js << "{\n";
+    js << "  \"task\": \"" << json_escape(task) << "\",\n";
+    js << "  \"language\": \"" << json_escape(language) << "\",\n";
+    js << std::setprecision(3);
+    js << "  \"duration\": " << duration_s << ",\n";
+    js << "  \"text\": \"" << json_escape(full_text) << "\",\n";
+    js << "  \"segments\": [\n";
+    for (size_t i = 0; i < segs.size(); i++) {
+        const auto& s = segs[i];
+        js << "    {\n";
+        js << "      \"id\": " << i << ",\n";
+        js << std::setprecision(2);
+        js << "      \"start\": " << cs_to_sec(s.t0) << ",\n";
+        js << "      \"end\": " << cs_to_sec(s.t1) << ",\n";
+        js << "      \"text\": \"" << json_escape(s.text) << "\",\n";
+
+        // Speaker label — normalised to letter form.
+        std::string spk = s.speaker.empty() ? "A" : normalise_speaker(s.speaker);
+        js << "      \"speaker\": \"" << json_escape(spk) << "\",\n";
+
+        js << "      \"type\": \"transcript.text.segment\"";
+        // #292: chunk scope — diarize speaker labels are CHUNK-LOCAL, so a
+        // consumer must not treat the same label across different chunk_ids as
+        // the same person. Present only on multi-chunk runs (single-pass = -1).
+        if (s.chunk_id >= 0)
+            js << ",\n      \"chunk_id\": " << s.chunk_id;
+
+        // Word-level timestamps if available.
+        if (!s.words.empty()) {
+            js << ",\n      \"words\": [\n";
+            for (size_t j = 0; j < s.words.size(); j++) {
+                const auto& w = s.words[j];
+                js << "        {\"word\": \"" << json_escape(w.text) << "\", ";
+                js << std::setprecision(2);
+                js << "\"start\": " << cs_to_sec(w.t0) << ", ";
+                js << "\"end\": " << cs_to_sec(w.t1) << "}";
+                if (j + 1 < s.words.size())
+                    js << ",";
+                js << "\n";
+            }
+            js << "      ]";
+        }
+
+        js << "\n    }";
+        if (i + 1 < segs.size())
+            js << ",";
+        js << "\n";
+    }
+    js << "  ]\n";
+    js << "}\n";
+    return js.str();
+}
+
 std::string crispasr_segments_to_native_json(const std::vector<crispasr_segment>& segs, const std::string& backend_name,
                                              double duration_s) {
     std::ostringstream js;
@@ -908,6 +1210,8 @@ std::string crispasr_segments_to_native_json(const std::vector<crispasr_segment>
         if (!s.speaker.empty()) {
             js << ",\n      \"speaker\": \"" << json_escape(s.speaker) << "\"";
         }
+        if (s.chunk_id >= 0) // #292: chunk-local speaker scope (multi-chunk only)
+            js << ",\n      \"chunk_id\": " << s.chunk_id;
         if (!s.tokens.empty()) {
             js << ",\n      \"tokens\": [\n";
             for (size_t j = 0; j < s.tokens.size(); j++) {

@@ -808,6 +808,120 @@ struct context {
     neural_model neural; // Neural G2P for OOV
 };
 
+// ── Text normalization (technical tokens) ──────────────────────────
+// Expand common technical terms containing symbols that the tokenizer
+// would otherwise mangle. Runs before tokenize().
+// Case-insensitive matching; replacements use natural English words
+// so that downstream G2P (CMUdict/LTS) handles them correctly.
+
+struct tech_token_rule {
+    const char* pattern; // case-insensitive match (exact word boundary)
+    const char* replacement;
+};
+
+// Sorted longest-first so "C++" matches before "C#" etc.
+// Only tokens that contain non-alpha chars that the tokenizer can't handle.
+inline const std::vector<tech_token_rule>& tech_token_rules() {
+    static const std::vector<tech_token_rule> rules = {
+        {"C++", "C plus plus"},
+        {"C#", "C sharp"},
+        {"F#", "F sharp"},
+        {".NET", "dot net"},
+        {"Node.js", "Node J S"},
+        {"Vue.js", "View J S"},
+        {"Next.js", "Next J S"},
+        {"Three.js", "Three J S"},
+        {"D3.js", "D three J S"},
+        {"Express.js", "Express J S"},
+        {"Nuxt.js", "Nuxt J S"},
+        {"Nest.js", "Nest J S"},
+        {"Deno.js", "Deno J S"},
+        {"Bun.js", "Bun J S"},
+        {"React.js", "React J S"},
+        {"Angular.js", "Angular J S"},
+        {"Ember.js", "Ember J S"},
+        {"Backbone.js", "Backbone J S"},
+        {"Svelte.js", "Svelte J S"},
+        {"Gatsby.js", "Gatsby J S"},
+        {"Remix.js", "Remix J S"},
+        {"Socket.io", "Socket I O"},
+        {"OAuth2", "O Auth two"},
+        {"OAuth", "O Auth"},
+        {"GitHub", "Git Hub"},
+        {"GitLab", "Git Lab"},
+        {"TypeScript", "Type Script"},
+        {"JavaScript", "Java Script"},
+        {"PostgreSQL", "Postgre S Q L"},
+        {"MySQL", "My S Q L"},
+        {"NoSQL", "No S Q L"},
+        {"GraphQL", "Graph Q L"},
+        {"WebGL", "Web G L"},
+        {"OpenGL", "Open G L"},
+        {"OpenCV", "Open C V"},
+        {"iOS", "I O S"},
+        {"macOS", "mac O S"},
+        {"DevOps", "Dev Ops"},
+        {"MLOps", "M L Ops"},
+        {"CI/CD", "C I C D"},
+    };
+    return rules;
+}
+
+// Case-insensitive prefix match at position `pos` in `text`.
+inline bool match_icase(const std::string& text, size_t pos, const char* pattern, size_t pat_len) {
+    if (pos + pat_len > text.size())
+        return false;
+    for (size_t i = 0; i < pat_len; i++) {
+        char tc = (char)tolower((unsigned char)text[pos + i]);
+        char pc = (char)tolower((unsigned char)pattern[i]);
+        if (tc != pc)
+            return false;
+    }
+    return true;
+}
+
+// Check if position is at a word boundary (start of string, after space/punct).
+inline bool is_word_start(const std::string& text, size_t pos) {
+    if (pos == 0)
+        return true;
+    char prev = text[pos - 1];
+    return prev == ' ' || prev == ',' || prev == '.' || prev == '!' || prev == '?' || prev == ';' || prev == ':' ||
+           prev == '-' || prev == '\n' || prev == '\t' || prev == '(' || prev == ')' || prev == '"' || prev == '\'';
+}
+
+// Check if position is at a word boundary (end of string, before space/punct).
+inline bool is_word_end(const std::string& text, size_t pos) {
+    if (pos >= text.size())
+        return true;
+    char next = text[pos];
+    return next == ' ' || next == ',' || next == '.' || next == '!' || next == '?' || next == ';' || next == ':' ||
+           next == '-' || next == '\n' || next == '\t' || next == '(' || next == ')' || next == '"' || next == '\'';
+}
+
+inline std::string normalize_technical_tokens(const std::string& text) {
+    std::string result;
+    result.reserve(text.size() + 32);
+    const auto& rules = tech_token_rules();
+    size_t i = 0;
+    while (i < text.size()) {
+        bool matched = false;
+        if (is_word_start(text, i)) {
+            for (const auto& rule : rules) {
+                size_t plen = strlen(rule.pattern);
+                if (match_icase(text, i, rule.pattern, plen) && is_word_end(text, i + plen)) {
+                    result += rule.replacement;
+                    i += plen;
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if (!matched)
+            result += text[i++];
+    }
+    return result;
+}
+
 // ── Tokenizer ───────────────────────────────────────────────────────
 
 inline std::vector<std::string> tokenize(const std::string& text) {
@@ -913,6 +1027,7 @@ inline std::string word_to_ipa(const context& ctx, const std::string& word) {
         const auto& ph = arpa_phones[pi];
         std::string base_ph = ph;
         int ph_stress = -1;
+        (void)ph_stress;
         if (!base_ph.empty() && base_ph.back() >= '0' && base_ph.back() <= '2') {
             ph_stress = base_ph.back() - '0';
             base_ph.pop_back();
@@ -967,7 +1082,7 @@ inline std::string word_to_ipa(const context& ctx, const std::string& word) {
 
 // Convert full text to IPA string.
 inline std::string text_to_ipa(const context& ctx, const std::string& text) {
-    auto words = tokenize(text);
+    auto words = tokenize(normalize_technical_tokens(text));
     std::string ipa;
     for (const auto& w : words) {
         if (w.size() == 1 &&

@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <mutex>
 
@@ -146,6 +147,21 @@ std::vector<std::string> kv_str_array(gguf_context* gctx, const char* key) {
     for (int i = 0; i < n; i++) {
         out.emplace_back(gguf_get_arr_str(gctx, k, i));
     }
+    return out;
+}
+
+std::vector<float> kv_f32_array(gguf_context* gctx, const char* key) {
+    std::vector<float> out;
+    const int k = gguf_find_key(gctx, key);
+    if (k < 0)
+        return out;
+    if (gguf_get_kv_type(gctx, k) != GGUF_TYPE_ARRAY)
+        return out;
+    if (gguf_get_arr_type(gctx, k) != GGUF_TYPE_FLOAT32)
+        return out;
+    const size_t n = gguf_get_arr_n(gctx, k);
+    const float* data = (const float*)gguf_get_arr_data(gctx, k);
+    out.assign(data, data + n);
     return out;
 }
 
@@ -435,16 +451,71 @@ static void try_mlock(const char* tag, void* base, size_t size) {
 
 } // namespace
 
-bool load_weights(const char* path, ggml_backend_t backend, const char* model_tag, WeightLoad& out) {
+static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeTensor include_tensor, void* user,
+                              const char* model_tag, WeightLoad& out) {
     const char* tag = model_tag ? model_tag : "core_gguf";
 
-    gguf_init_params gp = {/*.no_alloc=*/true, /*.ctx=*/&out.ctx};
+    ggml_context* source_ctx = nullptr;
+    gguf_init_params gp = {/*.no_alloc=*/true, /*.ctx=*/&source_ctx};
     gguf_context* gctx = gguf_init_from_file(path, gp);
-    if (!gctx || !out.ctx) {
+    if (!gctx || !source_ctx) {
         fprintf(stderr, "%s: failed to load tensor metadata from '%s'\n", tag, path);
         if (gctx)
             gguf_free(gctx);
+        if (source_ctx)
+            ggml_free(source_ctx);
         return false;
+    }
+
+    if (include_tensor) {
+        size_t n_selected = 0;
+        for (ggml_tensor* t = ggml_get_first_tensor(source_ctx); t; t = ggml_get_next_tensor(source_ctx, t)) {
+            if (include_tensor(ggml_get_name(t), user))
+                n_selected++;
+        }
+        if (n_selected == 0) {
+            fprintf(stderr, "%s: tensor filter selected no weights from '%s'\n", tag, path);
+            gguf_free(gctx);
+            ggml_free(source_ctx);
+            return false;
+        }
+
+        const size_t tensor_overhead = ggml_tensor_overhead();
+        if (tensor_overhead != 0 && n_selected > (std::numeric_limits<size_t>::max() - 1024) / tensor_overhead) {
+            fprintf(stderr, "%s: filtered tensor metadata size overflow\n", tag);
+            gguf_free(gctx);
+            ggml_free(source_ctx);
+            return false;
+        }
+        ggml_init_params fp = {
+            /*.mem_size   =*/n_selected * tensor_overhead + 1024,
+            /*.mem_buffer =*/nullptr,
+            /*.no_alloc   =*/true,
+        };
+        out.ctx = ggml_init(fp);
+        if (!out.ctx) {
+            fprintf(stderr, "%s: failed to create filtered tensor context\n", tag);
+            gguf_free(gctx);
+            ggml_free(source_ctx);
+            return false;
+        }
+        for (ggml_tensor* t = ggml_get_first_tensor(source_ctx); t; t = ggml_get_next_tensor(source_ctx, t)) {
+            if (!include_tensor(ggml_get_name(t), user))
+                continue;
+            ggml_tensor* selected = ggml_dup_tensor(out.ctx, t);
+            if (!selected) {
+                fprintf(stderr, "%s: failed to duplicate filtered tensor metadata for '%s'\n", tag, ggml_get_name(t));
+                gguf_free(gctx);
+                ggml_free(source_ctx);
+                ggml_free(out.ctx);
+                out.ctx = nullptr;
+                return false;
+            }
+            ggml_set_name(selected, ggml_get_name(t));
+        }
+        ggml_free(source_ctx);
+    } else {
+        out.ctx = source_ctx;
     }
 
     // PLAN #51a: zero-copy CPU path. Skip ggml_backend_alloc_ctx_tensors
@@ -459,6 +530,14 @@ bool load_weights(const char* path, ggml_backend_t backend, const char* model_ta
         if (mf.ok) {
             const size_t data_off = gguf_get_data_offset(gctx);
             const size_t mmap_size = mf.size;
+            if (data_off > mmap_size) {
+                fprintf(stderr, "%s: GGUF data offset %zu exceeds file size %zu - file truncated?\n", tag, data_off,
+                        mmap_size);
+                gguf_free(gctx);
+                ggml_free(out.ctx);
+                out.ctx = nullptr;
+                return false;
+            }
             char* tensor_base = (char*)mf.base + data_off;
             const size_t buf_size = mmap_size > data_off ? (mmap_size - data_off) : 0;
 
@@ -473,12 +552,17 @@ bool load_weights(const char* path, ggml_backend_t backend, const char* model_ta
             // external disk we hit during PLAN #51c F16 testing). Mirrors
             // llama.cpp's `llama_mmap` populate path.
 #if !defined(_WIN32)
-            ::posix_madvise(mctx->mmap_base, mctx->mmap_size, POSIX_MADV_WILLNEED);
+            if (!include_tensor)
+                ::posix_madvise(mctx->mmap_base, mctx->mmap_size, POSIX_MADV_WILLNEED);
 #endif
             // PLAN #60c / #60f: optional preload + mlock, opt-in via env.
-            if (preload_enabled())
+            // A filtered component may live inside a much larger parent GGUF.
+            // Whole-file readahead/preload/mlock would defeat filtered loading
+            // by making every unrelated tensor resident (or pinned), so let
+            // ordinary page faults bring in only the selected tensor ranges.
+            if (!include_tensor && preload_enabled())
                 preload_pages(mctx->mmap_base, mctx->mmap_size);
-            if (mlock_enabled())
+            if (!include_tensor && mlock_enabled())
                 try_mlock(tag, mctx->mmap_base, mctx->mmap_size);
 
             out.buf = ggml_backend_buffer_init(ggml_backend_cpu_buffer_type(), mmap_buffer_iface, mctx, buf_size);
@@ -507,12 +591,13 @@ bool load_weights(const char* path, ggml_backend_t backend, const char* model_ta
                 if (tid < 0)
                     continue;
                 const size_t off = gguf_get_tensor_offset(gctx, tid);
-                if (off + ggml_nbytes(t) > buf_size) {
+                const size_t nbytes = ggml_nbytes(t);
+                if (off > buf_size || nbytes > buf_size - off) {
                     fprintf(stderr,
                             "%s: mmap bounds check failed for tensor '%s' "
-                            "(off=%zu + nbytes=%zu > buf_size=%zu) — "
+                            "(off=%zu + nbytes=%zu > buf_size=%zu) - "
                             "falling back to legacy loader\n",
-                            tag, ggml_get_name(t), off, ggml_nbytes(t), buf_size);
+                            tag, ggml_get_name(t), off, nbytes, buf_size);
                     bounds_ok = false;
                     break;
                 }
@@ -566,6 +651,14 @@ bool load_weights(const char* path, ggml_backend_t backend, const char* model_ta
             MappedFile mf(path, /*writable=*/true);
             if (mf.ok) {
                 const size_t data_off = gguf_get_data_offset(gctx);
+                if (data_off > mf.size) {
+                    fprintf(stderr, "%s: GGUF data offset %zu exceeds file size %zu - file truncated?\n", tag, data_off,
+                            mf.size);
+                    gguf_free(gctx);
+                    ggml_free(out.ctx);
+                    out.ctx = nullptr;
+                    return false;
+                }
                 char* tensor_base = (char*)mf.base + data_off;
 
                 // Hand the entire mmap region (including GGUF header) to
@@ -584,15 +677,16 @@ bool load_weights(const char* path, ggml_backend_t backend, const char* model_ta
                     // pages, so this readahead benefits both CPU and GPU
                     // accesses with one call.
 #if !defined(_WIN32)
-                    ::posix_madvise(leaked_base, leaked_size, POSIX_MADV_WILLNEED);
+                    if (!include_tensor)
+                        ::posix_madvise(leaked_base, leaked_size, POSIX_MADV_WILLNEED);
 #endif
                     // PLAN #60c / #60f: optional preload + mlock, opt-in
                     // via env. mlock is particularly meaningful here —
                     // pinning prevents Metal's shared-storage reads from
                     // racing CPU page faults under memory pressure.
-                    if (preload_enabled())
+                    if (!include_tensor && preload_enabled())
                         preload_pages(leaked_base, leaked_size);
-                    if (mlock_enabled())
+                    if (!include_tensor && mlock_enabled())
                         try_mlock(tag, leaked_base, leaked_size);
 
                     register_gpu_mmap(inner, leaked_base, leaked_size);
@@ -605,7 +699,12 @@ bool load_weights(const char* path, ggml_backend_t backend, const char* model_ta
                         if (tid < 0)
                             continue;
                         const size_t off = gguf_get_tensor_offset(gctx, tid);
-                        if (data_off + off + ggml_nbytes(t) > leaked_size) {
+                        // Overflow-safe: a crafted GGUF can set off/nbytes near SIZE_MAX
+                        // so the additive data_off+off+nbytes wraps and passes. Compare
+                        // subtractively.
+                        const size_t nb = ggml_nbytes(t);
+                        if (data_off > leaked_size || off > leaked_size - data_off ||
+                            nb > leaked_size - data_off - off) {
                             fprintf(stderr,
                                     "%s: GPU mmap bounds check failed for tensor '%s' "
                                     "(data_off=%zu + off=%zu + nbytes=%zu > file_size=%zu) — "
@@ -662,7 +761,8 @@ bool load_weights(const char* path, ggml_backend_t backend, const char* model_ta
         // with CRISPASR_GGUF_MMAP=0 (e.g. model files on network
         // mounts where mmap would SIGBUS on disconnect).
 #if !defined(_WIN32)
-        ::posix_madvise(mf.base, mf.size, POSIX_MADV_WILLNEED);
+        if (!include_tensor)
+            ::posix_madvise(mf.base, mf.size, POSIX_MADV_WILLNEED);
 #endif
     }
     if (!mf.ok) {
@@ -673,10 +773,15 @@ bool load_weights(const char* path, ggml_backend_t backend, const char* model_ta
         if (!fp) {
             fprintf(stderr, "%s: cannot open '%s' for fread fallback\n", tag, path);
             gguf_free(gctx);
+            ggml_backend_buffer_free(out.buf);
+            out.buf = nullptr;
+            ggml_free(out.ctx);
+            out.ctx = nullptr;
             return false;
         }
         const size_t data_off = gguf_get_data_offset(gctx);
         std::vector<uint8_t> tbuf;
+        bool load_ok = true;
         for (ggml_tensor* t = ggml_get_first_tensor(out.ctx); t; t = ggml_get_next_tensor(out.ctx, t)) {
             out.tensors[ggml_get_name(t)] = t;
             const int64_t tid = gguf_find_tensor(gctx, ggml_get_name(t));
@@ -687,17 +792,36 @@ bool load_weights(const char* path, ggml_backend_t backend, const char* model_ta
             if (tbuf.size() < nbytes)
                 tbuf.resize(nbytes);
 #if defined(_WIN32)
-            if (_fseeki64(fp, (int64_t)(data_off + off), SEEK_SET) != 0)
+            if (_fseeki64(fp, (int64_t)(data_off + off), SEEK_SET) != 0) {
+                fprintf(stderr, "%s: fseek failed for tensor '%s' — file truncated?\n", tag, ggml_get_name(t));
+                load_ok = false;
                 break;
+            }
 #else
-            if (fseeko(fp, (off_t)(data_off + off), SEEK_SET) != 0)
+            if (fseeko(fp, (off_t)(data_off + off), SEEK_SET) != 0) {
+                fprintf(stderr, "%s: fseek failed for tensor '%s' — file truncated?\n", tag, ggml_get_name(t));
+                load_ok = false;
                 break;
+            }
 #endif
-            if (fread(tbuf.data(), 1, nbytes, fp) != nbytes)
+            if (fread(tbuf.data(), 1, nbytes, fp) != nbytes) {
+                fprintf(stderr, "%s: short read for tensor '%s' (%zu bytes expected) — file truncated?\n", tag,
+                        ggml_get_name(t), nbytes);
+                load_ok = false;
                 break;
+            }
             ggml_backend_tensor_set(t, tbuf.data(), 0, nbytes);
         }
         fclose(fp);
+        if (!load_ok) {
+            fprintf(stderr, "%s: legacy loader failed — model file may be truncated or corrupt\n", tag);
+            gguf_free(gctx);
+            ggml_backend_buffer_free(out.buf);
+            out.buf = nullptr;
+            ggml_free(out.ctx);
+            out.ctx = nullptr;
+            return false;
+        }
     } else {
         const size_t data_off = gguf_get_data_offset(gctx);
         for (ggml_tensor* t = ggml_get_first_tensor(out.ctx); t; t = ggml_get_next_tensor(out.ctx, t)) {
@@ -707,12 +831,42 @@ bool load_weights(const char* path, ggml_backend_t backend, const char* model_ta
                 continue;
             const size_t off = gguf_get_tensor_offset(gctx, tid);
             const size_t nbytes = ggml_nbytes(t);
+            // Bounds check: prevent segfault on truncated GGUF files
+            // Overflow-safe: a crafted GGUF can set off/nbytes near SIZE_MAX so the
+            // additive data_off+off+nbytes wraps and passes the check. Compare
+            // subtractively (each subtraction is valid once the prior guard holds).
+            if (data_off > mf.size || off > mf.size - data_off || nbytes > mf.size - data_off - off) {
+                fprintf(stderr,
+                        "%s: mmap legacy path: tensor '%s' exceeds file bounds "
+                        "(off=%zu + nbytes=%zu > file_size=%zu) — file truncated?\n",
+                        tag, ggml_get_name(t), data_off + off, nbytes, mf.size);
+                gguf_free(gctx);
+                ggml_backend_buffer_free(out.buf);
+                out.buf = nullptr;
+                ggml_free(out.ctx);
+                out.ctx = nullptr;
+                return false;
+            }
             ggml_backend_tensor_set(t, (const char*)mf.base + data_off + off, 0, nbytes);
         }
     }
 
     gguf_free(gctx);
     return true;
+}
+
+bool load_weights(const char* path, ggml_backend_t backend, const char* model_tag, WeightLoad& out) {
+    return load_weights_impl(path, backend, nullptr, nullptr, model_tag, out);
+}
+
+bool load_weights_filtered(const char* path, ggml_backend_t backend, IncludeTensor include_tensor, void* user,
+                           const char* model_tag, WeightLoad& out) {
+    if (!include_tensor) {
+        fprintf(stderr, "%s: load_weights_filtered requires a non-null tensor predicate\n",
+                model_tag ? model_tag : "core_gguf");
+        return false;
+    }
+    return load_weights_impl(path, backend, include_tensor, user, model_tag, out);
 }
 
 void free_weights(WeightLoad& wl) {
@@ -724,6 +878,10 @@ void free_weights(WeightLoad& wl) {
         ggml_backend_buffer_free(wl.buf_cpu);
         wl.buf_cpu = nullptr;
     }
+    // Issue #276: free any overflow chunk buffers from split allocation.
+    for (auto* b : wl.split_bufs)
+        ggml_backend_buffer_free(b);
+    wl.split_bufs.clear();
     if (wl.ctx) {
         ggml_free(wl.ctx);
         wl.ctx = nullptr;
@@ -806,48 +964,89 @@ bool load_weights_split(const char* path, ggml_backend_t gpu_backend, ggml_backe
     // Allocate per-partition backend buffers. Tensor alignment within the
     // buffer follows the backend buffer-type's alignment requirement;
     // pad each per-tensor offset up to that alignment.
+    //
+    // Issue #276: AMD Vulkan (proprietary driver on Windows) caps a single
+    // device allocation at 2 GiB (maxMemoryAllocationSize). Models larger
+    // than that need to be split across multiple backend buffers. We chunk
+    // tensors into groups of <= 1.5 GiB each and allocate one buffer per
+    // chunk; the 1.5 GiB limit leaves headroom for alignment padding.
+    static constexpr size_t max_alloc_chunk = (size_t)1536 * 1024 * 1024; // 1.5 GiB
+
     auto round_up = [](size_t n, size_t a) { return (n + a - 1) & ~(a - 1); };
-    auto bind_partition = [&](ggml_backend_t be, const std::vector<ggml_tensor*>& tensors, size_t total,
-                              ggml_backend_buffer_t* out_buf) -> bool {
+    auto bind_partition = [&](ggml_backend_t be, const std::vector<ggml_tensor*>& tensors,
+                              std::vector<ggml_backend_buffer_t>& out_bufs) -> bool {
         if (tensors.empty())
             return true;
         const size_t align = ggml_backend_get_alignment(be);
-        // Compute final size with per-tensor alignment slack.
-        size_t aligned_total = 0;
-        for (ggml_tensor* t : tensors)
-            aligned_total = round_up(aligned_total, align) + ggml_nbytes(t);
-        (void)total;
-        ggml_backend_buffer_t buf = ggml_backend_alloc_buffer(be, aligned_total);
-        if (!buf) {
-            fprintf(stderr, "%s: failed to allocate %zu MiB backend buffer\n", tag, aligned_total / 1048576);
-            return false;
-        }
-        char* base = (char*)ggml_backend_buffer_get_base(buf);
-        size_t cursor = 0;
+
+        // Partition tensors into chunks that each fit under max_alloc_chunk.
+        struct Chunk {
+            std::vector<ggml_tensor*> ts;
+            size_t aligned_total = 0;
+        };
+        std::vector<Chunk> chunks(1);
         for (ggml_tensor* t : tensors) {
-            cursor = round_up(cursor, align);
-            ggml_backend_tensor_alloc(buf, t, base + cursor);
-            cursor += ggml_nbytes(t);
+            const size_t nb = ggml_nbytes(t);
+            const size_t next = round_up(chunks.back().aligned_total, align) + nb;
+            if (next > max_alloc_chunk && !chunks.back().ts.empty()) {
+                // Start a new chunk.
+                chunks.push_back({});
+                chunks.back().ts.push_back(t);
+                chunks.back().aligned_total = nb;
+            } else {
+                chunks.back().ts.push_back(t);
+                chunks.back().aligned_total = next;
+            }
         }
-        *out_buf = buf;
+
+        for (auto& chunk : chunks) {
+            ggml_backend_buffer_t buf = ggml_backend_alloc_buffer(be, chunk.aligned_total);
+            if (!buf) {
+                fprintf(stderr, "%s: failed to allocate %zu MiB backend buffer\n", tag, chunk.aligned_total / 1048576);
+                for (auto* b : out_bufs)
+                    ggml_backend_buffer_free(b);
+                out_bufs.clear();
+                return false;
+            }
+            char* base = (char*)ggml_backend_buffer_get_base(buf);
+            size_t cursor = 0;
+            for (ggml_tensor* t : chunk.ts) {
+                cursor = round_up(cursor, align);
+                ggml_backend_tensor_alloc(buf, t, base + cursor);
+                cursor += ggml_nbytes(t);
+            }
+            out_bufs.push_back(buf);
+        }
         return true;
     };
 
-    if (!bind_partition(gpu_backend, gpu_tensors, gpu_size, &out.buf)) {
+    std::vector<ggml_backend_buffer_t> gpu_bufs, cpu_bufs;
+    if (!bind_partition(gpu_backend, gpu_tensors, gpu_bufs)) {
         gguf_free(gctx);
         ggml_free(out.ctx);
         out.ctx = nullptr;
         return false;
     }
-    if (!bind_partition(cpu_backend, cpu_tensors, cpu_size, &out.buf_cpu)) {
-        if (out.buf) {
-            ggml_backend_buffer_free(out.buf);
-            out.buf = nullptr;
-        }
+    if (!bind_partition(cpu_backend, cpu_tensors, cpu_bufs)) {
+        for (auto* b : gpu_bufs)
+            ggml_backend_buffer_free(b);
         gguf_free(gctx);
         ggml_free(out.ctx);
         out.ctx = nullptr;
         return false;
+    }
+
+    // First buffer of each partition goes into the canonical fields;
+    // any overflow chunks go into split_bufs for lifetime management.
+    if (!gpu_bufs.empty()) {
+        out.buf = gpu_bufs[0];
+        for (size_t i = 1; i < gpu_bufs.size(); i++)
+            out.split_bufs.push_back(gpu_bufs[i]);
+    }
+    if (!cpu_bufs.empty()) {
+        out.buf_cpu = cpu_bufs[0];
+        for (size_t i = 1; i < cpu_bufs.size(); i++)
+            out.split_bufs.push_back(cpu_bufs[i]);
     }
 
     // Copy tensor data from the file. Use mmap when available for zero-
@@ -891,6 +1090,22 @@ bool load_weights_split(const char* path, ggml_backend_t gpu_backend, ggml_backe
                 continue;
             const size_t off = gguf_get_tensor_offset(gctx, tid);
             const size_t nbytes = ggml_nbytes(t);
+            // Bounds check (mirrors load_weights' mmap paths): a crafted/truncated
+            // GGUF whose tensor offset+size runs past the mapping would SIGBUS, or
+            // copy adjacent memory into the tensor buffer (info leak). This split
+            // mmap path was the only one of the four missing the guard.
+            // Overflow-safe: a crafted GGUF can set off/nbytes near SIZE_MAX so the
+            // additive data_off+off+nbytes wraps and passes the check. Compare
+            // subtractively (each subtraction is valid once the prior guard holds).
+            if (data_off > mf.size || off > mf.size - data_off || nbytes > mf.size - data_off - off) {
+                fprintf(stderr,
+                        "%s: split mmap path: tensor '%s' exceeds file bounds "
+                        "(off=%zu + nbytes=%zu > file_size=%zu) — file truncated?\n",
+                        tag, ggml_get_name(t), data_off + off, nbytes, mf.size);
+                free_weights(out);
+                gguf_free(gctx);
+                return false;
+            }
             ggml_backend_tensor_set(t, (const char*)mf.base + data_off + off, 0, nbytes);
         }
     }
@@ -943,12 +1158,13 @@ void mmap_advise_random(ggml_backend_buffer_t buf) {
 // Tensor lookup helpers
 // ---------------------------------------------------------------------------
 
-ggml_tensor* try_get(const std::map<std::string, ggml_tensor*>& tensors, const char* name) {
+// Signatures use `core_gguf::tensor_map` (see gguf_loader.h cross-repo contract).
+ggml_tensor* try_get(const tensor_map& tensors, const char* name) {
     auto it = tensors.find(name);
     return it != tensors.end() ? it->second : nullptr;
 }
 
-ggml_tensor* require(const std::map<std::string, ggml_tensor*>& tensors, const char* name, const char* model_tag) {
+ggml_tensor* require(const tensor_map& tensors, const char* name, const char* model_tag) {
     auto it = tensors.find(name);
     if (it == tensors.end()) {
         fprintf(stderr, "%s: required tensor '%s' not found in GGUF\n", model_tag ? model_tag : "core_gguf", name);

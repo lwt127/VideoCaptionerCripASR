@@ -28,13 +28,17 @@
 // pass.
 
 #include "kokoro.h"
+#include "phonemizer.h"
 
 #include "core/activation.h"
 #include "core/align.h"
 #include "core/attention.h"
 #include "core/conv.h"
+#include "core/dac_decoder.h" // core_dac::fastconv_cache (FASTCONV kernel bake)
 #include "core/gguf_loader.h"
 #include "core/lstm.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -44,6 +48,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cfenv>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -65,9 +70,35 @@
 namespace {
 
 bool env_bool(const char* k) {
-    const char* v = std::getenv(k);
+    const char* v = crispasr_env::get(k);
     return v && *v && std::strcmp(v, "0") != 0 && std::strcmp(v, "false") != 0;
 }
+
+// ===========================================================================
+// Bench instrumentation — `KOKORO_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+bool kokoro_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_KOKORO_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct kokoro_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit kokoro_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~kokoro_bench_stage() {
+        if (!kokoro_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  kokoro_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // Hyperparameters read from `kokoro.*` and `kokoro.plbert.*` GGUF KV.
 struct kokoro_hp {
@@ -193,7 +224,16 @@ struct kokoro_context {
     ggml_context* ctx_w = nullptr;
     ggml_backend_buffer_t buf_w = nullptr;
     std::map<std::string, ggml_tensor*> tensors;
+
+    // Pre-permuted ConvTranspose1d weights for decomposed mul_mat + col2im_1d.
+    ggml_tensor* ups_w_perm[2] = {nullptr, nullptr}; // gen.ups.{0,1}
+    ggml_context* ctx_perm = nullptr;
+    ggml_backend_buffer_t buf_perm = nullptr;
     std::vector<uint8_t> compute_meta;
+
+    // FASTCONV: baked F32 copies of the F16 conv kernels (cast-kill). Owns its own
+    // ctx+buffer; freed in kokoro_free before the backend.
+    core_dac::fastconv_cache fc;
 
     // Voice pack (secondary GGUF).
     kokoro_voice_pack vp;
@@ -568,6 +608,7 @@ static ggml_cgraph* kokoro_build_graph_text_enc(kokoro_context* c, int L) {
 // Pad-wraps the raw ids before computing.
 static float* kokoro_run_text_enc(kokoro_context* c, const int32_t* raw_ids, int n_raw, const char* stage_name,
                                   int* out_n) {
+    kokoro_bench_stage _b("text_enc");
     if (out_n)
         *out_n = 0;
     if (n_raw <= 0)
@@ -620,6 +661,7 @@ static float* kokoro_run_text_enc(kokoro_context* c, const int32_t* raw_ids, int
 // computing, so the output corresponds to L+2 tokens.
 static float* kokoro_run_bert(kokoro_context* c, const int32_t* raw_ids, int n_raw, const char* stage_name,
                               int* out_n) {
+    kokoro_bench_stage _b("bert");
     if (out_n)
         *out_n = 0;
     if (n_raw <= 0) {
@@ -1093,6 +1135,7 @@ static ggml_cgraph* kokoro_build_graph_predictor(kokoro_context* c, int L, int L
 //   "durations"    → (L,) post-round, post-clamp(min=1), cast to float
 static float* kokoro_run_predictor(kokoro_context* c, const int32_t* raw_ids, int n_raw, const char* stage_name,
                                    int* out_n) {
+    kokoro_bench_stage _b("predictor");
     if (out_n)
         *out_n = 0;
     if (!c->vp_loaded) {
@@ -1303,7 +1346,7 @@ static ggml_cgraph* kokoro_build_graph_f0n(kokoro_context* c, int T_frames, int 
     // production builds pay zero cost. Used to bisect the ggml_norm
     // Metal regression — keep available for the next per-op-level bug.
     static const bool s_dbg = []() {
-        const char* v = std::getenv("KOKORO_DEBUG_INTERMEDIATES");
+        const char* v = crispasr_env::get("CRISPASR_KOKORO_DEBUG_INTERMEDIATES");
         return v && *v && *v != '0';
     }();
     auto run_stack = [&](const char* prefix, const char* stage_branch, ggml_tensor* in) -> ggml_tensor* {
@@ -1399,6 +1442,7 @@ static ggml_cgraph* kokoro_build_graph_f0n(kokoro_context* c, int T_frames, int 
 //   "f0_curve"  → (2*T_frames,)   (already squeezed from (1, 2*T_frames))
 //   "n_curve"   → (2*T_frames,)
 static float* kokoro_run_f0n(kokoro_context* c, const int32_t* raw_ids, int n_raw, const char* stage_name, int* out_n) {
+    kokoro_bench_stage _b("f0n");
     if (out_n)
         *out_n = 0;
     if (!c->vp_loaded) {
@@ -1644,6 +1688,7 @@ static ggml_cgraph* kokoro_build_graph_decoder_body(kokoro_context* c, int T_fra
 // decoder body, returning the named stage as malloc'd float[].
 static float* kokoro_run_decoder_body(kokoro_context* c, const int32_t* raw_ids, int n_raw, const char* stage_name,
                                       int* out_n) {
+    kokoro_bench_stage _b("decoder_body");
     if (out_n)
         *out_n = 0;
     if (!c->vp_loaded) {
@@ -1874,16 +1919,20 @@ static inline ggml_tensor* kokoro_resblock1_forward(ggml_context* ctx, ggml_tens
     return x;
 }
 
-// PyTorch ConvTranspose1d wrapper: ggml_conv_transpose_1d only supports
-// padding=0, so we run with p=0 and crop `pad` samples from each side of the
-// time axis afterwards. PyTorch formula (stride s, kernel k, padding p):
-//   T_out = (T_in - 1) * s - 2*p + k
-// ggml's p=0 output: T_unpad = (T_in - 1) * s + k. Crop p from each side.
+// PyTorch ConvTranspose1d wrapper: uses decomposed mul_mat + col2im_1d when
+// w_perm is available, otherwise falls back to ggml_conv_transpose_1d with
+// manual symmetric crop.
 //
 // in: (Cin, T) F32. w: ne=(K, Cout, Cin) F16. b: ne=(Cout,) F32.
+// w_perm: ne=(Cin, K*Cout) F32 or nullptr.
 // Returns (Cout, T_out) F32.
-static inline ggml_tensor* kokoro_convt1d_pad(ggml_context* ctx, ggml_tensor* in, ggml_tensor* w, ggml_tensor* b,
-                                              int stride, int pad) {
+static inline ggml_tensor* kokoro_convt1d_pad(ggml_context* ctx, ggml_tensor* in, ggml_tensor* w, ggml_tensor* w_perm,
+                                              ggml_tensor* b, int stride, int pad) {
+    if (w_perm) {
+        const int K = (int)w->ne[0];
+        return core_convt::convt1d_decomp(ctx, in, w_perm, b, stride, K, pad, pad);
+    }
+    // Old path — stable, works on CPU without the col2im op.
     const int Cout = (int)w->ne[1];
     ggml_tensor* xT = ggml_cont(ctx, ggml_transpose(ctx, in));         // (T, Cin)
     ggml_tensor* y = ggml_conv_transpose_1d(ctx, w, xT, stride, 0, 1); // (T_unpad, Cout, 1, 1)
@@ -2198,10 +2247,10 @@ static ggml_cgraph* kokoro_build_graph_generator(kokoro_context* c, int T_frames
         // x = ups[i](x)  with PyTorch padding handled via post-crop
         if (i == 0) {
             // k=20, s=10, p=(k-s)/2 = 5
-            x = kokoro_convt1d_pad(ctx0, x, ups0_w, ups0_b, /*s*/ 10, /*p*/ 5);
+            x = kokoro_convt1d_pad(ctx0, x, ups0_w, c->ups_w_perm[0], ups0_b, /*s*/ 10, /*p*/ 5);
         } else {
             // k=12, s=6, p=(k-s)/2 = 3
-            x = kokoro_convt1d_pad(ctx0, x, ups1_w, ups1_b, /*s*/ 6, /*p*/ 3);
+            x = kokoro_convt1d_pad(ctx0, x, ups1_w, c->ups_w_perm[1], ups1_b, /*s*/ 6, /*p*/ 3);
         }
 
         // Last upsample: reflection_pad((1, 0)) — 1 sample on the left, 0 on the right.
@@ -2267,6 +2316,7 @@ static ggml_cgraph* kokoro_build_graph_generator(kokoro_context* c, int T_frames
 // same seed on the Python side.
 static float* kokoro_run_generator(kokoro_context* c, const int32_t* raw_ids, int n_raw, const char* stage_name,
                                    int* out_n) {
+    kokoro_bench_stage _b("generator");
     if (out_n)
         *out_n = 0;
     if (!c->vp_loaded) {
@@ -2307,7 +2357,7 @@ static float* kokoro_run_generator(kokoro_context* c, const int32_t* raw_ids, in
     }
 
     // 3. Build `har` (22, T_har) on CPU.
-    const char* seed_env = std::getenv("KOKORO_SEED");
+    const char* seed_env = crispasr_env::get("CRISPASR_KOKORO_SEED");
     uint32_t seed = seed_env ? (uint32_t)std::strtoul(seed_env, nullptr, 0) : 0x12345u;
     std::mt19937 rng(seed);
     int T_har = 0;
@@ -2386,6 +2436,7 @@ static float* kokoro_run_generator(kokoro_context* c, const int32_t* raw_ids, in
 // ---------------------------------------------------------------------------
 
 static float* kokoro_run_istft(const float* mag, const float* phase, int T_har, int* out_T_audio) {
+    kokoro_bench_stage _b("istft");
     const int n_fft = 20;
     const int hop = 5;
     const int n_bins = n_fft / 2 + 1;
@@ -2518,7 +2569,7 @@ extern "C" struct kokoro_context_params kokoro_context_default_params(void) {
     //                              the M1 hang doesn't apply and CPU path
     //                              is dramatically slower than the GPU.
     // Mirrors the QWEN3_TTS_CODEC_GPU pattern from the qwen3-tts codec.
-    p.gen_force_metal = env_bool("KOKORO_GEN_FORCE_METAL") || env_bool("KOKORO_GEN_GPU");
+    p.gen_force_metal = env_bool("CRISPASR_KOKORO_GEN_FORCE_METAL") || env_bool("CRISPASR_KOKORO_GEN_GPU");
     p.flash_attn = true;
     p.length_scale = 1.0f;
     std::strncpy(p.espeak_lang, "en-us", sizeof(p.espeak_lang) - 1);
@@ -2628,7 +2679,7 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, 
         return nullptr;
     }
     ggml_backend_cpu_set_n_threads(c->backend_cpu, c->n_threads);
-    c->backend = params.use_gpu ? ggml_backend_init_best() : c->backend_cpu;
+    c->backend = params.use_gpu ? crispasr_init_gpu_backend() : c->backend_cpu;
     if (!c->backend)
         c->backend = c->backend_cpu;
     c->gen_backend = params.gen_force_metal ? c->backend : c->backend_cpu;
@@ -2648,6 +2699,62 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, 
         fprintf(stderr, "kokoro: weight sanity check failed for '%s'\n", path_model);
         kokoro_free(c);
         return nullptr;
+    }
+
+    // ---- Permute ConvTranspose1d weights for decomposed mul_mat + col2im ----
+    {
+        const char* ups_names[2] = {"dec.gen.ups.0.weight", "dec.gen.ups.1.weight"};
+        const size_t meta_bytes = ggml_tensor_overhead() * 2 + 4096;
+        struct ggml_init_params pp = {meta_bytes, nullptr, true};
+        c->ctx_perm = ggml_init(pp);
+        std::unique_ptr<float[]> perm_bufs[2];
+        for (int i = 0; i < 2; i++) {
+            auto it = c->tensors.find(ups_names[i]);
+            if (it == c->tensors.end())
+                continue;
+            ggml_tensor* src = it->second;
+            perm_bufs[i] = core_convt::permute_convt1d_weight(src);
+            c->ups_w_perm[i] =
+                ggml_new_tensor_2d(c->ctx_perm, GGML_TYPE_F32, (int)src->ne[2], (int)src->ne[0] * (int)src->ne[1]);
+        }
+        c->buf_perm = ggml_backend_alloc_ctx_tensors(c->ctx_perm, c->backend);
+        for (int i = 0; i < 2; i++) {
+            if (c->ups_w_perm[i] && perm_bufs[i])
+                ggml_backend_tensor_set(c->ups_w_perm[i], perm_bufs[i].get(), 0, ggml_nbytes(c->ups_w_perm[i]));
+        }
+    }
+
+    // ---- FASTCONV: bake one F32 copy of each F16 conv kernel and re-point the
+    // c->tensors map entry to it. kokoro feeds these kernels straight to
+    // ggml_conv_1d, which casts an F16 kernel → F32 inside EVERY graph when the
+    // activations are F32; baking that cast once makes it a no-op, bitwise-equal.
+    // The ConvTranspose1d upsamples (dec.gen.ups.{0,1}) use the SEPARATE F32
+    // `ups_w_perm` buffers built just above (from the original F16 src), so swapping
+    // their c->tensors entry is harmless (that entry is unused afterwards). The
+    // depthwise-convt path (core_convt::convt1d_depthwise_2x_k3) casts F16→F32
+    // internally too, so an already-F32 base just skips that cast. Gated
+    // CRISPASR_KOKORO_FASTCONV (default on — numerically equivalent).
+    {
+        const char* env = getenv("CRISPASR_KOKORO_FASTCONV");
+        const bool fc_on = !env || env[0] != '0';
+        std::vector<ggml_tensor*> kernels;
+        for (auto& kv : c->tensors) {
+            ggml_tensor* w = kv.second;
+            if (w && w->type == GGML_TYPE_F16 && ggml_n_dims(w) == 3)
+                kernels.push_back(w);
+        }
+        c->fc.bake(c->backend, kernels, fc_on);
+        int swapped = 0;
+        for (auto& kv : c->tensors) {
+            ggml_tensor* baked = c->fc.get(kv.second);
+            if (baked != kv.second) {
+                kv.second = baked;
+                swapped++;
+            }
+        }
+        if (getenv("CRISPASR_KOKORO_FASTCONV_DEBUG"))
+            fprintf(stderr, "kokoro: FASTCONV %s: %zu F16 3D conv kernels, %d baked+swapped\n", fc_on ? "ON" : "OFF",
+                    kernels.size(), swapped);
     }
 
     // ---- Schedulers ----
@@ -2697,9 +2804,9 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, 
         if (c->gen_backend != c->backend_cpu) {
             // Disambiguate which env var was set so the log line tells the
             // operator which knob is in effect.
-            if (env_bool("KOKORO_GEN_GPU"))
+            if (env_bool("CRISPASR_KOKORO_GEN_GPU"))
                 gpu_label = "GPU (KOKORO_GEN_GPU)";
-            else if (env_bool("KOKORO_GEN_FORCE_METAL"))
+            else if (env_bool("CRISPASR_KOKORO_GEN_FORCE_METAL"))
                 gpu_label = "GPU (KOKORO_GEN_FORCE_METAL)";
         }
         fprintf(stderr, "kokoro: loaded %zu tensors from '%s'  gen=%s\n", c->tensors.size(), path_model,
@@ -2868,7 +2975,11 @@ extern "C" float* kokoro_synthesize_phonemes(struct kokoro_context* ctx, const c
         return nullptr;
 
     int n_ids = 0;
-    int32_t* ids = kokoro_phonemes_to_ids(ctx, phonemes, &n_ids);
+    int32_t* ids = nullptr;
+    {
+        kokoro_bench_stage _b("phoneme_tokenize");
+        ids = kokoro_phonemes_to_ids(ctx, phonemes, &n_ids);
+    }
     if (!ids || n_ids == 0) {
         std::free(ids);
         fprintf(stderr, "kokoro: empty phoneme tokenisation for '%s'\n", phonemes);
@@ -2903,6 +3014,81 @@ std::mutex g_espeak_mu;
 bool g_espeak_inited = false;
 bool g_espeak_init_failed = false; // sticky — don't keep retrying
 std::string g_espeak_voice;
+
+// ---------------------------------------------------------------------------
+// MeCab-based kanji → kana preprocessor for Japanese (#56).
+// Uses dlopen to load libmecab at runtime — builds without MeCab still work,
+// the JA phonemizer just falls back to espeak (kana-only, kanji→English).
+// MeCab is BSD-3-Clause; mecab-ipadic is BSD-3-Clause + ICOT. MIT-clean.
+// ---------------------------------------------------------------------------
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
+
+static std::mutex g_mecab_mu;
+static bool g_mecab_tried = false;
+static bool g_mecab_ok = false;
+
+// MeCab C API (from mecab.h) — only the functions we need.
+typedef struct mecab_t mecab_t;
+typedef struct mecab_node_t {
+    // We only need surface + length + feature.
+    // The actual struct has more fields but we access them via the API.
+} mecab_node_t;
+
+// Function pointers loaded via dlopen
+static mecab_t* (*p_mecab_new2)(const char*) = nullptr;
+static const char* (*p_mecab_sparse_tostr)(mecab_t*, const char*) = nullptr;
+static void (*p_mecab_destroy)(mecab_t*) = nullptr;
+static mecab_t* g_mecab = nullptr;
+
+static bool mecab_init() {
+    if (g_mecab_tried)
+        return g_mecab_ok;
+    g_mecab_tried = true;
+#ifdef _WIN32
+    return false; // no dlopen on Windows
+#else
+    void* lib = dlopen("libmecab.so.2", RTLD_LAZY);
+    if (!lib)
+        lib = dlopen("libmecab.so", RTLD_LAZY);
+    if (!lib) {
+        if (getenv("CRISPASR_NEMOTRON_DEBUG") || getenv("CRISPASR_KOKORO_DEBUG"))
+            fprintf(stderr, "kokoro: libmecab not found — JA kanji→kana disabled\n");
+        return false;
+    }
+    p_mecab_new2 = (mecab_t * (*)(const char*)) dlsym(lib, "mecab_new2");
+    p_mecab_sparse_tostr = (const char* (*)(mecab_t*, const char*))dlsym(lib, "mecab_sparse_tostr");
+    p_mecab_destroy = (void (*)(mecab_t*))dlsym(lib, "mecab_destroy");
+    if (!p_mecab_new2 || !p_mecab_sparse_tostr || !p_mecab_destroy)
+        return false;
+    // Initialize with default dictionary + output reading
+    g_mecab = p_mecab_new2("-Oyomi");
+    if (!g_mecab) {
+        fprintf(stderr, "kokoro: mecab_new2 failed — check mecab dictionary\n");
+        return false;
+    }
+    g_mecab_ok = true;
+    fprintf(stderr, "kokoro: MeCab loaded — JA kanji→kana enabled\n");
+    return true;
+#endif
+}
+
+// Convert Japanese text (with kanji) to kana reading via MeCab.
+// Returns true if conversion was done; false means "leave text as-is".
+static bool kanji_to_kana(const std::string& text, std::string& kana) {
+    std::lock_guard<std::mutex> g(g_mecab_mu);
+    if (!mecab_init())
+        return false;
+    const char* result = p_mecab_sparse_tostr(g_mecab, text.c_str());
+    if (!result || !*result)
+        return false;
+    kana = result;
+    // MeCab -Oyomi output ends with newline — strip it
+    while (!kana.empty() && (kana.back() == '\n' || kana.back() == '\r'))
+        kana.pop_back();
+    return !kana.empty();
+}
 
 // Returns true on success and fills `out`. Returns false to signal "fall
 // back to popen" (init failed, voice switch failed, or no output).
@@ -3015,21 +3201,93 @@ static bool is_cmn_lang(const std::string& lang) {
     return lang == "cmn" || lang == "zh" || lang == "zh-cn" || lang == "zh_cn" || lang == "cmn-latn-pinyin";
 }
 
+#if defined(CRISPASR_HAVE_ESPEAK_NG) || defined(CRISPASR_ESPEAK_DLOPEN)
+static bool is_ja_lang(const std::string& lang) {
+    return lang == "ja" || lang == "ja-jp" || lang == "ja_jp";
+}
+#endif
+
 bool phonemize_cached(kokoro_context* ctx, const std::string& lang, const std::string& text, std::string& out) {
     std::string key = lang;
     key.push_back('\0');
     key += text;
     if (ctx->phon_cache.lookup(key, out))
         return true;
+
+    // §56 JA kanji→kana: convert kanji to kana via MeCab before espeak.
+    // espeak-ng's JA voice handles kana fine but falls back to English
+    // pronunciation for kanji (e.g. 日本語 → "Chinese letter"). MeCab
+    // converts kanji → katakana reading which espeak then IPA-phonemizes.
+    std::string effective_text = text;
+    // The JA kanji→kana pre-step (MeCab) is compiled under the same guard as
+    // espeak (both live in the espeak #if block above), and it only matters as a
+    // pre-step before espeak phonemization — so skip it cleanly on no-espeak
+    // builds where kanji_to_kana / is_ja_lang aren't compiled.
 #if defined(CRISPASR_HAVE_ESPEAK_NG) || defined(CRISPASR_ESPEAK_DLOPEN)
-    if (phonemize_espeak_lib(lang, text, out)) {
-        if (is_cmn_lang(lang))
-            strip_cmn_tone_numbers(out);
-        ctx->phon_cache.insert(key, out);
-        return true;
+    if (is_ja_lang(lang)) {
+        std::string kana;
+        if (kanji_to_kana(text, kana)) {
+            effective_text = kana;
+        }
     }
 #endif
-    if (phonemize_popen(lang, text, out)) {
+
+    // §156 permissive G2P dicts — try builtin phonemizers first (no GPL dep).
+    // These auto-download IPA dicts from HuggingFace on first call.
+    //
+    // CRISPASR_KOKORO_G2P env var selects strategy (#216):
+    //   "builtin-first"  — builtin G2P, then espeak fallback (default)
+    //   "espeak-first"   — espeak first, then builtin fallback
+    //   "espeak-only"    — espeak only, no builtin
+    //   "builtin-only"   — builtin only, no espeak
+    static const char* g2p_strategy = std::getenv("CRISPASR_KOKORO_G2P");
+    static const bool espeak_first =
+        g2p_strategy && (strcmp(g2p_strategy, "espeak-first") == 0 || strcmp(g2p_strategy, "espeak-only") == 0);
+    static const bool skip_builtin = g2p_strategy && strcmp(g2p_strategy, "espeak-only") == 0;
+    static const bool skip_espeak = g2p_strategy && strcmp(g2p_strategy, "builtin-only") == 0;
+
+    // Lambda: try builtin phonemizers for the given language.
+    auto try_builtin = [&]() -> bool {
+        if (skip_builtin)
+            return false;
+        bool ok = false;
+        if (lang == "en" || lang == "en-us" || lang == "en-gb")
+            ok = crispasr::phonemize_builtin_en(lang, text, out);
+        else if (lang == "de")
+            ok = crispasr::phonemize_builtin_de(lang, text, out);
+        else if (lang == "fr" || lang == "fr-fr")
+            ok = crispasr::phonemize_builtin_fr(lang, text, out);
+        else if (lang == "es" || lang == "es-es")
+            ok = crispasr::phonemize_builtin_es(lang, text, out);
+        return ok && !out.empty();
+    };
+
+    // Lambda: try espeak phonemizers (lib then popen).
+    auto try_espeak = [&]() -> bool {
+        if (skip_espeak)
+            return false;
+#if defined(CRISPASR_HAVE_ESPEAK_NG) || defined(CRISPASR_ESPEAK_DLOPEN)
+        if (phonemize_espeak_lib(lang, effective_text, out)) {
+            crispasr::strip_espeak_lang_markers(out); // #169
+            return true;
+        }
+#endif
+        if (phonemize_popen(lang, effective_text, out)) {
+            crispasr::strip_espeak_lang_markers(out); // #169
+            return true;
+        }
+        return false;
+    };
+
+    // Apply the selected strategy.
+    bool ok = false;
+    if (espeak_first) {
+        ok = try_espeak() || try_builtin();
+    } else {
+        ok = try_builtin() || try_espeak();
+    }
+
+    if (ok && !out.empty()) {
         if (is_cmn_lang(lang))
             strip_cmn_tone_numbers(out);
         ctx->phon_cache.insert(key, out);
@@ -3124,9 +3382,12 @@ extern "C" float* kokoro_synthesize(struct kokoro_context* ctx, const char* text
     }
 
     std::string phonemes;
-    if (!phonemize_cached(ctx, ctx->espeak_lang, text, phonemes)) {
-        fprintf(stderr, "kokoro: phonemizer produced no output for '%s'\n", text);
-        return nullptr;
+    {
+        kokoro_bench_stage _b("phonemize");
+        if (!phonemize_cached(ctx, ctx->espeak_lang, text, phonemes)) {
+            fprintf(stderr, "kokoro: phonemizer produced no output for '%s'\n", text);
+            return nullptr;
+        }
     }
     if (ctx->params.verbosity >= 1)
         fprintf(stderr, "kokoro: phonemes: '%s'\n", phonemes.c_str());
@@ -3297,6 +3558,7 @@ extern "C" void kokoro_set_length_scale(struct kokoro_context* ctx, float scale)
 extern "C" void kokoro_free(struct kokoro_context* ctx) {
     if (!ctx)
         return;
+    ctx->fc.free(); // FASTCONV baked kernels (before the backend is freed)
     if (ctx->gen_sched)
         ggml_backend_sched_free(ctx->gen_sched);
     if (ctx->sched)
@@ -3305,6 +3567,10 @@ extern "C" void kokoro_free(struct kokoro_context* ctx) {
         ggml_backend_buffer_free(ctx->vp.vp_buf_w);
     if (ctx->vp.vp_ctx_w)
         ggml_free(ctx->vp.vp_ctx_w);
+    if (ctx->buf_perm)
+        ggml_backend_buffer_free(ctx->buf_perm);
+    if (ctx->ctx_perm)
+        ggml_free(ctx->ctx_perm);
     if (ctx->buf_w)
         ggml_backend_buffer_free(ctx->buf_w);
     if (ctx->ctx_w)

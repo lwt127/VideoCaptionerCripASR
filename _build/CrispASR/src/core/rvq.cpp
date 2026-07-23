@@ -52,4 +52,38 @@ bool encode_euclidean(const float* features, int T, int dim, const Codebook* sta
     return true;
 }
 
+bool encode_euclidean_per_stage(const float* features, int T, int dim, const float* const* embeds, const int* sizes,
+                                int n_stages, std::vector<std::vector<int32_t>>& out_codes) {
+    if (!features || !embeds || !sizes || T <= 0 || dim <= 0 || n_stages <= 0)
+        return false;
+
+    // Precompute ‖E[k]‖² per stage + build Codebook views.
+    std::vector<std::vector<float>> norms(n_stages);
+    std::vector<Codebook> stages(n_stages);
+    for (int s = 0; s < n_stages; s++) {
+        if (!embeds[s] || sizes[s] <= 0)
+            return false;
+        norms[s].resize((size_t)sizes[s]);
+        for (int k = 0; k < sizes[s]; k++) {
+            const float* e = embeds[s] + (size_t)k * dim;
+            float n = 0.0f;
+            for (int j = 0; j < dim; j++)
+                n += e[j] * e[j];
+            norms[s][k] = n;
+        }
+        stages[s] = {embeds[s], norms[s].data(), sizes[s], dim};
+    }
+
+    std::vector<int32_t> flat((size_t)T * n_stages, 0);
+    if (!encode_euclidean(features, T, dim, stages.data(), n_stages, flat.data()))
+        return false;
+
+    // Transpose (T, n_stages) → out_codes[s][t].
+    out_codes.assign((size_t)n_stages, std::vector<int32_t>((size_t)T, 0));
+    for (int t = 0; t < T; t++)
+        for (int s = 0; s < n_stages; s++)
+            out_codes[(size_t)s][(size_t)t] = flat[(size_t)t * n_stages + s];
+    return true;
+}
+
 } // namespace core_rvq

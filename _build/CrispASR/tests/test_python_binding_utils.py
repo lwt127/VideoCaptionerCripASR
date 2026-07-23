@@ -43,6 +43,20 @@ class TestFunctionSignatures:
         sig = inspect.signature(_binding.detect_backend_from_gguf)
         assert "gguf_path" in sig.parameters
 
+    def test_detect_backend_from_gguf_returns_name(self):
+        """Regression: the ABI returns strlen(name) (>0) on a successful
+        detection, so a `rc != 0`-means-failure check wrongly rejected every
+        real detection (silently nulled / raised). Guard the correct contract
+        against a checked-in fixture."""
+        fixture = Path(__file__).parent / "fixtures" / "vibevoice-quant-carveout.gguf"
+        if not fixture.exists():
+            pytest.skip("fixture GGUF not present")
+        try:
+            name = _binding.detect_backend_from_gguf(str(fixture))
+        except OSError:
+            pytest.skip("native crispasr library not built/loadable")
+        assert name == "vibevoice", f"expected 'vibevoice', got {name!r}"
+
     def test_vad_span_dataclass(self):
         span = _binding.VadSpan(start=1.0, end=2.5)
         assert span.start == 1.0

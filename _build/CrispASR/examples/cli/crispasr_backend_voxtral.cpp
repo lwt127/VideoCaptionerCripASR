@@ -77,30 +77,8 @@ struct VoxtralOps {
             // and append a plain English directive in the user turn.
             // Map ISO codes to full English names so the model gets
             // an unambiguous target ("de" alone reads as Spanish "of").
-            auto to_eng = [](const std::string& c) -> std::string {
-                if (c == "en")
-                    return "English";
-                if (c == "de")
-                    return "German";
-                if (c == "fr")
-                    return "French";
-                if (c == "es")
-                    return "Spanish";
-                if (c == "it")
-                    return "Italian";
-                if (c == "pt")
-                    return "Portuguese";
-                if (c == "ru")
-                    return "Russian";
-                if (c == "ja")
-                    return "Japanese";
-                if (c == "zh")
-                    return "Chinese";
-                if (c == "nl")
-                    return "Dutch";
-                return c;
-            };
-            const std::string tgt = p.target_lang.empty() ? std::string("English") : to_eng(p.target_lang);
+            const std::string tgt =
+                p.target_lang.empty() ? std::string("English") : crispasr_iso_to_english_lang(p.target_lang);
             return "[/INST]lang:" + lang + " Translate the audio to " + tgt + ".[TRANSCRIBE]";
         }
         // PLAN #98 Phase B: hotword prompt injection
@@ -148,6 +126,12 @@ public:
         // bit-identical single-chunk path. The streamed wrapper itself
         // dispatches to the single-chunk path for n_samples <= 30 s.
         return crispasr_run_voxtral_style_pipeline_streamed<VoxtralOps>(ctx_, samples, n_samples, t_offset_cs, params);
+    }
+
+    void transcribe_streaming(const float* samples, int n_samples, int64_t t_offset_cs, const whisper_params& params,
+                              crispasr_stream_callback on_text) override {
+        (void)t_offset_cs; // Simplified streaming doesn't use t_offset_cs for token events
+        crispasr_run_voxtral_style_pipeline_streamed_cb<VoxtralOps>(ctx_, samples, n_samples, params, on_text);
     }
 
     void shutdown() override {

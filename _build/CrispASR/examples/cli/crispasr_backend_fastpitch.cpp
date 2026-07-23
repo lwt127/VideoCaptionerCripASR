@@ -35,6 +35,7 @@ public:
     bool init(const whisper_params& p) override {
         fastpitch_tts_params fp = fastpitch_tts_default_params();
         fp.n_threads = p.n_threads;
+        fp.use_gpu = p.use_gpu;
         fp.verbosity = p.no_prints ? 0 : 1;
         // Speaker selection via --voice <N> (integer string = speaker index).
         if (!p.tts_voice.empty()) {

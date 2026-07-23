@@ -6,7 +6,7 @@
 // silently change the wire format that downstream OpenAI clients
 // depend on.
 
-#include "crispasr_wav_writer.h"
+#include "core/crispasr_wav_writer.h"
 
 #include <catch2/catch_test_macros.hpp>
 

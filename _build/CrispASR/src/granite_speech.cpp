@@ -6,6 +6,7 @@
 //   3. 40-layer Granite 1B LLM (GQA 16/4, μP multipliers, RoPE)
 
 #include "granite_speech.h"
+#include "core/crispasr_env.h"
 #include <chrono>
 
 #ifndef M_PI
@@ -22,8 +23,21 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "crispasr_imatrix.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
+
+#if defined(HAVE_ACCELERATE)
+#include <Accelerate/Accelerate.h>
+#endif
+
+// §176d: env-gated fallback to scalar cpu_linear for A/B testing.
+static bool granite_force_scalar() {
+    static int v = -1;
+    if (v < 0)
+        v = (crispasr_env::get("CRISPASR_GRANITE_FORCE_SCALAR") != nullptr) ? 1 : 0;
+    return v != 0;
+}
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -56,7 +70,7 @@
 static bool granite_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("GRANITE_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_GRANITE_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -273,6 +287,47 @@ struct granite_speech_context {
 
     int n_threads = 4;
 
+    // Cached bucketed LLM-decode graph: fixed KV read extent (dec_bucket_len)
+    // keeps topology shape-stable across steps for CUDA-graph capture. nullptr
+    // until granite_speech_set_decode_bucket is called.
+    ggml_cgraph* cached_dec_gf = nullptr;
+    ggml_context* cached_dec_ctx = nullptr;
+    std::vector<uint8_t> cached_dec_meta;
+    int cached_dec_bucket = 0;         // fixed Lk the cached graph was built for
+    std::vector<uint8_t> dec_mask_buf; // host staging for the Lk fp16 mask
+    int dec_bucket_len = 0;
+    // Argmax-fused variant: appends ggml_argmax so the greedy loop D2Hs one
+    // int32 token id instead of the full vocab logits. Built lazily.
+    ggml_cgraph* cached_argmax_gf = nullptr;
+    // True when cached_argmax_gf folds the embed lookup inline (non-quantized
+    // token embedding); otherwise the caller supplies a pre-computed embeds.
+    bool dec_fused_embed = false;
+
+    // Raw-gallocr allocate-once decode (Metal/Vulkan/CPU — i.e. backends with
+    // no CUDA-graph capture). The bucketed decode graph is shape-stable, so we
+    // allocate it ONCE via a persistent ggml_gallocr on the single GPU backend
+    // and reuse it across steps with ggml_backend_graph_compute — skipping the
+    // per-step ggml_backend_sched_reset + sched_alloc_graph (which CUDA capture
+    // requires but which is pure overhead without it). gallocr_alloc_graph does
+    // not mutate the graph, so the same object is re-fed each step. Mirrors the
+    // chatterbox s3gen §208 single-backend path. CUDA keeps the sched path so
+    // ggml-cuda graph capture still engages. One allocator per cached graph.
+    ggml_gallocr_t dec_galloc = nullptr;    // for cached_dec_gf (logits)
+    ggml_gallocr_t argmax_galloc = nullptr; // for cached_argmax_gf (greedy)
+    int dec_use_gallocr = -1;               // -1 undecided, 0 sched, 1 gallocr
+    // Decode profiling accumulators (CRISPASR_GRANITE_DEC_PROFILE). Measure the
+    // per-step alloc vs compute split directly — deterministic, unlike noisy
+    // end-to-end wall time on M1.
+    int64_t dec_prof_alloc_us = 0;
+    int64_t dec_prof_compute_us = 0;
+
+    // §176s: cached encoder graph — reused when (T, with_rpe) matches.
+    ggml_cgraph* cached_enc_gf = nullptr;
+    ggml_context* cached_enc_ctx = nullptr;
+    std::vector<uint8_t> cached_enc_meta;
+    int cached_enc_T = 0;
+    bool cached_enc_rpe = false;
+
     // Precomputed relative position embedding lookup, per encoder block.
     // Layout: rpe_per_layer[il][c * C * hd + r * hd + d] = rel_pos_emb(attention_dists[c][r])[d]
     // granite-speech-4.1-2b stores DIFFERENT attn_rel_pos.weight per encoder
@@ -318,6 +373,7 @@ struct granite_speech_context {
 // ===========================================================================
 
 #include "core/gguf_loader.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -635,7 +691,7 @@ extern "C" struct granite_speech_context* granite_speech_init_from_file(const ch
     ctx->params = params;
     ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
-    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
     if (!ctx->backend)
         ctx->backend = ggml_backend_cpu_init();
     ctx->backend_cpu = ggml_backend_cpu_init();
@@ -792,6 +848,7 @@ extern "C" struct granite_speech_context* granite_speech_init_from_file(const ch
         if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
             backends[n_be++] = ctx->backend_cpu;
         ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+        crispasr_imatrix_install(ctx->sched); // no-op unless CRISPASR_IMATRIX_OUT is set
     }
     ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
 
@@ -806,6 +863,12 @@ extern "C" struct granite_speech_context* granite_speech_init_from_file(const ch
 extern "C" void granite_speech_free(struct granite_speech_context* ctx) {
     if (!ctx)
         return;
+    if (ctx->cached_enc_ctx)
+        ggml_free(ctx->cached_enc_ctx);
+    if (ctx->dec_galloc)
+        ggml_gallocr_free(ctx->dec_galloc);
+    if (ctx->argmax_galloc)
+        ggml_gallocr_free(ctx->argmax_galloc);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->kv_buf)
@@ -956,12 +1019,22 @@ static void depthwise_conv_1d_cpu(float* out, const float* in, const float* weig
 // which doesn't need the context.
 static void cpu_linear(granite_speech_context* /*ctx*/, float* out, const float* x, ggml_tensor* W, ggml_tensor* bias,
                        int d_in, int d_out, int T) {
-    // Simple CPU matmul (no ggml graph overhead for small ops)
-    // W in ggml: ne[0]=d_in, ne[1]=d_out. W[i,j] = data[j * d_in + i]
-    // ggml_mul_mat(W, x) computes W^T @ x
-    // For F32 weights, do it directly:
+    // W in ggml: ne[0]=d_in, ne[1]=d_out. Row-major: W[o * d_in + i].
+    // out[o + t * d_out] = sum_i W[o * d_in + i] * x[i + t * d_in] + bias[o]
+    // = W @ x^T in BLAS terms: C(d_out, T) = W(d_out, d_in) * x^T(d_in, T)
+
+    // Dequantize weight to F32.
     std::vector<float> w_f32((size_t)d_in * d_out);
-    ggml_backend_tensor_get(W, w_f32.data(), 0, w_f32.size() * sizeof(float));
+    if (W->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(W, w_f32.data(), 0, w_f32.size() * sizeof(float));
+    } else {
+        const size_t row_bytes = ggml_row_size(W->type, d_in);
+        std::vector<uint8_t> raw(row_bytes * (size_t)d_out);
+        ggml_backend_tensor_get(W, raw.data(), 0, raw.size());
+        for (int o = 0; o < d_out; o++)
+            ggml_get_type_traits(W->type)->to_float(raw.data() + (size_t)o * row_bytes, w_f32.data() + (size_t)o * d_in,
+                                                    d_in);
+    }
 
     std::vector<float> b_f32;
     if (bias) {
@@ -969,16 +1042,39 @@ static void cpu_linear(granite_speech_context* /*ctx*/, float* out, const float*
         ggml_backend_tensor_get(bias, b_f32.data(), 0, d_out * sizeof(float));
     }
 
-    // out[o, t] = sum_i W[i, o] * x[i, t] + bias[o]
-    // = sum_i w_f32[o * d_in + i] * x[i + t * d_in] + b[o]
-    for (int t = 0; t < T; t++) {
-        for (int o = 0; o < d_out; o++) {
-            float sum = 0.0f;
-            for (int i = 0; i < d_in; i++)
-                sum += w_f32[(size_t)o * d_in + i] * x[(size_t)i + (size_t)t * d_in];
-            if (bias)
-                sum += b_f32[o];
-            out[(size_t)o + (size_t)t * d_out] = sum;
+#if defined(HAVE_ACCELERATE)
+    if (!granite_force_scalar()) {
+        // C(d_out, T) = W(d_out, d_in) * X(d_in, T)
+        // X is stored as x[t * d_in + i], so X is (T, d_in) row-major = (d_in, T) col-major.
+        // W is (d_out, d_in) row-major.
+        // out is (T, d_out) row-major → we want out[t * d_out + o].
+        // BLAS: C = alpha * A * B + beta * C
+        //   A = W (d_out × d_in, row-major)
+        //   B = X^T (d_in × T, but X is row-major (T × d_in))
+        // Use CblasRowMajor, CblasNoTrans for A, CblasTrans for B:
+        //   C(d_out, T) = W(d_out, d_in) * X^T(d_in, T) but we want (T, d_out) output.
+        // Easier: transpose the whole thing.
+        // out^T(d_out, T) = W(d_out, d_in) @ x^T(d_in, T)
+        // Then transpose out to (T, d_out).
+        std::vector<float> tmp((size_t)d_out * T);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, d_out, T, d_in, 1.0f, w_f32.data(), d_in, x, d_in, 0.0f,
+                    tmp.data(), T);
+        // tmp is (d_out, T) row-major → transpose to (T, d_out) into out.
+        for (int t = 0; t < T; t++)
+            for (int o = 0; o < d_out; o++)
+                out[(size_t)t * d_out + o] = tmp[(size_t)o * T + t] + (bias ? b_f32[o] : 0.0f);
+    } else
+#endif
+    {
+        for (int t = 0; t < T; t++) {
+            for (int o = 0; o < d_out; o++) {
+                float sum = 0.0f;
+                for (int i = 0; i < d_in; i++)
+                    sum += w_f32[(size_t)o * d_in + i] * x[(size_t)i + (size_t)t * d_in];
+                if (bias)
+                    sum += b_f32[o];
+                out[(size_t)o + (size_t)t * d_out] = sum;
+            }
         }
     }
 }
@@ -1005,7 +1101,8 @@ static void cpu_linear(granite_speech_context* /*ctx*/, float* out, const float*
 // from any caller; it stays in tree as a simpler baseline we can diff
 // against if the CPU path ever drifts. The unused-local casts below
 // keep the file warning-free without deleting the reference.
-static ggml_cgraph* granite_build_encoder(granite_speech_context* ctx, int T, bool with_rpe) {
+static ggml_cgraph* granite_build_encoder(granite_speech_context* ctx, int T, bool with_rpe,
+                                          ggml_context* arena_ctx = nullptr) {
     const auto& m = ctx->model;
     const auto& hp = m.hparams;
     const int d = (int)hp.enc_d_model;       // 1024
@@ -1018,8 +1115,13 @@ static ggml_cgraph* granite_build_encoder(granite_speech_context* ctx, int T, bo
     (void)d;
     (void)ff; // reserved for future use (see header comment)
 
-    ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
-    ggml_context* ctx0 = ggml_init(ip);
+    ggml_context* ctx0;
+    if (arena_ctx) {
+        ctx0 = arena_ctx;
+    } else {
+        ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
+        ctx0 = ggml_init(ip);
+    }
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
 
     // Input: (T, input_dim=160) stacked mel frames
@@ -1348,7 +1450,8 @@ static ggml_cgraph* granite_build_encoder(granite_speech_context* ctx, int T, bo
 
     ggml_set_name(cur, "enc_output");
     ggml_build_forward_expand(gf, cur);
-    ggml_free(ctx0);
+    if (!arena_ctx)
+        ggml_free(ctx0);
     return gf;
 }
 
@@ -1379,7 +1482,23 @@ static float* granite_run_encoder_graph(granite_speech_context* ctx, const float
     if (!with_rpe)
         fprintf(stderr, "granite_encoder_graph: rpe_per_layer missing entries — using approximate no-RPE path\n");
 
-    ggml_cgraph* gf = granite_build_encoder(ctx, T, with_rpe);
+    // #235: always rebuild — cached graph has stale GPU buffer handles after sched regrow
+    ggml_cgraph* gf;
+    {
+        if (ctx->cached_enc_ctx) {
+            ggml_free(ctx->cached_enc_ctx);
+            ctx->cached_enc_ctx = nullptr;
+            ctx->cached_enc_gf = nullptr;
+        }
+        ctx->cached_enc_meta.assign(ctx->compute_meta.size(), 0);
+        ggml_init_params aip = {ctx->cached_enc_meta.size(), ctx->cached_enc_meta.data(), true};
+        ctx->cached_enc_ctx = ggml_init(aip);
+        gf = granite_build_encoder(ctx, T, with_rpe, ctx->cached_enc_ctx);
+        ctx->cached_enc_gf = gf;
+        ctx->cached_enc_T = T;
+        ctx->cached_enc_rpe = with_rpe;
+    }
+
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
         fprintf(stderr, "granite_encoder_graph: alloc failed\n");
@@ -1515,7 +1634,7 @@ extern "C" float* granite_speech_run_encoder(struct granite_speech_context* ctx,
     // the final encoder output. Set GRANITE_DISABLE_ENCODER_GRAPH=1 to
     // fall back to the CPU loop (slower but kept around for debugging).
     bool use_graph = true;
-    if (const char* e = std::getenv("GRANITE_DISABLE_ENCODER_GRAPH"))
+    if (const char* e = crispasr_env::get("CRISPASR_GRANITE_DISABLE_ENCODER_GRAPH"))
         if (e[0] != '0' && e[0] != '\0')
             use_graph = false;
     if (use_graph) {
@@ -2114,6 +2233,10 @@ static ggml_cgraph* granite_build_llm_kv(granite_speech_context* ctx, int n_past
     return gf;
 }
 
+// Forward decl for the bucketed decode path (defined below).
+static float* granite_run_bucket_decode(granite_speech_context* ctx, const float* input_embed, int n_past,
+                                        int bucket_len);
+
 extern "C" float* granite_speech_run_llm_kv(struct granite_speech_context* ctx, const float* inputs_embeds,
                                             int n_tokens, int n_past, int* out_n_tokens, int* out_vocab_size) {
     if (!ctx || !inputs_embeds || n_tokens <= 0)
@@ -2121,6 +2244,20 @@ extern "C" float* granite_speech_run_llm_kv(struct granite_speech_context* ctx, 
     const auto& hp = ctx->model.hparams;
     const int d = (int)hp.llm_d_model;
     const int vocab = (int)hp.llm_vocab_size;
+
+    // Single-token decode with a configured bucket reuses the cached graph
+    // (CUDA-graph capture). Prefill and no-bucket fall through to the rebuild path.
+    if (n_tokens == 1 && ctx->dec_bucket_len > 0 && n_past < ctx->dec_bucket_len) {
+        float* r = granite_run_bucket_decode(ctx, inputs_embeds, n_past, ctx->dec_bucket_len);
+        if (r) {
+            if (out_n_tokens)
+                *out_n_tokens = 1;
+            if (out_vocab_size)
+                *out_vocab_size = vocab;
+            return r;
+        }
+        // fall through to legacy path on failure
+    }
 
     std::vector<int32_t> positions(n_tokens);
     for (int i = 0; i < n_tokens; i++)
@@ -2214,6 +2351,429 @@ extern "C" float* granite_speech_run_llm_kv(struct granite_speech_context* ctx, 
     if (out_vocab_size)
         *out_vocab_size = vocab;
     return result;
+}
+
+// Decide once whether the bucket decode uses the raw-gallocr allocate-once path
+// (no per-step sched reset+alloc) instead of the sched. Enabled when the whole
+// decode graph runs on a single GPU/CPU backend that has no CUDA-graph capture:
+//   - not CUDA/HIP (those want the sched so ggml-cuda capture engages)
+//   - no CPU layer split (CRISPASR_N_GPU_LAYERS) — a split graph spans two
+//     backends and must go through the sched.
+// Override: CRISPASR_GRANITE_DEC_GALLOCR=0 forces the sched path, =1 forces the
+// gallocr path (debug/bench).
+static bool granite_dec_use_gallocr(granite_speech_context* ctx) {
+    if (ctx->dec_use_gallocr >= 0)
+        return ctx->dec_use_gallocr != 0;
+    bool use = true;
+    if (!ctx->backend) {
+        use = false;
+    } else {
+        const char* name = ggml_backend_name(ctx->backend);
+        const bool is_cuda = name && (std::strstr(name, "CUDA") || std::strstr(name, "ROCm") ||
+                                      std::strstr(name, "HIP") || std::strstr(name, "MUSA"));
+        const bool split = ctx->model.buf_cpu != nullptr; // some weights on CPU
+        use = !is_cuda && !split;
+    }
+    if (const char* s = std::getenv("CRISPASR_GRANITE_DEC_GALLOCR"))
+        use = (std::atoi(s) != 0);
+    ctx->dec_use_gallocr = use ? 1 : 0;
+    if (std::getenv("CRISPASR_GRANITE_DEC_PROFILE"))
+        fprintf(stderr, "[granite dec-profile] backend=%s split=%d -> gallocr=%d\n",
+                ctx->backend ? ggml_backend_name(ctx->backend) : "(null)", ctx->model.buf_cpu != nullptr ? 1 : 0, use);
+    return use;
+}
+
+// Free the persistent decode allocators (on bucket change / teardown).
+static void granite_free_dec_gallocs(granite_speech_context* ctx) {
+    if (ctx->dec_galloc) {
+        ggml_gallocr_free(ctx->dec_galloc);
+        ctx->dec_galloc = nullptr;
+    }
+    if (ctx->argmax_galloc) {
+        ggml_gallocr_free(ctx->argmax_galloc);
+        ctx->argmax_galloc = nullptr;
+    }
+}
+
+extern "C" void granite_speech_set_decode_bucket(struct granite_speech_context* ctx, int bucket_len) {
+    if (!ctx)
+        return;
+    // A new bucket length invalidates the cached graph (different Lk).
+    if (bucket_len != ctx->dec_bucket_len) {
+        if (ctx->cached_dec_ctx) {
+            ggml_free(ctx->cached_dec_ctx);
+            ctx->cached_dec_ctx = nullptr;
+            ctx->cached_dec_gf = nullptr;
+            ctx->cached_argmax_gf = nullptr;
+        }
+        granite_free_dec_gallocs(ctx); // allocators are tied to the freed graphs
+        ctx->cached_dec_bucket = 0;
+    }
+    ctx->dec_bucket_len = bucket_len;
+}
+
+// Bucketed single-token decode: pin the KV read extent so graph topology is
+// constant across steps, enabling CUDA-graph capture. See PERFORMANCE.md.
+static ggml_cgraph* granite_build_bucket_decode(granite_speech_context* ctx, int bucket_len) {
+    if (ctx->cached_dec_gf && ctx->cached_dec_bucket == bucket_len)
+        return ctx->cached_dec_gf;
+
+    // Free a previous cached graph built for a different bucket. The argmax
+    // graph lives in the same arena, so it dies too; drop both allocators.
+    if (ctx->cached_dec_ctx) {
+        ggml_free(ctx->cached_dec_ctx);
+        ctx->cached_dec_ctx = nullptr;
+        ctx->cached_dec_gf = nullptr;
+        ctx->cached_argmax_gf = nullptr;
+        ctx->cached_dec_meta.assign(ctx->cached_dec_meta.size(), 0);
+        granite_free_dec_gallocs(ctx);
+    }
+
+    const auto& m = ctx->model;
+    const auto& hp = m.hparams;
+    const int d = (int)hp.llm_d_model;
+    const int n_layers = (int)hp.llm_n_layers;
+
+    // Persistent arena for the graph's tensor metadata (must outlive all steps
+    // that reuse the cached graph). Sized like compute_meta.
+    ctx->cached_dec_meta.assign(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false), 0);
+    ggml_init_params ip = {ctx->cached_dec_meta.size(), ctx->cached_dec_meta.data(), true};
+    ctx->cached_dec_ctx = ggml_init(ip);
+    ggml_context* ctx0 = ctx->cached_dec_ctx;
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
+
+    // Single-token decode: T = 1.
+    ggml_tensor* embeds = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d, 1);
+    ggml_set_name(embeds, "inputs_embeds");
+    ggml_set_input(embeds);
+
+    ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+    ggml_set_name(positions, "positions");
+    ggml_set_input(positions);
+
+    // Fixed-extent mask: (bucket_len, 1). Contents updated each step.
+    ggml_tensor* causal_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, bucket_len, 1);
+    ggml_set_name(causal_mask, "causal_mask");
+    ggml_set_input(causal_mask);
+
+    core_granite_llm::Hparams llm_hp = {};
+    llm_hp.n_layers = n_layers;
+    llm_hp.d_model = d;
+    llm_hp.n_heads = (int)hp.llm_n_heads;
+    llm_hp.n_kv_heads = (int)hp.llm_n_kv_heads;
+    llm_hp.head_dim = (int)hp.llm_head_dim;
+    llm_hp.rms_eps = hp.llm_rms_eps;
+    llm_hp.rope_theta = hp.llm_rope_theta;
+    llm_hp.embedding_multiplier = hp.embedding_multiplier;
+    llm_hp.attention_multiplier = hp.attention_multiplier;
+    llm_hp.residual_multiplier = hp.residual_multiplier;
+
+    std::vector<core_granite_llm::LayerWeights> blocks(n_layers);
+    for (int il = 0; il < n_layers; il++) {
+        const auto& b = m.llm.blocks[il];
+        blocks[il] = {b.attn_norm_w, b.attn_q_w,   b.attn_k_w, b.attn_v_w,  b.attn_out_w,
+                      b.ffn_norm_w,  b.ffn_gate_w, b.ffn_up_w, b.ffn_down_w};
+    }
+
+    // fixed_kv_len pins the KV read extent; kv_indices routes the write via
+    // set_rows with a runtime row index, keeping topology shape-stable.
+    ggml_tensor* cur = core_granite_llm::build_decoder(ctx0, gf, embeds, positions, causal_mask, ctx->kv_k, ctx->kv_v,
+                                                       /*n_past=*/0, blocks, m.llm.output_norm_w, llm_hp,
+                                                       /*is_causal=*/true,
+                                                       /*fixed_kv_len=*/bucket_len,
+                                                       /*kv_indices=*/positions);
+
+    cur = ggml_mul_mat(ctx0, m.llm.output_w, cur);
+    cur = ggml_scale(ctx0, cur, 1.0f / hp.logits_scaling);
+    ggml_set_name(cur, "logits");
+    ggml_build_forward_expand(gf, cur);
+
+    ctx->cached_dec_gf = gf;
+    ctx->cached_dec_bucket = bucket_len;
+    return gf;
+}
+
+// One bucketed single-token decode step. Reuses the cached graph; returns
+// malloc'd (vocab,) logits to match the run_llm_kv contract.
+static float* granite_run_bucket_decode(granite_speech_context* ctx, const float* input_embed, int n_past,
+                                        int bucket_len) {
+    const auto& hp = ctx->model.hparams;
+    const int d = (int)hp.llm_d_model;
+    const int vocab = (int)hp.llm_vocab_size;
+
+    // n_past indexes the set_rows KV write into a fixed [0, bucket_len) view;
+    // out of range would corrupt the cache. Caller (run_llm_kv) already gates on
+    // n_past < dec_bucket_len, but stay self-safe and fall back on misuse.
+    if (n_past < 0 || n_past >= bucket_len)
+        return nullptr;
+
+    ggml_cgraph* gf = granite_build_bucket_decode(ctx, bucket_len);
+    const bool use_ga = granite_dec_use_gallocr(ctx);
+    if (use_ga) {
+        // Raw-gallocr: allocate the shape-stable graph once, reuse every step.
+        if (!ctx->dec_galloc) {
+            ctx->dec_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+            if (!ctx->dec_galloc || !ggml_gallocr_alloc_graph(ctx->dec_galloc, gf)) {
+                granite_free_dec_gallocs(ctx);
+                return nullptr; // caller falls back to the legacy rebuild path
+            }
+        }
+    } else {
+        // Sched path (CUDA capture): reset+alloc every step. Subsequent steps
+        // reuse the allocation.
+        ggml_backend_sched_reset(ctx->sched);
+        if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
+            return nullptr;
+    }
+
+    // positions: the single new token's absolute position.
+    int32_t pos = n_past;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "positions"), &pos, 0, sizeof(int32_t));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "inputs_embeds"), input_embed, 0, (size_t)d * sizeof(float));
+
+    // Mask slots [n_past+1 .. bucket_len) to -inf (their KV rows are stale).
+    ctx->dec_mask_buf.assign((size_t)bucket_len * sizeof(ggml_fp16_t), 0);
+    ggml_fp16_t* pmask = (ggml_fp16_t*)ctx->dec_mask_buf.data();
+    ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+    ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+    for (int k = 0; k < bucket_len; k++)
+        pmask[k] = (k <= n_past) ? zero : neg_inf;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "causal_mask"), pmask, 0, ctx->dec_mask_buf.size());
+
+    const ggml_status st =
+        use_ga ? ggml_backend_graph_compute(ctx->backend, gf) : ggml_backend_sched_graph_compute(ctx->sched, gf);
+    if (st != GGML_STATUS_SUCCESS)
+        return nullptr;
+
+    ggml_tensor* logits_t = ggml_graph_get_tensor(gf, "logits");
+    float* result = (float*)malloc((size_t)vocab * sizeof(float));
+    ggml_backend_tensor_get(logits_t, result, 0, (size_t)vocab * sizeof(float));
+    return result;
+}
+
+// Bucketed decode graph with an appended ggml_argmax over the vocab logits.
+// Greedy token selection uses strict-> (lowest index), matching
+// core_greedy_decode::argmax and ggml's CUDA argmax kernel — bit-identical to
+// the host path. "logits" is kept as a graph output for callers needing the
+// full vocab (sampling / best-of-N).
+static ggml_cgraph* granite_build_argmax_decode(granite_speech_context* ctx, int bucket_len) {
+    if (ctx->cached_argmax_gf && ctx->cached_dec_bucket == bucket_len)
+        return ctx->cached_argmax_gf;
+
+    // Build on the base bucket graph's arena (it owns the metadata arena);
+    // argmax adds one node.
+    ggml_context* ctx0 = ctx->cached_dec_ctx;
+    if (!ctx0 || !ctx->cached_dec_gf || ctx->cached_dec_bucket != bucket_len) {
+        granite_build_bucket_decode(ctx, bucket_len);
+        ctx0 = ctx->cached_dec_ctx;
+    }
+
+    // Fused-embed mode: fold the embed lookup into this graph when the token
+    // embedding is non-quantized (capture-safe get_rows). k-quant embeddings
+    // can't be captured (get_rows_cuda_kquant host-syncs), so those keep the
+    // embed as a separate graph and pass a pre-computed F32 input.
+    const auto& m = ctx->model;
+    const bool fused_embed = m.llm.token_embd_w && !ggml_is_quantized(m.llm.token_embd_w->type);
+
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
+    // Rebuild the forward in its own cgraph (capture keys on cgraph->nodes[0],
+    // so the argmax variant must not share the logits variant's cgraph).
+    const auto& hp = m.hparams;
+    const int d = (int)hp.llm_d_model;
+    const int n_layers = (int)hp.llm_n_layers;
+
+    ggml_tensor* embeds;
+    if (fused_embed) {
+        // input_ids (1 token) -> get_rows(token_embd_w) inline.
+        ggml_tensor* ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+        ggml_set_name(ids, "input_ids");
+        ggml_set_input(ids);
+        embeds = ggml_get_rows(ctx0, m.llm.token_embd_w, ids);
+    } else {
+        embeds = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d, 1);
+        ggml_set_name(embeds, "inputs_embeds");
+        ggml_set_input(embeds);
+    }
+    ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+    ggml_set_name(positions, "positions");
+    ggml_set_input(positions);
+    ggml_tensor* causal_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, bucket_len, 1);
+    ggml_set_name(causal_mask, "causal_mask");
+    ggml_set_input(causal_mask);
+
+    core_granite_llm::Hparams llm_hp = {};
+    llm_hp.n_layers = n_layers;
+    llm_hp.d_model = d;
+    llm_hp.n_heads = (int)hp.llm_n_heads;
+    llm_hp.n_kv_heads = (int)hp.llm_n_kv_heads;
+    llm_hp.head_dim = (int)hp.llm_head_dim;
+    llm_hp.rms_eps = hp.llm_rms_eps;
+    llm_hp.rope_theta = hp.llm_rope_theta;
+    llm_hp.embedding_multiplier = hp.embedding_multiplier;
+    llm_hp.attention_multiplier = hp.attention_multiplier;
+    llm_hp.residual_multiplier = hp.residual_multiplier;
+
+    std::vector<core_granite_llm::LayerWeights> blocks(n_layers);
+    for (int il = 0; il < n_layers; il++) {
+        const auto& b = m.llm.blocks[il];
+        blocks[il] = {b.attn_norm_w, b.attn_q_w,   b.attn_k_w, b.attn_v_w,  b.attn_out_w,
+                      b.ffn_norm_w,  b.ffn_gate_w, b.ffn_up_w, b.ffn_down_w};
+    }
+    ggml_tensor* cur = core_granite_llm::build_decoder(ctx0, gf, embeds, positions, causal_mask, ctx->kv_k, ctx->kv_v,
+                                                       /*n_past=*/0, blocks, m.llm.output_norm_w, llm_hp,
+                                                       /*is_causal=*/true, /*fixed_kv_len=*/bucket_len,
+                                                       /*kv_indices=*/positions);
+    cur = ggml_mul_mat(ctx0, m.llm.output_w, cur);
+    cur = ggml_scale(ctx0, cur, 1.0f / hp.logits_scaling);
+    ggml_set_name(cur, "logits");
+
+    ctx->dec_fused_embed = fused_embed;
+    ggml_tensor* am = ggml_argmax(ctx0, cur);
+    ggml_set_name(am, "argmax");
+    ggml_build_forward_expand(gf, am);
+
+    ctx->cached_argmax_gf = gf;
+    return gf;
+}
+
+// One argmax-fused greedy decode step. Runs the forward + argmax and returns
+// the chosen token id; *out_logit (optional) receives that token's logit.
+// Returns -1 on failure.
+static int granite_greedy_decode_step(granite_speech_context* ctx, int32_t token_id, const float* input_embed,
+                                      int n_past, int bucket_len, float* out_logit) {
+    // The new token's KV is written at row n_past via set_rows into a fixed
+    // [0, bucket_len) view; n_past >= bucket_len would index past it (and past
+    // the KV cache, which is allocated == max bucket). Refuse rather than
+    // corrupt — callers stop at the bucket ceiling. See PERFORMANCE.md §210.
+    if (n_past < 0 || n_past >= bucket_len)
+        return -1;
+    ggml_cgraph* gf = granite_build_argmax_decode(ctx, bucket_len);
+    const bool use_ga = granite_dec_use_gallocr(ctx);
+    const int64_t t_alloc0 = ggml_time_us();
+    if (use_ga) {
+        // Raw-gallocr (Metal/Vulkan/CPU): allocate the shape-stable argmax graph
+        // once and reuse it every step — no per-step sched reset+alloc.
+        if (!ctx->argmax_galloc) {
+            ctx->argmax_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+            if (!ctx->argmax_galloc || !ggml_gallocr_alloc_graph(ctx->argmax_galloc, gf)) {
+                granite_free_dec_gallocs(ctx);
+                return -1;
+            }
+        }
+    } else {
+        // Sched path: reset+alloc every step. The documented sched reuse
+        // shortcut (ggml-backend.h:285) breaks CUDA-graph capture here ("CUDA
+        // error: invalid argument" mid-decode), and capture already removes the
+        // dominant per-launch cost there.
+        ggml_backend_sched_reset(ctx->sched);
+        if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
+            return -1;
+    }
+    ctx->dec_prof_alloc_us += ggml_time_us() - t_alloc0;
+
+    const auto& hp = ctx->model.hparams;
+    const int d = (int)hp.llm_d_model;
+    int32_t pos = n_past;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "positions"), &pos, 0, sizeof(int32_t));
+    if (ctx->dec_fused_embed) {
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "input_ids"), &token_id, 0, sizeof(int32_t));
+    } else {
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "inputs_embeds"), input_embed, 0, (size_t)d * sizeof(float));
+    }
+
+    ctx->dec_mask_buf.assign((size_t)bucket_len * sizeof(ggml_fp16_t), 0);
+    ggml_fp16_t* pmask = (ggml_fp16_t*)ctx->dec_mask_buf.data();
+    ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+    ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+    for (int k = 0; k < bucket_len; k++)
+        pmask[k] = (k <= n_past) ? zero : neg_inf;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "causal_mask"), pmask, 0, ctx->dec_mask_buf.size());
+
+    const int64_t t_comp0 = ggml_time_us();
+    const ggml_status st =
+        use_ga ? ggml_backend_graph_compute(ctx->backend, gf) : ggml_backend_sched_graph_compute(ctx->sched, gf);
+    ctx->dec_prof_compute_us += ggml_time_us() - t_comp0;
+    if (st != GGML_STATUS_SUCCESS)
+        return -1;
+
+    int32_t token = -1;
+    ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "argmax"), &token, 0, sizeof(int32_t));
+
+    if (out_logit) {
+        float lv = 0.0f;
+        ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "logits"), &lv, (size_t)token * sizeof(float), sizeof(float));
+        *out_logit = lv;
+    }
+    return (int)token;
+}
+
+extern "C" int32_t* granite_speech_greedy_decode(struct granite_speech_context* ctx, int32_t first_token,
+                                                 int initial_n_past, int max_new_tokens, int eos_id, int* out_n) {
+    if (!ctx || ctx->dec_bucket_len <= 0 || max_new_tokens <= 0) {
+        if (out_n)
+            *out_n = 0;
+        return nullptr;
+    }
+    const int bucket = ctx->dec_bucket_len;
+    // Build the graph up front so dec_fused_embed is resolved before the loop.
+    granite_build_argmax_decode(ctx, bucket);
+
+    std::vector<int32_t> tokens;
+    tokens.reserve((size_t)max_new_tokens);
+    tokens.push_back(first_token);
+
+    // CRISPASR_GRANITE_DEC_PROFILE=1 → report decode-loop wall time + per-step
+    // cost (isolates the decode path from the encoder; A/B the gallocr vs sched
+    // path with CRISPASR_GRANITE_DEC_GALLOCR).
+    const bool dec_profile = std::getenv("CRISPASR_GRANITE_DEC_PROFILE") != nullptr;
+    const int64_t prof_t0 = dec_profile ? ggml_time_us() : 0;
+    ctx->dec_prof_alloc_us = 0;
+    ctx->dec_prof_compute_us = 0;
+
+    int n_past = initial_n_past;
+    // Stop at the bucket ceiling: the per-step KV write lands at row n_past in a
+    // fixed [0, bucket) view, so n_past must stay < bucket. bucket <= the KV
+    // cache capacity (both 4096), so this is also the hard context limit — the
+    // legacy path runs out of cache at the same point. Without this guard a
+    // long generation (e.g. --max-new-tokens that pushes prompt+gen past the
+    // 4096 clamp) writes out of bounds.
+    while ((int)tokens.size() < max_new_tokens && tokens.back() != eos_id && n_past < bucket) {
+        int32_t last = tokens.back();
+        float* emb = nullptr;
+        if (!ctx->dec_fused_embed) {
+            emb = granite_speech_embed_tokens(ctx, &last, 1);
+            if (!emb)
+                break;
+        }
+        int nx = granite_greedy_decode_step(ctx, last, emb, n_past, bucket, /*out_logit*/ nullptr);
+        std::free(emb);
+        if (nx < 0)
+            break;
+        n_past++;
+        tokens.push_back((int32_t)nx);
+    }
+
+    if (dec_profile) {
+        const int64_t dt = ggml_time_us() - prof_t0;
+        const int steps = (int)tokens.size() - 1; // first_token came from prefill
+        const double inv = steps > 0 ? 1.0 / steps : 0.0;
+        fprintf(stderr,
+                "[granite dec-profile] %d steps, %.1f ms total | alloc %.0f us/step, compute %.0f us/step "
+                "(gallocr=%d)\n",
+                steps, dt / 1000.0, ctx->dec_prof_alloc_us * inv, ctx->dec_prof_compute_us * inv,
+                granite_dec_use_gallocr(ctx) ? 1 : 0);
+    }
+
+    int32_t* out = (int32_t*)malloc(tokens.size() * sizeof(int32_t));
+    if (!out) {
+        if (out_n)
+            *out_n = 0;
+        return nullptr;
+    }
+    memcpy(out, tokens.data(), tokens.size() * sizeof(int32_t));
+    if (out_n)
+        *out_n = (int)tokens.size();
+    return out;
 }
 
 extern "C" float* granite_speech_embed_tokens(struct granite_speech_context* ctx, const int32_t* input_ids,

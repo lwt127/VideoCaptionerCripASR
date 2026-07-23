@@ -1,17 +1,17 @@
 # crispasr
 
-Dart / Flutter FFI bindings for [CrispASR](https://github.com/CrispStrobe/CrispASR) — lightweight on-device speech recognition via ggml.
+Dart / Flutter FFI bindings for [CrispASR](https://github.com/CrispStrobe/CrispASR) — lightweight on-device speech recognition and speech tooling via ggml.
 
-Supports 17 ASR backends including Whisper, Qwen3-ASR, FastConformer, Canary, Parakeet, Cohere, Granite-Speech, Voxtral, wav2vec2, GLM-ASR, Kyutai-STT, Moonshine, FireRed, OmniASR, and VibeVoice-ASR.
+The native project currently ships 43 ASR backends, 48 TTS engines, language detection, punctuation, diarization, translation and chat/text helpers. This package exposes the Dart FFI API and expects the native `libcrispasr` library to be installed or bundled by the application.
 
 ## Install
 
 ```yaml
 dependencies:
-  crispasr: ^0.4.9
+  crispasr: ^0.8.10
 ```
 
-This package is **pure Dart FFI** and does **not** bundle the native library — install `libcrispasr` separately, the same way `crispasr`'s bindings work:
+This package is **pure Dart FFI** and does **not** bundle the native library. Install `libcrispasr` separately or ship it with your app:
 
 ```bash
 git clone https://github.com/CrispStrobe/CrispASR

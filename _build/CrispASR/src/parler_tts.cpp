@@ -32,6 +32,8 @@
 #include "core/dac_decoder.h"
 #include "core/gguf_loader.h"
 #include "core/sentencepiece.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -40,7 +42,9 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -50,6 +54,32 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+// ===========================================================================
+// Bench instrumentation — `PARLER_TTS_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool parler_tts_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_PARLER_TTS_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct parler_tts_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit parler_tts_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~parler_tts_bench_stage() {
+        if (!parler_tts_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  parler_tts_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ── Configuration ───────────────────────────────────────────────────
 
@@ -193,6 +223,8 @@ struct parler_tts_context {
     ggml_context* ctx_w = nullptr;
     ggml_backend_buffer_t buf_w = nullptr;
     std::map<std::string, ggml_tensor*> tensors;
+    ggml_context* ctx_perm = nullptr;
+    ggml_backend_buffer_t buf_perm = nullptr;
 
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
@@ -207,14 +239,59 @@ struct parler_tts_context {
     // Cached cross-attention KV per decoder layer
     // These are computed once from enc_hidden and stored in model.dec_layers[i].cross_k/v_cache
 
-    // Decoder self-attention KV cache
+    // Decoder self-attention KV cache (legacy host-side path)
     // Flat buffers: (n_layers, max_seq, hidden_size) for k and v
     std::vector<float> kv_k;
     std::vector<float> kv_v;
 
+    // ── §176c device-resident self-attn KV (bucket fast path) ──
+    // sa_kv_k / sa_kv_v: (D, kv_max_ctx, n_layers) on the compute backend.
+    // Written in-place via ggml_set_rows each decode step; never re-uploaded.
+    ggml_context* dkv_ctx = nullptr;
+    ggml_backend_buffer_t dkv_buf = nullptr;
+    ggml_tensor* sa_kv_k = nullptr;
+    ggml_tensor* sa_kv_v = nullptr;
+    int kv_max_ctx = 0;
+
+    // ── §176b device-resident cross-attn KV ──
+    // Per-layer (D, T_enc) device tensors; uploaded once per utterance.
+    ggml_context* cross_kv_ctx = nullptr;
+    ggml_backend_buffer_t cross_kv_buf = nullptr;
+    std::vector<ggml_tensor*> cross_kv_k;
+    std::vector<ggml_tensor*> cross_kv_v;
+    int cross_kv_T = 0;
+
+    // ── §176b Lk-bucketed AR decode-step graphs ──
+    // Each bucket is a fixed-Lk single-token decode graph reused across steps.
+    struct ParlerBucket {
+        int Lk = 0;
+        ggml_context* arena = nullptr;
+        std::vector<uint8_t> meta;
+        ggml_cgraph* gf = nullptr;
+    };
+    static constexpr int kNBuckets = 7;
+    static constexpr int kBucketLks[kNBuckets] = {64, 128, 256, 512, 1024, 2048, 4096};
+    std::array<ParlerBucket, kNBuckets> dec_buckets{};
+    ggml_backend_sched_t dec_step_sched = nullptr; // dedicated sched for reused bucket graphs
+    int dec_active_bucket = -1;
+
     // RNG
     std::mt19937 rng;
 };
+
+// Free all cached Lk-bucket decode graphs (called when the device KV or
+// cross-attn KV tensors they reference are (re)allocated).
+static void parler_invalidate_dec_buckets(parler_tts_context* c) {
+    for (auto& bk : c->dec_buckets) {
+        if (bk.arena)
+            ggml_free(bk.arena);
+        bk.arena = nullptr;
+        bk.gf = nullptr;
+        bk.Lk = 0;
+        bk.meta.clear();
+    }
+    c->dec_active_bucket = -1;
+}
 
 // ── T5 relative position bias ───────────────────────────────────────
 
@@ -687,7 +764,7 @@ struct parler_tts_context* parler_tts_init_from_file(const char* path_model, str
     // Pass 2: allocate backend buffer and load weights
     ctx->backend_cpu = ggml_backend_cpu_init();
     ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads);
-    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ctx->backend_cpu;
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (!ctx->backend)
         ctx->backend = ctx->backend_cpu;
     if (ggml_backend_is_cpu(ctx->backend))
@@ -711,6 +788,19 @@ struct parler_tts_context* parler_tts_init_from_file(const char* path_model, str
 
     bind_tensors(ctx);
 
+    // Permute DAC ConvTranspose1d weights for decomposed path
+    {
+        const int n = 4; // DAC always has 4 decoder blocks
+        std::vector<ggml_tensor*> srcs(n);
+        std::vector<ggml_tensor**> dsts(n);
+        for (int i = 0; i < n; i++) {
+            srcs[i] = ctx->model.dac.blocks[i].up_w;
+            dsts[i] = &ctx->model.dac.blocks[i].up_w_perm;
+        }
+        core_convt::permute_convt1d_weights_batch(srcs.data(), dsts.data(), n, ctx->backend, &ctx->ctx_perm,
+                                                  &ctx->buf_perm);
+    }
+
     if (params.verbosity >= 1) {
         auto& dc = ctx->model.dec_cfg;
         auto& tc = ctx->model.t5_cfg;
@@ -730,6 +820,10 @@ struct parler_tts_context* parler_tts_init_from_file(const char* path_model, str
         if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
             backends[n_be++] = ctx->backend_cpu;
         ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 65536, false, false);
+        // §176b: dedicated sched for the reused Lk-bucket decode-step graphs so the
+        // allocation stays stable across steps (reusing the main sched's allocation
+        // across computes faults on Metal — its galloc gets recycled).
+        ctx->dec_step_sched = ggml_backend_sched_new(backends, nullptr, n_be, 65536, false, false);
     }
 
     return ctx;
@@ -853,7 +947,7 @@ int parler_tts_set_description(struct parler_tts_context* ctx, const char* descr
     // tokenizer can't handle correctly. Override via PARLER_DESC_IDS env var
     // (comma-separated ints) for diff-testing.
     std::vector<int> desc_ids;
-    const char* override_ids = getenv("PARLER_DESC_IDS");
+    const char* override_ids = crispasr_env::get("CRISPASR_PARLER_DESC_IDS");
     if (override_ids && override_ids[0]) {
         // Parse comma-separated IDs for diff-testing
         std::string s(override_ids);
@@ -951,7 +1045,7 @@ int parler_tts_set_description(struct parler_tts_context* ctx, const char* descr
     }
 
     // Optionally dump encoder output for diff-testing
-    const char* dump_path = getenv("PARLER_DUMP_ENC");
+    const char* dump_path = crispasr_env::get("CRISPASR_PARLER_DUMP_ENC");
     if (dump_path && dump_path[0]) {
         FILE* f = fopen(dump_path, "wb");
         if (f) {
@@ -985,8 +1079,15 @@ static ggml_tensor* dac_conv1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w
 
 // ConvTranspose1d: x is (C_in, T), w is (K, C_out, C_in) per ggml convention
 // Applies padding by cropping output. Returns (C_out, T_out).
-static ggml_tensor* dac_conv_transpose_1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w, ggml_tensor* b, int stride,
-                                          int pad) {
+static ggml_tensor* dac_conv_transpose_1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w, ggml_tensor* w_perm,
+                                          ggml_tensor* b, int stride, int pad) {
+    if (w_perm) {
+        const int K = (int)w->ne[0];
+        ggml_tensor* y = core_convt::convt1d_decomp(ctx, x, w_perm, nullptr, stride, K, pad, pad);
+        if (b)
+            y = ggml_add(ctx, y, cast_f32(ctx, b));
+        return y;
+    }
     const int Cout = (int)w->ne[1];
     ggml_tensor* xt = ggml_cont(ctx, ggml_transpose(ctx, x)); // (T, C_in)
     ggml_tensor* y = ggml_conv_transpose_1d(ctx, w, xt, stride, 0, 1);
@@ -1023,9 +1124,15 @@ float* parler_tts_synthesize(struct parler_tts_context* ctx, const char* text, i
         return nullptr;
     }
 
+    parler_tts_bench_stage _bs_synth("synthesize");
+
     // Get audio codes
     int n_codes = 0;
-    int32_t* codes = parler_tts_synthesize_codes(ctx, text, &n_codes);
+    int32_t* codes;
+    {
+        parler_tts_bench_stage _bs("ar_decode");
+        codes = parler_tts_synthesize_codes(ctx, text, &n_codes);
+    }
     if (!codes || n_codes <= 0)
         return nullptr;
 
@@ -1038,6 +1145,7 @@ float* parler_tts_synthesize(struct parler_tts_context* ctx, const char* text, i
         fprintf(stderr, "parler_tts: DAC decode %d frames x %d codebooks\n", T_audio, num_codebooks);
 
     // Build DAC decode graph
+    parler_tts_bench_stage _bs_dac("dac_decode");
     // Step 1: RVQ dequantize - lookup embeddings and project
     // Step 2: Decoder conv stack
 
@@ -1099,7 +1207,7 @@ float* parler_tts_synthesize(struct parler_tts_context* ctx, const char* text, i
         x = core_dac::snake(ctx0, x, blk.snake_alpha);
 
         // ConvTranspose1d (upsample): padding = stride/2
-        x = dac_conv_transpose_1d(ctx0, x, blk.up_w, blk.up_b, stride, stride / 2);
+        x = dac_conv_transpose_1d(ctx0, x, blk.up_w, blk.up_w_perm, blk.up_b, stride, stride / 2);
 
         // 3 residual units with dilations 1, 3, 9
         for (int r = 0; r < 3; r++) {
@@ -1177,7 +1285,16 @@ float* parler_tts_synthesize(struct parler_tts_context* ctx, const char* text, i
 // T_dec: number of new tokens to process (prefill: n_prompt+1, incremental: 1)
 // past_len: number of tokens already in KV cache (0 for prefill)
 // T_enc: encoder sequence length
-static ggml_cgraph* build_decoder_step_graph(parler_tts_context* c, int T_dec, int past_len, int T_enc) {
+// §176b+c: when fixed_kv_len > 0 (bucket mode) the graph reads/writes the
+// device-resident self-attn KV (c->sa_kv_k/v) in-place via ggml_set_rows and
+// uses the device cross-attn KV (c->cross_kv_k/v); kv_len is fixed to the
+// bucket size and a (Lk, T_dec) causal mask kills the unwritten tail slots
+// (zero-K columns masked to -inf → softmax weight exactly 0). This is
+// numerically identical to the legacy (fixed_kv_len == 0) host-KV path.
+// arena_ctx, when non-null, is a persistent ggml_context owned by the bucket;
+// the graph is then NOT freed here so it can be reused across decode steps.
+static ggml_cgraph* build_decoder_step_graph(parler_tts_context* c, int T_dec, int past_len, int T_enc,
+                                             int fixed_kv_len = 0, ggml_context* arena_ctx = nullptr) {
     const auto& m = c->model;
     const auto& dc = m.dec_cfg;
     const int D = dc.hidden_size;
@@ -1185,12 +1302,18 @@ static ggml_cgraph* build_decoder_step_graph(parler_tts_context* c, int T_dec, i
     const int hd = D / nh; // per-head dim
     const int n_layers = dc.num_layers;
     const int n_cb = dc.num_codebooks;
-    const int kv_len = past_len + T_dec; // total KV length after this step
+    const bool bucket = (fixed_kv_len > 0);
+    const int kv_len = bucket ? fixed_kv_len : (past_len + T_dec); // total KV length read this step
 
-    size_t meta_sz = ggml_tensor_overhead() * 32768 + ggml_graph_overhead();
-    c->compute_meta.resize(meta_sz);
-    ggml_init_params ip = {meta_sz, c->compute_meta.data(), true};
-    ggml_context* ctx0 = ggml_init(ip);
+    ggml_context* ctx0;
+    if (arena_ctx) {
+        ctx0 = arena_ctx;
+    } else {
+        size_t meta_sz = ggml_tensor_overhead() * 32768 + ggml_graph_overhead();
+        c->compute_meta.resize(meta_sz);
+        ggml_init_params ip = {meta_sz, c->compute_meta.data(), true};
+        ctx0 = ggml_init(ip);
+    }
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 32768, false);
 
     // Input: pre-computed hidden states (D, T_dec)
@@ -1200,10 +1323,18 @@ static ggml_cgraph* build_decoder_step_graph(parler_tts_context* c, int T_dec, i
 
     ggml_tensor* cur = inp_hidden;
 
-    // Causal mask for self-attention during prefill (T_dec > 1)
-    // For incremental decode (T_dec=1), no mask needed (single query attends to all KV)
+    // Bucket mode: KV write positions (one per new token).
+    ggml_tensor* kv_pos = nullptr;
+    if (bucket) {
+        kv_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T_dec);
+        ggml_set_name(kv_pos, "kv_pos");
+        ggml_set_input(kv_pos);
+    }
+
+    // Causal mask. Legacy: only for prefill (T_dec > 1). Bucket: always present
+    // (must mask the fixed-size tail of the Lk window down to -inf).
     ggml_tensor* causal_mask = nullptr;
-    if (T_dec > 1) {
+    if (bucket || T_dec > 1) {
         causal_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, kv_len, T_dec);
         ggml_set_name(causal_mask, "causal_mask");
         ggml_set_input(causal_mask);
@@ -1214,10 +1345,10 @@ static ggml_cgraph* build_decoder_step_graph(parler_tts_context* c, int T_dec, i
     for (int il = 0; il < n_layers; il++) {
         const auto& l = m.dec_layers[il];
 
-        // Self-attention KV cache inputs: (D, past_len) -- past KV
+        // Self-attention KV cache inputs: (D, past_len) -- past KV (legacy only)
         ggml_tensor* past_k = nullptr;
         ggml_tensor* past_v = nullptr;
-        if (past_len > 0) {
+        if (!bucket && past_len > 0) {
             past_k = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, D, past_len);
             snprintf(name_buf, sizeof(name_buf), "self_k_%d", il);
             ggml_set_name(past_k, name_buf);
@@ -1229,16 +1360,23 @@ static ggml_cgraph* build_decoder_step_graph(parler_tts_context* c, int T_dec, i
             ggml_set_input(past_v);
         }
 
-        // Cross-attention KV (precomputed from encoder)
-        ggml_tensor* cross_k = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, D, T_enc);
-        snprintf(name_buf, sizeof(name_buf), "cross_k_%d", il);
-        ggml_set_name(cross_k, name_buf);
-        ggml_set_input(cross_k);
+        // Cross-attention KV: device-resident in bucket mode, input tensors in legacy.
+        ggml_tensor* cross_k;
+        ggml_tensor* cross_v;
+        if (bucket) {
+            cross_k = c->cross_kv_k[il];
+            cross_v = c->cross_kv_v[il];
+        } else {
+            cross_k = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, D, T_enc);
+            snprintf(name_buf, sizeof(name_buf), "cross_k_%d", il);
+            ggml_set_name(cross_k, name_buf);
+            ggml_set_input(cross_k);
 
-        ggml_tensor* cross_v = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, D, T_enc);
-        snprintf(name_buf, sizeof(name_buf), "cross_v_%d", il);
-        ggml_set_name(cross_v, name_buf);
-        ggml_set_input(cross_v);
+            cross_v = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, D, T_enc);
+            snprintf(name_buf, sizeof(name_buf), "cross_v_%d", il);
+            ggml_set_name(cross_v, name_buf);
+            ggml_set_input(cross_v);
+        }
 
         ggml_tensor* residual = cur;
 
@@ -1252,20 +1390,46 @@ static ggml_cgraph* build_decoder_step_graph(parler_tts_context* c, int T_dec, i
         ggml_tensor* K_new = ggml_mul_mat(ctx0, l.self_attn_k, cur); // (D, T_dec)
         ggml_tensor* V_new = ggml_mul_mat(ctx0, l.self_attn_v, cur); // (D, T_dec)
 
-        // Output new K/V for cache update — mark as output to prevent
-        // the scheduler from reusing their memory before we read them post-compute
-        snprintf(name_buf, sizeof(name_buf), "new_k_%d", il);
-        ggml_set_name(K_new, name_buf);
-        ggml_set_output(K_new);
-        ggml_build_forward_expand(gf, K_new);
-        snprintf(name_buf, sizeof(name_buf), "new_v_%d", il);
-        ggml_set_name(V_new, name_buf);
-        ggml_set_output(V_new);
-        ggml_build_forward_expand(gf, V_new);
+        ggml_tensor* K_full;
+        ggml_tensor* V_full;
+        if (bucket) {
+            // Write the new K/V rows into the device KV at kv_pos (in-place), then
+            // read back a fixed Lk window. Read from the set_rows *result* (not
+            // c->sa_kv_k directly) so there is an explicit write->read dependency
+            // edge: the backend must not schedule the KV read before the in-place
+            // write completes. Metal runs independent graph nodes concurrently, so
+            // reading the bare tensor races the write and corrupts the result.
+            const int64_t Lcap = c->sa_kv_k->ne[1];
+            ggml_tensor* k_layer =
+                ggml_view_2d(ctx0, c->sa_kv_k, D, Lcap, c->sa_kv_k->nb[1], (size_t)il * c->sa_kv_k->nb[2]);
+            ggml_tensor* v_layer =
+                ggml_view_2d(ctx0, c->sa_kv_v, D, Lcap, c->sa_kv_v->nb[1], (size_t)il * c->sa_kv_v->nb[2]);
+            ggml_tensor* sr_k = ggml_set_rows(ctx0, k_layer, K_new, kv_pos);
+            ggml_tensor* sr_v = ggml_set_rows(ctx0, v_layer, V_new, kv_pos);
+            ggml_build_forward_expand(gf, sr_k);
+            ggml_build_forward_expand(gf, sr_v);
+            // The Lk window is the contiguous leading block of the layer's KV slice,
+            // so feed the view straight into reshape (the later permute+mul_mat read
+            // it strided, same as before) — skip the per-step D×Lk cont copy, which
+            // grows with the bucket size and dominates the long-utterance cost.
+            K_full = ggml_view_2d(ctx0, sr_k, D, kv_len, sr_k->nb[1], 0);
+            V_full = ggml_view_2d(ctx0, sr_v, D, kv_len, sr_v->nb[1], 0);
+        } else {
+            // Output new K/V for cache update — mark as output to prevent
+            // the scheduler from reusing their memory before we read them post-compute
+            snprintf(name_buf, sizeof(name_buf), "new_k_%d", il);
+            ggml_set_name(K_new, name_buf);
+            ggml_set_output(K_new);
+            ggml_build_forward_expand(gf, K_new);
+            snprintf(name_buf, sizeof(name_buf), "new_v_%d", il);
+            ggml_set_name(V_new, name_buf);
+            ggml_set_output(V_new);
+            ggml_build_forward_expand(gf, V_new);
 
-        // Full KV: concatenate past + new
-        ggml_tensor* K_full = (past_len > 0) ? ggml_concat(ctx0, past_k, K_new, 1) : K_new;
-        ggml_tensor* V_full = (past_len > 0) ? ggml_concat(ctx0, past_v, V_new, 1) : V_new;
+            // Full KV: concatenate past + new
+            K_full = (past_len > 0) ? ggml_concat(ctx0, past_k, K_new, 1) : K_new;
+            V_full = (past_len > 0) ? ggml_concat(ctx0, past_v, V_new, 1) : V_new;
+        }
 
         // Reshape to multi-head: (hd, nh, seq) -> permute to (hd, seq, nh)
         Q = ggml_permute(ctx0, ggml_reshape_3d(ctx0, Q, hd, nh, T_dec), 0, 2, 1, 3);
@@ -1348,10 +1512,14 @@ static ggml_cgraph* build_decoder_step_graph(parler_tts_context* c, int T_dec, i
         ggml_tensor* logits_k = ggml_mul_mat(ctx0, m.lm_heads[k], cur); // (vocab_size, 1)
         snprintf(name_buf, sizeof(name_buf), "logits_%d", k);
         ggml_set_name(logits_k, name_buf);
+        if (bucket)
+            ggml_set_output(logits_k); // reused graph: keep outputs from being aliased
         ggml_build_forward_expand(gf, logits_k);
     }
 
-    ggml_free(ctx0);
+    // Bucket graphs live in a persistent arena reused across steps — don't free.
+    if (!arena_ctx)
+        ggml_free(ctx0);
     return gf;
 }
 
@@ -1367,7 +1535,7 @@ int32_t* parler_tts_synthesize_codes(struct parler_tts_context* ctx, const char*
 
     // Tokenize the text prompt (override via PARLER_PROMPT_IDS for diff-testing)
     std::vector<int> prompt_ids;
-    const char* prompt_override = getenv("PARLER_PROMPT_IDS");
+    const char* prompt_override = crispasr_env::get("CRISPASR_PARLER_PROMPT_IDS");
     if (prompt_override && prompt_override[0]) {
         std::string s(prompt_override);
         size_t pos = 0;
@@ -1417,8 +1585,9 @@ int32_t* parler_tts_synthesize_codes(struct parler_tts_context* ctx, const char*
     // Precompute cross-attention KV projections (one-time per description)
     // cross_k[layer] = K_proj @ enc_hidden, cross_v[layer] = V_proj @ enc_hidden
     // Each is (D, T_enc) stored flat
-    std::vector<std::vector<float>> cross_k_cache(n_layers);
-    std::vector<std::vector<float>> cross_v_cache(n_layers);
+    // §176i: cross-KV stored as F16 (read-only after projection, halves memory)
+    std::vector<std::vector<ggml_fp16_t>> cross_k_cache(n_layers);
+    std::vector<std::vector<ggml_fp16_t>> cross_v_cache(n_layers);
 
     {
         // Build a small graph for cross KV projection
@@ -1463,14 +1632,16 @@ int32_t* parler_tts_synthesize_codes(struct parler_tts_context* ctx, const char*
 
         for (int il = 0; il < n_layers; il++) {
             char buf[64];
-            cross_k_cache[il].resize(D * T_enc);
-            cross_v_cache[il].resize(D * T_enc);
+            const size_t n_elem = (size_t)D * T_enc;
+            std::vector<float> f32_buf(n_elem);
+            cross_k_cache[il].resize(n_elem);
+            cross_v_cache[il].resize(n_elem);
             snprintf(buf, sizeof(buf), "xk_%d", il);
-            ggml_backend_tensor_get(ggml_graph_get_tensor(gf, buf), cross_k_cache[il].data(), 0,
-                                    (size_t)D * T_enc * sizeof(float));
+            ggml_backend_tensor_get(ggml_graph_get_tensor(gf, buf), f32_buf.data(), 0, n_elem * sizeof(float));
+            ggml_fp32_to_fp16_row(f32_buf.data(), cross_k_cache[il].data(), (int)n_elem);
             snprintf(buf, sizeof(buf), "xv_%d", il);
-            ggml_backend_tensor_get(ggml_graph_get_tensor(gf, buf), cross_v_cache[il].data(), 0,
-                                    (size_t)D * T_enc * sizeof(float));
+            ggml_backend_tensor_get(ggml_graph_get_tensor(gf, buf), f32_buf.data(), 0, n_elem * sizeof(float));
+            ggml_fp32_to_fp16_row(f32_buf.data(), cross_v_cache[il].data(), (int)n_elem);
         }
     }
 
@@ -1556,6 +1727,97 @@ int32_t* parler_tts_synthesize_codes(struct parler_tts_context* ctx, const char*
     ctx->kv_k.resize((size_t)n_layers * kv_capacity * D, 0.0f);
     ctx->kv_v.resize((size_t)n_layers * kv_capacity * D, 0.0f);
 
+    // ── §176b+c: device-resident KV + Lk-bucket AR decode fast path ──
+    // OPT-IN via CRISPASR_PARLER_BUCKET=1. Bit-identical to the legacy host-KV
+    // path (validated). It skips the per-step graph rebuild and per-step KV host
+    // re-upload by caching one fixed-Lk graph per bucket and keeping the self-attn
+    // KV device-resident (written in place via ggml_set_rows). The win is real on
+    // backends with costly host<->device transfer (discrete GPU / CUDA); on M1's
+    // unified memory the transfer is a cheap memcpy, so the fixed-Lk over-read can
+    // make long utterances slower — hence opt-in, not default. Prefill always uses
+    // the legacy dynamic path below.
+    const bool bucket_enabled = (getenv("CRISPASR_PARLER_BUCKET") && getenv("CRISPASR_PARLER_BUCKET")[0] == '1');
+    bool use_bucket =
+        bucket_enabled && kv_capacity <= parler_tts_context::kBucketLks[parler_tts_context::kNBuckets - 1];
+    // Size the device KV to the smallest bucket Lk that covers the whole
+    // utterance, so every per-layer fixed-Lk read view stays within its slice.
+    int kv_alloc_ctx = 0;
+    if (use_bucket) {
+        for (int i = 0; i < parler_tts_context::kNBuckets; i++) {
+            if (parler_tts_context::kBucketLks[i] >= kv_capacity) {
+                kv_alloc_ctx = parler_tts_context::kBucketLks[i];
+                break;
+            }
+        }
+    }
+    if (use_bucket) {
+        // Device self-attn KV: (D, kv_alloc_ctx, n_layers). Reuse if big enough.
+        if (!ctx->sa_kv_k || ctx->kv_max_ctx < kv_alloc_ctx) {
+            parler_invalidate_dec_buckets(ctx);
+            if (ctx->dkv_buf)
+                ggml_backend_buffer_free(ctx->dkv_buf);
+            if (ctx->dkv_ctx)
+                ggml_free(ctx->dkv_ctx);
+            ggml_init_params kvip = {2 * ggml_tensor_overhead(), nullptr, true};
+            ctx->dkv_ctx = ggml_init(kvip);
+            ctx->sa_kv_k = ggml_new_tensor_3d(ctx->dkv_ctx, GGML_TYPE_F32, D, kv_alloc_ctx, n_layers);
+            ctx->sa_kv_v = ggml_new_tensor_3d(ctx->dkv_ctx, GGML_TYPE_F32, D, kv_alloc_ctx, n_layers);
+            // Match vibevoice §201: explicit backend buffer (Metal residency-set safe).
+            size_t kv_size = (size_t)ggml_type_size(GGML_TYPE_F32) * D * kv_alloc_ctx * n_layers;
+            ctx->dkv_buf = ggml_backend_alloc_buffer(ctx->backend, 2 * kv_size);
+            uint8_t* kv_base = (uint8_t*)ggml_backend_buffer_get_base(ctx->dkv_buf);
+            ggml_backend_tensor_alloc(ctx->dkv_buf, ctx->sa_kv_k, kv_base);
+            ggml_backend_tensor_alloc(ctx->dkv_buf, ctx->sa_kv_v, kv_base + kv_size);
+            ctx->kv_max_ctx = kv_alloc_ctx;
+        }
+        // Device cross-attn KV: per-layer (D, T_enc). Reuse if T_enc unchanged.
+        if (ctx->cross_kv_T != T_enc || (int)ctx->cross_kv_k.size() != n_layers) {
+            parler_invalidate_dec_buckets(ctx);
+            if (ctx->cross_kv_buf)
+                ggml_backend_buffer_free(ctx->cross_kv_buf);
+            if (ctx->cross_kv_ctx)
+                ggml_free(ctx->cross_kv_ctx);
+            ggml_init_params cip = {(size_t)(2 * n_layers + 2) * ggml_tensor_overhead(), nullptr, true};
+            ctx->cross_kv_ctx = ggml_init(cip);
+            ctx->cross_kv_k.assign(n_layers, nullptr);
+            ctx->cross_kv_v.assign(n_layers, nullptr);
+            for (int il = 0; il < n_layers; il++) {
+                ctx->cross_kv_k[il] = ggml_new_tensor_2d(ctx->cross_kv_ctx, GGML_TYPE_F16, D, T_enc);
+                ctx->cross_kv_v[il] = ggml_new_tensor_2d(ctx->cross_kv_ctx, GGML_TYPE_F16, D, T_enc);
+            }
+            // Explicit backend buffer (Metal residency-set safe), one slab for all layers.
+            size_t ck_size = (size_t)ggml_type_size(GGML_TYPE_F16) * D * T_enc;
+            ctx->cross_kv_buf = ggml_backend_alloc_buffer(ctx->backend, (size_t)2 * n_layers * ck_size);
+            uint8_t* ck_base = (uint8_t*)ggml_backend_buffer_get_base(ctx->cross_kv_buf);
+            size_t off = 0;
+            for (int il = 0; il < n_layers; il++) {
+                ggml_backend_tensor_alloc(ctx->cross_kv_buf, ctx->cross_kv_k[il], ck_base + off);
+                off += ck_size;
+                ggml_backend_tensor_alloc(ctx->cross_kv_buf, ctx->cross_kv_v[il], ck_base + off);
+                off += ck_size;
+            }
+            ctx->cross_kv_T = T_enc;
+        }
+        if (ctx->dkv_buf && ctx->cross_kv_buf) {
+            ggml_backend_buffer_clear(ctx->dkv_buf, 0); // unwritten tail slots = 0 (masked to -inf at read)
+            for (int il = 0; il < n_layers; il++) {
+                ggml_backend_tensor_set(ctx->cross_kv_k[il], cross_k_cache[il].data(), 0,
+                                        (size_t)D * T_enc * sizeof(ggml_fp16_t));
+                ggml_backend_tensor_set(ctx->cross_kv_v[il], cross_v_cache[il].data(), 0,
+                                        (size_t)D * T_enc * sizeof(ggml_fp16_t));
+            }
+        } else {
+            use_bucket = false; // allocation failed → legacy path
+        }
+        // Rebuild the bucket graphs fresh for this utterance. Their compute
+        // tensors were allocated by dec_step_sched on a prior call; reusing those
+        // cached graphs across synthesize calls leaves dangling tensor->buffer
+        // pointers (the next ggml_backend_tensor_set memmoves into freed memory).
+        // Within this call the per-step reuse (build once per bucket) is preserved.
+        parler_invalidate_dec_buckets(ctx);
+    }
+    ctx->dec_active_bucket = -1; // force (re)alloc of the bucket sched on first step
+
     // ── Prefill: process all prompt tokens + first BOS codebook token together ──
     // Build input: [prompt_embed_0, prompt_embed_1, ..., prompt_embed_{n-1}, bos_sum]
     // with positional embedding added
@@ -1563,7 +1825,8 @@ int32_t* parler_tts_synthesize_codes(struct parler_tts_context* ctx, const char*
     std::vector<float> prefill_embed(prefill_len * D, 0.0f);
 
     // Prompt tokens
-    const bool parler_debug = (getenv("PARLER_DEBUG") && getenv("PARLER_DEBUG")[0] == '1');
+    const bool parler_debug =
+        (crispasr_env::get("CRISPASR_PARLER_DEBUG") && crispasr_env::get("CRISPASR_PARLER_DEBUG")[0] == '1');
     for (int i = 0; i < n_prompt; i++) {
         read_embed_row(m.dec_embed_prompts, prompt_ids[i], &prefill_embed[i * D], D);
     }
@@ -1607,9 +1870,9 @@ int32_t* parler_tts_synthesize_codes(struct parler_tts_context* ctx, const char*
         for (int il = 0; il < n_layers; il++) {
             char buf[64];
             snprintf(buf, sizeof(buf), "cross_k_%d", il);
-            safe_set(gf, buf, cross_k_cache[il].data(), (size_t)D * T_enc * sizeof(float));
+            safe_set(gf, buf, cross_k_cache[il].data(), (size_t)D * T_enc * sizeof(ggml_fp16_t));
             snprintf(buf, sizeof(buf), "cross_v_%d", il);
-            safe_set(gf, buf, cross_v_cache[il].data(), (size_t)D * T_enc * sizeof(float));
+            safe_set(gf, buf, cross_v_cache[il].data(), (size_t)D * T_enc * sizeof(ggml_fp16_t));
         }
 
         if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
@@ -1634,6 +1897,17 @@ int32_t* parler_tts_synthesize_codes(struct parler_tts_context* ctx, const char*
             if (parler_debug && (il == 0 || il == 23)) {
                 fprintf(stderr, "parler_tts: KV cache layer %d K[:5]=%.4f %.4f %.4f %.4f %.4f data=%p\n", il, k_dst[0],
                         k_dst[1], k_dst[2], k_dst[3], k_dst[4], (void*)kt->data);
+            }
+        }
+
+        // §176c: seed the device-resident KV with the prefill rows so the
+        // bucketed decode steps can read+append in place.
+        if (use_bucket) {
+            for (int il = 0; il < n_layers; il++) {
+                ggml_backend_tensor_set(ctx->sa_kv_k, ctx->kv_k.data() + (size_t)il * kv_capacity * D,
+                                        (size_t)il * ctx->sa_kv_k->nb[2], (size_t)prefill_len * D * sizeof(float));
+                ggml_backend_tensor_set(ctx->sa_kv_v, ctx->kv_v.data() + (size_t)il * kv_capacity * D,
+                                        (size_t)il * ctx->sa_kv_v->nb[2], (size_t)prefill_len * D * sizeof(float));
             }
         }
 
@@ -1705,44 +1979,105 @@ int32_t* parler_tts_synthesize_codes(struct parler_tts_context* ctx, const char*
                     inp_embed[0], inp_embed[1], inp_embed[2], inp_embed[3], inp_embed[4], pos);
         }
 
-        // Build incremental step graph
-        ggml_cgraph* gf = build_decoder_step_graph(ctx, 1, past_len, T_enc);
-        ggml_backend_sched_reset(ctx->sched);
-        if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
-            fprintf(stderr, "parler_tts: gen step %d alloc failed\n", gen_step);
-            break;
+        // ── §176b: bucketed device-KV fast path (reused single-token graph) ──
+        ggml_cgraph* gf = nullptr;
+        bool did_bucket = false;
+        if (use_bucket) {
+            const int needed = past_len + 1; // KV length after writing this token
+            int bidx = -1;
+            for (int i = 0; i < parler_tts_context::kNBuckets; i++) {
+                if (parler_tts_context::kBucketLks[i] >= needed &&
+                    parler_tts_context::kBucketLks[i] <= ctx->kv_max_ctx) {
+                    bidx = i;
+                    break;
+                }
+            }
+            if (bidx >= 0) {
+                auto& bk = ctx->dec_buckets[bidx];
+                if (!bk.gf) {
+                    bk.Lk = parler_tts_context::kBucketLks[bidx];
+                    bk.meta.assign(ggml_tensor_overhead() * 32768 + ggml_graph_overhead(), 0);
+                    ggml_init_params ip = {bk.meta.size(), bk.meta.data(), true};
+                    bk.arena = ggml_init(ip);
+                    bk.gf = build_decoder_step_graph(ctx, 1, 0, T_enc, bk.Lk, bk.arena);
+                }
+                if (bk.gf) {
+                    // Reuse the dedicated sched's allocation across steps: only
+                    // reset + alloc on a bucket switch, otherwise just update inputs
+                    // and recompute the cached graph. The device KV persists across
+                    // computes (set_rows writes in place), so nothing needs realloc
+                    // between steps. (Reuse is safe because reads come from the
+                    // set_rows result, giving an explicit write→read edge, and the
+                    // bucket graphs are rebuilt per utterance — see the setup above.)
+                    if (ctx->dec_active_bucket != bidx) {
+                        ggml_backend_sched_reset(ctx->dec_step_sched);
+                        if (!ggml_backend_sched_alloc_graph(ctx->dec_step_sched, bk.gf)) {
+                            fprintf(stderr, "parler_tts: bucket %d alloc failed at step %d\n", bidx, gen_step);
+                            return nullptr; // device-only KV: legacy fallback would read stale host KV
+                        }
+                        ctx->dec_active_bucket = bidx;
+                    }
+                    safe_set(bk.gf, "inp_hidden", inp_embed.data(), D * sizeof(float));
+                    int32_t pos_i = past_len;
+                    safe_set(bk.gf, "kv_pos", &pos_i, sizeof(int32_t));
+                    // Mask: KV slots [0..past_len] visible, [past_len+1..Lk-1] = -inf.
+                    std::vector<float> mask(bk.Lk, 0.0f);
+                    for (int kk = past_len + 1; kk < bk.Lk; kk++)
+                        mask[kk] = -1e9f;
+                    safe_set(bk.gf, "causal_mask", mask.data(), (size_t)bk.Lk * sizeof(float));
+                    if (ggml_backend_sched_graph_compute(ctx->dec_step_sched, bk.gf) != GGML_STATUS_SUCCESS) {
+                        fprintf(stderr, "parler_tts: bucket compute failed at step %d\n", gen_step);
+                        return nullptr;
+                    }
+                    gf = bk.gf;
+                    did_bucket = true;
+                    past_len++; // device KV updated in-place by set_rows
+                }
+            }
         }
 
-        safe_set(gf, "inp_hidden", inp_embed.data(), D * sizeof(float));
+        if (!did_bucket) {
+            // Legacy dynamic path (host-side KV concat).
+            gf = build_decoder_step_graph(ctx, 1, past_len, T_enc);
+            ggml_backend_sched_reset(ctx->sched);
+            if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+                fprintf(stderr, "parler_tts: gen step %d alloc failed\n", gen_step);
+                break;
+            }
 
-        for (int il = 0; il < n_layers; il++) {
-            char buf[64];
-            snprintf(buf, sizeof(buf), "self_k_%d", il);
-            safe_set(gf, buf, ctx->kv_k.data() + (size_t)il * kv_capacity * D, (size_t)past_len * D * sizeof(float));
-            snprintf(buf, sizeof(buf), "self_v_%d", il);
-            safe_set(gf, buf, ctx->kv_v.data() + (size_t)il * kv_capacity * D, (size_t)past_len * D * sizeof(float));
-            snprintf(buf, sizeof(buf), "cross_k_%d", il);
-            safe_set(gf, buf, cross_k_cache[il].data(), (size_t)D * T_enc * sizeof(float));
-            snprintf(buf, sizeof(buf), "cross_v_%d", il);
-            safe_set(gf, buf, cross_v_cache[il].data(), (size_t)D * T_enc * sizeof(float));
-        }
+            safe_set(gf, "inp_hidden", inp_embed.data(), D * sizeof(float));
 
-        if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
-            fprintf(stderr, "parler_tts: gen step %d compute failed\n", gen_step);
-            break;
-        }
+            for (int il = 0; il < n_layers; il++) {
+                char buf[64];
+                snprintf(buf, sizeof(buf), "self_k_%d", il);
+                safe_set(gf, buf, ctx->kv_k.data() + (size_t)il * kv_capacity * D,
+                         (size_t)past_len * D * sizeof(float));
+                snprintf(buf, sizeof(buf), "self_v_%d", il);
+                safe_set(gf, buf, ctx->kv_v.data() + (size_t)il * kv_capacity * D,
+                         (size_t)past_len * D * sizeof(float));
+                snprintf(buf, sizeof(buf), "cross_k_%d", il);
+                safe_set(gf, buf, cross_k_cache[il].data(), (size_t)D * T_enc * sizeof(ggml_fp16_t));
+                snprintf(buf, sizeof(buf), "cross_v_%d", il);
+                safe_set(gf, buf, cross_v_cache[il].data(), (size_t)D * T_enc * sizeof(ggml_fp16_t));
+            }
 
-        // Read new K/V and append to cache
-        for (int il = 0; il < n_layers; il++) {
-            char buf[64];
-            snprintf(buf, sizeof(buf), "new_k_%d", il);
-            float* k_dst = ctx->kv_k.data() + (size_t)il * kv_capacity * D + (size_t)past_len * D;
-            ggml_backend_tensor_get(ggml_graph_get_tensor(gf, buf), k_dst, 0, D * sizeof(float));
-            snprintf(buf, sizeof(buf), "new_v_%d", il);
-            float* v_dst = ctx->kv_v.data() + (size_t)il * kv_capacity * D + (size_t)past_len * D;
-            ggml_backend_tensor_get(ggml_graph_get_tensor(gf, buf), v_dst, 0, D * sizeof(float));
+            if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+                fprintf(stderr, "parler_tts: gen step %d compute failed\n", gen_step);
+                break;
+            }
+
+            // Read new K/V and append to cache
+            for (int il = 0; il < n_layers; il++) {
+                char buf[64];
+                snprintf(buf, sizeof(buf), "new_k_%d", il);
+                float* k_dst = ctx->kv_k.data() + (size_t)il * kv_capacity * D + (size_t)past_len * D;
+                ggml_backend_tensor_get(ggml_graph_get_tensor(gf, buf), k_dst, 0, D * sizeof(float));
+                snprintf(buf, sizeof(buf), "new_v_%d", il);
+                float* v_dst = ctx->kv_v.data() + (size_t)il * kv_capacity * D + (size_t)past_len * D;
+                ggml_backend_tensor_get(ggml_graph_get_tensor(gf, buf), v_dst, 0, D * sizeof(float));
+            }
+            past_len++;
         }
-        past_len++;
 
         // Read logits and sample for each codebook
         std::vector<int32_t> step_tokens(num_codebooks);
@@ -1831,8 +2166,23 @@ void parler_tts_pcm_free(float* pcm) {
 void parler_tts_free(struct parler_tts_context* ctx) {
     if (!ctx)
         return;
+    parler_invalidate_dec_buckets(ctx);
+    if (ctx->dec_step_sched)
+        ggml_backend_sched_free(ctx->dec_step_sched);
+    if (ctx->dkv_buf)
+        ggml_backend_buffer_free(ctx->dkv_buf);
+    if (ctx->dkv_ctx)
+        ggml_free(ctx->dkv_ctx);
+    if (ctx->cross_kv_buf)
+        ggml_backend_buffer_free(ctx->cross_kv_buf);
+    if (ctx->cross_kv_ctx)
+        ggml_free(ctx->cross_kv_ctx);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
+    if (ctx->buf_perm)
+        ggml_backend_buffer_free(ctx->buf_perm);
+    if (ctx->ctx_perm)
+        ggml_free(ctx->ctx_perm);
     if (ctx->buf_w)
         ggml_backend_buffer_free(ctx->buf_w);
     if (ctx->ctx_w)

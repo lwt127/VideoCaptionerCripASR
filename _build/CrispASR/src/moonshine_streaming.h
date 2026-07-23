@@ -79,6 +79,14 @@ int moonshine_streaming_stream_get_text(struct moonshine_streaming_stream* s, ch
 int moonshine_streaming_stream_flush(struct moonshine_streaming_stream* s);
 void moonshine_streaming_stream_close(struct moonshine_streaming_stream* s);
 
+// Per-token streaming callback.
+typedef void (*moonshine_streaming_token_cb)(int tok_id, float prob, void* userdata);
+
+// Like moonshine_streaming_transcribe() but fires cb for each generated token.
+// Falls back to greedy decode (beam_size ignored).
+void moonshine_streaming_transcribe_cb(struct moonshine_streaming_context* ctx, const float* pcm, int n_samples,
+                                       moonshine_streaming_token_cb cb, void* userdata);
+
 #ifdef __cplusplus
 }
 #endif

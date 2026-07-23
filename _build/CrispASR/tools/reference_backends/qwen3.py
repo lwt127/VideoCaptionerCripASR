@@ -68,8 +68,13 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
             f"(original import error: {e})")
 
     print(f"  loading Qwen3-ASR model from {model_dir}")
+    # bfloat16 is the model's native dtype — the reference forward runs in
+    # bf16 (activations are cast to f32 only at capture time). Set
+    # QWEN3_REF_DTYPE=float32 for an f32 reference when memory allows.
+    import os
+    dtype = os.environ.get("QWEN3_REF_DTYPE", "bfloat16")
     wrapper = Qwen3ASRModel.from_pretrained(
-        str(model_dir), dtype="float32", device_map="cpu",
+        str(model_dir), dtype=dtype, device_map="cpu",
     )
     processor = wrapper.processor
     model = wrapper.model
@@ -119,7 +124,32 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
     # ---- Run the audio encoder ----
     # HF's audio_tower.forward expects a 2D mel (128, T) plus feature_lens
     # because it internally does .T.split(...).
-    mel_2d = mel.squeeze(0)  # (128, T)
+    #
+    # QWEN3_REF_WINDOWED=1: reference for the WINDOWED encoder-attention
+    # path. The vendored eager/SDPA attention ignores cu_seqlens (full
+    # attention); FlashAttention-2 — and the C++ port's windowed mode —
+    # restrict attention to n_window_infer blocks. Reproduce that on CPU by
+    # monkey-patching each attention layer to receive the block-diagonal
+    # mask the modeling's own _prepare_attention_mask() builds from
+    # cu_seqlens.
+    import os as _os
+    if _os.environ.get("QWEN3_REF_WINDOWED", "") not in ("", "0"):
+        print("  windowed-attention reference (block-diagonal cu_seqlens mask)")
+        _orig_layer_forwards = []
+        for layer in audio_tower.layers:
+            _orig_layer_forwards.append(layer.forward)
+
+        def _windowed_layer_forward(_self_layer, hidden_states, cu_seqlens, attention_mask=None, **kw):
+            if attention_mask is None:
+                attention_mask = audio_tower._prepare_attention_mask(hidden_states, cu_seqlens)
+            return type(_self_layer).forward(
+                _self_layer, hidden_states, cu_seqlens, attention_mask=attention_mask, **kw)
+
+        import functools
+        for layer in audio_tower.layers:
+            layer.forward = functools.partial(_windowed_layer_forward, layer)
+
+    mel_2d = mel.squeeze(0).to(model.dtype)  # (128, T), model-native dtype
     feature_lens = torch.tensor([mel_2d.shape[-1]], dtype=torch.long)
     with torch.no_grad():
         enc_out = audio_tower(mel_2d, feature_lens=feature_lens)
@@ -184,34 +214,39 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
 
         # One forward pass through the text model + lm_head to capture the
         # last-token logits used as "first logits" by the trace test.
+        # lm_head over all T positions is a (T, 151936) tensor — only
+        # materialize it when a full-logits stage was requested.
+        want_full_logits = bool(stages & {"llm_logits", "llm_argmax"})
         with torch.no_grad():
             lm_out = text_model(
                 inputs_embeds=inputs_embeds_spliced, use_cache=False,
             )
             hidden = lm_out.last_hidden_state                         # (1, T, D)
-            logits = lm_head(hidden)                                  # (1, T, V)
-        last_logits = logits[0, -1].detach().cpu().float().numpy()
+            last_logits_t = lm_head(hidden[:, -1:])                   # (1, 1, V)
+        last_logits = last_logits_t[0, -1].detach().cpu().float().numpy()
 
         if "trace_first_logits" in stages:
             out["trace_first_logits"] = last_logits
-        if "llm_logits" in stages:
-            # Full per-token logits in ne-order [vocab, T] so the existing
-            # qwen3-asr-test-llm driver can compare element-wise.
-            full = logits[0].detach().cpu().float().numpy()           # (T, V)
-            out["llm_logits"] = full.T.copy()                          # (V, T)
-        if "llm_argmax" in stages:
-            out["llm_argmax"] = (
-                logits[0].argmax(dim=-1).detach().cpu().numpy().astype(np.int32))
+        if want_full_logits:
+            with torch.no_grad():
+                logits = lm_head(hidden)                              # (1, T, V)
+            if "llm_logits" in stages:
+                # Full per-token logits in ne-order [vocab, T] so the existing
+                # qwen3-asr-test-llm driver can compare element-wise.
+                full = logits[0].detach().cpu().float().numpy()       # (T, V)
+                out["llm_logits"] = full.T.copy()                      # (V, T)
+            if "llm_argmax" in stages:
+                out["llm_argmax"] = (
+                    logits[0].argmax(dim=-1).detach().cpu().numpy().astype(np.int32))
 
     # ---- End-to-end transcribe() for generated text + ids ----
     want_text     = "generated_text" in stages
     want_gen_ids  = "trace_generated_ids" in stages
     if want_text or want_gen_ids:
         print("  running wrapper.transcribe() for generated text/ids")
-        try:
-            result = wrapper.transcribe(audio=None, raw_audio=audio)
-        except TypeError:
-            result = wrapper.transcribe(audio=str(model_dir))  # last-ditch
+        # qwen_asr's transcribe() accepts (waveform, sr) tuples via
+        # normalize_audio_input — pass the already-loaded 16k mono audio.
+        result = wrapper.transcribe(audio=[(audio, 16000)])
         if isinstance(result, list):
             result = result[0]
         text = getattr(result, "text", str(result))

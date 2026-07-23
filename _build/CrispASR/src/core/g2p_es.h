@@ -89,6 +89,7 @@ inline std::string lts_word_to_ipa(const std::string& word) {
     auto is_vowel = [](char c) -> bool { return c == 'a' || c == 'e' || c == 'i' || c == 'o' || c == 'u'; };
     // Check if previous char was a vowel (for lenition)
     auto prev_vowel = [&](int pos) -> bool { return pos > 0 && is_vowel(w[pos - 1]); };
+    (void)prev_vowel;
     // Check if word-initial or after nasal (for stop vs fricative)
     auto is_stop_context = [&](int pos) -> bool {
         if (pos == 0)

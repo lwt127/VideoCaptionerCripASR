@@ -15,31 +15,42 @@ add_executable(${TARGET}
     cli.cpp
     crispasr_backend.cpp
     crispasr_backend_crispasr.cpp
+    crispasr_backend_nemotron.cpp
     crispasr_backend_parakeet.cpp
     crispasr_backend_canary.cpp
+    crispasr_backend_canary_qwen.cpp
+    crispasr_backend_lfm2_audio.cpp
+    crispasr_backend_mini_omni2.cpp
     crispasr_backend_cohere.cpp
     crispasr_backend_granite.cpp
     crispasr_backend_granite_nle.cpp
     crispasr_backend_voxtral.cpp
     crispasr_backend_voxtral4b.cpp
+    crispasr_backend_voxtral_tts.cpp
+    crispasr_backend_higgs_stt.cpp
     crispasr_backend_qwen3.cpp
     crispasr_backend_fastconformer_ctc.cpp
     crispasr_backend_wav2vec2.cpp
     crispasr_backend_vibevoice.cpp
     crispasr_backend_kugelaudio.cpp
     crispasr_backend_qwen3_tts.cpp
+    crispasr_backend_omnivoice.cpp
     crispasr_backend_orpheus.cpp
     crispasr_backend_chatterbox.cpp
     crispasr_backend_tada.cpp
     crispasr_backend_indextts.cpp
     crispasr_backend_f5_tts.cpp
+    crispasr_backend_irodori_tts.cpp
     crispasr_backend_pocket_tts.cpp
     crispasr_backend_csm.cpp
     crispasr_backend_parler.cpp
     crispasr_backend_fastpitch.cpp
+    crispasr_backend_bananamind_tts.cpp
     crispasr_backend_bark.cpp
     crispasr_backend_dia.cpp
+    crispasr_backend_dots_tts.cpp
     crispasr_backend_voxcpm2_tts.cpp
+    crispasr_backend_voxcpm2_vae.cpp
     crispasr_backend_cosyvoice3.cpp
     crispasr_backend_kokoro.cpp
     crispasr_backend_piper.cpp
@@ -47,6 +58,13 @@ add_executable(${TARGET}
     crispasr_backend_m2m100.cpp
     crispasr_backend_t5.cpp
     crispasr_backend_glm_asr.cpp
+    crispasr_backend_htdemucs.cpp
+    crispasr_backend_crepe.cpp
+    crispasr_backend_btc.cpp
+    crispasr_backend_rvc.cpp
+    crispasr_piano_cli.cpp
+    crispasr_backend_beat_this.cpp
+    crispasr_backend_mel_band_roformer.cpp
     crispasr_backend_kyutai_stt.cpp
     crispasr_backend_firered_asr.cpp
     crispasr_backend_moonshine.cpp
@@ -54,14 +72,28 @@ add_executable(${TARGET}
     crispasr_backend_gemma4_e2b.cpp
     crispasr_backend_omniasr.cpp
     crispasr_backend_mimo_asr.cpp
+    crispasr_backend_ark_asr.cpp
+    crispasr_backend_miotts.cpp
+    crispasr_backend_piano_transcription.cpp
     crispasr_backend_moss_audio.cpp
+    crispasr_backend_moss_tts.cpp
+    crispasr_backend_moss_tts_local.cpp
+    crispasr_backend_moss_transcribe.cpp
+    crispasr_backend_moss_transcribe_diarize.cpp
     crispasr_backend_funasr.cpp
     crispasr_backend_paraformer.cpp
     crispasr_backend_sensevoice.cpp
+    crispasr_backend_sidon.cpp
     crispasr_backend_speecht5.cpp
     crispasr_backend_zonos.cpp
     crispasr_aligner_cli.cpp
     crispasr_vad_cli.cpp
+    crispasr_separate_cli.cpp
+    crispasr_beats_cli.cpp
+    crispasr_chords_cli.cpp
+    crispasr_tab_cli.cpp
+    crispasr_backend_tabcnn.cpp
+    crispasr_pitch_cli.cpp
     crispasr_lid_cli.cpp
     crispasr_diarize_cli.cpp
     crispasr_output.cpp
@@ -70,6 +102,12 @@ add_executable(${TARGET}
     crispasr_run.cpp
     crispasr_server.cpp
     crispasr_tts_chunking.cpp
+    # Real-time WebSocket ASR streaming, shared with the standalone server
+    # (examples/server). Wired into `crispasr --server` via --ws-port.
+    ${CMAKE_CURRENT_SOURCE_DIR}/../server/ws_stream.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../server/realtime_server.cpp
+    # Wyoming protocol TCP server (issue #172) — Home Assistant Assist STT+TTS.
+    wyoming.cpp
 )
 
 # ---------------------------------------------------------------------------
@@ -152,7 +190,10 @@ target_include_directories(crispasr-diff-lib PUBLIC
 target_link_libraries(crispasr-diff-lib PUBLIC
     crispasr-core
     ggml
-)
+ btc-chords
+    tabcnn
+    rvc-svc
+    beatrice-pitch)
 set_target_properties(crispasr-diff-lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # ---------------------------------------------------------------------------
@@ -173,25 +214,40 @@ target_link_libraries(crispasr-diff PRIVATE
     granite_nle
     voxtral
     voxtral4b
+    voxtral_tts
+    higgs_stt
     qwen3_asr
     qwen3_tts
+    omnivoice
     orpheus
     kokoro
     chatterbox
     tada-tts
+    tada-encoder
     indextts
     m2m100
     gemma4_e2b
     mimo_tokenizer
     mimo_asr
+    ark_asr
     moss_audio
+    moss_tts
+    moss_tts_local
+    moss_transcribe
+    moss_transcribe_diarize
     voxcpm2_tts
     funasr
     paraformer
     sensevoice
+    sidon
     cosyvoice3_tts
     csm-tts
     parler-tts
+    mini-omni2
+    dots-tts
+    miotts
+    miocodec
+    crepe
     crispasr-diff-lib
     ${FFMPEG_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
@@ -221,9 +277,12 @@ install(TARGETS crispasr-diff RUNTIME BUNDLE DESTINATION bin)
 # MSVC but MinGW silently ignores those pragmas.
 # ---------------------------------------------------------------------------
 add_executable(crispasr-lid crispasr_lid_main.cpp)
+if(TARGET crisp_lid)
+    target_link_libraries(crispasr-lid PRIVATE crisp_lid crispasr-lib)
+else()
+    target_link_libraries(crispasr-lid PRIVATE text-lid-dispatch crispasr-lib)
+endif()
 target_link_libraries(crispasr-lid PRIVATE
-    text-lid-dispatch
-    crispasr-lib
     ${CMAKE_THREAD_LIBS_INIT}
     $<$<BOOL:${WIN32}>:winhttp>
     $<$<BOOL:${WIN32}>:ws2_32>
@@ -245,6 +304,15 @@ target_link_libraries(mimo-tokenizer-smoke PRIVATE
     ${CMAKE_THREAD_LIBS_INIT}
 )
 
+# 4B MossTTSLocal (#249) — P5-lite runtime smoke test (generate_codes end-to-end).
+if (TARGET moss_tts_local)
+    add_executable(moss-tts-local-smoke moss_tts_local_smoke.cpp)
+    target_link_libraries(moss-tts-local-smoke PRIVATE
+        moss_tts_local
+        ${CMAKE_THREAD_LIBS_INIT}
+    )
+endif()
+
 set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME crispasr)
 
 # httplib.h is in the server example directory
@@ -262,18 +330,25 @@ target_link_libraries(${TARGET} PRIVATE
     granite_nle
     voxtral
     voxtral4b
+    voxtral_tts
+    higgs_stt
     qwen3_asr
     qwen3_tts
+    omnivoice
     orpheus
     chatterbox
     tada-tts
+    tada-encoder
     indextts
     kokoro
     piper-tts
     speecht5-tts
     fastpitch-tts
+    bananamind-tts
     bark-tts
     dia-tts
+    dots-tts
+    irodori-tts
     pocket-tts
     csm-tts
     voxcpm2_tts
@@ -288,7 +363,13 @@ target_link_libraries(${TARGET} PRIVATE
     funasr
     paraformer
     sensevoice
+    sidon
     moss_audio
+    moss_tts
+    moss_tts_local
+    moss_transcribe
+    moss_transcribe_diarize
+    miotts
     ${FFMPEG_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
     $<$<BOOL:${WIN32}>:winhttp>
@@ -321,16 +402,20 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/crispasr_backend_parler.cpp")
     target_link_libraries(${TARGET} PRIVATE parler-tts)
 endif()
 
-# Optional MP3 output (libmp3lame)
+# MP3 output — in-tree glint encoder (glint/), always available.
+target_link_libraries(${TARGET} PRIVATE glint)
+
+# Optional libmp3lame fallback (used if glint fails, or forced with
+# CRISPASR_MP3_ENCODER=lame for A/B comparisons)
 find_library(LAME_LIBRARY NAMES mp3lame)
 find_path(LAME_INCLUDE_DIR lame/lame.h)
 if (LAME_LIBRARY AND LAME_INCLUDE_DIR)
     target_link_libraries(${TARGET} PRIVATE ${LAME_LIBRARY})
     target_include_directories(${TARGET} PRIVATE ${LAME_INCLUDE_DIR})
     target_compile_definitions(${TARGET} PRIVATE CRISPASR_HAVE_LAME=1)
-    message(STATUS "MP3 output enabled (libmp3lame)")
+    message(STATUS "MP3 output: glint + libmp3lame fallback")
 else()
-    message(STATUS "MP3 output disabled (libmp3lame-dev not found)")
+    message(STATUS "MP3 output: glint (libmp3lame fallback not found)")
 endif()
 
 # Optional Opus output (libopus + libogg for OGG container)
@@ -345,17 +430,8 @@ else()
     message(STATUS "Opus output disabled (libopus-dev not found)")
 endif()
 
-# Optional C2PA Content Credentials signing (c2pa-c library)
-find_library(C2PA_LIBRARY NAMES c2pa)
-find_path(C2PA_INCLUDE_DIR NAMES c2pa.h c2pa/c2pa.h)
-if (C2PA_LIBRARY AND C2PA_INCLUDE_DIR)
-    target_link_libraries(${TARGET} PRIVATE ${C2PA_LIBRARY})
-    target_include_directories(${TARGET} PRIVATE ${C2PA_INCLUDE_DIR})
-    target_compile_definitions(${TARGET} PRIVATE CRISPASR_HAVE_C2PA=1)
-    message(STATUS "C2PA signing enabled (c2pa-c)")
-else()
-    message(STATUS "C2PA signing disabled (c2pa-c not found; install from github.com/contentauth/c2pa-c)")
-endif()
+# C2PA (Content Credentials) signing — shared logic in cmake/CrispasrC2pa.cmake.
+crispasr_enable_c2pa(${TARGET})
 
 install(TARGETS ${TARGET} RUNTIME BUNDLE DESTINATION bin)
 
@@ -377,3 +453,7 @@ target_link_libraries(crispasr-chat PRIVATE
 )
 include(DefaultTargetOptions)
 install(TARGETS crispasr-chat RUNTIME BUNDLE DESTINATION bin)
+
+add_executable(crispasr-f0-eval crispasr_f0_eval.cpp)
+target_link_libraries(crispasr-f0-eval PRIVATE crispasr-lib crepe beatrice-pitch)
+target_include_directories(crispasr-f0-eval PRIVATE ${CMAKE_SOURCE_DIR}/src)

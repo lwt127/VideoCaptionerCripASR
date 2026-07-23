@@ -97,3 +97,32 @@ TEST_CASE("defensive zero/negative inputs return false", "[unit][long-audio][iss
     REQUIRE_FALSE(should_auto_chunk_long(0, false, kUnboundedBackendCaps, 300 * kSR, 0, kThreshold));
     REQUIRE_FALSE(should_auto_chunk_long(0, false, kUnboundedBackendCaps, 300 * kSR, kSR, 0));
 }
+
+// Issue #290: canary-qwen declared CAP_INTERNAL_CHUNKING without implementing a
+// chunker. src/canary_qwen.cpp contains no chunk_seconds handling at all, unlike
+// src/parakeet.cpp and src/canary.cpp, which take a real chunk_seconds. The flag
+// disabled BOTH dispatcher safety nets — the #257 gate handed the whole clip over
+// when --chunk-seconds was given, and this function bailed at the
+// CAP_INTERNAL_CHUNKING branch when it wasn't — so a long clip ran through the
+// encoder in a single pass. Reported symptoms: no chunking either way, sparse
+// output, and RSS scaling 384 MiB -> 6.3 GiB -> 10.2 GiB with clip length.
+//
+// These pin the POST-FIX capability set. They fail if CAP_INTERNAL_CHUNKING is
+// ever re-added to a backend that cannot honour it.
+TEST_CASE("issue #290: canary-qwen (unbounded, no internal chunker) auto-chunks long audio",
+          "[unit][long-audio][issue-290]") {
+    // canary-qwen's declared caps, reduced to the bits this gate reads.
+    constexpr uint32_t kCanaryQwenCaps = CAP_UNBOUNDED_INPUT_FLAG;
+    REQUIRE(should_auto_chunk_long(0, false, kCanaryQwenCaps, 600 * kSR, kSR, kThreshold));
+    REQUIRE(should_auto_chunk_long(0, false, kCanaryQwenCaps, 60 * kSR, kSR, kThreshold));
+    // Short audio still takes the full-audio path — the fix must not chunk everything.
+    REQUIRE_FALSE(should_auto_chunk_long(0, false, kCanaryQwenCaps, 10 * kSR, kSR, kThreshold));
+}
+
+TEST_CASE("issue #290: the pre-fix capability set is what silenced the fallback", "[unit][long-audio][issue-290]") {
+    // Documents the regression rather than asserting current behaviour: with
+    // CAP_INTERNAL_CHUNKING set, a 10 min clip got NO dispatcher chunking. That is
+    // correct ONLY when the backend really chunks internally (parakeet, canary).
+    constexpr uint32_t kBuggyCaps = CAP_UNBOUNDED_INPUT_FLAG | crispasr_long_audio::CAP_INTERNAL_CHUNKING_FLAG;
+    REQUIRE_FALSE(should_auto_chunk_long(0, false, kBuggyCaps, 600 * kSR, kSR, kThreshold));
+}

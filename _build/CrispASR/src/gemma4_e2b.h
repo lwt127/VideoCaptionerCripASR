@@ -82,6 +82,18 @@ float* gemma4_e2b_compute_mel(struct gemma4_e2b_context* ctx, const float* pcm, 
 float* gemma4_e2b_run_encoder(struct gemma4_e2b_context* ctx, const float* mel, int n_mels, int T_mel, int* out_T_enc,
                               int* out_d_model);
 
+// Returns 1 if id is a control/special token (bos, eos, sot, eot) that should be filtered
+// from visible output. 0 otherwise.
+int gemma4_e2b_is_control_token(struct gemma4_e2b_context* ctx, int id);
+
+// Per-token streaming callback. Fires once per generated token (id, softmax prob, userdata).
+typedef void (*gemma4_e2b_token_cb)(int tok_id, float prob, void* userdata);
+
+// Like gemma4_e2b_transcribe() but fires cb(tok_id, prob, userdata) for each generated token.
+// Falls back to greedy decode (beam_size ignored).
+void gemma4_e2b_transcribe_cb(struct gemma4_e2b_context* ctx, const float* pcm, int n_samples, gemma4_e2b_token_cb cb,
+                              void* userdata);
+
 #ifdef __cplusplus
 }
 #endif

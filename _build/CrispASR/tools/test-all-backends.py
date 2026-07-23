@@ -366,7 +366,7 @@ REGISTRY: tuple[Backend, ...] = (
     # orpheus: Llama-3.2-3B talker + SNAC 24 kHz codec. Auto-download
     # pulls both. --voice tara is the default English speaker.
     Backend("orpheus",   "Orpheus 3B-FT (TTS)",  "orpheus-3b-0.1-ft-q8_0.gguf",
-            "cstr/orpheus-3b-base-GGUF", "orpheus-3b-0.1-ft-q8_0.gguf",
+            "cstr/orpheus-3b-0.1-ft-GGUF", "orpheus-3b-0.1-ft-q8_0.gguf",
             timeout_s=600, approx_size_mb=3500,
             capabilities=("tts-roundtrip", "temperature")),
     # lex-au-orpheus-de: lex-au's German fine-tune of Orpheus-3B.

@@ -577,13 +577,17 @@ class TtsBackendsSchemaTests(unittest.TestCase):
                 f"duplicate tts backend name: {name}")
             names_seen.add(name)
 
-            # Exactly one of `voice` (block) or `voice_preset` (string).
+            # Exactly one of `voice` (block), `voice_preset` (string), or
+            # `no_voice: true` (no-voice-clone model — synth with its baked
+            # default speaker, pass no --voice; e.g. pocket-tts-english-novc).
             has_voice = "voice" in entry
             has_preset = "voice_preset" in entry
-            self.assertTrue(
-                has_voice ^ has_preset,
-                f"{name}: must set exactly one of `voice` block or "
-                f"`voice_preset` string (got voice={has_voice} preset={has_preset})")
+            has_no_voice = bool(entry.get("no_voice", False))
+            self.assertEqual(
+                int(has_voice) + int(has_preset) + int(has_no_voice), 1,
+                f"{name}: must set exactly one of `voice` block, `voice_preset` "
+                f"string, or `no_voice: true` (got voice={has_voice} "
+                f"preset={has_preset} no_voice={has_no_voice})")
             if has_preset:
                 self.assertIsInstance(entry["voice_preset"], str,
                     f"{name}.voice_preset must be a string")

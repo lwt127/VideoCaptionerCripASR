@@ -23,17 +23,22 @@ GGUF / ggml conversions of [`nvidia/parakeet-tdt_ctc-0.6b-ja`](https://huggingfa
 
 A 600 M-parameter Japanese ASR model with punctuation:
 
-- **Hybrid FastConformer-TDT-CTC**: TDT (Token-and-Duration Transducer) decoder by default, CTC available as a fallback (Python only — the GGUF runtime exercises the TDT path).
+- **Hybrid FastConformer-TDT-CTC**: TDT (Token-and-Duration Transducer) decoder by default; the CTC head is included in these GGUFs and selectable at runtime with `--parakeet-decoder ctc`.
 - **Built-in word-level timestamps** from the TDT duration head — no separate CTC alignment.
 - **6.4 % CER on JSUT basic5000**.
 - **CC-BY-4.0** licence.
 
 ## Files
 
+All files include both the TDT decoder and the **CTC head** (added 2026-07;
+earlier uploads lacked the CTC tensors, so `--parakeet-decoder ctc` silently
+fell back to TDT).
+
 | File | Size | Notes |
 | --- | ---: | --- |
-| `parakeet-tdt-0.6b-ja.gguf`        | 1.24 GB | F16, **bit-exact match with NeMo on JSUT samples** |
-| `parakeet-tdt-0.6b-ja-q4_k.gguf`   | ~470 MB | Q4_K — degrades after ~8 tokens on this model, see note below |
+| `parakeet-tdt-0.6b-ja.gguf`        | 1.25 GB | F16, **bit-exact match with NeMo on JSUT samples** |
+| `parakeet-tdt-0.6b-ja-q8_0.gguf`   | ~660 MB | Q8_0 — TDT output identical to F16 on our tests; recommended small file |
+| `parakeet-tdt-0.6b-ja-q4_k.gguf`   | ~476 MB | Q4_K — TDT decode degrades on this model (repetition loops); **use `--parakeet-decoder ctc`**, which is clean at Q4_K. See note below |
 
 ## Recommended: F16
 
@@ -54,9 +59,12 @@ With our default Q4_K quantisation, two of the most logit-shaping
 tensors (`joint.pred.weight`, `decoder.embed.weight`) fall back to
 `q4_0` because their dimensions don't tile cleanly for q4_k blocks.
 This is enough quantisation noise that the TDT decoder enters a
-fixed-point loop after the first ~8 tokens. **If you don't need a
-small file, prefer the F16.** A Q5_K build (or Q4_K with the two
-above tensors pinned to F16) is on the roadmap.
+fixed-point loop after the first ~8 tokens. Two clean options:
+prefer the **Q8_0** (TDT output identical to F16 in our tests), or
+keep the Q4_K and decode with the **CTC head**
+(`--parakeet-decoder ctc`) — CTC has no autoregressive feedback, so
+the quantisation noise doesn't compound, and its output matches the
+F16 CTC transcript.
 
 ## Quick start
 
@@ -82,6 +90,23 @@ You can also let crispasr auto-download the model:
 ./build/bin/crispasr --backend parakeet -m auto --auto-download \
     -f your-japanese-audio.wav --model-name parakeet-ja
 ```
+
+## Long-form audio (v0.8.8+)
+
+The encoder is numerically fragile past ~12 s of context on real speech —
+single-pass decoding of long audio silently drops content (upstream NeMo
+behaves the same on the same clips: its plain, local-attention, and
+buffered long-form modes score 1–51 % content recall on our reference
+clip). CrispASR ≥ `3a8141e3` handles this automatically: audio > 30 s is
+VAD-segmented, slices are capped at 12 s (split at energy minima), each
+slice decodes in one NeMo-exact pass, and a gap-fill second pass
+re-transcribes any span the first pass left empty. Measured on the
+issue #89 reporter's clips (phonetic char-bigram recall vs
+whisper-large-v3-turbo): **97.2 %** (60 s), **96.9 %** (120 s), **95.9 %**
+(300 s) — at the inter-model agreement ceiling (an independent
+SenseVoice-small run scores the same recall on the same audio). No flags
+needed; `--vad`, `--chunk-seconds N`, and `CRISPASR_PARAKEET_*` env vars
+override the defaults (see the CrispASR CLI docs).
 
 ## Word-level timestamps for free
 

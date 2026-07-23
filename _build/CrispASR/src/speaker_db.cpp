@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <string>
 #include <vector>
 
@@ -23,11 +24,13 @@
 #endif
 
 static const char kMagic[4] = {'S', 'P', 'K', 'R'};
-static const uint32_t kVersion = 1;
+static const uint32_t kVersion = 2;
 
 struct speaker_profile {
     std::string name;
     std::vector<float> embedding;
+    bool consent_attested = false; // v1 files carry no record
+    uint64_t enroll_time = 0;      // unix time; 0 for v1 files
 };
 
 struct speaker_db {
@@ -35,7 +38,7 @@ struct speaker_db {
     std::vector<speaker_profile> speakers;
 };
 
-// Read a .spkr file. Returns false if the file is invalid.
+// Read a .spkr file (v1 or v2). Returns false if the file is invalid.
 static bool read_spkr_file(const char* path, speaker_profile& out) {
     FILE* f = fopen(path, "rb");
     if (!f)
@@ -44,11 +47,24 @@ static bool read_spkr_file(const char* path, speaker_profile& out) {
     char magic[4];
     uint32_t version = 0, dim = 0;
     bool ok = fread(magic, 1, 4, f) == 4 && memcmp(magic, kMagic, 4) == 0 && fread(&version, 4, 1, f) == 1 &&
-              version == kVersion && fread(&dim, 4, 1, f) == 1 && dim > 0 && dim <= 4096;
+              (version == 1 || version == kVersion) && fread(&dim, 4, 1, f) == 1 && dim > 0 && dim <= 4096;
 
     if (ok) {
         out.embedding.resize(dim);
         ok = fread(out.embedding.data(), sizeof(float), dim, f) == dim;
+    }
+    if (ok && version >= 2) {
+        uint8_t consent = 0;
+        uint64_t when = 0;
+        ok = fread(&consent, 1, 1, f) == 1 && fread(&when, 8, 1, f) == 1;
+        out.consent_attested = consent != 0;
+        out.enroll_time = when;
+    } else if (ok) {
+        // Legacy v1 profile: no consent record was stored at enrollment.
+        fprintf(stderr,
+                "speaker_db: '%s' is a legacy v1 profile without a consent record; "
+                "re-enroll to attach the consent attestation\n",
+                path);
     }
     fclose(f);
     return ok;
@@ -112,6 +128,56 @@ extern "C" int speaker_db_count(const struct speaker_db* db) {
     return db ? (int)db->speakers.size() : 0;
 }
 
+extern "C" const char* speaker_db_name(const struct speaker_db* db, int idx) {
+    if (!db || idx < 0 || idx >= (int)db->speakers.size())
+        return nullptr;
+    return db->speakers[idx].name.c_str();
+}
+
+extern "C" int speaker_db_retain(struct speaker_db* db, const char* csv_names) {
+    if (!db)
+        return 0;
+    if (!csv_names || !*csv_names) {
+        // No roster claimed — retain nothing. An unclaimed db must never
+        // silently fall back to an open 1:N search.
+        db->speakers.clear();
+        return 0;
+    }
+
+    std::vector<std::string> claimed;
+    std::string cur;
+    for (const char* p = csv_names;; p++) {
+        if (*p == ',' || *p == '\0') {
+            size_t b = cur.find_first_not_of(" \t");
+            size_t e = cur.find_last_not_of(" \t");
+            if (b != std::string::npos)
+                claimed.push_back(cur.substr(b, e - b + 1));
+            cur.clear();
+            if (*p == '\0')
+                break;
+        } else {
+            cur += *p;
+        }
+    }
+
+    std::vector<speaker_profile> kept;
+    for (const auto& name : claimed) {
+        bool found = false;
+        for (auto& sp : db->speakers) {
+            if (sp.name == name) {
+                kept.push_back(sp);
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+            fprintf(stderr, "speaker_db: claimed speaker '%s' has no enrolled profile in %s\n", name.c_str(),
+                    db->dir_path.c_str());
+    }
+    db->speakers = std::move(kept);
+    return (int)db->speakers.size();
+}
+
 extern "C" const char* speaker_db_match(const struct speaker_db* db, const float* embedding, int dim, float threshold,
                                         float* out_score) {
     if (!db || !embedding || dim <= 0 || db->speakers.empty())
@@ -145,11 +211,17 @@ extern "C" const char* speaker_db_match(const struct speaker_db* db, const float
     return nullptr;
 }
 
-extern "C" bool speaker_db_enroll(const char* dir_path, const char* name, const float* embedding, int dim) {
+extern "C" bool speaker_db_enroll(const char* dir_path, const char* name, const float* embedding, int dim,
+                                  bool consent_attested) {
     if (!dir_path || !name || !embedding || dim <= 0)
         return false;
+    if (!consent_attested) {
+        fprintf(stderr, "speaker_db: enrollment refused: a voiceprint linked to a real name is biometric\n"
+                        "  data (GDPR Art. 9); the caller must attest the enrolled person's explicit consent\n");
+        return false;
+    }
 
-        // Ensure directory exists
+    // Ensure directory exists
 #ifdef _WIN32
     CreateDirectoryA(dir_path, nullptr);
 #else
@@ -164,11 +236,14 @@ extern "C" bool speaker_db_enroll(const char* dir_path, const char* name, const 
     }
 
     uint32_t udim = (uint32_t)dim;
+    uint8_t consent = 1;
+    uint64_t when = (uint64_t)time(nullptr);
     bool ok = fwrite(kMagic, 1, 4, f) == 4 && fwrite(&kVersion, 4, 1, f) == 1 && fwrite(&udim, 4, 1, f) == 1 &&
-              fwrite(embedding, sizeof(float), dim, f) == (size_t)dim;
+              fwrite(embedding, sizeof(float), dim, f) == (size_t)dim && fwrite(&consent, 1, 1, f) == 1 &&
+              fwrite(&when, 8, 1, f) == 1;
 
     fclose(f);
     if (ok)
-        fprintf(stderr, "speaker_db: enrolled '%s' → %s (%d-d)\n", name, path.c_str(), dim);
+        fprintf(stderr, "speaker_db: enrolled '%s' → %s (%d-d, consent recorded)\n", name, path.c_str(), dim);
     return ok;
 }

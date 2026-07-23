@@ -46,7 +46,7 @@ class TestBackendConfig(unittest.TestCase):
         self.assertIn("return (T_mel + 1) / 2;", impl)
         self.assertEqual(impl.count("glm_asr_encoder_frames_from_mel_frames(T_mel)"), 2)
         self.assertIn("if (T_mel != T_target) {", impl)
-        self.assertIn("const int T_copy = std::min(T_mel, T_target);", impl)
+        self.assertIn("const int T_valid = std::min(T_mel, T_target);", impl)
         self.assertIn("const int T_pack = T_proj * 4;", impl)
 
     def test_cli_only_loads_all_backends_when_gpu_is_enabled(self) -> None:

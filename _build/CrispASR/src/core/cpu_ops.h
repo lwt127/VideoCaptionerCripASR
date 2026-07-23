@@ -24,9 +24,10 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cmath>
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 #include "ggml.h"
@@ -34,6 +35,42 @@
 #include "ggml-backend.h"
 
 namespace core_cpu {
+
+// FP16/quantized → F32 dequantization (GPU-safe). Reads a whole tensor to a
+// host F32 buffer via ggml_backend_tensor_get() (works whether the weight lives
+// in a CPU or GPU buffer). Correct for F32, F16, AND any block-quantized type —
+// unlike a raw `ggml_backend_tensor_get(t, buf, 0, n*sizeof(float))`, which
+// over-reads a quantized tensor (its ggml_nbytes is far smaller than n*4) and
+// asserts, or an F16-only reader that leaves the buffer as garbage on a
+// quantized weight. Use this for every CPU-side weight read; never size the copy
+// by n*sizeof(float) on a tensor whose type you don't control.
+static inline std::vector<float> to_f32(const ggml_tensor* t) {
+    if (!t)
+        return {};
+    int64_t n = ggml_nelements(t);
+    std::vector<float> out((size_t)n);
+    if (t->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(t, out.data(), 0, (size_t)n * sizeof(float));
+    } else if (t->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> tmp((size_t)n);
+        ggml_backend_tensor_get(t, tmp.data(), 0, (size_t)n * sizeof(ggml_fp16_t));
+        for (int64_t i = 0; i < n; i++)
+            out[(size_t)i] = ggml_fp16_to_fp32(tmp[(size_t)i]);
+    } else {
+        // Quantized: read the tensor's native bytes, then dequantize via the
+        // type's to_float trait (block-aligned rows — ne[0] is a multiple of the
+        // block size for any quantizable tensor, so a whole-buffer pass matches
+        // per-row layout).
+        std::vector<uint8_t> raw(ggml_nbytes(t));
+        ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+        const ggml_type_traits* tr = ggml_get_type_traits(t->type);
+        if (tr && tr->to_float)
+            tr->to_float(raw.data(), out.data(), n);
+        else
+            std::fill(out.begin(), out.end(), 0.0f);
+    }
+    return out;
+}
 
 // CPU LayerNorm in (d, T) layout: out = (x - mean) / sqrt(var + eps) * w + b.
 // Parallel over time frames. Supports in-place (out == x) because each

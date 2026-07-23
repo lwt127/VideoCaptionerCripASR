@@ -51,6 +51,8 @@ void glm_asr_set_seed(struct glm_asr_context* ctx, unsigned int seed);
 // existing transcribe path at glm_asr.cpp:629 clamps to >= 1 and
 // switches to replay-from-prefix beam search when > 1.
 void glm_asr_set_beam_size(struct glm_asr_context* ctx, int beam_size);
+// #292: forward --max-new-tokens. <= 0 keeps the backend default.
+void glm_asr_set_max_new_tokens(struct glm_asr_context* ctx, int n);
 
 // Override the default transcription instruction ("Please transcribe the
 // following audio" or translate variant). Pass NULL or "" to clear and

@@ -19,6 +19,7 @@
 #include "core/gguf_loader.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -28,6 +29,32 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+// ===========================================================================
+// Bench instrumentation — `LID_CLD3_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool lid_cld3_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("LID_CLD3_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct lid_cld3_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit lid_cld3_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~lid_cld3_bench_stage() {
+        if (!lid_cld3_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  lid_cld3_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ===========================================================================
 // Constants. Must match models/convert-cld3-to-gguf.py and
@@ -824,6 +851,7 @@ static ForwardOut run_forward(lid_cld3_context* ctx, const std::string& utf8_tex
 extern "C" const char* lid_cld3_predict(lid_cld3_context* ctx, const char* utf8_text, float* confidence) {
     if (!ctx || !utf8_text)
         return nullptr;
+    lid_cld3_bench_stage _bs_total("predict_total");
     auto fo = run_forward(ctx, utf8_text);
     int top = 0;
     float best = fo.softmax[0];

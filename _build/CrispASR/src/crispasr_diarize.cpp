@@ -14,6 +14,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <string>
 
 namespace {
 
@@ -180,18 +182,51 @@ void apply_vad_turns(std::vector<CrispasrDiarizeSegment>& segs) {
 // globally. For reliable multi-speaker diarization on long-form audio
 // today, use --diarize-method sherpa (full segmentation + embedding +
 // clustering pipeline).
+// §176e: static cache for pyannote segmentation context. Avoids init/free
+// per diarize call — same pattern as Silero VAD (#132) and MarbleNet/EncDec.
+static std::mutex g_pyannote_cache_mtx;
+static pyannote_seg_context* g_pyannote_cache_ctx = nullptr;
+static std::string g_pyannote_cache_path;
+static int g_pyannote_cache_threads = 0;
+
+static pyannote_seg_context* pyannote_get_cached_locked(const char* path, int n_threads) {
+    if (g_pyannote_cache_ctx && g_pyannote_cache_path == path && g_pyannote_cache_threads == n_threads)
+        return g_pyannote_cache_ctx;
+    if (g_pyannote_cache_ctx) {
+        pyannote_seg_free(g_pyannote_cache_ctx);
+        g_pyannote_cache_ctx = nullptr;
+        g_pyannote_cache_path.clear();
+    }
+    g_pyannote_cache_ctx = pyannote_seg_init(path, n_threads);
+    if (g_pyannote_cache_ctx) {
+        g_pyannote_cache_path = path;
+        g_pyannote_cache_threads = n_threads;
+    }
+    return g_pyannote_cache_ctx;
+}
+
+void crispasr_diarize_free_pyannote_cache() {
+    std::lock_guard<std::mutex> lock(g_pyannote_cache_mtx);
+    if (g_pyannote_cache_ctx) {
+        pyannote_seg_free(g_pyannote_cache_ctx);
+        g_pyannote_cache_ctx = nullptr;
+        g_pyannote_cache_path.clear();
+    }
+}
+
 bool apply_pyannote(const float* mono, int n_samples, int64_t slice_t0_cs, std::vector<CrispasrDiarizeSegment>& segs,
                     const std::string& model_path, int n_threads) {
     if (model_path.empty())
         return false;
 
-    pyannote_seg_context* pctx = pyannote_seg_init(model_path.c_str(), n_threads);
+    std::lock_guard<std::mutex> lock(g_pyannote_cache_mtx);
+    pyannote_seg_context* pctx = pyannote_get_cached_locked(model_path.c_str(), n_threads);
     if (!pctx)
         return false;
 
     int T_seg = 0;
     float* probs = pyannote_seg_run(pctx, mono, n_samples, &T_seg);
-    pyannote_seg_free(pctx);
+    // Do NOT free pctx — it's cached.
     if (!probs || T_seg <= 0) {
         if (probs)
             std::free(probs);
@@ -287,6 +322,66 @@ void assign_speakers_from_log_posteriors(const float* log_probs, int T, double f
         if (spk >= 0)
             seg.speaker = spk;
     }
+}
+
+std::vector<SpeakerRun> group_words_into_speaker_runs(const std::vector<int>& word_spk,
+                                                      const std::vector<int64_t>& word_t0_cs,
+                                                      const std::vector<int64_t>& word_t1_cs, int64_t min_run_cs) {
+    std::vector<SpeakerRun> runs;
+    const std::size_t n = word_spk.size();
+    if (n == 0)
+        return runs;
+
+    // Build maximal same-speaker runs.
+    std::size_t rs = 0;
+    while (rs < n) {
+        const int rspk = word_spk[rs];
+        std::size_t re = rs + 1;
+        while (re < n && word_spk[re] == rspk)
+            re++;
+        runs.push_back({rs, re, rspk});
+        rs = re;
+    }
+
+    if (min_run_cs <= 0)
+        return runs;
+
+    auto run_span_cs = [&](const SpeakerRun& r) -> int64_t {
+        if (r.end <= r.start || r.end > n)
+            return 0;
+        const int64_t t0 = word_t0_cs[r.start];
+        const int64_t t1 = word_t1_cs[r.end - 1];
+        return t1 > t0 ? (t1 - t0) : 0;
+    };
+
+    // Fold every run shorter than min_run_cs into its longer neighbour;
+    // repeat until stable. A folded run inherits the neighbour's speaker.
+    bool changed = true;
+    while (changed && runs.size() >= 2) {
+        changed = false;
+        for (std::size_t i = 0; i < runs.size(); i++) {
+            if (run_span_cs(runs[i]) >= min_run_cs)
+                continue;
+            std::size_t merge_into;
+            if (i == 0) {
+                merge_into = i + 1;
+            } else if (i == runs.size() - 1) {
+                merge_into = i - 1;
+            } else {
+                const int64_t prev_dur = run_span_cs(runs[i - 1]);
+                const int64_t next_dur = run_span_cs(runs[i + 1]);
+                merge_into = (prev_dur >= next_dur) ? (i - 1) : (i + 1);
+            }
+            if (merge_into == i + 1)
+                runs[i + 1].start = runs[i].start;
+            else // merge_into == i - 1
+                runs[i - 1].end = runs[i].end;
+            runs.erase(runs.begin() + (std::ptrdiff_t)i);
+            changed = true;
+            break;
+        }
+    }
+    return runs;
 }
 
 } // namespace crispasr_diarize_internal

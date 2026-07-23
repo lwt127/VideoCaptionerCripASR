@@ -39,6 +39,36 @@ struct CrispasrAlignedWord {
     int64_t t1_cs = 0;
 };
 
+/// A re-timed segment: one input SRT cue (or one text line) with timings
+/// derived from the word alignment that covers it.
+struct CrispasrAlignedSegment {
+    std::string text;
+    int64_t t0_cs = 0;
+    int64_t t1_cs = 0;
+    size_t word_begin = 0; // [word_begin, word_end) into the aligned-word vector
+    size_t word_end = 0;
+};
+
+/// Split text into alignment "words": whitespace-delimited for
+/// space-delimited languages, per-character for CJK. This is the exact
+/// splitter the aligner backends use — callers that map aligned words back
+/// onto larger units (SRT cues, lines) must count with this, not with a
+/// naive space count.
+std::vector<std::string> crispasr_tokenise_align_words(const std::string& text);
+
+/// Parse SRT content into cue texts (indices and timestamps discarded,
+/// multi-line cue text joined with spaces, whitespace-only cues dropped).
+std::vector<std::string> crispasr_parse_srt_cues(const std::string& raw);
+
+/// Group a flat word alignment back into the segment texts it was built
+/// from. `segment_texts` joined with spaces must equal the transcript the
+/// words were aligned against; each segment consumes its own word count
+/// (per crispasr_tokenise_align_words). Segment timings are the first
+/// word's t0 and the last word's t1; leftover words extend the last
+/// segment; segments left without words (alignment ended early) are dropped.
+std::vector<CrispasrAlignedSegment> crispasr_group_aligned_segments(const std::vector<std::string>& segment_texts,
+                                                                    const std::vector<CrispasrAlignedWord>& words);
+
 /// Run CTC forced alignment.
 ///
 /// Dispatches to canary-ctc-aligner by default, to qwen3-fa when
@@ -51,3 +81,6 @@ struct CrispasrAlignedWord {
 std::vector<CrispasrAlignedWord> crispasr_align_words(const std::string& aligner_model, const std::string& transcript,
                                                       const float* samples, int n_samples, int64_t t_offset_cs,
                                                       int n_threads);
+
+/// Free the cached aligner model context (§176e). Call at shutdown.
+void crispasr_aligner_free_cache();

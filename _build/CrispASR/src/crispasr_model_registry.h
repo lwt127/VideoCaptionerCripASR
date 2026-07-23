@@ -15,6 +15,27 @@
 #pragma once
 
 #include <string>
+#include <vector>
+
+enum class CrispasrRegistryArtifactKind {
+    Primary = 0,
+    Companion = 1,
+    Extra = 2,
+};
+
+struct CrispasrRegistryArtifact {
+    CrispasrRegistryArtifactKind kind;
+    std::string filename;
+    std::string url;
+    std::string approx_size; // empty when the registry does not record one
+};
+
+struct CrispasrRegistryBundle {
+    std::string backend; // canonical registry key (aliases are resolved)
+    std::string license;
+    bool requires_license_acceptance = false;
+    std::vector<CrispasrRegistryArtifact> artifacts;
+};
 
 struct CrispasrRegistryEntry {
     std::string backend;
@@ -27,9 +48,37 @@ struct CrispasrRegistryEntry {
     std::string license;               // empty = permissive; non-empty = printed to stderr on download
 };
 
+/// Normalise a registry `license` string to its leading SPDX-ish tag,
+/// lowercased (e.g. "CC-BY-NC-4.0 — NON-COMMERCIAL ..." -> "cc-by-nc-4.0").
+std::string crispasr_license_tag(const std::string& license);
+
+/// True when the licence designates a RESTRICTED model the user must
+/// explicitly accept before download: cc-by-nc-*, gemma, llama*,
+/// qwen-research, mistral-ai-research, lfm1.0, other.
+/// Same list as CrispEmbed's crispembed_mgr::license_requires_acceptance.
+bool crispasr_license_requires_acceptance(const std::string& license);
+
+/// True when `accepted` attests this licence: the exact tag, or "all" / "*".
+/// Falls back to the CRISPASR_ACCEPT_LICENSE env var.
+bool crispasr_license_accepted(const std::string& license, const std::string& accepted);
+
 /// Look up a registry entry by backend name. Returns true on hit.
 bool crispasr_registry_lookup(const std::string& backend, CrispasrRegistryEntry& out,
                               const std::string& preferred_quant = "");
+
+/// Return the default artifact bundle for a backend: primary model, inline
+/// companion (if any), then extra companions.
+///
+/// This is the bundle `-m auto` downloads *with no quant suffix*. It
+/// deliberately does not apply a preferred quant or infer a recommendation, so
+/// it does NOT reproduce `-m auto:<quant>`: that path threads `preferred_quant`
+/// through crispasr_registry_lookup(), which rewrites both the filename and the
+/// URL of the primary and its companion. Callers mirroring `-m auto:<quant>`
+/// must go through crispasr_registry_lookup() instead — the filenames here
+/// would be wrong for them.
+///
+/// Returns false when the backend has no registry entry.
+bool crispasr_registry_default_bundle(const std::string& backend, CrispasrRegistryBundle& out);
 
 /// Number of entries in the static registry.
 int crispasr_registry_count();
@@ -64,6 +113,12 @@ bool crispasr_find_cached_model(CrispasrRegistryEntry& out, const std::string& c
 /// decide what to do (prompt on TTY, raise an error, etc.).
 ///
 /// Returns an empty string on unrecoverable failure.
+/// `accepted_license` attests acceptance of a RESTRICTED licence (cc-by-nc-*,
+/// gemma, llama*, lfm1.0, other): pass the exact SPDX-ish tag, or "all".
+/// Falls back to the `CRISPASR_ACCEPT_LICENSE` env var. For such models
+/// `allow_download` alone is NOT sufficient — without acceptance the download
+/// is refused (non-TTY) or prompted (TTY), BEFORE any bytes are fetched.
+/// Mirrors CrispEmbed's crispembed_mgr::resolve_model.
 std::string crispasr_resolve_model(const std::string& model_arg, const std::string& backend_name, bool quiet,
                                    const std::string& cache_dir_override = "", bool allow_download = false,
-                                   const std::string& preferred_quant = "");
+                                   const std::string& preferred_quant = "", const std::string& accepted_license = "");

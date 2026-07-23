@@ -7,6 +7,7 @@
 // Reports per-stage cosine similarity.
 
 #include "audioseal.h"
+#include "core/crispasr_env.h"
 
 #include <cmath>
 #include <cstdio>
@@ -50,12 +51,13 @@ static double cosine_similarity(const float* a, const float* b, int n) {
         na += (double)a[i] * (double)a[i];
         nb += (double)b[i] * (double)b[i];
     }
-    if (na < 1e-12 || nb < 1e-12) return 0.0;
+    if (na < 1e-12 || nb < 1e-12)
+        return 0.0;
     return dot / (std::sqrt(na) * std::sqrt(nb));
 }
 
 int main() {
-    const char* gguf_path = getenv("AUDIOSEAL_GGUF");
+    const char* gguf_path = crispasr_env::get("CRISPASR_AUDIOSEAL_GGUF");
     if (!gguf_path) {
         fprintf(stderr, "Set AUDIOSEAL_GGUF=/tmp/audioseal.gguf\n");
         return 1;
@@ -118,7 +120,8 @@ int main() {
     float max_err = 0;
     for (int i = 0; i < n; i++) {
         float err = std::abs(our_output[i] - ref_output[i]);
-        if (err > max_err) max_err = err;
+        if (err > max_err)
+            max_err = err;
     }
     printf("Max absolute error: %.6f\n", max_err);
 

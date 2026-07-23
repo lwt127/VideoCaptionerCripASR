@@ -9,6 +9,7 @@
 
 #include "outetts_wavtok.h"
 #include "core/gguf_loader.h"
+#include "core/crispasr_env.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -16,6 +17,7 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -27,6 +29,32 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+// ===========================================================================
+// Bench instrumentation — `WAVTOK_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool wavtok_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_WAVTOK_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct wavtok_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit wavtok_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~wavtok_bench_stage() {
+        if (!wavtok_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  wavtok_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 namespace {
 
@@ -119,11 +147,14 @@ struct wavtok_decoder_ctx {
 
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
+    ggml_backend_sched_t sched = nullptr;
     ggml_context* ctx_w = nullptr;
     ggml_backend_buffer_t buf_w = nullptr;
     std::map<std::string, ggml_tensor*> tensors;
 
     ~wavtok_decoder_ctx() {
+        if (sched)
+            ggml_backend_sched_free(sched);
         if (ctx_w)
             ggml_free(ctx_w);
         if (buf_w)
@@ -634,13 +665,13 @@ extern "C" float* wavtok_decoder_decode(struct wavtok_decoder_ctx* ctx, const in
     const int n_freq = n_fft / 2 + 1; // 641
 
     // Env var overrides for diff testing
-    const char* env_dump = std::getenv("WAVTOK_DUMP_DIR");
+    const char* env_dump = crispasr_env::get("CRISPASR_WAVTOK_DUMP_DIR");
     const char* dump_dir_eff = ctx->params.dump_dir ? ctx->params.dump_dir : env_dump;
     const bool dumping = dump_dir_eff != nullptr;
 
     // Allow overriding input codes for diff testing (e.g. "0,1,2,3,4,5,6,7,8,9")
     std::vector<int32_t> fixed_codes;
-    const char* env_codes = std::getenv("WAVTOK_FIXED_CODES");
+    const char* env_codes = crispasr_env::get("CRISPASR_WAVTOK_FIXED_CODES");
     if (env_codes && env_codes[0]) {
         std::string sc(env_codes);
         size_t pos = 0;
@@ -657,6 +688,8 @@ extern "C" float* wavtok_decoder_decode(struct wavtok_decoder_ctx* ctx, const in
     }
 
     const int T = n_codes;
+
+    wavtok_bench_stage _bs_total("decode");
 
     // Build and compute the backbone graph
     const size_t meta_size = ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false);
@@ -740,19 +773,22 @@ extern "C" float* wavtok_decoder_decode(struct wavtok_decoder_ctx* ctx, const in
     ggml_build_forward_expand(gf, x);
 
     // Allocate and compute
-    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
-    if (!ggml_gallocr_alloc_graph(alloc, gf)) {
-        fprintf(stderr, "wavtok: graph alloc failed\n");
-        ggml_gallocr_free(alloc);
+    if (!ctx->sched) {
+        ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
+        int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
+        ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 8192, false, false);
+    }
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        fprintf(stderr, "wavtok: sched alloc graph failed\n");
         ggml_free(ctx0);
         return nullptr;
     }
 
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "codes_in"), codes, 0, T * sizeof(int32_t));
 
-    if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "wavtok: graph compute failed\n");
-        ggml_gallocr_free(alloc);
         ggml_free(ctx0);
         return nullptr;
     }
@@ -806,7 +842,6 @@ extern "C" float* wavtok_decoder_decode(struct wavtok_decoder_ctx* ctx, const in
     std::vector<float> stft_data(stft_dim * T_out);
     ggml_backend_tensor_get(stft_out, stft_data.data(), 0, stft_data.size() * sizeof(float));
 
-    ggml_gallocr_free(alloc);
     ggml_free(ctx0);
 
     // Split into magnitude and phase
@@ -833,8 +868,11 @@ extern "C" float* wavtok_decoder_decode(struct wavtok_decoder_ctx* ctx, const in
     }
 
     // iSTFT
-    std::vector<float> pcm =
-        istft_cpu(mag.data(), phase.data(), n_freq, T_out, n_fft, hop, window.empty() ? nullptr : window.data());
+    std::vector<float> pcm;
+    {
+        wavtok_bench_stage _bs("istft");
+        pcm = istft_cpu(mag.data(), phase.data(), n_freq, T_out, n_fft, hop, window.empty() ? nullptr : window.data());
+    }
 
     // Dump mag, phase, audio if requested
     if (dumping) {

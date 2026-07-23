@@ -31,11 +31,28 @@ GGUF conversions and quantisations of [`zai-org/GLM-ASR-Nano-2512`](https://hugg
 
 All variants produce correct transcription on test audio.
 
+### 2026-07 update — BPE merges baked in + long-form single-pass
+
+All files were re-published with the tokenizer's **BPE merges** in the GGUF
+metadata (`tokenizer.ggml.merges`, +2 MB). CrispASR ≥ this date uses them to
+encode the transcription prompt exactly like the HF blueprint — earlier
+GGUF+runtime combinations silently sent **no instruction at all**, which is
+what caused repetition loops on noisy audio and empty output on long clips
+([CrispASR #218](https://github.com/CrispStrobe/CrispASR/issues/218)).
+Old GGUFs still work with the new runtime (it falls back to a baked default
+prompt), but custom `--ask` / `--language` instructions need these files.
+
+Long audio: `--chunk-seconds 0` now decodes up to **655 s in one pass**
+(30 s encoder windows, one LLM prompt — the blueprint's layout), matching
+the transformers reference verbatim on the #218 test clip. Note the model
+skips leading non-speech audio in single-pass mode (blueprint behaviour);
+the default 30 s-chunked mode covers more of such clips.
+
 ## Model details
 
 - **Architecture:** Whisper encoder (1280d, 32L, partial RoPE) + 4-frame projector + Llama LLM (2048d, 28L, GQA 16/4)
 - **Parameters:** 1.5B
-- **Languages:** 17 (Mandarin, English, Cantonese, + 14 more)
+- **Languages:** Mandarin (+ Chinese dialects), English, Cantonese (model card metadata declares `en`, `zh`; prose adds Cantonese 粤语 + other Chinese dialects). Not a general multilingual model — no Japanese/Korean/European-language support.
 - **License:** MIT
 - **Outperforms OpenAI Whisper V3** on benchmarks (lowest avg error rate 4.10)
 

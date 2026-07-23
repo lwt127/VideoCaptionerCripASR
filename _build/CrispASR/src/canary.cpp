@@ -19,6 +19,7 @@
 //   <|startoftranscript|> <|src|> <|tgt|> <|pnc|> <|notimestamp|> <|nodiarize|> ...
 
 #include "canary.h"
+#include "core/crispasr_env.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -26,6 +27,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "crispasr_imatrix.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
 
@@ -33,6 +35,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 #include "core/attention.h"
+#include "core/cpu_ops.h" // core_cpu::to_f32 (quantized-safe weight read)
 #include "core/beam_decode.h"
 #include "core/crispasr_lcs.h"
 #include "core/fastconformer.h"
@@ -42,6 +45,7 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <set>
 #include <cstdio>
@@ -57,6 +61,33 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+// ===========================================================================
+// Bench instrumentation — `CANARY_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool canary_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_CANARY_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct canary_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit canary_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~canary_bench_stage() {
+        if (!canary_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  canary_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
+
 // ===========================================================================
 // Hyper-parameters
 // ===========================================================================
@@ -145,6 +176,11 @@ struct canary_model {
     ggml_context* ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
 
+    // Q8_0 repack of the F16 conv pw1/pw2 weights (issue #81, CRISPASR_FC_PW_Q8)
+    core_conformer::PwRepackBuf pw_q8;
+    // Fused Q/K/V weight concat (issue #81, CRISPASR_FC_FUSED_QKV)
+    core_conformer::PwRepackBuf qkv_fused;
+
     std::map<std::string, ggml_tensor*> tensors;
 };
 
@@ -201,6 +237,12 @@ struct canary_context {
 
     int n_threads = 4;
 
+    // §176s: cached encoder graph — reused when T_mel matches.
+    ggml_cgraph* cached_enc_gf = nullptr;
+    ggml_context* cached_enc_ctx = nullptr;
+    std::vector<uint8_t> cached_enc_meta;
+    int cached_enc_T_mel = 0;
+
     // Sticky decode-time sampling controls. temperature == 0 keeps the
     // bit-identical greedy path; > 0 switches to numerically-stable
     // softmax sampling. Set via canary_set_temperature().
@@ -209,6 +251,9 @@ struct canary_context {
 
     // §90 beam-search width. 1 = greedy (default).
     int beam_size = 1;
+    // #292: decode cap; forwarded from --max-new-tokens when the user set it,
+    // else this default. Clamped to the model's decoder context at use.
+    int max_new_tokens = 256;
 };
 
 // ===========================================================================
@@ -473,6 +518,7 @@ static void canary_fft_r2c(const float* in, int N, float* out) {
 // Delegates to core_mel::compute() with the NeMo cluster's parameters; only
 // the FFT function pointer differs between parakeet/canary/canary_ctc/cohere.
 #include "core/mel.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -530,7 +576,7 @@ static std::vector<float> canary_compute_mel_impl(canary_context* ctx, const flo
 
 static const float kLayerNormEps = 1e-5f;
 
-static ggml_cgraph* canary_build_graph_encoder(canary_context* ctx, int T_mel) {
+static ggml_cgraph* canary_build_graph_encoder(canary_context* ctx, int T_mel, ggml_context* arena_ctx = nullptr) {
     const auto& m = ctx->model;
     const auto& hp = m.hparams;
     const int n_mels = (int)hp.n_mels;
@@ -540,7 +586,7 @@ static ggml_cgraph* canary_build_graph_encoder(canary_context* ctx, int T_mel) {
         /*mem_buffer=*/ctx->compute_meta.data(),
         /*no_alloc=*/true,
     };
-    ggml_context* ctx0 = ggml_init(ip);
+    ggml_context* ctx0 = arena_ctx ? arena_ctx : ggml_init(ip);
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
 
     // ----- Inputs -----
@@ -567,7 +613,8 @@ static ggml_cgraph* canary_build_graph_encoder(canary_context* ctx, int T_mel) {
 
     ggml_set_name(cur, "enc_out");
     ggml_build_forward_expand(gf, cur);
-    ggml_free(ctx0);
+    if (!arena_ctx)
+        ggml_free(ctx0);
     return gf;
 }
 
@@ -636,12 +683,27 @@ static std::vector<float> canary_encode_mel(canary_context* ctx, const float* me
         ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
         int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
         ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+        crispasr_imatrix_install(ctx->sched); // no-op unless CRISPASR_IMATRIX_OUT is set
     }
     if (ctx->compute_meta.empty()) {
         ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
     }
 
-    ggml_cgraph* gf = canary_build_graph_encoder(ctx, T_mel);
+    // #215e UAF fix: rebuild the encoder graph every invocation. A cached graph's
+    // tensor->buffer pointers go stale when the sched's gallocr regrows for a
+    // larger interleaved graph (decoder/adapter). The graph-build is fast (~0.1 ms);
+    // the sched alloc + compute dominate. Same fix as moss_transcribe (#215).
+    if (ctx->cached_enc_ctx) {
+        ggml_free(ctx->cached_enc_ctx);
+        ctx->cached_enc_ctx = nullptr;
+        ctx->cached_enc_gf = nullptr;
+    }
+    ctx->cached_enc_meta.assign(ctx->compute_meta.size(), 0);
+    ggml_init_params aip = {ctx->cached_enc_meta.size(), ctx->cached_enc_meta.data(), true};
+    ctx->cached_enc_ctx = ggml_init(aip);
+    ggml_cgraph* gf = canary_build_graph_encoder(ctx, T_mel, ctx->cached_enc_ctx);
+    ctx->cached_enc_gf = gf;
+    ctx->cached_enc_T_mel = T_mel;
 
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
@@ -1117,17 +1179,20 @@ static void canary_fold_batchnorm(canary_model& model) {
         for (int c = 0; c < d; c++)
             s[c] = bn_w[c] / sqrtf(bn_var[c] + eps);
 
-        std::vector<ggml_fp16_t> w_f16((size_t)K * d);
-        ggml_backend_tensor_get(e.conv_dw_w, w_f16.data(), 0, w_f16.size() * sizeof(ggml_fp16_t));
-        std::vector<float> w_f32((size_t)K * d);
-        for (size_t i = 0; i < w_f16.size(); i++)
-            w_f32[i] = ggml_fp16_to_fp32(w_f16[i]);
+        std::vector<float> w_f32 = core_cpu::to_f32(e.conv_dw_w); // F32/F16/quantized-safe read
         for (int c = 0; c < d; c++)
             for (int ki = 0; ki < K; ki++)
                 w_f32[ki + c * K] *= s[c];
-        for (size_t i = 0; i < w_f16.size(); i++)
-            w_f16[i] = ggml_fp32_to_fp16(w_f32[i]);
-        ggml_backend_tensor_set(e.conv_dw_w, w_f16.data(), 0, w_f16.size() * sizeof(ggml_fp16_t));
+        // Write back in the tensor's native dtype — an F32 conv_dw_w (--f32-encoder
+        // GGUFs / diff-harness validation) must NOT be clobbered with F16 (c9a4de65).
+        if (e.conv_dw_w->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_set(e.conv_dw_w, w_f32.data(), 0, w_f32.size() * sizeof(float));
+        } else {
+            std::vector<ggml_fp16_t> w_f16(w_f32.size());
+            for (size_t i = 0; i < w_f16.size(); i++)
+                w_f16[i] = ggml_fp32_to_fp16(w_f32[i]);
+            ggml_backend_tensor_set(e.conv_dw_w, w_f16.data(), 0, w_f16.size() * sizeof(ggml_fp16_t));
+        }
 
         // Fold into existing dw_b: b'[c] = (dw_b[c] - mean[c]) * s[c] + bn_b[c]
         for (int c = 0; c < d; c++)
@@ -1143,11 +1208,11 @@ static void canary_fold_batchnorm(canary_model& model) {
 // ===========================================================================
 
 static ggml_backend_t pick_backend() {
-    // ggml_backend_init_best() tries all compiled backends in priority
+    // crispasr_init_gpu_backend() tries all compiled backends in priority
     // order (CUDA > Metal > Vulkan > CPU) and returns the first one
     // that initialises. This replaces the old Metal/CUDA-specific
     // #ifdef chain and adds Vulkan support for free.
-    ggml_backend_t b = ggml_backend_init_best();
+    ggml_backend_t b = crispasr_init_gpu_backend();
     return b ? b : ggml_backend_cpu_init();
 }
 
@@ -1214,6 +1279,7 @@ extern "C" int canary_run_encoder_staged(struct canary_context* ctx, const float
         ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
         int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
         ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 24576, false, false);
+        crispasr_imatrix_install(ctx->sched); // no-op unless CRISPASR_IMATRIX_OUT is set
     }
     if (ctx->compute_meta.empty()) {
         ctx->compute_meta.resize(ggml_tensor_overhead() * 24576 + ggml_graph_overhead_custom(24576, false));
@@ -1310,12 +1376,26 @@ extern "C" struct canary_context* canary_init_from_file(const char* path_model, 
         return nullptr;
     }
     canary_fold_batchnorm(ctx->model);
+
+    // Repack F16 conv pw1/pw2 to Q8_0 (issue #81 — the 3D conv layout dodges
+    // crispasr-quantize, and the CPU F16 mul_mat path is ~6x slower than Q8_0).
+    {
+        auto& m = ctx->model;
+        std::vector<core_conformer::BlockWeights*> layers;
+        for (auto& e : m.enc)
+            layers.push_back(&e);
+        const bool quantized = !m.enc.empty() && m.enc[0].attn_q_w && ggml_is_quantized(m.enc[0].attn_q_w->type);
+        core_conformer::repack_conv_pw_q8(layers, ctx->backend, quantized, m.pw_q8, "canary");
+        core_conformer::fuse_qkv(layers, ctx->backend, m.qkv_fused, "canary");
+    }
     return ctx;
 }
 
 extern "C" void canary_free(struct canary_context* ctx) {
     if (!ctx)
         return;
+    if (ctx->cached_enc_ctx)
+        ggml_free(ctx->cached_enc_ctx);
     if (ctx->cross_buf)
         ggml_backend_buffer_free(ctx->cross_buf);
     if (ctx->cross_ctx)
@@ -1326,6 +1406,8 @@ extern "C" void canary_free(struct canary_context* ctx) {
         ggml_free(ctx->kv_ctx);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
+    ctx->model.pw_q8.free();
+    ctx->model.qkv_fused.free();
     if (ctx->model.buf)
         ggml_backend_buffer_free(ctx->model.buf);
     if (ctx->model.ctx)
@@ -1357,6 +1439,12 @@ extern "C" void canary_set_beam_size(struct canary_context* ctx, int n) {
     if (!ctx)
         return;
     ctx->beam_size = n > 0 ? n : 1;
+}
+
+// #292: forward --max-new-tokens. <= 0 keeps the 256 default.
+extern "C" void canary_set_max_new_tokens(struct canary_context* ctx, int n) {
+    if (ctx && n > 0)
+        ctx->max_new_tokens = n;
 }
 
 extern "C" int canary_n_vocab(struct canary_context* ctx) {
@@ -1441,16 +1529,25 @@ extern "C" struct canary_result* canary_transcribe_ex(struct canary_context* ctx
 
     // 1. Mel
     int T_mel = 0;
-    auto mel = canary_compute_mel_impl(ctx, samples, n_samples, T_mel);
+    std::vector<float> mel;
+    {
+        canary_bench_stage _b("mel");
+        mel = canary_compute_mel_impl(ctx, samples, n_samples, T_mel);
+    }
     if (mel.empty())
         return nullptr;
 
     // 2. Encoder
     int T_enc = 0;
-    auto enc = canary_encode_mel(ctx, mel.data(), (int)ctx->model.hparams.n_mels, T_mel, &T_enc);
+    std::vector<float> enc;
+    {
+        canary_bench_stage _b("encoder");
+        enc = canary_encode_mel(ctx, mel.data(), (int)ctx->model.hparams.n_mels, T_mel, &T_enc);
+    }
     if (enc.empty())
         return nullptr;
 
+    canary_bench_stage _b("decoder");
     return canary_finish_from_encoder(ctx, enc.data(), T_enc, source_lang, target_lang, punctuation, t_offset_cs);
 }
 
@@ -1707,8 +1804,12 @@ static canary_result* canary_finish_from_encoder(canary_context* ctx, const floa
 
     // 5. Greedy decode
     const int eos = canary_str_to_token(ctx, "<|endoftext|>");
-    const int max_steps = 256;
     const int max_ctx = (int)ctx->model.hparams.max_dec_ctx;
+    // #292: honor --max-new-tokens, clamped to the model's decoder context so a
+    // large value can't run past the trained window / KV allocation.
+    int max_steps = ctx->max_new_tokens > 0 ? ctx->max_new_tokens : 256;
+    if (max_ctx > 0 && max_steps > max_ctx)
+        max_steps = max_ctx;
 
     std::vector<int> generated = prompt;
     std::vector<float> emitted_p; // softmax prob per generated non-prompt token
@@ -1735,28 +1836,15 @@ static canary_result* canary_finish_from_encoder(canary_context* ctx, const floa
     // Cross-attention KV (cross_k/v) is shared across beams; only self-attention
     // KV (kv_k/kv_v) is snapshotted per beam.
     if (ctx->beam_size > 1) {
-        struct canary_kv_snap {
-            std::vector<uint8_t> k_data;
-            std::vector<uint8_t> v_data;
-        };
+        // GH #161: snapshot/restore self-attention KV on-device via a recycled
+        // buffer pool (no PCIe round-trip + sync per beam per step).
+        core_attn::kv_snapshot_pool kv_pool(ctx->kv_k, ctx->kv_v);
 
-        auto save_fn = [](canary_context* c) -> canary_kv_snap* {
-            auto* s = new canary_kv_snap();
-            size_t kb = ggml_nbytes(c->kv_k);
-            size_t vb = ggml_nbytes(c->kv_v);
-            s->k_data.resize(kb);
-            s->v_data.resize(vb);
-            ggml_backend_tensor_get(c->kv_k, s->k_data.data(), 0, kb);
-            ggml_backend_tensor_get(c->kv_v, s->v_data.data(), 0, vb);
-            return s;
-        };
+        auto save_fn = [&kv_pool](canary_context*) -> core_attn::kv_snapshot* { return kv_pool.save(); };
 
-        auto restore_fn = [](canary_context* c, canary_kv_snap* s) {
-            ggml_backend_tensor_set(c->kv_k, s->k_data.data(), 0, s->k_data.size());
-            ggml_backend_tensor_set(c->kv_v, s->v_data.data(), 0, s->v_data.size());
-        };
+        auto restore_fn = [&kv_pool](canary_context*, core_attn::kv_snapshot* s) { kv_pool.restore(s); };
 
-        auto snap_free_fn = [](canary_kv_snap* s) { delete s; };
+        auto snap_free_fn = [&kv_pool](core_attn::kv_snapshot* s) { kv_pool.release(s); };
 
         auto step_fn = [](canary_context* c, int32_t tok, int n_past) -> float* {
             auto lg = canary_decode_step(c, &tok, 1, n_past);

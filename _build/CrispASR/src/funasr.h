@@ -60,6 +60,13 @@ void funasr_free(struct funasr_context* ctx);
 
 // Beam search width. 1 = greedy (default); >1 = replay-from-prefix beam.
 void funasr_set_beam_size(struct funasr_context* ctx, int beam_size);
+// #292: decode cap; pass <= 0 to keep the backend default (512).
+void funasr_set_max_new_tokens(struct funasr_context* ctx, int n);
+
+// Language hint for the prompt (matches upstream get_prompt(language=...)).
+// nullptr or "" = default ("语音转写："); "en" / "English" / "中文" etc.
+// = "语音转写成{lang}：". Call before transcribe; sticky across calls.
+void funasr_set_language(struct funasr_context* ctx, const char* lang);
 
 // Transcribe 16 kHz mono PCM. Returns malloc'd UTF-8 string; caller frees with free().
 char* funasr_transcribe(struct funasr_context* ctx, const float* samples, int n_samples);

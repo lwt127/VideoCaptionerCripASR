@@ -22,6 +22,10 @@ option(GGML_HOME "whisper: Path to external GGML source" OFF)
 set(
     SOURCE_FILES
     ${CRISPASR_LIB_DIR}/src/crispasr
+    # imatrix collector: crispasr.cpp calls crispasr_imatrix_install(); this
+    # minimal whisper-only lib doesn't link crispasr-core, so compile it here.
+    # No-op unless CRISPASR_IMATRIX_OUT is set.
+    ${CRISPASR_LIB_DIR}/src/crispasr_imatrix.cpp
     ${CMAKE_SOURCE_DIR}/jni.c
     )
 

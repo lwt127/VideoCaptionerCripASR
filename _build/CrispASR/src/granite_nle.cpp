@@ -28,6 +28,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "crispasr_imatrix.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
 #include "core/bpe.h"
@@ -40,6 +41,8 @@
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
 #include "core/mel.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include <algorithm>
 #include <chrono>
@@ -286,6 +289,10 @@ struct granite_nle_context {
     int last_ctc_T = 0;
     std::vector<float> last_bpe_logits;
     int last_bpe_T = 0;
+
+    // CTC beam search controls
+    int beam_size = 1;
+    float beam_gamma = 0.0f;
 };
 
 // ===========================================================================
@@ -295,7 +302,7 @@ struct granite_nle_context {
 static bool granite_nle_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("GRANITE_NLE_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_GRANITE_NLE_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -534,7 +541,7 @@ extern "C" struct granite_nle_context* granite_nle_init_from_file(const char* pa
     ctx->params = params;
     ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
-    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
     if (!ctx->backend)
         ctx->backend = ggml_backend_cpu_init();
     ctx->backend_cpu = ggml_backend_cpu_init();
@@ -697,6 +704,7 @@ extern "C" struct granite_nle_context* granite_nle_init_from_file(const char* pa
         if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
             backends[n_be++] = ctx->backend_cpu;
         ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+        crispasr_imatrix_install(ctx->sched); // no-op unless CRISPASR_IMATRIX_OUT is set
     }
     ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
 
@@ -1266,7 +1274,7 @@ extern "C" float* granite_nle_run_encoder(struct granite_nle_context* ctx, const
     // debugging). The graph path also populates ctx->last_ctc_logits and
     // ctx->last_bpe_logits.
     bool use_graph = true;
-    if (const char* e = std::getenv("GRANITE_DISABLE_ENCODER_GRAPH"))
+    if (const char* e = crispasr_env::get("CRISPASR_GRANITE_DISABLE_ENCODER_GRAPH"))
         if (e[0] != '0' && e[0] != '\0')
             use_graph = false;
     if (use_graph) {
@@ -1848,7 +1856,7 @@ extern "C" float* granite_nle_run_llm_editing(struct granite_nle_context* ctx, c
                 s / (n_text * vocab));
     }
 
-    if (const char* p = std::getenv("GRANITE_NLE_EDIT_DUMP")) {
+    if (const char* p = crispasr_env::get("CRISPASR_GRANITE_NLE_EDIT_DUMP")) {
         FILE* fp = std::fopen(p, "wb");
         if (fp) {
             std::fwrite(result, sizeof(float), (size_t)vocab * n_text, fp);
@@ -1890,15 +1898,40 @@ extern "C" char* granite_nle_transcribe(struct granite_nle_context* ctx, const f
         return nullptr;
     }
 
-    // 3+4. BPE-CTC greedy decode → LLM token IDs.
+    // 3+4. BPE-CTC decode → LLM token IDs.
     // Upstream _decode_bpe_ctc_greedy: argmax → unique_consecutive → drop
     // blanks (id 0) → shift to LLM token IDs (id - 1). Lifted to
-    // core_ctc::greedy_decode_with_blank.
+    // core_ctc::greedy_decode_with_blank (greedy) or
+    // core_ctc::prefix_beam_search (beam_size > 1).
     std::string ctc_text;
     {
-        const std::vector<int32_t> ids =
-            core_ctc::greedy_decode_with_blank(ctx->last_bpe_logits.data(), ctx->last_bpe_T, (int)hp.enc_bpe_vocab,
-                                               /*blank_id=*/0, /*shift=*/-1);
+        std::vector<int32_t> ids;
+        if (ctx->beam_size > 1) {
+            // Beam search with optional gamma pruning
+            const int V = (int)hp.enc_bpe_vocab;
+            std::vector<float> logprobs((size_t)ctx->last_bpe_T * V);
+            for (int t = 0; t < ctx->last_bpe_T; t++) {
+                const float* row = ctx->last_bpe_logits.data() + (size_t)t * V;
+                float* lp = logprobs.data() + (size_t)t * V;
+                float mx = row[0];
+                for (int v = 1; v < V; v++)
+                    if (row[v] > mx)
+                        mx = row[v];
+                double sum = 0.0;
+                for (int v = 0; v < V; v++)
+                    sum += std::exp((double)(row[v] - mx));
+                double log_sum = (double)mx + std::log(sum);
+                for (int v = 0; v < V; v++)
+                    lp[v] = (float)((double)row[v] - log_sum);
+            }
+            auto br = core_ctc::prefix_beam_search(logprobs.data(), ctx->last_bpe_T, V,
+                                                   /*blank_id=*/0, /*shift=*/-1, ctx->beam_size, ctx->beam_gamma);
+            ids = std::move(br.tokens);
+        } else {
+            ids =
+                core_ctc::greedy_decode_with_blank(ctx->last_bpe_logits.data(), ctx->last_bpe_T, (int)hp.enc_bpe_vocab,
+                                                   /*blank_id=*/0, /*shift=*/-1);
+        }
         if (!ids.empty())
             ctc_text = core_bpe::detokenize(ctx->id_to_token, ids.data(), ids.size());
         else
@@ -2051,4 +2084,11 @@ extern "C" char* granite_nle_ctc_decode(struct granite_nle_context* ctx, const i
 
 extern "C" int granite_nle_eos_token_id(struct granite_nle_context* ctx) {
     return ctx ? (int)ctx->model.hparams.eos_token_id : -1;
+}
+
+extern "C" void granite_nle_set_beam_size(struct granite_nle_context* ctx, int beam_size, float gamma) {
+    if (!ctx)
+        return;
+    ctx->beam_size = beam_size > 1 ? beam_size : 1;
+    ctx->beam_gamma = gamma > 0.0f ? gamma : 0.0f;
 }

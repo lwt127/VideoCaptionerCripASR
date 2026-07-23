@@ -131,3 +131,42 @@ std::vector<int> crispasr_agglomerative_cluster(const std::vector<float>& embedd
     }
     return labels;
 }
+
+std::vector<float> crispasr_cluster_centroids(const std::vector<float>& embeddings, const std::vector<int>& labels,
+                                              int n, int dim) {
+    if (n <= 0 || dim <= 0 || (int)labels.size() < n || (int)embeddings.size() < n * dim)
+        return {};
+
+    int k = 0;
+    for (int i = 0; i < n; i++)
+        k = std::max(k, labels[i] + 1);
+    if (k <= 0)
+        return {};
+
+    std::vector<float> centroids((size_t)k * dim, 0.0f);
+    std::vector<int> counts(k, 0);
+    for (int i = 0; i < n; i++) {
+        const int c = labels[i];
+        if (c < 0)
+            continue;
+        for (int d = 0; d < dim; d++)
+            centroids[(size_t)c * dim + d] += embeddings[(size_t)i * dim + d];
+        counts[c]++;
+    }
+    for (int c = 0; c < k; c++) {
+        if (counts[c] == 0)
+            continue;
+        double norm = 0.0;
+        for (int d = 0; d < dim; d++) {
+            const float v = centroids[(size_t)c * dim + d] / counts[c];
+            centroids[(size_t)c * dim + d] = v;
+            norm += (double)v * v;
+        }
+        if (norm > 0.0) {
+            const float inv = (float)(1.0 / std::sqrt(norm));
+            for (int d = 0; d < dim; d++)
+                centroids[(size_t)c * dim + d] *= inv;
+        }
+    }
+    return centroids;
+}

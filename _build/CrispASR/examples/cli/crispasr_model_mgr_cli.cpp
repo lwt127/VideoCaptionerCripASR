@@ -69,7 +69,14 @@ static CrispasrResolvePreview build_preview(const std::string& model_arg, const 
     if (effective_model_arg == "auto" || effective_model_arg == "default") {
         have_match = crispasr_registry_lookup(backend_name, match, effective_quant);
     } else {
+        // Mirror crispasr_resolve_model's match priority exactly, or the preview
+        // lies: (1) exact filename/companion, (2) backend-key match on the
+        // literal -m arg (so sub-variant keys like parakeet-tdt_ctc-110m resolve
+        // to their own entry rather than being shadowed by the filename-inferred
+        // backend), (3) fallback to the --backend name.
         have_match = crispasr_registry_lookup_by_filename(effective_model_arg, match, effective_quant);
+        if (!have_match)
+            have_match = crispasr_registry_lookup(effective_model_arg, match, effective_quant);
         if (!have_match && !backend_name.empty())
             have_match = crispasr_registry_lookup(backend_name, match, effective_quant);
     }
@@ -106,7 +113,7 @@ CrispasrResolvePreview crispasr_preview_model_cli(const std::string& model_arg, 
 
 std::string crispasr_resolve_model_cli(const std::string& model_arg, const std::string& backend_name, bool quiet,
                                        const std::string& cache_dir_override, bool auto_download,
-                                       const std::string& preferred_quant) {
+                                       const std::string& preferred_quant, const std::string& accepted_license) {
     std::string effective_model_arg = model_arg;
     std::string effective_quant = preferred_quant;
     std::string auto_base;
@@ -119,7 +126,7 @@ std::string crispasr_resolve_model_cli(const std::string& model_arg, const std::
     // "auto"/"default" and already-on-disk paths: library handles them.
     if (effective_model_arg == "auto" || effective_model_arg == "default") {
         return crispasr_resolve_model(effective_model_arg, backend_name, quiet, cache_dir_override, auto_download,
-                                      effective_quant);
+                                      effective_quant, accepted_license);
     }
 
     // Concrete path: check existence ourselves so we can interpose the
@@ -154,8 +161,7 @@ std::string crispasr_resolve_model_cli(const std::string& model_arg, const std::
     const std::string cached_path = crispasr_cache::dir(cache_dir_override) + "/" + match.filename;
     if (crispasr_cache::file_present(cached_path)) {
         if (!match.license.empty()) {
-            const bool is_nc = match.license.find("NC") != std::string::npos ||
-                               match.license.find("NonCommercial") != std::string::npos;
+            const bool is_nc = crispasr_license_requires_acceptance(match.license);
             if (is_nc)
                 fprintf(stderr,
                         "crispasr: WARNING: %s is licensed %s — NON-COMMERCIAL USE ONLY.\n"
@@ -168,8 +174,7 @@ std::string crispasr_resolve_model_cli(const std::string& model_arg, const std::
     fprintf(stderr, "crispasr: model '%s' not found locally.\n", effective_model_arg.c_str());
     fprintf(stderr, "  Available for download: %s (%s)\n", match.filename.c_str(), match.approx_size.c_str());
     if (!match.license.empty()) {
-        const bool is_nc =
-            match.license.find("NC") != std::string::npos || match.license.find("NonCommercial") != std::string::npos;
+        const bool is_nc = crispasr_license_requires_acceptance(match.license);
         if (is_nc)
             fprintf(stderr, "  LICENSE: %s — NON-COMMERCIAL USE ONLY. Do not use for commercial purposes.\n",
                     match.license.c_str());
@@ -177,8 +182,18 @@ std::string crispasr_resolve_model_cli(const std::string& model_arg, const std::
             fprintf(stderr, "  License: %s\n", match.license.c_str());
     }
 
+    // Restricted licences need explicit acceptance; --auto-download alone is
+    // NOT sufficient (mirrors CrispEmbed).
+    const bool restricted = !match.license.empty() && crispasr_license_requires_acceptance(match.license);
+    const bool accepted = restricted && crispasr_license_accepted(match.license, accepted_license);
+    if (restricted && !accepted && !isatty(fileno(stdin))) {
+        fprintf(stderr, "  Refusing: pass --accept-license %s (or set CRISPASR_ACCEPT_LICENSE).\n",
+                crispasr_license_tag(match.license).c_str());
+        return effective_model_arg;
+    }
+
     bool do_download = false;
-    if (auto_download) {
+    if (auto_download && (!restricted || accepted)) {
         do_download = true;
         fprintf(stderr, "  Auto-downloading (--auto-download is set)...\n");
     } else if (isatty(fileno(stdin))) {

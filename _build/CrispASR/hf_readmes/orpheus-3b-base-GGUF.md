@@ -18,7 +18,9 @@ tags:
 library_name: ggml
 ---
 
-# Orpheus 3B — GGUF (ggml-quantised)
+# [DEPRECATED] Orpheus 3B — GGUF (ggml-quantised)
+
+> **This repo is deprecated.** Use [`cstr/orpheus-3b-0.1-ft-GGUF`](https://huggingface.co/cstr/orpheus-3b-0.1-ft-GGUF) instead — it has F16 + Q8_0 + Q4_K quants plus the diff-harness reference file. CrispASR's model registry and auto-download now point there.
 
 GGUF / ggml conversion of [`canopylabs/orpheus-3b-0.1-ft`](https://huggingface.co/canopylabs/orpheus-3b-0.1-ft) (sourced via the non-gated [`unsloth/orpheus-3b-0.1-ft`](https://huggingface.co/unsloth/orpheus-3b-0.1-ft) mirror) for use with **[CrispStrobe/CrispASR](https://github.com/CrispStrobe/CrispASR)**.
 

@@ -37,6 +37,38 @@ WhisperLidCache& whisper_lid_cache() {
     return c;
 }
 
+// Same process-lifetime caching for the silero / firered / ecapa LID models —
+// previously each was init'd + freed on every detect() call, so a server with
+// `language=auto` reloaded the model per request (#165). Keyed on model path +
+// thread count; freed by crispasr_lid_free_cache() at shutdown.
+struct SileroLidCache {
+    silero_lid_context* ctx = nullptr;
+    std::string model_path;
+    int n_threads = 0;
+};
+struct FireredLidCache {
+    firered_lid_context* ctx = nullptr;
+    std::string model_path;
+    int n_threads = 0;
+};
+struct EcapaLidCache {
+    ecapa_lid_context* ctx = nullptr;
+    std::string model_path;
+    int n_threads = 0;
+};
+SileroLidCache& silero_lid_cache() {
+    static SileroLidCache c;
+    return c;
+}
+FireredLidCache& firered_lid_cache() {
+    static FireredLidCache c;
+    return c;
+}
+EcapaLidCache& ecapa_lid_cache() {
+    static EcapaLidCache c;
+    return c;
+}
+
 bool detect_whisper(const float* samples, int n_samples, const CrispasrLidOptions& opts, CrispasrLidResult& out) {
     if (opts.model_path.empty())
         return false;
@@ -121,17 +153,26 @@ bool detect_silero(const float* samples, int n_samples, const CrispasrLidOptions
     if (opts.model_path.empty())
         return false;
 
-    silero_lid_context* lid = silero_lid_init(opts.model_path.c_str(), opts.n_threads);
-    if (!lid) {
-        if (opts.verbose)
-            fprintf(stderr, "crispasr[lid]: silero_lid_init('%s') failed\n", opts.model_path.c_str());
-        return false;
+    SileroLidCache& sc = silero_lid_cache();
+    if (!sc.ctx || sc.model_path != opts.model_path || sc.n_threads != opts.n_threads) {
+        if (sc.ctx) {
+            silero_lid_free(sc.ctx);
+            sc.ctx = nullptr;
+        }
+        sc.ctx = silero_lid_init(opts.model_path.c_str(), opts.n_threads);
+        if (!sc.ctx) {
+            if (opts.verbose)
+                fprintf(stderr, "crispasr[lid]: silero_lid_init('%s') failed\n", opts.model_path.c_str());
+            return false;
+        }
+        sc.model_path = opts.model_path;
+        sc.n_threads = opts.n_threads;
     }
+    silero_lid_context* lid = sc.ctx;
 
     float conf = 0.0f;
     const char* lang = silero_lid_detect(lid, samples, n_samples, &conf);
     std::string code = lang ? lang : "";
-    silero_lid_free(lid);
 
     if (code.empty()) {
         if (opts.verbose)
@@ -157,17 +198,26 @@ bool detect_firered(const float* samples, int n_samples, const CrispasrLidOption
     if (opts.model_path.empty())
         return false;
 
-    firered_lid_context* lid = firered_lid_init(opts.model_path.c_str(), opts.n_threads);
-    if (!lid) {
-        if (opts.verbose)
-            fprintf(stderr, "crispasr[lid]: firered_lid_init('%s') failed\n", opts.model_path.c_str());
-        return false;
+    FireredLidCache& fc = firered_lid_cache();
+    if (!fc.ctx || fc.model_path != opts.model_path || fc.n_threads != opts.n_threads) {
+        if (fc.ctx) {
+            firered_lid_free(fc.ctx);
+            fc.ctx = nullptr;
+        }
+        fc.ctx = firered_lid_init(opts.model_path.c_str(), opts.n_threads);
+        if (!fc.ctx) {
+            if (opts.verbose)
+                fprintf(stderr, "crispasr[lid]: firered_lid_init('%s') failed\n", opts.model_path.c_str());
+            return false;
+        }
+        fc.model_path = opts.model_path;
+        fc.n_threads = opts.n_threads;
     }
+    firered_lid_context* lid = fc.ctx;
 
     float conf = 0.0f;
     const char* lang = firered_lid_detect(lid, samples, n_samples, &conf);
     std::string code = lang ? lang : "";
-    firered_lid_free(lid);
 
     if (code.empty()) {
         if (opts.verbose)
@@ -188,17 +238,26 @@ bool detect_ecapa(const float* samples, int n_samples, const CrispasrLidOptions&
     if (opts.model_path.empty())
         return false;
 
-    ecapa_lid_context* lid = ecapa_lid_init(opts.model_path.c_str(), opts.n_threads);
-    if (!lid) {
-        if (opts.verbose)
-            fprintf(stderr, "crispasr[lid]: ecapa_lid_init('%s') failed\n", opts.model_path.c_str());
-        return false;
+    EcapaLidCache& ec = ecapa_lid_cache();
+    if (!ec.ctx || ec.model_path != opts.model_path || ec.n_threads != opts.n_threads) {
+        if (ec.ctx) {
+            ecapa_lid_free(ec.ctx);
+            ec.ctx = nullptr;
+        }
+        ec.ctx = ecapa_lid_init(opts.model_path.c_str(), opts.n_threads);
+        if (!ec.ctx) {
+            if (opts.verbose)
+                fprintf(stderr, "crispasr[lid]: ecapa_lid_init('%s') failed\n", opts.model_path.c_str());
+            return false;
+        }
+        ec.model_path = opts.model_path;
+        ec.n_threads = opts.n_threads;
     }
+    ecapa_lid_context* lid = ec.ctx;
 
     float conf = 0.0f;
     const char* lang = ecapa_lid_detect(lid, samples, n_samples, &conf);
     std::string code = lang ? lang : "";
-    ecapa_lid_free(lid);
 
     if (code.empty()) {
         if (opts.verbose)
@@ -244,5 +303,23 @@ void crispasr_lid_free_cache() {
         whisper_free(c.ctx);
         c.ctx = nullptr;
         c.model_path.clear();
+    }
+    SileroLidCache& sc = silero_lid_cache();
+    if (sc.ctx) {
+        silero_lid_free(sc.ctx);
+        sc.ctx = nullptr;
+        sc.model_path.clear();
+    }
+    FireredLidCache& fc = firered_lid_cache();
+    if (fc.ctx) {
+        firered_lid_free(fc.ctx);
+        fc.ctx = nullptr;
+        fc.model_path.clear();
+    }
+    EcapaLidCache& ec = ecapa_lid_cache();
+    if (ec.ctx) {
+        ecapa_lid_free(ec.ctx);
+        ec.ctx = nullptr;
+        ec.model_path.clear();
     }
 }

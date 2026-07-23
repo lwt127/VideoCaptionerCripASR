@@ -36,6 +36,10 @@ std::string crispasr_resolve_vad_model(const whisper_params& p);
 // Silero-only VAD loader.
 bool crispasr_vad_is_firered(const whisper_params& p);
 
+// Returns true if the user selected WebRTC VAD (no model file, pure algorithmic).
+// Like FireRed, this cannot be passed to whisper's internal Silero VAD loader.
+bool crispasr_vad_is_webrtc(const whisper_params& p);
+
 // Build the list of audio slices for a CLI invocation.
 //
 // If `params.vad` or `params.vad_model` is set, resolves the VAD model

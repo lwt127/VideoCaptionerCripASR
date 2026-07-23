@@ -157,7 +157,8 @@ void whisper_print_usage(int /*argc*/, char** argv, const whisper_params& params
     fprintf(stderr, "  -sow,      --split-on-word     [%-7s] split on word rather than on token\n",
             params.split_on_word ? "true" : "false");
     fprintf(stderr, "  -bo N,     --best-of N         [%-7d] number of best candidates to keep\n", params.best_of);
-    fprintf(stderr, "  -bs N,     --beam-size N       [%-7d] beam size for beam search\n", params.beam_size);
+    fprintf(stderr, "  -bs N,     --beam-size N       [%-7s] beam size (default: greedy, -bs 5 for beam search)\n",
+            params.beam_size > 0 ? std::to_string(params.beam_size).c_str() : "greedy");
     fprintf(stderr, "  -ac N,     --audio-ctx N       [%-7d] audio context size (0 - all)\n", params.audio_ctx);
     fprintf(stderr, "  -wt N,     --word-thold N      [%-7.2f] word timestamp probability threshold\n",
             params.word_thold);
@@ -1007,7 +1008,7 @@ int main(int argc, char** argv) {
             wparams.initial_prompt = params.prompt.c_str();
 
             wparams.greedy.best_of = params.best_of;
-            wparams.beam_search.beam_size = params.beam_size;
+            wparams.beam_search.beam_size = params.beam_size > 0 ? params.beam_size : 5;
 
             wparams.temperature = params.temperature;
             wparams.max_tokens = params.max_tokens;

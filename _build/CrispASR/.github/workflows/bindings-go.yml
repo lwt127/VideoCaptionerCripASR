@@ -24,6 +24,8 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
       - run: |
           cmake -S . -B /tmp/go_drift_build \
             --graphviz=/tmp/crispasr.dot \
@@ -31,7 +33,8 @@ jobs:
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=OFF \
             -DCRISPASR_BUILD_SERVER=OFF \
-            -DGGML_CUDA=OFF
+            -DGGML_CUDA=OFF \
+            -DCRISPASR_OPUS_FETCH=ON
           python tools/sync_go_cgo_ldflags.py --check --dot /tmp/crispasr.dot
 
   ubuntu-22:
@@ -41,6 +44,8 @@ jobs:
         with:
           go-version: '^1.23'
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
       - run: |
           cd bindings/go
           make test

@@ -166,7 +166,7 @@ if model_gguf.exists() and model_gguf.stat().st_size > 0:
     try:
         kh.sh_with_progress(
             f"cmake -G Ninja -B {build_dir} -S {REPO}"
-            f" -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF"
+            f" -DCMAKE_BUILD_TYPE=Release -DCRISPASR_NO_C2PA_NATIVE=ON -DGGML_CUDA=OFF"
             f" -DCMAKE_C_COMPILER_LAUNCHER=ccache"
             f" -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
         )

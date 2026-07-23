@@ -3,8 +3,15 @@
   "version": "@PROJECT_VERSION@",
   "description": "CrispASR speech recognition",
   "main": "crispasr.js",
+  "exports": {
+    ".": "./crispasr.js",
+    "./c2pa": "./c2pa.mjs",
+    "./c2pa-verify": "./c2pa-verify.mjs"
+  },
   "scripts": {
-    "test": "echo \"todo: add tests\" && exit 0"
+    "test": "node --test test/*.test.mjs",
+    "test:unit": "node --test test/c2pa.unit.test.mjs",
+    "test:parity": "node --test test/c2pa.parity.test.mjs"
   },
   "repository": {
     "type": "git",

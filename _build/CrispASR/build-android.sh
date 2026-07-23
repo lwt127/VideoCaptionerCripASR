@@ -54,7 +54,8 @@ for ABI in "${ABIS[@]}"; do
         -DBUILD_SHARED_LIBS=ON \
         -DCRISPASR_BUILD_EXAMPLES=OFF \
         -DCRISPASR_BUILD_TESTS=OFF \
-        -DGGML_VULKAN="$VULKAN"
+        -DGGML_VULKAN="$VULKAN" \
+        -DCRISPASR_OPUS_FETCH=ON
 
     cmake --build "$BUILD_DIR/$ABI" -j"$(nproc 2>/dev/null || echo 4)"
 

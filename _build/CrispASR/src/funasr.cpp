@@ -20,6 +20,8 @@
 #include "core/kaldi_fbank.h"
 #include "core/lfr.h"
 #include "core/sanm.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include <algorithm>
 #include <cassert>
@@ -61,7 +63,7 @@
 static bool funasr_bench_enabled() {
     static int v = -1;
     if (v < 0) {
-        const char* e = std::getenv("FUNASR_BENCH");
+        const char* e = crispasr_env::get("CRISPASR_FUNASR_BENCH");
         v = (e && *e && *e != '0') ? 1 : 0;
     }
     return v != 0;
@@ -247,6 +249,12 @@ struct funasr_context {
 
     std::vector<uint8_t> compute_meta;
 
+    // §176s: cached encoder+adaptor graph — reused when T_lfr matches.
+    ggml_cgraph* cached_enc_gf = nullptr;
+    ggml_context* cached_enc_ctx = nullptr;
+    std::vector<uint8_t> cached_enc_meta;
+    int cached_enc_T_lfr = 0;
+
     // KV cache for the LLM body — same layout as qwen3_asr.
     ggml_context* kv_ctx = nullptr;
     ggml_backend_buffer_t kv_buf = nullptr;
@@ -254,6 +262,8 @@ struct funasr_context {
     ggml_tensor* kv_v = nullptr;
     int kv_max_ctx = 0;
     int beam_size = 1;
+    // #292: decode cap; forwarded from --max-new-tokens when set, else this default.
+    int max_new_tokens = 512;
 
     // Cached per-step LLM decode graph (PLAN funasr-perf #1). Built once
     // at first decode call (via funasr_ensure_step_graph) using
@@ -290,6 +300,10 @@ struct funasr_context {
     //     graphs (PLAN funasr-perf #1).
     bool enc_flash_attn = true;
     bool step_graph_cache = false;
+
+    // Language hint from -l / set_language. Empty = default ("语音转写：").
+    // Non-empty = "语音转写成{language}：" matching upstream get_prompt().
+    std::string language;
 
     // Stage-capture state — set by funasr_extract_stage to request a
     // specific intermediate tensor; consumed by the encoder graph builder
@@ -424,7 +438,7 @@ static bool funasr_load_model(funasr_model& model, funasr_vocab& vocab, const ch
     // LLM CPU) for testing or as a safety net.
     core_gguf::WeightLoad wl;
     const bool force_llm_cpu = []() {
-        const char* s = std::getenv("FUNASR_LLM_CPU");
+        const char* s = crispasr_env::get("CRISPASR_FUNASR_LLM_CPU");
         return s && *s && *s != '0';
     }();
     if (!ggml_backend_is_cpu(backend) && cpu_backend && force_llm_cpu) {
@@ -578,13 +592,13 @@ static ggml_tensor* maybe_snap(ggml_context* ctx0, ggml_cgraph* gf, ggml_tensor*
     return t;
 }
 
-static ggml_cgraph* funasr_build_graph_features(funasr_context* ctx, int T_lfr) {
+static ggml_cgraph* funasr_build_graph_features(funasr_context* ctx, int T_lfr, ggml_context* arena_ctx = nullptr) {
     const auto& hp = ctx->model.hparams;
     const int D_in = (int)hp.input_size;
     const int D = (int)hp.d_model;
 
     ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
-    ggml_context* ctx0 = ggml_init(ip);
+    ggml_context* ctx0 = arena_ctx ? arena_ctx : ggml_init(ip);
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
 
     // ---- inputs ----
@@ -720,7 +734,8 @@ static ggml_cgraph* funasr_build_graph_features(funasr_context* ctx, int T_lfr) 
 
     ggml_set_name(cur, "audio_adaptor_output");
     ggml_build_forward_expand(gf, cur);
-    ggml_free(ctx0);
+    if (!arena_ctx)
+        ggml_free(ctx0);
     return gf;
 }
 
@@ -737,7 +752,22 @@ static std::vector<float> funasr_run_encoder_adaptor(funasr_context* ctx, const 
         compute_encoder_pe(ctx->model, T_lfr + 256);
     }
 
-    ggml_cgraph* gf = funasr_build_graph_features(ctx, T_lfr);
+    // #235: always rebuild — cached graph has stale GPU buffer handles after sched regrow
+    ggml_cgraph* gf;
+    {
+        if (ctx->cached_enc_ctx) {
+            ggml_free(ctx->cached_enc_ctx);
+            ctx->cached_enc_ctx = nullptr;
+            ctx->cached_enc_gf = nullptr;
+        }
+        ctx->cached_enc_meta.assign(ctx->compute_meta.size(), 0);
+        ggml_init_params ip = {ctx->cached_enc_meta.size(), ctx->cached_enc_meta.data(), true};
+        ctx->cached_enc_ctx = ggml_init(ip);
+        gf = funasr_build_graph_features(ctx, T_lfr, ctx->cached_enc_ctx);
+        ctx->cached_enc_gf = gf;
+        ctx->cached_enc_T_lfr = T_lfr;
+    }
+
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
         std::fprintf(stderr, "funasr: failed to alloc encoder graph\n");
@@ -760,7 +790,7 @@ static std::vector<float> funasr_run_encoder_adaptor(funasr_context* ctx, const 
     {
         static int dump_flag = -1;
         if (dump_flag < 0) {
-            const char* e = std::getenv("FUNASR_DUMP_STAGES");
+            const char* e = crispasr_env::get("CRISPASR_FUNASR_DUMP_STAGES");
             dump_flag = (e && *e && *e != '0') ? 1 : 0;
         }
         if (dump_flag) {
@@ -1074,7 +1104,7 @@ static ggml_cgraph* funasr_build_graph_llm_kv_impl(funasr_context* ctx, int n_pa
     {
         static int layers_override = -1;
         if (layers_override < 0) {
-            const char* e = std::getenv("FUNASR_LLM_LAYERS");
+            const char* e = crispasr_env::get("CRISPASR_FUNASR_LLM_LAYERS");
             layers_override = (e && *e) ? std::atoi(e) : 0;
         }
         if (layers_override > 0 && (uint32_t)layers_override < n_layers_eff) {
@@ -1109,7 +1139,7 @@ static ggml_cgraph* funasr_build_graph_llm_kv_impl(funasr_context* ctx, int n_pa
         {
             static int dump_flag = -1;
             if (dump_flag < 0) {
-                const char* e = std::getenv("FUNASR_DUMP_STAGES");
+                const char* e = crispasr_env::get("CRISPASR_FUNASR_DUMP_STAGES");
                 dump_flag = (e && *e && *e != '0') ? 1 : 0;
             }
             if (dump_flag) {
@@ -1129,7 +1159,7 @@ static ggml_cgraph* funasr_build_graph_llm_kv_impl(funasr_context* ctx, int n_pa
     {
         static int dump_flag = -1;
         if (dump_flag < 0) {
-            const char* e = std::getenv("FUNASR_DUMP_STAGES");
+            const char* e = crispasr_env::get("CRISPASR_FUNASR_DUMP_STAGES");
             dump_flag = (e && *e && *e != '0') ? 1 : 0;
         }
         if (dump_flag) {
@@ -1530,7 +1560,7 @@ static std::vector<float> funasr_run_llm_step(funasr_context* ctx, const float* 
     {
         static int nan_check_flag = -1;
         if (nan_check_flag < 0) {
-            const char* e = std::getenv("FUNASR_NAN_CHECK");
+            const char* e = crispasr_env::get("CRISPASR_FUNASR_NAN_CHECK");
             nan_check_flag = (e && *e && *e != '0') ? 1 : 0;
         }
         if (nan_check_flag && n_tokens > 1) {
@@ -1558,7 +1588,7 @@ static std::vector<float> funasr_run_llm_step(funasr_context* ctx, const float* 
     {
         static int dump_flag = -1;
         if (dump_flag < 0) {
-            const char* e = std::getenv("FUNASR_DUMP_STAGES");
+            const char* e = crispasr_env::get("CRISPASR_FUNASR_DUMP_STAGES");
             dump_flag = (e && *e && *e != '0') ? 1 : 0;
         }
         if (dump_flag && n_tokens > 1) {
@@ -1642,9 +1672,35 @@ static std::vector<float> funasr_run_llm_step(funasr_context* ctx, const float* 
 
 // Get the inputs_embeds for an arbitrary token sequence via the model's
 // token_embd table (shared with output.weight thanks to Qwen3 tied embeddings).
+// For n==1 (the AR decode hot path), skip the graph and dequant one row
+// directly — eliminates graph-build + sched overhead per decode step (§176o).
+// Gated by CRISPASR_FUNASR_EMBED_FAST (default ON, set =0 to disable).
 static std::vector<float> funasr_embed_tokens(funasr_context* ctx, const std::vector<int32_t>& ids) {
     const int n = (int)ids.size();
     const int d = (int)ctx->model.hparams.llm_d_model;
+
+    // Fast path: single-token lookup avoids full graph build + sched alloc.
+    static int use_fast = -1;
+    if (use_fast < 0) {
+        const char* e = std::getenv("CRISPASR_FUNASR_EMBED_FAST");
+        use_fast = (!e || *e != '0') ? 1 : 0;
+    }
+    if (n == 1 && use_fast) {
+        const ggml_tensor* w = ctx->model.llm.token_embd_w;
+        if (w) {
+            const size_t row_bytes = ggml_row_size(w->type, d);
+            std::vector<uint8_t> raw(row_bytes);
+            ggml_backend_tensor_get(w, raw.data(), (size_t)ids[0] * row_bytes, row_bytes);
+            std::vector<float> result((size_t)d);
+            if (w->type == GGML_TYPE_F32) {
+                std::memcpy(result.data(), raw.data(), (size_t)d * sizeof(float));
+            } else {
+                ggml_get_type_traits(w->type)->to_float(raw.data(), result.data(), d);
+            }
+            return result;
+        }
+    }
+
     ggml_cgraph* gf = funasr_build_graph_embed(ctx, n);
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
@@ -1667,8 +1723,22 @@ static std::vector<float> funasr_embed_tokens(funasr_context* ctx, const std::ve
 // High-level pipeline: build prompt, splice audio, run AR decode → text.
 // ===========================================================================
 
-static const char* PROMPT_PREFIX = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n"
-                                   "\xE8\xAF\xAD\xE9\x9F\xB3\xE8\xBD\xAC\xE5\x86\x99\xEF\xBC\x9A"; // "语音转写："
+// Build the ChatML prompt prefix matching upstream get_prompt(language=...).
+// Default (empty language): "语音转写："
+// With language: "语音转写成{language}："
+static std::string funasr_build_prompt_prefix(const std::string& language) {
+    std::string prefix = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n";
+    // "语音转写" = speech transcription
+    prefix += "\xE8\xAF\xAD\xE9\x9F\xB3\xE8\xBD\xAC\xE5\x86\x99";
+    if (!language.empty()) {
+        // "成" = "to/into"
+        prefix += "\xE6\x88\x90";
+        prefix += language;
+    }
+    // "：" = Chinese colon
+    prefix += "\xEF\xBC\x9A";
+    return prefix;
+}
 static const char* PROMPT_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n";
 
 static std::string funasr_transcribe_impl(funasr_context* ctx, const float* pcm, int n_samples,
@@ -1707,7 +1777,8 @@ static std::string funasr_transcribe_impl(funasr_context* ctx, const float* pcm,
     std::vector<int32_t> suffix_ids;
     {
         funasr_bench_stage s("prompt_tokenize");
-        prefix_ids = funasr_bpe_encode(ctx->vocab, PROMPT_PREFIX);
+        std::string prompt_prefix = funasr_build_prompt_prefix(ctx->language);
+        prefix_ids = funasr_bpe_encode(ctx->vocab, prompt_prefix);
         suffix_ids = funasr_bpe_encode(ctx->vocab, PROMPT_SUFFIX);
     }
     const int fake_token_len = compute_fake_token_len(T_lfr, hp.use_low_frame_rate);
@@ -1745,7 +1816,7 @@ static std::string funasr_transcribe_impl(funasr_context* ctx, const float* pcm,
     {
         static int dump_flag = -1;
         if (dump_flag < 0) {
-            const char* e = std::getenv("FUNASR_DUMP_STAGES");
+            const char* e = crispasr_env::get("CRISPASR_FUNASR_DUMP_STAGES");
             dump_flag = (e && *e && *e != '0') ? 1 : 0;
         }
         if (dump_flag) {
@@ -1786,7 +1857,7 @@ static std::string funasr_transcribe_impl(funasr_context* ctx, const float* pcm,
     }
 
     // KV cache sized for prompt + up to max_new_tokens.
-    const int max_new_tokens = 512;
+    const int max_new_tokens = ctx->max_new_tokens > 0 ? ctx->max_new_tokens : 512;
     {
         funasr_bench_stage s("kv_init");
         // Tight kv_max_ctx — only allocate what this session actually needs.
@@ -1812,7 +1883,7 @@ static std::string funasr_transcribe_impl(funasr_context* ctx, const float* pcm,
     {
         static int dump_flag = -1;
         if (dump_flag < 0) {
-            const char* e = std::getenv("FUNASR_DUMP_STAGES");
+            const char* e = crispasr_env::get("CRISPASR_FUNASR_DUMP_STAGES");
             dump_flag = (e && *e && *e != '0') ? 1 : 0;
         }
         if (dump_flag) {
@@ -1883,6 +1954,7 @@ static std::string funasr_transcribe_impl(funasr_context* ctx, const float* pcm,
     std::vector<int32_t> generated;
     std::vector<float> generated_probs;
     auto decode_t0 = std::chrono::steady_clock::now();
+    double decode_embed_ms = 0;
 
     if (ctx->beam_size > 1) {
         // Beam search via replay-from-prefix. Each beam step embeds
@@ -1940,7 +2012,17 @@ static std::string funasr_transcribe_impl(funasr_context* ctx, const float* pcm,
             }
             generated.push_back(next_id);
             generated_probs.push_back(next_prob);
+            double t_emb0 =
+                funasr_bench_enabled()
+                    ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch())
+                          .count()
+                    : 0;
             std::vector<float> step_embed = funasr_embed_tokens(ctx, {next_id});
+            if (funasr_bench_enabled())
+                decode_embed_ms +=
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch())
+                        .count() -
+                    t_emb0;
             if (step_embed.empty())
                 break;
             logits = funasr_run_llm_step(ctx, step_embed.data(), 1, n_past);
@@ -1957,6 +2039,8 @@ static std::string funasr_transcribe_impl(funasr_context* ctx, const float* pcm,
         const int n_steps = (int)generated.size();
         std::fprintf(stderr, "  funasr_bench: %-22s %.2f ms  (%d tokens, %.2f ms/tok)\n", "llm_decode_total", ms,
                      n_steps, n_steps > 0 ? ms / n_steps : 0.0);
+        std::fprintf(stderr, "  funasr_bench: %-22s %.2f ms  (%.2f ms/tok)\n", "decode_embed_only", decode_embed_ms,
+                     n_steps > 0 ? decode_embed_ms / n_steps : 0.0);
     }
     (void)d;
 
@@ -1997,7 +2081,7 @@ extern "C" funasr_context* funasr_init_from_file(const char* path, funasr_contex
     ctx->params = params;
     ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
-    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
     if (!ctx->backend)
         ctx->backend = ggml_backend_cpu_init();
     ctx->backend_cpu = ggml_backend_cpu_init();
@@ -2079,7 +2163,7 @@ extern "C" funasr_context* funasr_init_from_file(const char* path, funasr_contex
     // regression diffing. The default ON path matches the parakeet /
     // qwen3-asr default; FUNASR_NO_FA=1 reverts to the original kernel
     // sequence.
-    if (const char* s = std::getenv("FUNASR_NO_FA")) {
+    if (const char* s = crispasr_env::get("CRISPASR_FUNASR_NO_FA")) {
         if (*s && *s != '0')
             ctx->enc_flash_attn = false;
     }
@@ -2089,7 +2173,7 @@ extern "C" funasr_context* funasr_init_from_file(const char* path, funasr_contex
     // saves vs the per-call path's growing-Lk attention. The cache
     // becomes a win only with bucketed Lk graphs (voxcpm2 TSLM pattern,
     // PLAN funasr-perf #1) — when that lands we'll flip the default.
-    if (const char* s = std::getenv("FUNASR_STEP_CACHE")) {
+    if (const char* s = crispasr_env::get("CRISPASR_FUNASR_STEP_CACHE")) {
         if (*s && *s != '0')
             ctx->step_graph_cache = true;
     }
@@ -2112,9 +2196,23 @@ extern "C" void funasr_set_beam_size(funasr_context* ctx, int beam_size) {
     ctx->beam_size = beam_size > 1 ? beam_size : 1;
 }
 
+extern "C" void funasr_set_max_new_tokens(funasr_context* ctx, int n) {
+    if (ctx && n > 0)
+        ctx->max_new_tokens = n;
+}
+
+extern "C" void funasr_set_language(funasr_context* ctx, const char* lang) {
+    if (!ctx)
+        return;
+    ctx->language = (lang && *lang) ? lang : "";
+}
+
 extern "C" void funasr_free(funasr_context* ctx) {
     if (!ctx)
         return;
+    // §176s: free cached encoder graph arena.
+    if (ctx->cached_enc_ctx)
+        ggml_free(ctx->cached_enc_ctx);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->step_galloc)

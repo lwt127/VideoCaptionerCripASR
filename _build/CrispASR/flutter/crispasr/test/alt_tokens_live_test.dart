@@ -33,8 +33,7 @@ Float32List _loadJfkPcm() {
   // jfk.wav is a 16 kHz mono 16-bit PCM file — header is exactly
   // 44 bytes (the canonical PCM-WAV header), no LIST / INFO chunks,
   // no extension. Skip past it and reinterpret the rest as int16.
-  final wavPath =
-      '${Directory.current.parent.parent.path}/samples/jfk.wav';
+  final wavPath = '${Directory.current.parent.parent.path}/samples/jfk.wav';
   final file = File(wavPath);
   if (!file.existsSync()) {
     throw StateError('jfk.wav not found at $wavPath');
@@ -47,16 +46,14 @@ Float32List _loadJfkPcm() {
 void main() {
   final libEnv = Platform.environment['CRISPASR_LIB'];
   final modelEnv = Platform.environment['CRISPASR_MODEL'];
-  final libPath = (libEnv != null &&
-          libEnv.isNotEmpty &&
-          File(libEnv).existsSync())
-      ? libEnv
-      : null;
-  final modelPath = (modelEnv != null &&
-          modelEnv.isNotEmpty &&
-          File(modelEnv).existsSync())
-      ? modelEnv
-      : '${Directory.current.parent.parent.path}/models/ggml-tiny.en.bin';
+  final libPath =
+      (libEnv != null && libEnv.isNotEmpty && File(libEnv).existsSync())
+          ? libEnv
+          : null;
+  final modelPath =
+      (modelEnv != null && modelEnv.isNotEmpty && File(modelEnv).existsSync())
+          ? modelEnv
+          : '${Directory.current.parent.parent.path}/models/ggml-tiny.en.bin';
   final canRun = libPath != null && File(modelPath).existsSync();
   final skipReason = canRun
       ? null
@@ -89,8 +86,7 @@ void main() {
                 'data — see 0.5.13 release note)');
 
         // (a) At least one word has non-empty alts.
-        final withAlts =
-            allWords.where((w) => w.alts.isNotEmpty).toList();
+        final withAlts = allWords.where((w) => w.alts.isNotEmpty).toList();
         expect(withAlts, isNotEmpty,
             reason: 'altN=3 should leave at least one word '
                 'with runner-up candidates — if this is empty '
@@ -127,8 +123,7 @@ void main() {
         // Print a small summary — comes out under `dart test
         // --reporter=expanded` and is genuinely useful when
         // tuning the chip-row UX.
-        print(
-            '\n[alt-tokens] altN=3 on JFK: ${withAlts.length}/'
+        print('\n[alt-tokens] altN=3 on JFK: ${withAlts.length}/'
             '${allWords.length} words have runner-ups.');
         for (final w in withAlts.take(5)) {
           final altSummary = w.alts

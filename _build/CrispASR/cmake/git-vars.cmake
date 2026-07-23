@@ -123,3 +123,15 @@ string(REPLACE "#"  "no."  GIT_COMMIT_SUBJECT "${GIT_COMMIT_SUBJECT}")
 # `test[regression]-_add_TTS-]ASR` — a small readability tax for a
 # CI-wide build break.
 string(REPLACE " "  "_"  GIT_COMMIT_SUBJECT "${GIT_COMMIT_SUBJECT}")
+# Final catch-all. The specific readable substitutions above cover the common
+# punctuation; this backstop maps every remaining character outside
+# [A-Za-z0-9._-] to "." so no future commit subject can break a build. It was
+# added after a `/` slipped through: a subject like
+#   "perf(#254): ... (Kaggle A/B: 67 vs 77 ms/step, -13%)"
+# embeds `A/B` and `ms/step` into -DCRISPASR_GIT_SUBJECT=, and MSVC cl.exe reads
+# the `/B` / `/step` as compiler switches →
+#   "cl : Command line error D8038: invalid argument 'CRISPASR_GIT_SUBJECT=...'"
+# (`%` is a cmd/link metacharacter with the same hazard). This ends the
+# per-character whack-a-mole documented above; the specific maps stay only for
+# nicer `--version` output.
+string(REGEX REPLACE "[^A-Za-z0-9._-]" "." GIT_COMMIT_SUBJECT "${GIT_COMMIT_SUBJECT}")

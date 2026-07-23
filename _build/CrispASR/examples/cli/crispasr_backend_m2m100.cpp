@@ -42,6 +42,7 @@ public:
     bool init(const whisper_params& p) override {
         m2m100_context_params cp = m2m100_context_default_params();
         cp.n_threads = p.n_threads;
+        cp.use_gpu = p.use_gpu;
         cp.verbosity = p.no_prints ? 0 : 1;
         ctx_ = m2m100_init_from_file(p.model.c_str(), cp);
         if (!ctx_) {

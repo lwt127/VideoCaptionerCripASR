@@ -5,6 +5,14 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
+#ifdef _WIN32
+#include <io.h>
+#define isatty _isatty
+#define fileno _fileno
+#else
+#include <unistd.h>
+#endif
 #include <cstdio>
 #include <vector>
 
@@ -42,10 +50,60 @@ struct ExtraList {
 constexpr Entry k_registry[] = {
     {"whisper", "ggml-base.bin",
      "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin", "~147 MB", nullptr, nullptr},
+    // AudioSeal (Meta FAIR) — optional NEURAL watermark model (MIT code + weights).
+    // Not a transcription/TTS backend: resolved by the name "audioseal" when the
+    // user passes `--watermark-model auto`. CrispASR's built-in zero-dependency
+    // spread-spectrum watermark stays the always-on default; this is the opt-in
+    // SOTA upgrade (imperceptible + robust neural watermark). #260.
+    {"audioseal", "audioseal.gguf",
+     "https://huggingface.co/cstr/audioseal-GGUF/resolve/main/audioseal.gguf", "~89 MB", nullptr, nullptr},
+    // §248 source separation (--separate). Mel-Band RoFormer vocal/instrumental
+    // split; MIT weights (KimberleyJSN) + MIT code (lucidrains). Resolved when
+    // `--separate` runs with the default separation backend key.
+    {"mel-band-roformer", "mel-band-roformer-vocals-f16.gguf",
+     "https://huggingface.co/cstr/mel-band-roformer-vocals-GGUF/resolve/main/mel-band-roformer-vocals-f16.gguf",
+     "~436 MB", nullptr, nullptr},
+    // Sidon v0.1 (SaruLab) speech restoration (--s2s). w2v-BERT predictor +
+    // continuous DAC decoder; MIT. Q8_0 is the best-fidelity practical quant
+    // (predictor cos 0.998 vs the upstream F32; ASR round-trip identical). #283.
+    {"sidon", "sidon-v0.1-q8_0.gguf",
+     "https://huggingface.co/cstr/Sidon-GGUF/resolve/main/sidon-v0.1-q8_0.gguf", "~335 MB", nullptr, nullptr},
+    {"nemotron", "nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
+     "https://huggingface.co/cstr/nemotron-3.5-asr-streaming-0.6b-GGUF/resolve/main/nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
+     "~458 MB", nullptr, nullptr},
     {"parakeet", "parakeet-tdt-0.6b-v3-q4_k.gguf",
      "https://huggingface.co/cstr/parakeet-tdt-0.6b-v3-GGUF/resolve/main/parakeet-tdt-0.6b-v3-q4_k.gguf", "~467 MB", nullptr, nullptr},
     {"canary", "canary-1b-v2-q4_k.gguf",
      "https://huggingface.co/cstr/canary-1b-v2-GGUF/resolve/main/canary-1b-v2-q4_k.gguf", "~600 MB", nullptr, nullptr},
+    {"canary-qwen", "canary-qwen-2.5b-q8_0.gguf",
+     "https://huggingface.co/cstr/canary-qwen-2.5b-GGUF/resolve/main/canary-qwen-2.5b-q8_0.gguf", "~4.1 GB", nullptr, nullptr},
+    // AutoArk-AI/ARK-ASR-3B: Whisper-RoPE encoder + Qwen2.5-3B decoder (19-lang).
+    // NOTE: GGUF repo to be published (PLAN §ARK) — placeholder URL.
+    {"ark-asr", "ark-asr-3b-q4_k.gguf",
+     "https://huggingface.co/cstr/ark-asr-3b-GGUF/resolve/main/ark-asr-3b-q4_k.gguf", "~2.2 GB", nullptr, nullptr},
+    // LiquidAI LFM2.5-Audio-1.5B: FastConformer + LFM2 hybrid
+    // conv+attention backbone. ASR (+ TTS/speech-to-speech planned).
+    // English base model — Q5_K recommended (Q4_K too aggressive for EN).
+    {"lfm2-audio", "lfm2-audio-1.5b-q5_k.gguf",
+     "https://huggingface.co/cstr/lfm2-audio-1.5b-GGUF/resolve/main/lfm2-audio-1.5b-q5_k.gguf",
+     "~1.6 GB", nullptr, nullptr, nullptr,
+     "LFM Open License v1.0 (commercial use OK under $10M revenue; see "
+     "https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B)"},
+    // Japanese variant — Q5_K minimum (Q4_K produces 0 tokens on hybrid backbone).
+    {"lfm2-audio", "lfm2-audio-1.5b-jp-q5_k.gguf",
+     "https://huggingface.co/cstr/lfm2-audio-1.5b-jp-GGUF/resolve/main/lfm2-audio-1.5b-jp-q5_k.gguf",
+     "~1.5 GB", nullptr, nullptr, nullptr,
+     "LFM Open License v1.0 (commercial use OK under $10M revenue; see "
+     "https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-JP)"},
+    // gpt-omni/mini-omni2: Whisper-small + Qwen2-0.5B multimodal (ASR+TTS+S2S).
+    // Q4_K is safe — identical ASR transcript to F16 on JFK 11s.
+    // SNAC 24kHz codec companion for TTS/S2S output.
+    {"mini-omni2", "mini-omni2-q4_k.gguf",
+     "https://huggingface.co/cstr/mini-omni2-GGUF/resolve/main/mini-omni2-q4_k.gguf",
+     "~1.0 GB",
+     "snac-24khz.gguf",
+     "https://huggingface.co/cstr/snac-24khz-GGUF/resolve/main/snac-24khz.gguf",
+     "~80 MB"},
     {"voxtral", "voxtral-mini-3b-2507-q4_k.gguf",
      "https://huggingface.co/cstr/voxtral-mini-3b-2507-GGUF/resolve/main/voxtral-mini-3b-2507-q4_k.gguf", "~2.5 GB", nullptr, nullptr},
     {"voxtral4b", "voxtral-mini-4b-realtime-q4_k.gguf",
@@ -66,6 +124,15 @@ constexpr Entry k_registry[] = {
     {"qwen3-1.7b", "qwen3-asr-1.7b-q4_k.gguf",
      "https://huggingface.co/cstr/qwen3-asr-1.7b-GGUF/resolve/main/qwen3-asr-1.7b-q4_k.gguf",
      "~1.3 GB", nullptr, nullptr},
+    // Qwen3-ASR-1.7B fine-tuned for Japanese anime/galgame speech (Apache-2.0).
+    // Same architecture as qwen3-1.7b; uses the standard qwen3 backend.
+    {"qwen3-ja-anime", "qwen3-asr-1.7b-ja-anime-q4_k.gguf",
+     "https://huggingface.co/cstr/qwen3-asr-1.7b-ja-anime-GGUF/resolve/main/qwen3-asr-1.7b-ja-anime-q4_k.gguf",
+     "~1.3 GB", nullptr, nullptr},
+    // higgs-audio-v3-stt: Whisper-large-v3 encoder + Qwen3-1.7B decoder (Apache-2.0).
+    {"higgs-stt", "higgs-stt-q4_k.gguf",
+     "https://huggingface.co/cstr/higgs-audio-v3-stt-GGUF/resolve/main/higgs-stt-q4_k.gguf",
+     "~2.3 GB", nullptr, nullptr},
     // Mega-ASR: Qwen3-ASR-1.7B with the upstream robustness LoRA merged
     // offline. It uses the standard qwen3 backend at runtime; the upstream
     // router is not required for this always-on robust path.
@@ -160,6 +227,24 @@ constexpr Entry k_registry[] = {
     {"cohere", "cohere-asr-ja-v0.1-q8_0.gguf",
      "https://huggingface.co/TransWithAI/cohere-transcribe-ja-v0.1-GGUF/resolve/main/cohere-asr-ja-v0.1-q8_0.gguf",
      "~2.4 GB", nullptr, nullptr},
+    // cohere-transcribe-arabic — Arabic model (CohereLabs/cohere-transcribe-arabic-07-2026,
+    // Apache-2.0; #231). q4_k-imatrix is the recommended Arabic variant (Arabic
+    // CC0 Common Voice calibration; matches F16 transcript where plain q4_k drifts).
+    {"cohere", "cohere-transcribe-arabic-q4_k-imatrix.gguf",
+     "https://huggingface.co/cstr/cohere-transcribe-arabic-07-2026-GGUF/resolve/main/cohere-transcribe-arabic-q4_k-imatrix.gguf",
+     "~1.5 GB", nullptr, nullptr},
+    // `--backend cohere-ar` (or `-m auto --backend cohere-ar`) short alias →
+    // recommended Arabic imatrix GGUF. Routes to the cohere runtime via the
+    // factory alias in crispasr_backend.cpp. Still pass `-l ar`.
+    {"cohere-ar", "cohere-transcribe-arabic-q4_k-imatrix.gguf",
+     "https://huggingface.co/cstr/cohere-transcribe-arabic-07-2026-GGUF/resolve/main/cohere-transcribe-arabic-q4_k-imatrix.gguf",
+     "~1.5 GB", nullptr, nullptr},
+    {"cohere", "cohere-transcribe-arabic-q4_k.gguf",
+     "https://huggingface.co/cstr/cohere-transcribe-arabic-07-2026-GGUF/resolve/main/cohere-transcribe-arabic-q4_k.gguf",
+     "~1.5 GB", nullptr, nullptr},
+    {"cohere", "cohere-transcribe-arabic-q8_0.gguf",
+     "https://huggingface.co/cstr/cohere-transcribe-arabic-07-2026-GGUF/resolve/main/cohere-transcribe-arabic-q8_0.gguf",
+     "~2.4 GB", nullptr, nullptr},
     {"wav2vec2", "wav2vec2-xlsr-en-q4_k.gguf",
      "https://huggingface.co/cstr/wav2vec2-large-xlsr-53-english-GGUF/resolve/main/wav2vec2-xlsr-en-q4_k.gguf",
      "~212 MB", nullptr, nullptr},
@@ -210,6 +295,12 @@ constexpr Entry k_registry[] = {
     {"moss-audio", "moss-audio-4b-instruct-q4_k.gguf",
      "https://huggingface.co/cstr/MOSS-Audio-4B-Instruct-GGUF/resolve/main/moss-audio-4b-instruct-q4_k.gguf", "~3.8 GB",
      nullptr, nullptr},
+    {"moss-transcribe", "moss-transcribe-preview-2b-q4_k.gguf",
+     "https://huggingface.co/cstr/MOSS-Transcribe-preview-2B-GGUF/resolve/main/moss-transcribe-preview-2b-q4_k.gguf",
+     "~1.6 GB", nullptr, nullptr},
+    {"moss-diarize", "moss-transcribe-diarize-0.9b-q4_k.gguf",
+     "https://huggingface.co/cstr/MOSS-Transcribe-Diarize-GGUF/resolve/main/moss-transcribe-diarize-0.9b-q4_k.gguf",
+     "~1.2 GB", nullptr, nullptr},
     {"omniasr", "omniasr-ctc-1b-v2-q4_k.gguf",
      "https://huggingface.co/cstr/omniASR-CTC-1B-v2-GGUF/resolve/main/omniasr-ctc-1b-v2-q4_k.gguf", "~658 MB", nullptr, nullptr},
     {"omniasr-300m", "omniasr-ctc-300m-v2-q4_k.gguf",
@@ -240,6 +331,111 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/firered-asr2-aed-GGUF/resolve/main/firered-asr2-aed-q4_k.gguf", "~918 MB", nullptr, nullptr},
     {"kyutai-stt", "kyutai-stt-1b-q4_k.gguf",
      "https://huggingface.co/cstr/kyutai-stt-1b-GGUF/resolve/main/kyutai-stt-1b-q4_k.gguf", "~636 MB", nullptr, nullptr},
+    {"kyutai-stt-2.6b", "kyutai-stt-2.6b-q4_k.gguf",
+     "https://huggingface.co/cstr/kyutai-stt-2.6b-en-GGUF/resolve/main/kyutai-stt-2.6b-q4_k.gguf", "~1.5 GB",
+     nullptr, nullptr},
+    {"voxtral-tts", "voxtral-4b-tts-q4_k.gguf",
+     "https://huggingface.co/cstr/voxtral-4b-tts-GGUF/resolve/main/voxtral-4b-tts-q4_k.gguf", "~2.5 GB", nullptr,
+     nullptr, nullptr,
+     "CC-BY-NC-4.0 — NON-COMMERCIAL use only (base model mistralai/Voxtral-4B-TTS-2603; see "
+     "https://huggingface.co/mistralai/Voxtral-4B-TTS-2603)"},
+    {"htdemucs", "htdemucs-q4_k.gguf",
+     "https://huggingface.co/cstr/htdemucs-GGUF/resolve/main/htdemucs-q4_k.gguf", "~38 MB", nullptr, nullptr},
+    // BTC chord recognition (--chords). Upstream CODE is MIT, but the SHIPPED
+    // WEIGHTS are CC-BY-NC-SA: they were trained on Isophonics / Robbie
+    // Williams / UsPop2002 chord annotations, which are non-commercial. The
+    // licence field below is what arms the acceptance gate — without it these
+    // would download silently to commercial users.
+    //
+    // DEFAULT IS THE 170-CLASS MODEL: it collapses to the 25-class maj/min
+    // vocabulary on demand (CRISPASR_BTC_MAJ_MIN=1), whereas a 25-class model
+    // can never be expanded. One model, two output modes.
+    {"btc-chords", "btc-chords-large-f16.gguf",
+     "https://huggingface.co/cstr/btc-chords-GGUF/resolve/main/btc-chords-large-f16.gguf", "~6 MB", nullptr, nullptr,
+     nullptr, "cc-by-nc-sa-4.0"},
+    {"btc-chords-large", "btc-chords-large-f16.gguf",
+     "https://huggingface.co/cstr/btc-chords-GGUF/resolve/main/btc-chords-large-f16.gguf", "~6 MB", nullptr, nullptr,
+     nullptr, "cc-by-nc-sa-4.0"},
+    {"btc-chords-majmin", "btc-chords-f16.gguf",
+     "https://huggingface.co/cstr/btc-chords-GGUF/resolve/main/btc-chords-f16.gguf", "~6 MB", nullptr, nullptr, nullptr,
+     "cc-by-nc-sa-4.0"},
+    // q8_0 — 4.5 MB, and indistinguishable from f16: 13/13 diff stages, and on
+    // 257 s of real music vs the torch reference root 99.17 % / tetrads
+    // 98.52 % (f16 is 99.17 / 98.56). NO q4_k is published: it costs 3.1 points
+    // of tetrad accuracy (95.46 %) to save 0.6 MB. Quantize from the f16 — only
+    // 73/213 tensors are quantizable, so a q8_0 built from f32 lands at 7.5 MB,
+    // LARGER than the f16 it was meant to shrink.
+    {"btc-chords-q8_0", "btc-chords-large-q8_0.gguf",
+     "https://huggingface.co/cstr/btc-chords-GGUF/resolve/main/btc-chords-large-q8_0.gguf", "~4.5 MB", nullptr, nullptr,
+     nullptr, "cc-by-nc-sa-4.0"},
+    {"btc-chords-majmin-q8_0", "btc-chords-q8_0.gguf",
+     "https://huggingface.co/cstr/btc-chords-GGUF/resolve/main/btc-chords-q8_0.gguf", "~4.4 MB", nullptr, nullptr,
+     nullptr, "cc-by-nc-sa-4.0"},
+    // Beat This! beat/downbeat tracking (--beats). MIT for code AND weights,
+    // so no licence gate — deliberately unlike btc-chords above. The reason it
+    // can be MIT at all is that it needs no DBN: madmom's is Boeck-patented and
+    // non-commercial, and this model reaches SOTA without one.
+    //
+    // DEFAULT IS F16: cos >= 0.9999997 per stage against the torch reference,
+    // with the residual flat across all 12 sub-blocks (weight quantisation, not
+    // drift). f32 is exact (cos = 1.00000000, rel err ~1e-6) and is kept for
+    // parity debugging, not for production — it is 2x the size for no
+    // measurable difference in detected beats.
+    // TabCNN guitar tablature (--tab). Weights are CC BY 4.0 from the EGSet12
+    // record (https://zenodo.org/records/11406378) — attribution required, commercial
+    // use permitted. This is the GuitarProFX-augmented variant: the vanilla
+    // GuitarSet-trained model collapses from tablature F1 0.748 to 0.447 on
+    // real electric guitar, the augmented one recovers to 0.585 (DAFx-24).
+    {"tabcnn", "tabcnn-f16.gguf", "https://huggingface.co/cstr/tabcnn-GGUF/resolve/main/tabcnn-f16.gguf", "~1.8 MB",
+     nullptr, nullptr, nullptr, "cc-by-4.0"},
+    // Quants get their OWN entries or `-m auto` can never reach them — the exact
+    // gap that left crepe's q8_0/q4_k unreachable on HF for weeks. Both preserve
+    // head.weight at f32; measured on EGSet12 track 01 they are indistinguishable
+    // from f16 (F1 0.7749 vs 0.7732, within noise), so q4_k is the size pick.
+    // NOTE the "q4_k" file is really Q4_0 — no tensor is 256-aligned, so k-quants
+    // fall back. The name follows the request, not the content.
+    {"tabcnn-q8_0", "tabcnn-q8_0.gguf", "https://huggingface.co/cstr/tabcnn-GGUF/resolve/main/tabcnn-q8_0.gguf",
+     "~1.1 MB", nullptr, nullptr, nullptr, "cc-by-4.0"},
+    {"tabcnn-q4_k", "tabcnn-q4_k.gguf", "https://huggingface.co/cstr/tabcnn-GGUF/resolve/main/tabcnn-q4_k.gguf",
+     "~0.7 MB", nullptr, nullptr, nullptr, "cc-by-4.0"},
+    {"beat-this", "beat-this-f16.gguf",
+     "https://huggingface.co/cstr/beat-this-GGUF/resolve/main/beat-this-f16.gguf", "~41 MB", nullptr, nullptr, nullptr,
+     "MIT"},
+    {"beat-this-f32", "beat-this-f32.gguf",
+     "https://huggingface.co/cstr/beat-this-GGUF/resolve/main/beat-this-f32.gguf", "~81 MB", nullptr, nullptr, nullptr,
+     "MIT"},
+    // CREPE monophonic F0 (--pitch). MIT weights + MIT code (torchcrepe).
+    // DEFAULT IS TINY: measured RTF 0.28 on Metal vs 2.0 for full, and full is
+    // 38x the MACs per frame. `full` stays available for offline accuracy.
+    {"crepe", "crepe-tiny-f16.gguf",
+     "https://huggingface.co/cstr/crepe-GGUF/resolve/main/crepe-tiny-f16.gguf", "~1.0 MB", nullptr, nullptr, nullptr,
+     "MIT"},
+    {"crepe-tiny", "crepe-tiny-f16.gguf",
+     "https://huggingface.co/cstr/crepe-GGUF/resolve/main/crepe-tiny-f16.gguf", "~1.0 MB", nullptr, nullptr, nullptr,
+     "MIT"},
+    {"crepe-full", "crepe-full-f16.gguf",
+     "https://huggingface.co/cstr/crepe-GGUF/resolve/main/crepe-full-f16.gguf", "~44.5 MB", nullptr, nullptr, nullptr,
+     "MIT"},
+    // Quantized CREPE. These were uploaded to cstr/crepe-GGUF but had NO
+    // registry entry, so `-m auto` could never select them. Measured against
+    // the f16 of the same capacity on a 3 s tone (test-crepe-parity):
+    //   tiny q8_0  cos 0.999993   f0 872.54 vs 872.44 Hz
+    //   tiny q4_k  cos 0.998757   f0 871.84 vs 872.44 Hz
+    //   full q8_0  cos 0.999999   f0 880.69 vs 880.69 Hz (identical)
+    //   full q4_k  cos 0.999933   f0 880.87 vs 880.69 Hz
+    // All four are usable; q4_k tiny at 0.26 MB is the mobile pick.
+    {"crepe-tiny-q8_0", "crepe-tiny-q8_0.gguf",
+     "https://huggingface.co/cstr/crepe-GGUF/resolve/main/crepe-tiny-q8_0.gguf", "~0.5 MB", nullptr, nullptr, nullptr,
+     "MIT"},
+    {"crepe-tiny-q4_k", "crepe-tiny-q4_k.gguf",
+     "https://huggingface.co/cstr/crepe-GGUF/resolve/main/crepe-tiny-q4_k.gguf", "~0.3 MB", nullptr, nullptr, nullptr,
+     "MIT"},
+    {"crepe-full-q8_0", "crepe-full-q8_0.gguf",
+     "https://huggingface.co/cstr/crepe-GGUF/resolve/main/crepe-full-q8_0.gguf", "~22.6 MB", nullptr, nullptr, nullptr,
+     "MIT"},
+    {"crepe-full-q4_k", "crepe-full-q4_k.gguf",
+     "https://huggingface.co/cstr/crepe-GGUF/resolve/main/crepe-full-q4_k.gguf", "~12.0 MB", nullptr, nullptr, nullptr,
+     "MIT"},
     {"glm-asr", "glm-asr-nano-q4_k.gguf",
      "https://huggingface.co/cstr/glm-asr-nano-GGUF/resolve/main/glm-asr-nano-q4_k.gguf", "~1.2 GB", nullptr, nullptr},
     {"moonshine", "moonshine-tiny-q4_k.gguf",
@@ -271,6 +467,124 @@ constexpr Entry k_registry[] = {
     {"fastconformer-ctc", "stt-en-fastconformer-ctc-large-q4_k.gguf",
      "https://huggingface.co/cstr/stt-en-fastconformer-ctc-large-GGUF/resolve/main/stt-en-fastconformer-ctc-large-q4_k.gguf",
      "~83 MB", nullptr, nullptr},
+    // FastConformer-CTC models double as compact CTC forced aligners
+    // (-am <name>): the GGUF arch tag is canary-ctc, so crispasr_aligner's
+    // default dispatch loads them directly. The *-aligner-* aliases below
+    // mirror the wav2vec2-aligner-<lang> naming for discoverability.
+    {"fastconformer-aligner", "stt-en-fastconformer-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-en-fastconformer-ctc-large-GGUF/resolve/main/stt-en-fastconformer-ctc-large-q4_k.gguf",
+     "~83 MB", nullptr, nullptr},
+    {"fastconformer-aligner-en", "stt-en-fastconformer-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-en-fastconformer-ctc-large-GGUF/resolve/main/stt-en-fastconformer-ctc-large-q4_k.gguf",
+     "~83 MB", nullptr, nullptr},
+    // CTC branches of the nvidia/stt_*_fastconformer_hybrid_large[_pc] fleet
+    // (all CC-BY-4.0; pt is excluded upstream-NC): per-language ASR + forced
+    // alignment, ~82 MB q4_k each. _pc variants add punctuation/capitalisation
+    // (fa and kk-ru are non-pc). en-pc complements the uncased en standalone.
+    {"fastconformer-ctc-en-pc", "stt-en-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-en-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-en-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-en-pc", "stt-en-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-en-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-en-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-es", "stt-es-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-es-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-es-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-es", "stt-es-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-es-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-es-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-fr", "stt-fr-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-fr-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-fr-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-fr", "stt-fr-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-fr-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-fr-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-it", "stt-it-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-it-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-it-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-it", "stt-it-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-it-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-it-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-nl", "stt-nl-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-nl-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-nl-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-nl", "stt-nl-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-nl-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-nl-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-pl", "stt-pl-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-pl-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-pl-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-pl", "stt-pl-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-pl-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-pl-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-ru", "stt-ru-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-ru-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-ru-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-ru", "stt-ru-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-ru-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-ru-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-ua", "stt-ua-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-ua-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-ua-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-ua", "stt-ua-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-ua-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-ua-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-hr", "stt-hr-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-hr-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-hr-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-hr", "stt-hr-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-hr-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-hr-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-be", "stt-be-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-be-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-be-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-be", "stt-be-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-be-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-be-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-ar", "stt-ar-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-ar-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-ar-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-ar", "stt-ar-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-ar-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-ar-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-fa", "stt-fa-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-fa-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-fa-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-fa", "stt-fa-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-fa-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-fa-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-ka", "stt-ka-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-ka-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-ka-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-ka", "stt-ka-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-ka-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-ka-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-hy", "stt-hy-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-hy-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-hy-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-hy", "stt-hy-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-hy-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-hy-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-uz", "stt-uz-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-uz-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-uz-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-uz", "stt-uz-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-uz-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-uz-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-ctc-kk-ru", "stt-kk-ru-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-kk-ru-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-kk-ru-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    {"fastconformer-aligner-kk-ru", "stt-kk-ru-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-kk-ru-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-kk-ru-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~82 MB", nullptr, nullptr},
+    // CTC branch of nvidia/stt_de_fastconformer_hybrid_large_pc (CC-BY-4.0):
+    // German ASR + forced alignment with punctuation/capitalisation.
+    {"fastconformer-ctc-de", "stt-de-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-de-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-de-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~78 MB", nullptr, nullptr},
+    {"fastconformer-aligner-de", "stt-de-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "https://huggingface.co/cstr/stt-de-fastconformer-hybrid-ctc-large-GGUF/resolve/main/stt-de-fastconformer-hybrid-ctc-large-q4_k.gguf",
+     "~78 MB", nullptr, nullptr},
     // nvidia/parakeet-ctc-{0.6b,1.1b} — same FastConformer-CTC architecture
     // as the stt_en_fastconformer_ctc_* family (24 / 42 layers respectively),
     // English-only, lowercase + light-punct output. Filename heuristic
@@ -284,18 +598,24 @@ constexpr Entry k_registry[] = {
     {"gemma4-e2b", "gemma4-e2b-it-q4_k.gguf",
      "https://huggingface.co/cstr/gemma4-e2b-it-GGUF/resolve/main/gemma4-e2b-it-q4_k.gguf",
      "~2.5 GB", nullptr, nullptr},
+    // gemma4-e4b: same `gemma4` architecture as E2B (byte-identical 1024d USM
+    // audio tower) with a larger decoder (42L×2560) — runs on the same backend.
+    {"gemma4-e4b", "gemma4-e4b-it-q4_k.gguf",
+     "https://huggingface.co/cstr/gemma4-e4b-it-GGUF/resolve/main/gemma4-e4b-it-q4_k.gguf",
+     "~4.1 GB", nullptr, nullptr},
     {"titanet", "titanet-large.gguf",
      "https://huggingface.co/cstr/titanet-large-GGUF/resolve/main/titanet-large.gguf",
      "~45 MB", nullptr, nullptr},
-    // parakeet-ja: F16 is the auto-download default — Q4_K of this
+    // parakeet-ja: Q8_0 is the auto-download default — its TDT output is
+    // byte-identical to F16 in our tests at half the size. Q4_K of this
     // model is quantisation-sensitive (joint.pred / decoder.embed
-    // dimensions fall back to q4_0 inside q4_k mode) and the talker
-    // enters a fixed-point loop after ~8 tokens. The Q4_K file is
-    // available at the same repo for users who pin disk space, but
-    // we'd rather have correct output by default.
-    {"parakeet-ja", "parakeet-tdt-0.6b-ja.gguf",
-     "https://huggingface.co/cstr/parakeet-tdt-0.6b-ja-GGUF/resolve/main/parakeet-tdt-0.6b-ja.gguf",
-     "~1.24 GB", nullptr, nullptr},
+    // dimensions fall back to q4_0 inside q4_k mode) and the TDT decode
+    // enters a fixed-point repetition loop; CTC decode over the same q4_k
+    // file is clean (--parakeet-decoder ctc). All files at the repo carry
+    // the hybrid model's CTC head since 2026-07 (#89 / #221d).
+    {"parakeet-ja", "parakeet-tdt-0.6b-ja-q8_0.gguf",
+     "https://huggingface.co/cstr/parakeet-tdt-0.6b-ja-GGUF/resolve/main/parakeet-tdt-0.6b-ja-q8_0.gguf",
+     "~710 MB", nullptr, nullptr},
     // parakeet-v2 — English-only TDT (1024-vocab BPE, pred_layers=2).
     // The original Open ASR Leaderboard topper before v3 spread capacity
     // to 25 languages; often stronger on plain English. Same FastConformer
@@ -333,6 +653,20 @@ constexpr Entry k_registry[] = {
     {"parakeet-rnnt-1.1b", "parakeet-rnnt-1.1b-q4_k.gguf",
      "https://huggingface.co/cstr/parakeet-rnnt-1.1b-GGUF/resolve/main/parakeet-rnnt-1.1b-q4_k.gguf",
      "~770 MB", nullptr, nullptr},
+    // parakeet-ctc-1.1b-ja — Japanese FastConformer-CTC (42L, 1.1B params).
+    // Fine-tuned from nvidia/parakeet-ctc-1.1b on Japanese data. Uses the
+    // GAL checkpoint (parakeet-ja-gal.nemo) — the non-GAL checkpoint has
+    // corrupt F32 weights in layers 26-28 (NaN + values >1e38).
+    {"parakeet-ctc-1.1b-ja", "parakeet-ctc-1.1b-ja-q8_0.gguf",
+     "https://huggingface.co/cstr/parakeet-ctc-1.1b-ja-GGUF/resolve/main/parakeet-ctc-1.1b-ja-q8_0.gguf",
+     "~1.2 GB", nullptr, nullptr},
+    // reazonspeech-nemo-v2 — Japanese FastConformer-RNNT (619M params).
+    // 80-mel input, rel_pos_local_attn (window=128+128, 1 global token),
+    // 3000-token SentencePiece vocab. Pure RNNT (n_tdt_durations=0).
+    // Trained on the ReazonSpeech v2.0 corpus (multi-hour capability).
+    {"reazonspeech", "reazonspeech-nemo-v2-q8_0.gguf",
+     "https://huggingface.co/cstr/reazonspeech-nemo-v2-GGUF/resolve/main/reazonspeech-nemo-v2-q8_0.gguf",
+     "~704 MB", nullptr, nullptr},
     // Qwen3-TTS: the talker LM and the codec live in two separate HF
     // repos. Default download is Q8_0 talker (the LEARNINGS-recommended
     // deployment quant — Q4_K drifts noticeably in strict diffs) paired
@@ -345,6 +679,40 @@ constexpr Entry k_registry[] = {
      "qwen3-tts-tokenizer-12hz.gguf",
      "https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF/resolve/main/qwen3-tts-tokenizer-12hz.gguf",
      "~60 MB"},
+    // MOSS-TTS-v1.5 (MossTTSDelay): Qwen3-8B backbone + 32 RVQ audio codebooks
+    // + a 1.6B transformer codec companion (kept F16 — quantising the codec
+    // degrades audio earlier than the backbone). Default download is the Q4_K
+    // backbone (~5 GB) paired with the F16 codec. (URLs populated at ship after
+    // the GGUF upload — see Phase 6.)
+    // MioCodec v2 — standalone audio codec (44.1kHz, 25Hz tokens, MIT).
+    {"miocodec", "miocodec-v2-44k-q8_0.gguf",
+     "https://huggingface.co/cstr/miocodec-v2-44k-GGUF/resolve/main/miocodec-v2-44k-q8_0.gguf",
+     "~155 MB"},
+    // MioTTS-0.6B (Qwen3 LLM + MioCodec-25Hz-24kHz, Apache-2.0).
+    // Single GGUF, tokenizer.json loaded at runtime.
+    {"miotts", "miotts-0.6b-q8_0.gguf",
+     "https://huggingface.co/cstr/miotts-0.6b-GGUF/resolve/main/miotts-0.6b-q8_0.gguf",
+     "~723 MB"},
+    {"piano-transcription", "piano-transcription-f16.gguf",
+     "https://huggingface.co/cstr/piano-transcription-GGUF/resolve/main/piano-transcription-f16.gguf",
+     "~77 MB"},
+    {"moss-tts", "moss-tts-v1.5-q4_k.gguf",
+     "https://huggingface.co/cstr/moss-tts-v1.5-GGUF/resolve/main/moss-tts-v1.5-q4_k.gguf",
+     "~5 GB",
+     "moss-tts-v1.5-codec.gguf",
+     "https://huggingface.co/cstr/moss-tts-v1.5-GGUF/resolve/main/moss-tts-v1.5-codec.gguf",
+     "~3.4 GB"},
+    // MOSS-TTS-Local-Transformer-v1.5 (4B, arch "moss-tts-local"): Qwen3-4B
+    // backbone + MOSS-Audio-Tokenizer-v2 codec (48 kHz stereo, decode-only
+    // companion). Apache-2.0. Default = F16 backbone: the acceptance target
+    // (P5 round-trip overlap 0.969). Q4_K exists but its long trajectory runs away
+    // (intrinsic quantized-AR drift) — F16 is the reliable config, fits a 16 GB GPU.
+    {"moss-tts-local", "moss-tts-local-v1.5-f16.gguf",
+     "https://huggingface.co/cstr/moss-tts-local-v1.5-GGUF/resolve/main/moss-tts-local-v1.5-f16.gguf",
+     "~9.1 GB",
+     "moss-tts-local-v1.5-codec.gguf",
+     "https://huggingface.co/cstr/moss-tts-local-v1.5-GGUF/resolve/main/moss-tts-local-v1.5-codec.gguf",
+     "~2.1 GB"},
     // gwen-tts-0.6B: Vietnamese-optimized Qwen3-TTS-0.6B-Base finetune
     // (MIT, g-group-ai-lab). Same architecture as qwen3-tts-0.6B-Base,
     // trained on ~1000h Vietnamese TikTok audio. Supports all 10 Qwen3-TTS
@@ -405,6 +773,20 @@ constexpr Entry k_registry[] = {
      "qwen3-tts-tokenizer-12hz.gguf",
      "https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF/resolve/main/qwen3-tts-tokenizer-12hz.gguf",
      "~60 MB"},
+    // OmniVoice: k2-fsa/OmniVoice — Qwen3-0.6B backbone with masked
+    // iterative multi-codebook TTS (8 codebooks × 1025 vocab, 600+
+    // languages). Uses HiggsAudioV2 audio tokenizer for encode/decode.
+    // cstr/omnivoice-GGUF also hosts base quants omnivoice-{q8_0,q4_k}.gguf and a
+    // smaller TTS-ONLY omnivoice-tokenizer-q8_0.gguf (320 MB) — the Q8 tokenizer
+    // decodes fine but voice-clone ENCODE needs F16 (RVQ nearest-neighbor is
+    // quant-sensitive), so the default tokenizer stays f16.
+    {"omnivoice", "omnivoice-f16.gguf",
+     "https://huggingface.co/cstr/omnivoice-GGUF/resolve/main/omnivoice-f16.gguf",
+     "~1.2 GB",
+     "omnivoice-tokenizer-f16.gguf",
+     "https://huggingface.co/cstr/omnivoice-GGUF/resolve/main/omnivoice-tokenizer-f16.gguf",
+     "~400 MB"},
+    //
     // Orpheus-3B (canopylabs/orpheus-3b-0.1-ft is gated; we convert
     // from the non-gated mirror unsloth/orpheus-3b-0.1-ft, llama3.2 —
     // "Built with Llama"). Talker = Llama-3.2-3B-Instruct + 7×4096
@@ -415,19 +797,40 @@ constexpr Entry k_registry[] = {
     // ship-default (greedy loops in a 7-slot pattern). The companion
     // URL points at the cstr/snac-24khz-GGUF mirror that gets published
     // alongside the talker GGUF.
-    {"orpheus", "orpheus-3b-base-q8_0.gguf",
-     "https://huggingface.co/cstr/orpheus-3b-base-GGUF/resolve/main/orpheus-3b-base-q8_0.gguf",
-     "~3.5 GB",
+    {"orpheus", "orpheus-3b-0.1-ft-q8_0.gguf",
+     "https://huggingface.co/cstr/orpheus-3b-0.1-ft-GGUF/resolve/main/orpheus-3b-0.1-ft-q8_0.gguf",
+     "~3.7 GB",
      "snac-24khz.gguf",
      "https://huggingface.co/cstr/snac-24khz-GGUF/resolve/main/snac-24khz.gguf",
      "~80 MB"},
+    // TADA TTS 1B: Llama-3.2-1B + flow matching + TADA codec.
+    // Q4_K is the canonical CLI auto-download target; F16 is also listed so
+    // explicit filename resolution can find the matching HF URL.
+    {"tada-1b", "tada-tts-1b-q4_k.gguf",
+     "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-tts-1b-q4_k.gguf",
+     "~1.7 GB",
+     "tada-codec-f16.gguf",
+     "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-codec-f16.gguf",
+     "~250 MB"},
+    {"tada-tts-1b", "tada-tts-1b-q4_k.gguf",
+     "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-tts-1b-q4_k.gguf",
+     "~1.7 GB",
+     "tada-codec-f16.gguf",
+     "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-codec-f16.gguf",
+     "~250 MB"},
+    {"tada-1b", "tada-tts-1b-f16.gguf",
+     "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-tts-1b-f16.gguf",
+     "~3.1 GB",
+     "tada-codec-f16.gguf",
+     "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-codec-f16.gguf",
+     "~250 MB"},
     // TADA-3B-ML (HumeAI/tada-3b-ml): Llama-3.2-3B + flow matching + TADA codec.
     {"tada", "tada-tts-3b-ml-f16.gguf",
      "https://huggingface.co/cstr/tada-tts-3b-ml-GGUF/resolve/main/tada-tts-3b-ml-f16.gguf",
      "~6.6 GB",
      "tada-codec-f16.gguf",
      "https://huggingface.co/cstr/tada-tts-3b-ml-GGUF/resolve/main/tada-codec-f16.gguf",
-     "~1 GB"},
+     "~250 MB"},
     // lex-au's German Orpheus-3B fine-tune. Already published as a Q8_0
     // GGUF on HF (`lex-au/Orpheus-3b-German-FT-Q8_0.gguf`, 3.52 GB) — the
     // repo name itself ends in `.gguf`, lex-au's convention. License
@@ -459,7 +862,10 @@ constexpr Entry k_registry[] = {
      "snac-24khz.gguf",
      "https://huggingface.co/cstr/snac-24khz-GGUF/resolve/main/snac-24khz.gguf",
      "~80 MB"},
-    // Chatterbox family — ResembleAI MIT TTS. Two-GGUF runtime:
+    // Chatterbox family — ResembleAI MIT TTS. Base model is the 23-language
+    // multilingual Chatterbox; language-specific fine-tunes live in
+    // `kartoffelbox-turbo` (German turbo) and `lahgtna-chatterbox` (Arabic).
+    // Two-GGUF runtime:
     //   primary  = T3 (text → speech tokens) — also carries baked conds
     //   companion = S3Gen (tokens → 24 kHz waveform via CFM + HiFTGenerator)
     // CLI adapter (`crispasr_backend_chatterbox.cpp`) is shipped — surfaces
@@ -523,6 +929,16 @@ constexpr Entry k_registry[] = {
      "dac-44khz.gguf",
      "https://huggingface.co/cstr/dia-1.6b-GGUF/resolve/main/dac-44khz.gguf",
      "~80 MB"},
+    // dots.tts: rednote-hilab's 2B continuous AR TTS (48 kHz, Apache-2.0).
+    // Qwen2.5-1.5B LLM + 18L DiT flow-matching + BigVGAN vocoder.
+    // No discrete codec tokens — generates continuous latents patch-by-patch.
+    // BPE text input (no phonemes). Vocoder is a separate GGUF companion.
+    {"dots-tts", "dots-tts-soar-f16.gguf",
+     "https://huggingface.co/cstr/dots-tts-soar-GGUF/resolve/main/dots-tts-soar-f16.gguf",
+     "~4.4 GB",
+     "dots-tts-soar-vocoder-f16.gguf",
+     "https://huggingface.co/cstr/dots-tts-soar-GGUF/resolve/main/dots-tts-soar-vocoder-f16.gguf",
+     "~345 MB"},
     // Pocket TTS: Kyutai's 100M continuous-latent AR TTS (24 kHz, MIT/CC-BY-4.0).
     // Generates continuous 32-dim float vectors at 12.5 Hz via one-step LSD,
     // decoded by Mimi VAE to 24 kHz PCM. Single GGUF, no codec companion.
@@ -558,6 +974,30 @@ constexpr Entry k_registry[] = {
     {"f5-tts", "f5-tts-v1-base-f16.gguf",
      "https://huggingface.co/cstr/f5-tts-GGUF/resolve/main/f5-tts-v1-base-f16.gguf",
      "~953 MB", nullptr, nullptr},
+    // Irodori-TTS v3 500M: RF-DiT flow-matching TTS with zero-shot voice
+    // cloning via DAC-VAE latents. 48 kHz output, Japanese-focused.
+    {"irodori-tts", "irodori-tts-500m-v3-q4_k.gguf",
+     "https://huggingface.co/cstr/irodori-tts-GGUF/resolve/main/irodori-tts-500m-v3-q4_k.gguf",
+     "~852 MB",
+     "dacvae-ja-32dim-f16.gguf",
+     "https://huggingface.co/cstr/irodori-tts-GGUF/resolve/main/dacvae-ja-32dim-f16.gguf",
+     "~135 MB"},
+    // Irodori-TTS v3 600M VoiceDesign: caption encoder for style/emotion
+    // conditioning via text descriptions. Same codec companion.
+    {"irodori-tts-voicedesign", "irodori-tts-600m-v3-voicedesign-q4_k.gguf",
+     "https://huggingface.co/cstr/irodori-tts-voicedesign-GGUF/resolve/main/irodori-tts-600m-v3-voicedesign-q4_k.gguf",
+     "~526 MB",
+     "dacvae-ja-32dim-f16.gguf",
+     "https://huggingface.co/cstr/irodori-tts-voicedesign-GGUF/resolve/main/dacvae-ja-32dim-f16.gguf",
+     "~135 MB"},
+    // BananaMind-TTS: Tacotron-lite + HiFi-GAN vocoder. Lightweight
+    // (~50 MB) single-speaker TTS, EN and DE variants.
+    {"bananamind-tts", "bananamind-tts-en-q8_0.gguf",
+     "https://huggingface.co/cstr/bananamind-tts-GGUF/resolve/main/bananamind-tts-en-q8_0.gguf",
+     "~38 MB", nullptr, nullptr},
+    {"bananamind-tts-de", "bananamind-tts-de-q8_0.gguf",
+     "https://huggingface.co/cstr/bananamind-tts-GGUF/resolve/main/bananamind-tts-de-q8_0.gguf",
+     "~38 MB", nullptr, nullptr},
     // CTC forced aligner — used by `-am auto` to attach word-level
     // timestamps (LLM-decode backends, or any backend when paired
     // with `--force-aligner` / `-fa`). Q4_K is the recommended quant
@@ -566,6 +1006,18 @@ constexpr Entry k_registry[] = {
     {"canary-ctc-aligner", "canary-ctc-aligner-q4_k.gguf",
      "https://huggingface.co/cstr/canary-ctc-aligner-GGUF/resolve/main/canary-ctc-aligner-q4_k.gguf",
      "~442 MB", nullptr, nullptr},
+    // Qwen3-ForcedAligner-0.6B — same architecture as qwen3-asr-0.6B but
+    // with a 5000-class timestamp head instead of a vocabulary head.
+    // Identified at load time by the lm_head output dimension; crispasr_aligner
+    // dispatches to the qwen3 path when the filename contains
+    // "forced-aligner", "qwen3-fa", or "qwen3-forced". Q4_K (~500 MB)
+    // is the recommended quant; Q5_0 / Q8_0 / F16 also available on the repo.
+    {"qwen3-forced-aligner", "qwen3-forced-aligner-0.6b-q4_k.gguf",
+     "https://huggingface.co/cstr/qwen3-forced-aligner-0.6b-GGUF/resolve/main/qwen3-forced-aligner-0.6b-q4_k.gguf",
+     "~500 MB", nullptr, nullptr},
+    {"qwen3-fa", "qwen3-forced-aligner-0.6b-q4_k.gguf",
+     "https://huggingface.co/cstr/qwen3-forced-aligner-0.6b-GGUF/resolve/main/qwen3-forced-aligner-0.6b-q4_k.gguf",
+     "~500 MB", nullptr, nullptr},
     // M2M-100 (facebook/m2m100_418M, MIT) — multilingual text-to-text
     // translation. 100 source/target languages via SentencePiece + lang
     // codes prefix. Encoder-decoder transformer with cross-attention
@@ -577,6 +1029,11 @@ constexpr Entry k_registry[] = {
     {"m2m100", "m2m100-418m-q8_0.gguf",
      "https://huggingface.co/cstr/m2m100-418m-GGUF/resolve/main/m2m100-418m-q8_0.gguf",
      "~502 MB", nullptr, nullptr},
+    // f16 build — exact HF translation parity (q8_0 has rare quant-floor
+    // decode flips on borderline words). Same faithful SP-BPE tokenizer.
+    {"m2m100-f16", "m2m100-418m-f16.gguf",
+     "https://huggingface.co/cstr/m2m100-418m-GGUF/resolve/main/m2m100-418m-f16.gguf",
+     "~980 MB", nullptr, nullptr},
     // WMT21 dense-24-wide-en-x (facebook, MIT) — same m2m100
     // architecture as the 418M base, scaled up to 4.7B params and
     // narrower in coverage (English → 7 target languages, won the
@@ -615,6 +1072,16 @@ constexpr Entry k_registry[] = {
     {"piper", "piper-en_US-lessac-medium-f16.gguf",
      "https://huggingface.co/cstr/piper-en_US-lessac-medium-GGUF/resolve/main/piper-en_US-lessac-medium-f16.gguf",
      "~16 MB", nullptr, nullptr},
+    // German voices from the consolidated piper-voices-GGUF repo
+    {"piper", "piper-de_DE-thorsten-medium-f16.gguf",
+     "https://huggingface.co/cstr/piper-voices-GGUF/resolve/main/piper-de_DE-thorsten-medium-f16.gguf",
+     "~30 MB", nullptr, nullptr},
+    {"piper", "piper-de_DE-thorsten-high-f16.gguf",
+     "https://huggingface.co/cstr/piper-voices-GGUF/resolve/main/piper-de_DE-thorsten-high-f16.gguf",
+     "~60 MB", nullptr, nullptr},
+    {"piper", "piper-de_DE-kerstin-low-f16.gguf",
+     "https://huggingface.co/cstr/piper-voices-GGUF/resolve/main/piper-de_DE-kerstin-low-f16.gguf",
+     "~12 MB", nullptr, nullptr},
 
     // Bark — suno/bark 3-stage hierarchical TTS (MIT). bark-small ~300M params,
     // 24 kHz, 10 German speakers (v2/de_speaker_0..9). Single GGUF packs all
@@ -683,11 +1150,6 @@ constexpr Entry k_registry[] = {
     // Audio-LID family — speech-signal language identification.
     // Silero + Ecapa run through the module-level `detect_language_pcm`;
     // FireRed requires the session-level `Session::detect_language` (Phase 6).
-    // `lid-silero` is the recommended default: 95 languages, ~16 MB, Apache-2.0.
-    // Converted from deepghs/silero-lang95-onnx via models/convert-silero-lid-to-gguf.py.
-    {"lid-silero", "silero-lid-95-f16.gguf",
-     "https://huggingface.co/cstr/silero-lid-95-GGUF/resolve/main/silero-lid-95-f16.gguf",
-     "~16 MB", nullptr, nullptr},
     // ECAPA-TDNN LID: speechbrain/lang-id-voxlingua107-ecapa (Apache-2.0),
     // 107 languages, attentive statistical pooling. ~42 MB F16.
     // Converted via models/convert-ecapa-tdnn-lid-to-gguf.py.
@@ -804,10 +1266,48 @@ constexpr ExtraCompanion k_cosyvoice3_tts_extras[] = {
     {nullptr, nullptr},
 };
 
+// qwen3-tts Base variants need a default voice pack so synthesis works
+// without --voice. One pack covers both 0.6B and 1.7B Base since the
+// voice embedding format is model-size-agnostic (spk_embedding + ref_code).
+constexpr ExtraCompanion k_qwen3_tts_base_extras[] = {
+    {"qwen3-tts-voice-default.gguf",
+     "https://huggingface.co/cstr/qwen3-tts-voices-GGUF/resolve/main/qwen3-tts-voice-default.gguf"},
+    {nullptr, nullptr},
+};
+
+// TADA generation expects an aligned acoustic prompt, matching the official
+// model.generate(prompt=...) path. Ship the JFK prompt with auto-download so
+// `-m auto --backend tada[-1b] --tts ...` does not fall back to the unprompted
+// path with unstable timing.
+constexpr ExtraCompanion k_tada_1b_extras[] = {
+    {"tada-ref.gguf", "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/tada-ref.gguf"},
+    {nullptr, nullptr},
+};
+
+constexpr ExtraCompanion k_tada_3b_extras[] = {
+    {"tada-ref.gguf", "https://huggingface.co/cstr/tada-tts-3b-ml-GGUF/resolve/main/tada-ref.gguf"},
+    {nullptr, nullptr},
+};
+
+// dots.tts: the CAM++ speaker encoder (15 MB) rides along so that `--voice`
+// voice cloning works after `-m auto --auto-download` — discover_speaker()
+// finds it as a sibling of the core model. Negligible vs the 4.6 GB core.
+constexpr ExtraCompanion k_dots_tts_extras[] = {
+    {"dots-tts-soar-spk-f16.gguf",
+     "https://huggingface.co/cstr/dots-tts-soar-GGUF/resolve/main/dots-tts-soar-spk-f16.gguf"},
+    {nullptr, nullptr},
+};
+
 constexpr ExtraList k_extras[] = {
     {"kokoro", k_kokoro_extras},
+    {"dots-tts", k_dots_tts_extras},
     {"vibevoice-tts", k_vibevoice_tts_extras},
     {"cosyvoice3-tts", k_cosyvoice3_tts_extras},
+    {"qwen3-tts", k_qwen3_tts_base_extras},
+    {"qwen3-tts-1.7b-base", k_qwen3_tts_base_extras},
+    {"tada", k_tada_3b_extras},
+    {"tada-1b", k_tada_1b_extras},
+    {"tada-tts-1b", k_tada_1b_extras},
     {nullptr, nullptr},
 };
 // clang-format on
@@ -816,6 +1316,18 @@ const Entry* find_by_backend(const std::string& backend) {
     for (const auto& e : k_registry)
         if (backend == e.backend)
             return &e;
+    // Fallback: the CLI passes the raw `--backend` alias (e.g. the short
+    // `cosyvoice3` / `voxcpm2`) while the registry keys the canonical
+    // `cosyvoice3-tts` / `voxcpm2-tts`. When the exact alias has no entry,
+    // retry with a `-tts` suffix so `-m auto --backend cosyvoice3` resolves
+    // instead of failing with "no default model registered". Exact match is
+    // tried first, so this can never shadow a real non-`-tts` entry.
+    if (backend.size() < 4 || backend.compare(backend.size() - 4, 4, "-tts") != 0) {
+        const std::string with_tts = backend + "-tts";
+        for (const auto& e : k_registry)
+            if (with_tts == e.backend)
+                return &e;
+    }
     return nullptr;
 }
 
@@ -943,8 +1455,105 @@ void download_extras(const Entry& e, bool quiet, const std::string& cache_dir_ov
     }
 }
 
+// ---------------------------------------------------------------------------
+// Restricted-licence acceptance gate.
+//
+// Mirrors CrispEmbed's examples/cli/model_mgr.{h,cpp} so the two repos behave
+// identically: acceptance is per-licence (an exact SPDX tag, or "all"), keyed
+// off a tag rather than a substring, and `allow_download` alone is NEVER
+// sufficient for a restricted model.
+//
+// Registry entries carry human prose today (e.g. "CC-BY-NC-4.0 — NON-COMMERCIAL
+// use only (base model ...)"), so normalise to the leading SPDX-ish token first
+// rather than rewriting every entry. New entries should use a bare tag.
+// ---------------------------------------------------------------------------
+
+static std::string license_tag(const std::string& lic) {
+    std::string t;
+    for (char c : lic) {
+        if (c == ' ' || c == '\t' || c == '(' || c == ',')
+            break;
+        if ((unsigned char)c >= 0x80) // em-dash and friends
+            break;
+        t += (char)tolower((unsigned char)c);
+    }
+    while (!t.empty() && (t.back() == '-' || t.back() == '.'))
+        t.pop_back();
+    return t;
+}
+
+// True when the tag designates a licence the user must explicitly accept.
+// Same list as CrispEmbed, so a future gemma/llama model is gated on arrival
+// instead of shipping ungated.
+static bool license_requires_acceptance_tag(const std::string& tag) {
+    if (tag.rfind("cc-by-nc", 0) == 0)
+        return true;
+    if (tag.rfind("llama", 0) == 0)
+        return true;
+    static const char* restricted[] = {"gemma", "qwen-research", "mistral-ai-research", "lfm1.0", "other", nullptr};
+    for (const char** p = restricted; *p; ++p)
+        if (tag == *p)
+            return true;
+    return false;
+}
+
 static bool license_is_nc(const std::string& lic) {
-    return lic.find("NC") != std::string::npos || lic.find("NonCommercial") != std::string::npos;
+    return license_requires_acceptance_tag(license_tag(lic));
+}
+
+// Has the user accepted this specific licence? Exact tag, or "all" / "*".
+// Checked against the caller-supplied string, then the process-level setting,
+// then CRISPASR_ACCEPT_LICENSE.
+static bool license_accepted(const std::string& lic, const std::string& accepted_arg) {
+    const std::string tag = license_tag(lic);
+    auto matches = [&](const std::string& acc) {
+        if (acc.empty())
+            return false;
+        if (acc == "all" || acc == "*")
+            return true;
+        return license_tag(acc) == tag;
+    };
+    if (matches(accepted_arg))
+        return true;
+    if (const char* env = std::getenv("CRISPASR_ACCEPT_LICENSE"))
+        if (matches(env))
+            return true;
+    return false;
+}
+
+// Gate a restricted model BEFORE any bytes are fetched. Returns true to
+// proceed. On a TTY the user is shown the licence and prompted; otherwise the
+// download is refused with instructions. `allow_download` alone is NOT enough.
+static bool license_gate_allows_download(const CrispasrRegistryEntry& e, const std::string& accepted_license) {
+    if (e.license.empty() || !license_is_nc(e.license))
+        return true;
+    if (license_accepted(e.license, accepted_license))
+        return true;
+
+    const std::string tag = license_tag(e.license);
+    fprintf(stderr, "crispasr: model '%s' is released under a restricted licence:\n", e.filename.c_str());
+    fprintf(stderr, "  Licence: %s\n", e.license.c_str());
+    if (tag.rfind("cc-by-nc", 0) == 0)
+        fprintf(stderr, "  Notice:  NON-COMMERCIAL USE ONLY — see the upstream model card for terms.\n");
+    else
+        fprintf(stderr, "  Notice:  review the upstream model card for the full licence terms.\n");
+
+    if (isatty(fileno(stdin))) {
+        fprintf(stderr, "Download %s (%s) and accept this licence? [y/N] ", e.filename.c_str(), e.approx_size.c_str());
+        fflush(stderr);
+        int c = fgetc(stdin);
+        if (c == 'y' || c == 'Y')
+            return true;
+        fprintf(stderr, "crispasr: declined — not downloading.\n");
+        return false;
+    }
+
+    fprintf(stderr,
+            "crispasr: refusing to download without explicit licence acceptance.\n"
+            "  Pass --accept-license %s (or set CRISPASR_ACCEPT_LICENSE=%s).\n"
+            "  --auto-download / -m auto alone is NOT sufficient for a restricted licence.\n",
+            tag.c_str(), tag.c_str());
+    return false;
 }
 
 void print_license_note(const CrispasrRegistryEntry& e, bool quiet) {
@@ -962,12 +1571,48 @@ void print_license_note(const CrispasrRegistryEntry& e, bool quiet) {
 
 } // namespace
 
+std::string crispasr_license_tag(const std::string& license) {
+    return license_tag(license);
+}
+
+bool crispasr_license_requires_acceptance(const std::string& license) {
+    return license_is_nc(license);
+}
+
+bool crispasr_license_accepted(const std::string& license, const std::string& accepted) {
+    return license_accepted(license, accepted);
+}
+
 bool crispasr_registry_lookup(const std::string& backend, CrispasrRegistryEntry& out,
                               const std::string& preferred_quant) {
     const Entry* e = find_by_backend(backend);
     if (!e)
         return false;
     fill(out, *e, preferred_quant);
+    return true;
+}
+
+bool crispasr_registry_default_bundle(const std::string& backend, CrispasrRegistryBundle& out) {
+    const Entry* e = find_by_backend(backend);
+    if (!e)
+        return false;
+
+    out = {};
+    out.backend = e->backend;
+    out.license = e->license ? e->license : "";
+    out.requires_license_acceptance = crispasr_license_requires_acceptance(out.license);
+    out.artifacts.push_back(
+        {CrispasrRegistryArtifactKind::Primary, e->filename, e->url, e->approx_size ? e->approx_size : ""});
+
+    if (e->companion_file && e->companion_url) {
+        out.artifacts.push_back({CrispasrRegistryArtifactKind::Companion, e->companion_file, e->companion_url,
+                                 e->companion_size ? e->companion_size : (e->approx_size ? e->approx_size : "")});
+    }
+
+    if (const ExtraCompanion* extras = find_extras(e->backend)) {
+        for (const ExtraCompanion* it = extras; it->file && it->url; ++it)
+            out.artifacts.push_back({CrispasrRegistryArtifactKind::Extra, it->file, it->url, ""});
+    }
     return true;
 }
 
@@ -1027,7 +1672,7 @@ bool crispasr_find_cached_model(CrispasrRegistryEntry& out, const std::string& c
 
 std::string crispasr_resolve_model(const std::string& model_arg, const std::string& backend_name, bool quiet,
                                    const std::string& cache_dir_override, bool allow_download,
-                                   const std::string& preferred_quant) {
+                                   const std::string& preferred_quant, const std::string& accepted_license) {
     // Concrete path that exists on disk — pass through.
     if (model_arg != "auto" && model_arg != "default") {
         FILE* f = fopen(model_arg.c_str(), "rb");
@@ -1053,11 +1698,19 @@ std::string crispasr_resolve_model(const std::string& model_arg, const std::stri
 
         if (have_match) {
             const std::string cached = crispasr_cache::dir(cache_dir_override) + "/" + match.filename;
-            if (crispasr_cache::file_present(cached))
+            if (crispasr_cache::file_present(cached)) {
+                // A previously-downloaded restricted model used to load in
+                // total silence — state the licence on every load, not just
+                // the one where it happened to be fetched.
+                print_license_note(match, quiet);
                 return cached;
+            }
         }
 
         if (have_match && allow_download) {
+            // Restricted-licence gate BEFORE any bytes are fetched.
+            if (!license_gate_allows_download(match, accepted_license))
+                return "";
             if (!quiet) {
                 fprintf(stderr, "crispasr: model '%s' not found locally — downloading %s (%s)\n", model_arg.c_str(),
                         match.filename.c_str(), match.approx_size.c_str());
@@ -1087,6 +1740,12 @@ std::string crispasr_resolve_model(const std::string& model_arg, const std::stri
                 backend_name.c_str());
         return "";
     }
+
+    // Restricted-licence gate BEFORE any bytes are fetched. Skipped when the
+    // file is already cached (acceptance happened at download time).
+    if (!crispasr_cache::file_present(crispasr_cache::dir(cache_dir_override) + "/" + e.filename) &&
+        !license_gate_allows_download(e, accepted_license))
+        return "";
 
     if (!quiet)
         fprintf(stderr, "crispasr: resolving %s (%s) via -m auto\n", e.filename.c_str(), e.approx_size.c_str());

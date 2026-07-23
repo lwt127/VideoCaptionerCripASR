@@ -268,7 +268,24 @@ combine_static_libraries() {
     local src_libs=()
     while IFS= read -r -d '' lib; do
         src_libs+=("$lib")
+    # crisp_lid / crisp_punc / crisp_truecase are STATIC libs added via
+    # add_subdirectory(.. ${CMAKE_BINARY_DIR}/crisp_<x>), so their .a lands
+    # under build/crisp_<x>/, NOT build/src/ — include those roots too or the
+    # iOS dylib link fails with undefined fireredpunc_*/pcs_*/text_lid_*/
+    # truecaser_lstm_* symbols. Missing roots are skipped (-print0 2>/dev/null).
+    # Also search _deps/ for FetchContent-built static libs (opus, ogg,
+    # opusfile, opencore-amr) that crispasr-lib links via PRIVATE but
+    # whose objects must be in combined.a for the xcframework consumer.
+    # glint is the in-tree clean-room codec suite (glint/CMakeLists.txt); its
+    # libglint.a lands under build/glint/, and crispasr-lib links it PUBLIC. It
+    # was NOT in these roots, so the iOS xcframework link failed with undefined
+    # glint_aac_dec_*/glint_opus_* (v0.8.20 build-xcframework). Same drift this
+    # comment already flags for crisp_lid/punc/truecase — the root list is hand-
+    # maintained and a new subdirectory target has to be added here.
     done < <(find "${base_dir}/${build_dir}/src" "${base_dir}/${build_dir}/crisp_audio" \
+                  "${base_dir}/${build_dir}/crisp_lid" "${base_dir}/${build_dir}/crisp_punc" \
+                  "${base_dir}/${build_dir}/crisp_truecase" "${base_dir}/${build_dir}/glint" \
+                  "${base_dir}/${build_dir}/_deps" \
                   -path "*/${release_dir}/*.a" -print0 2>/dev/null)
     if [ ${#src_libs[@]} -gt 0 ]; then
         echo "Auto-discovered ${#src_libs[@]} static backend libraries under src/${release_dir}/ + crisp_audio/${release_dir}/"
@@ -297,7 +314,7 @@ combine_static_libraries() {
     local archs=""
     local min_version_flag=""
     local install_name=""
-    local frameworks="-framework Foundation -framework Metal -framework Accelerate"
+    local frameworks="-framework Foundation -framework Metal -framework Accelerate -framework AudioToolbox -framework CoreFoundation -framework CoreAudio"
 
     case "$platform" in
         "ios")
@@ -459,7 +476,7 @@ cmake -B build-ios-sim -G Xcode \
     -DCRISPASR_COREML="ON" \
     -DCRISPASR_COREML_ALLOW_FALLBACK="ON" \
     -S .
-cmake --build build-ios-sim --config Release -- -quiet
+cmake --build build-ios-sim --config Release -- -quiet || { echo "::error::xcframework slice build-ios-sim failed to build"; exit 1; }
 
 echo "Building for iOS devices..."
 cmake -B build-ios-device -G Xcode \
@@ -473,7 +490,7 @@ cmake -B build-ios-device -G Xcode \
     -DCRISPASR_COREML="ON" \
     -DCRISPASR_COREML_ALLOW_FALLBACK="ON" \
     -S .
-cmake --build build-ios-device --config Release -- -quiet
+cmake --build build-ios-device --config Release -- -quiet || { echo "::error::xcframework slice build-ios-device failed to build"; exit 1; }
 
 echo "Building for macOS..."
 cmake -B build-macos -G Xcode \
@@ -485,11 +502,17 @@ cmake -B build-macos -G Xcode \
     -DCRISPASR_COREML="ON" \
     -DCRISPASR_COREML_ALLOW_FALLBACK="ON" \
     -S .
-cmake --build build-macos --config Release -- -quiet
+cmake --build build-macos --config Release -- -quiet || { echo "::error::xcframework slice build-macos failed to build"; exit 1; }
 
+# visionOS/tvOS: build with -DCRISPASR_OPUS=OFF. Opus 1.5.2's FetchContent
+# build doesn't compile cleanly on these SDKs (the u_int/_XOPEN_SOURCE compat
+# gaps noted below), which broke the ios-xcode-build CI at the xcframework
+# step. These platforms use AudioToolbox for decode anyway, so opus isn't
+# needed. iOS keeps opus (links via the _deps glob, 1ed1e62b); macOS unaffected.
 echo "Building for visionOS..."
 cmake -B build-visionos -G Xcode \
     "${COMMON_CMAKE_ARGS[@]}" \
+    -DCRISPASR_OPUS=OFF \
     -DCMAKE_OSX_DEPLOYMENT_TARGET=${VISIONOS_MIN_OS_VERSION} \
     -DCMAKE_OSX_ARCHITECTURES="arm64" \
     -DCMAKE_SYSTEM_NAME=visionOS \
@@ -498,11 +521,12 @@ cmake -B build-visionos -G Xcode \
     -DCMAKE_C_FLAGS="-D_XOPEN_SOURCE=700 ${COMMON_C_FLAGS}" \
     -DCMAKE_CXX_FLAGS="-D_XOPEN_SOURCE=700 ${COMMON_CXX_FLAGS}" \
     -S .
-cmake --build build-visionos --config Release -- -quiet
+cmake --build build-visionos --config Release -- -quiet || { echo "::error::xcframework slice build-visionos failed to build"; exit 1; }
 
 echo "Building for visionOS simulator..."
 cmake -B build-visionos-sim -G Xcode \
     "${COMMON_CMAKE_ARGS[@]}" \
+    -DCRISPASR_OPUS=OFF \
     -DCMAKE_OSX_DEPLOYMENT_TARGET=${VISIONOS_MIN_OS_VERSION} \
     -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
     -DCMAKE_SYSTEM_NAME=visionOS \
@@ -511,12 +535,13 @@ cmake -B build-visionos-sim -G Xcode \
     -DCMAKE_C_FLAGS="-D_XOPEN_SOURCE=700 ${COMMON_C_FLAGS}" \
     -DCMAKE_CXX_FLAGS="-D_XOPEN_SOURCE=700 ${COMMON_CXX_FLAGS}" \
     -S .
-cmake --build build-visionos-sim --config Release -- -quiet
+cmake --build build-visionos-sim --config Release -- -quiet || { echo "::error::xcframework slice build-visionos-sim failed to build"; exit 1; }
 
 # Add tvOS builds (might need the same u_int definitions as watchOS and visionOS)
 echo "Building for tvOS simulator..."
 cmake -B build-tvos-sim -G Xcode \
     "${COMMON_CMAKE_ARGS[@]}" \
+    -DCRISPASR_OPUS=OFF \
     -DCMAKE_OSX_DEPLOYMENT_TARGET=${TVOS_MIN_OS_VERSION} \
     -DCMAKE_SYSTEM_NAME=tvOS \
     -DCMAKE_OSX_SYSROOT=appletvsimulator \
@@ -526,11 +551,12 @@ cmake -B build-tvos-sim -G Xcode \
     -DCMAKE_C_FLAGS="${COMMON_C_FLAGS}" \
     -DCMAKE_CXX_FLAGS="${COMMON_CXX_FLAGS}" \
     -S .
-cmake --build build-tvos-sim --config Release -- -quiet
+cmake --build build-tvos-sim --config Release -- -quiet || { echo "::error::xcframework slice build-tvos-sim failed to build"; exit 1; }
 
 echo "Building for tvOS devices..."
 cmake -B build-tvos-device -G Xcode \
     "${COMMON_CMAKE_ARGS[@]}" \
+    -DCRISPASR_OPUS=OFF \
     -DCMAKE_OSX_DEPLOYMENT_TARGET=${TVOS_MIN_OS_VERSION} \
     -DCMAKE_SYSTEM_NAME=tvOS \
     -DCMAKE_OSX_SYSROOT=appletvos \
@@ -540,7 +566,7 @@ cmake -B build-tvos-device -G Xcode \
     -DCMAKE_C_FLAGS="${COMMON_C_FLAGS}" \
     -DCMAKE_CXX_FLAGS="${COMMON_CXX_FLAGS}" \
     -S .
-cmake --build build-tvos-device --config Release -- -quiet
+cmake --build build-tvos-device --config Release -- -quiet || { echo "::error::xcframework slice build-tvos-device failed to build"; exit 1; }
 
 # Setup frameworks and copy binaries and headers
 echo "Setting up framework structures..."

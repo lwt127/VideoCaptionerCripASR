@@ -15,9 +15,9 @@ logger = setup_logger("crisp_asr")
 # CrispASR 二进制目录（随应用打包在 resource/bin/CrispASR 下）
 CRISP_ASR_BIN = Path(BIN_PATH) / "CrispASR" / "crispasr.exe"
 
-# 期望的最低引擎版本；低于该版本的本地引擎会被自动升级（下载 v0.8.8）。
+# 期望的最低引擎版本；低于该版本的本地引擎会被自动升级（下载 v0.8.21）。
 # 与 crisp_asr_download_thread.CRISP_ASR_PINNED_TAG 保持一致。
-CRISP_ASR_MIN_VERSION = (0, 8, 8)
+CRISP_ASR_MIN_VERSION = (0, 8, 21)
 
 # CrispASR 引擎内部把解码后的采样点数量强转为 32 位有符号 int
 # （examples/cli/crispasr_run.cpp: `(int)samples.size()`）。解码后统一为
@@ -181,7 +181,7 @@ class CrispASR(BaseASR):
         want_cuda = self.use_gpu and cuda_available()
 
         # 已存在引擎时：
-        #   1) 版本低于最低要求 → 升级到目标版本（v0.8.8）；
+        #   1) 版本低于最低要求 → 升级到目标版本（v0.8.21）；
         #   2) 需要 CUDA 但当前为 CPU-only → 升级为 CUDA 构建。
         if self.crisp_asr_path.exists():
             ver = engine_version(self.crisp_asr_path)

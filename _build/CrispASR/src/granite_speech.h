@@ -67,6 +67,16 @@ void granite_speech_kv_reset(struct granite_speech_context* ctx);
 float* granite_speech_run_llm_kv(struct granite_speech_context* ctx, const float* inputs_embeds, int n_tokens,
                                  int n_past, int* out_n_tokens, int* out_vocab_size);
 
+// Enable bucketed decode for CUDA-graph capture. Call after prefill with
+// bucket_len >= n_past + max_new_tokens (0 disables; requires KV cache >= bucket_len).
+void granite_speech_set_decode_bucket(struct granite_speech_context* ctx, int bucket_len);
+
+// Argmax-fused greedy decode over the bucketed graph. Returns malloc'd token
+// ids (incl. first_token, stopping at eos_id/max_new_tokens); bit-identical to
+// core_greedy_decode::argmax. NULL on failure. Caller frees *out_n ids.
+int32_t* granite_speech_greedy_decode(struct granite_speech_context* ctx, int32_t first_token, int initial_n_past,
+                                      int max_new_tokens, int eos_id, int* out_n);
+
 // Embed token IDs. Returns malloc'd (n_tokens, d_model) F32.
 float* granite_speech_embed_tokens(struct granite_speech_context* ctx, const int32_t* input_ids, int n_tokens);
 

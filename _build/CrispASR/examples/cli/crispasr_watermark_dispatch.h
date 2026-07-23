@@ -25,6 +25,25 @@ inline audioseal_ctx*& get_ctx() {
     return ctx;
 }
 
+// Operator opt-out flag, set once at startup from the --no-watermark CLI flag.
+// The CRISPASR_NO_WATERMARK env var is an equivalent opt-out (both are honored;
+// neither is more "official" than the other). Either path disables watermark
+// embedding for the process.
+inline bool& disabled_flag() {
+    static bool disabled = false;
+    return disabled;
+}
+
+// Set from the --no-watermark CLI flag at startup.
+inline void set_disabled(bool value) {
+    disabled_flag() = value;
+}
+
+// True if watermarking has been turned off via the CLI flag or the env var.
+inline bool is_disabled() {
+    return disabled_flag() || std::getenv("CRISPASR_NO_WATERMARK") != nullptr;
+}
+
 // Initialize AudioSeal from GGUF path. Call once at startup.
 // Returns true if loaded, false if not (falls back to spread-spectrum).
 inline bool init(const std::string& model_path) {
@@ -54,10 +73,23 @@ inline void shutdown() {
 // Embed watermark into float32 PCM. Modifies in-place.
 // If AudioSeal is loaded, resamples to 16kHz if needed, embeds, and
 // resamples back. Otherwise uses spread-spectrum.
-// Set CRISPASR_NO_WATERMARK=1 to disable (debug only).
+//
+// Watermarking is on by default. It can be turned off with the --no-watermark
+// CLI flag or the CRISPASR_NO_WATERMARK env var (equivalent opt-outs). Either
+// way we log a one-time warning: disabling the mark shifts the AI-content
+// disclosure/marking duty onto the operator (see docs/issue-260/PLAN.md for the
+// regulatory background, incl. EU AI Act Art. 50, which we intentionally do NOT
+// name at runtime — the obligation is jurisdiction-specific and the operator,
+// not this binary, is the party bound by it).
 inline void embed(float* pcm, int n_samples, int sample_rate = 24000) {
-    if (std::getenv("CRISPASR_NO_WATERMARK")) {
-        return; // debug: skip watermarking entirely
+    if (is_disabled()) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "crispasr: warning: watermarking disabled. "
+                            "AI usage marking responsibility rests with the operator.\n");
+        }
+        return; // opt-out honored; warning emitted once per process
     }
     if (get_ctx()) {
         // AudioSeal operates at 16 kHz. If audio is at a different rate,

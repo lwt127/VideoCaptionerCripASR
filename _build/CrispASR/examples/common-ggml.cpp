@@ -14,6 +14,8 @@ static const std::map<std::string, enum ggml_ftype> GGML_FTYPE_MAP = {
     {"q4_k", GGML_FTYPE_MOSTLY_Q4_K},
     {"q5_k", GGML_FTYPE_MOSTLY_Q5_K},
     {"q6_k", GGML_FTYPE_MOSTLY_Q6_K},
+    {"iq4_nl", GGML_FTYPE_MOSTLY_IQ4_NL},
+    {"iq4_xs", GGML_FTYPE_MOSTLY_IQ4_XS},
 };
 
 void ggml_print_ftypes(FILE * fp) {
@@ -24,7 +26,7 @@ void ggml_print_ftypes(FILE * fp) {
 
 enum ggml_ftype ggml_parse_ftype(const char * str) {
     enum ggml_ftype ftype;
-    if (str[0] == 'q') {
+    if (str[0] == 'q' || str[0] == 'i') {
         const auto it = GGML_FTYPE_MAP.find(str);
         if (it == GGML_FTYPE_MAP.end()) {
             fprintf(stderr, "%s: unknown ftype '%s'\n", __func__, str);

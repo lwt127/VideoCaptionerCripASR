@@ -10,6 +10,7 @@
 // sanity checking.
 
 #include "canary_ctc.h"
+#include "core/crispasr_env.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -29,6 +30,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -42,6 +44,116 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+// ===========================================================================
+// Bench instrumentation — `CANARY_CTC_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool canary_ctc_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_CANARY_CTC_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct canary_ctc_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit canary_ctc_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~canary_ctc_bench_stage() {
+        if (!canary_ctc_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  canary_ctc_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
+
+// ===========================================================================
+// Per-node profiler — `CRISPASR_FC_PROFILE=1` aggregates graph-compute time
+// by op (mul_mat keyed by src0 type+shape). Forces per-node sched splits, so
+// absolute times carry dispatch overhead; use the relative shares.
+// ===========================================================================
+
+static bool canary_ctc_profile_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("CRISPASR_FC_PROFILE");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct cc_prof_state {
+    std::map<std::string, std::pair<double, int64_t>> agg; // key → (ms, count)
+    std::chrono::steady_clock::time_point last;
+
+    void dump() const {
+        std::vector<std::pair<std::string, std::pair<double, int64_t>>> rows(agg.begin(), agg.end());
+        std::sort(rows.begin(), rows.end(),
+                  [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+        double total = 0;
+        for (const auto& r : rows)
+            total += r.second.first;
+        std::fprintf(stderr, "  cc_profile: %-52s %9s %6s %6s\n", "op", "ms", "%", "n");
+        for (const auto& r : rows)
+            std::fprintf(stderr, "  cc_profile: %-52s %9.2f %5.1f%% %6lld\n", r.first.c_str(), r.second.first,
+                         100.0 * r.second.first / total, (long long)r.second.second);
+        std::fprintf(stderr, "  cc_profile: total %.2f ms\n", total);
+    }
+};
+
+static bool cc_prof_cb(ggml_tensor* t, bool ask, void* ud) {
+    auto* st = (cc_prof_state*)ud;
+    if (ask)
+        return true; // observe every node → per-node splits
+    // CRISPASR_FC_PROF_FP=1: per-node fingerprint of one valid column
+    // (debug tool for localizing bucketed-vs-plain divergences).
+    static int fp_en = -1;
+    if (fp_en < 0) {
+        const char* e = std::getenv("CRISPASR_FC_PROF_FP");
+        fp_en = (e && *e && *e != '0') ? 1 : 0;
+    }
+    static int fp_cols = -1;
+    if (fp_cols < 0) {
+        const char* e = std::getenv("CRISPASR_FC_PROF_FP_COLS");
+        fp_cols = (e && *e) ? atoi(e) : 5;
+    }
+    // Only (features, T)-shaped nodes: checksum the first fp_cols columns so
+    // padded and unpadded runs sample the same logical frames.
+    if (fp_en && t->type == GGML_TYPE_F32 && t->ne[0] >= 512 && t->ne[1] >= fp_cols && t->ne[2] == 1 && t->nb[0] == 4) {
+        std::vector<float> col(t->ne[0]);
+        double s = 0;
+        for (int c = 0; c < fp_cols; c++) {
+            ggml_backend_tensor_get(t, col.data(), (size_t)c * t->nb[1], t->ne[0] * sizeof(float));
+            for (float v : col)
+                s += (double)(v < 0 ? -v : v);
+        }
+        fprintf(stderr, "FP %-14s [%lldx%lldx%lld] %.10e\n", ggml_op_name(t->op), (long long)t->ne[0],
+                (long long)t->ne[1], (long long)t->ne[2], s);
+    }
+    auto now = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(now - st->last).count();
+    st->last = now;
+    char key[192];
+    if (t->op == GGML_OP_MUL_MAT) {
+        snprintf(key, sizeof(key), "MUL_MAT %s [%lldx%lld]@[%lldx%lld]", ggml_type_name(t->src[0]->type),
+                 (long long)t->src[0]->ne[0], (long long)t->src[0]->ne[1], (long long)t->src[1]->ne[0],
+                 (long long)t->src[1]->ne[1]);
+    } else if (t->op == GGML_OP_CPY || t->op == GGML_OP_CONT || t->op == GGML_OP_DUP) {
+        snprintf(key, sizeof(key), "%s %s→%s [%lldx%lldx%lld]", ggml_op_name(t->op), ggml_type_name(t->src[0]->type),
+                 ggml_type_name(t->type), (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2]);
+    } else {
+        snprintf(key, sizeof(key), "%s", ggml_op_name(t->op));
+    }
+    auto& e = st->agg[key];
+    e.first += ms;
+    e.second += 1;
+    return true;
+}
+
 // ===========================================================================
 // Hyperparameters (mirror canary_ctc.* keys in the GGUF)
 // ===========================================================================
@@ -73,6 +185,9 @@ struct canary_ctc_hparams {
     // xscaling=false. Default false preserves canary_ctc's existing
     // bit-identical path; the stt converter sets this to 1 in the GGUF.
     uint32_t xscaling = 0;
+    // NeMo conv_norm_type: 0 = batch_norm (folded into conv_dw at load),
+    // 1 = layer_norm (applied in-graph after the depthwise conv).
+    uint32_t conv_norm_layer = 0;
 };
 
 // ===========================================================================
@@ -106,6 +221,15 @@ struct cc_model {
     ggml_context* ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
 
+    // F32 conv_dw_w copies (created during BN fold, avoids per-forward F16→F32 cast)
+    ggml_context* ctx_f32 = nullptr;
+    ggml_backend_buffer_t buf_f32 = nullptr;
+
+    // Q8_0 repack of the F16 conv pw1/pw2 weights (issue #81, CRISPASR_FC_PW_Q8)
+    core_conformer::PwRepackBuf pw_q8;
+    // Fused Q/K/V weight concat (issue #81, CRISPASR_FC_FUSED_QKV)
+    core_conformer::PwRepackBuf qkv_fused;
+
     std::map<std::string, ggml_tensor*> tensors;
 };
 
@@ -126,6 +250,15 @@ struct canary_ctc_context {
     std::vector<uint8_t> compute_meta;
 
     int n_threads = 4;
+
+    // §176s: cached encoder+CTC graph — reused when T_mel matches.
+    ggml_cgraph* cached_gf = nullptr;
+    std::vector<uint8_t> cached_meta;
+    int cached_T_mel = 0;
+
+    // Manual attention on backends where flash_attn_ext would bounce to CPU
+    // (CUDA per-head-mask guard) — set once at init from fc_gpu_manual_attn.
+    bool manual_attn = false;
 };
 
 // ===========================================================================
@@ -187,6 +320,7 @@ static void cc_fft_r2c(const float* in, int N, float* out) {
 // ===========================================================================
 
 #include "core/mel.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -232,7 +366,37 @@ static std::vector<float> cc_compute_mel(canary_ctc_context* ctx, const float* s
 
 static const float kLayerNormEps = 1e-5f;
 
-static ggml_cgraph* cc_build_graph(canary_ctc_context* ctx, int T_mel) {
+// Bucketed-padding gate (issue #81 GPU phase, CRISPASR_FC_BUCKET=<mel frames>).
+// Padding T_mel up to a bucket keeps the graph topology stable across
+// utterances of similar length, so the per-bucket graph + allocation are
+// reused and ggml-cuda's CUDA-graph replay can kick in (starling-style).
+// Pad keys are masked in attention (-inf), pad columns are zeroed before
+// every depthwise conv and at each block boundary, and the pre-encode conv
+// stack is stage-masked — structurally the valid columns equal the unpadded
+// graph. Residual difference is GEMM micro-kernel ULP reassociation (size-
+// adaptive kernels regroup the same dot products; bisected to rel≈3e-9 at
+// the pre-encode matmuls), the same accepted class as BLAS-variant drift —
+// so the acceptance criterion is identical decoded output, verified across
+// 4.05/7.3/11/33 s on parakeet-ctc q8_0 (bit-identical whenever the backend
+// picks the same kernels, e.g. same-T_enc buckets).
+static int cc_fc_bucket() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("CRISPASR_FC_BUCKET");
+        v = (e && *e) ? std::max(0, atoi(e)) : 0;
+    }
+    return v;
+}
+
+// Mirror of the dw_striding output length: three k=3 s=2 p=1 convs
+// (conv3/conv6 are k=1 s=1). Must match build_pre_encode's H3.
+static int cc_sub_len(int t_mel) {
+    for (int i = 0; i < 3; i++)
+        t_mel = (t_mel - 1) / 2 + 1;
+    return t_mel;
+}
+
+static ggml_cgraph* cc_build_graph(canary_ctc_context* ctx, int T_mel, bool with_pad_masks = false) {
     const auto& m = ctx->model;
     const auto& hp = m.hparams;
     const int n_mels = (int)hp.n_mels;
@@ -250,8 +414,22 @@ static ggml_cgraph* cc_build_graph(canary_ctc_context* ctx, int T_mel) {
     ggml_set_input(mel);
 
     // ----- Pre-encode (dw_striding 8×) -----
+    // Bucketed path: per-stage time masks keep the padded subsampling stack
+    // bit-identical to the unpadded one (see build_pre_encode header note).
+    ggml_tensor *sm0 = nullptr, *sm1 = nullptr;
+    if (with_pad_masks) {
+        const int T0 = (T_mel - 1) / 2 + 1;
+        const int T1 = (T0 - 1) / 2 + 1;
+        sm0 = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, T0, 1, 1);
+        ggml_set_name(sm0, "stage_mask_t0");
+        ggml_set_input(sm0);
+        sm1 = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, T1, 1, 1);
+        ggml_set_name(sm1, "stage_mask_t1");
+        ggml_set_input(sm1);
+    }
     int T = 0;
-    ggml_tensor* cur = core_conformer::build_pre_encode(ctx0, mel, m.pre_encode, (int)hp.subsampling_channels, &T);
+    ggml_tensor* cur =
+        core_conformer::build_pre_encode(ctx0, mel, m.pre_encode, (int)hp.subsampling_channels, &T, nullptr, sm0, sm1);
 
     // ----- Optional xscaling (NeMo standalone FastConformer-CTC) -----
     // When xscaling is set in the GGUF, multiply the pre-encoder output
@@ -270,13 +448,30 @@ static ggml_cgraph* cc_build_graph(canary_ctc_context* ctx, int T_mel) {
     ggml_set_name(pos_enc, "pos_enc");
     ggml_set_input(pos_enc);
 
+    // ----- Pad masks (bucketed path only — legacy graph stays op-identical) --
+    ggml_tensor *pad_mask = nullptr, *time_mask = nullptr;
+    if (with_pad_masks) {
+        pad_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, T, T); // additive, mask[q*T+k]
+        ggml_set_name(pad_mask, "pad_mask");
+        ggml_set_input(pad_mask);
+        time_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, T); // multiplicative (1,T)
+        ggml_set_name(time_mask, "time_mask");
+        ggml_set_input(time_mask);
+    }
+
     // ----- N × FastConformer block (biases optional — nullptr bias
     // fields skip the ggml_add inside core_conformer::build_block) -----
     core_conformer::BlockParams bp = {
         (int)hp.d_model, (int)hp.n_heads, (int)hp.head_dim, (int)hp.conv_kernel, kLayerNormEps,
     };
-    for (uint32_t il = 0; il < hp.n_layers; il++) {
-        cur = core_conformer::build_block(ctx0, cur, pos_enc, T, m.enc[il], bp);
+    bp.manual_attn = ctx->manual_attn;
+    // CRISPASR_FC_MAX_LAYERS=N truncates the block stack — the genuine-
+    // truncated-output bisection tool for localizing divergences.
+    uint32_t n_layers = hp.n_layers;
+    if (const char* e = std::getenv("CRISPASR_FC_MAX_LAYERS"))
+        n_layers = std::min(n_layers, (uint32_t)std::max(0, atoi(e)));
+    for (uint32_t il = 0; il < n_layers; il++) {
+        cur = core_conformer::build_block(ctx0, cur, pos_enc, T, m.enc[il], bp, pad_mask, time_mask);
     }
 
     // CTC head: linear (d_model → vocab_total)
@@ -291,12 +486,20 @@ static ggml_cgraph* cc_build_graph(canary_ctc_context* ctx, int T_mel) {
 // BatchNorm folding (load-time, once)
 // ===========================================================================
 
-static void cc_fold_batchnorm(cc_model& model) {
+static void cc_fold_batchnorm(cc_model& model, ggml_backend_t backend) {
+    if (model.hparams.conv_norm_layer) {
+        fprintf(stderr, "canary_ctc: conv norm is layer_norm — applied in-graph, no BN folding\n");
+        return;
+    }
     const int d = (int)model.hparams.d_model;
     const int K = (int)model.hparams.conv_kernel;
     const float eps = 1e-5f;
+    const uint32_t n_layers = model.hparams.n_layers;
 
-    for (uint32_t il = 0; il < model.hparams.n_layers; il++) {
+    // Collect folded F32 weights for all layers, then batch-allocate.
+    std::vector<std::vector<float>> all_w_f32(n_layers);
+
+    for (uint32_t il = 0; il < n_layers; il++) {
         auto& e = model.enc[il];
         if (!e.conv_dw_w || !e.conv_dw_b || !e.conv_bn_w || !e.conv_bn_b || !e.conv_bn_rm || !e.conv_bn_rv)
             continue;
@@ -311,31 +514,34 @@ static void cc_fold_batchnorm(cc_model& model) {
         for (int c = 0; c < d; c++)
             s[c] = bn_w[c] / sqrtf(bn_var[c] + eps);
 
-        std::vector<ggml_fp16_t> w_f16((size_t)K * d);
-        ggml_backend_tensor_get(e.conv_dw_w, w_f16.data(), 0, w_f16.size() * sizeof(ggml_fp16_t));
-        std::vector<float> w_f32((size_t)K * d);
-        for (size_t i = 0; i < w_f16.size(); i++)
-            w_f32[i] = ggml_fp16_to_fp32(w_f16[i]);
+        // Read in the tensor's native dtype — an F32 conv_dw_w (--f32-encoder /
+        // diff-harness) read as F16 would misinterpret the bytes and corrupt the
+        // folded F32 copy fed to the graph below (c9a4de65).
+        const size_t n_dw = (size_t)K * d;
+        std::vector<float> w_f32(n_dw);
+        if (e.conv_dw_w->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_get(e.conv_dw_w, w_f32.data(), 0, n_dw * sizeof(float));
+        } else {
+            std::vector<ggml_fp16_t> w_f16(n_dw);
+            ggml_backend_tensor_get(e.conv_dw_w, w_f16.data(), 0, n_dw * sizeof(ggml_fp16_t));
+            for (size_t i = 0; i < n_dw; i++)
+                w_f32[i] = ggml_fp16_to_fp32(w_f16[i]);
+        }
         for (int c = 0; c < d; c++)
             for (int ki = 0; ki < K; ki++)
                 w_f32[ki + c * K] *= s[c];
-        for (size_t i = 0; i < w_f16.size(); i++)
-            w_f16[i] = ggml_fp32_to_fp16(w_f32[i]);
-        ggml_backend_tensor_set(e.conv_dw_w, w_f16.data(), 0, w_f16.size() * sizeof(ggml_fp16_t));
+        // Write back in native dtype (superseded by conv_dw_w_f32 below, but kept correct).
+        if (e.conv_dw_w->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_set(e.conv_dw_w, w_f32.data(), 0, n_dw * sizeof(float));
+        } else {
+            std::vector<ggml_fp16_t> w_f16(n_dw);
+            for (size_t i = 0; i < n_dw; i++)
+                w_f16[i] = ggml_fp32_to_fp16(w_f32[i]);
+            ggml_backend_tensor_set(e.conv_dw_w, w_f16.data(), 0, n_dw * sizeof(ggml_fp16_t));
+        }
 
-        // Read the original depthwise-conv bias (the pretrained value)
-        // BEFORE overwriting it — NeMo's FastConformer Conformer conv
-        // module learns a bias on the depthwise conv, so the pre-BN
-        // output is `conv(x) + orig_dw_b`. Folding BN into the conv
-        // gives:
-        //   y = scale * (conv(x) + orig_dw_b) + shift
-        //     = scale * conv(x) + (scale * orig_dw_b + shift)
-        //
-        // canary_ctc aligner has synthetic zero orig_dw_b so the term
-        // vanishes, but for stt_en_fastconformer_ctc_large (and any
-        // other NeMo FC-CTC release with biased conv.depthwise_conv)
-        // dropping the orig_dw_b contribution silently zeros a learned
-        // offset and collapses the encoder output across time.
+        all_w_f32[il] = std::move(w_f32);
+
         std::vector<float> orig_dw_b(d);
         ggml_backend_tensor_get(e.conv_dw_b, orig_dw_b.data(), 0, d * sizeof(float));
 
@@ -346,7 +552,34 @@ static void cc_fold_batchnorm(cc_model& model) {
         }
         ggml_backend_tensor_set(e.conv_dw_b, dw_b.data(), 0, d * sizeof(float));
     }
-    fprintf(stderr, "canary_ctc: BN folded into conv_dw weights for %u layers\n", model.hparams.n_layers);
+
+    // Allocate F32 copies of conv_dw_w so build_block skips the per-forward cast.
+    {
+        size_t n_tensors = 0;
+        for (uint32_t il = 0; il < n_layers; il++)
+            if (!all_w_f32[il].empty())
+                n_tensors++;
+
+        if (n_tensors > 0) {
+            ggml_init_params ip = {n_tensors * ggml_tensor_overhead(), nullptr, true};
+            model.ctx_f32 = ggml_init(ip);
+            for (uint32_t il = 0; il < n_layers; il++) {
+                if (all_w_f32[il].empty())
+                    continue;
+                auto& e = model.enc[il];
+                e.conv_dw_w_f32 = ggml_new_tensor_1d(model.ctx_f32, GGML_TYPE_F32, (int64_t)K * d);
+            }
+            model.buf_f32 = ggml_backend_alloc_ctx_tensors(model.ctx_f32, backend);
+            for (uint32_t il = 0; il < n_layers; il++) {
+                if (all_w_f32[il].empty())
+                    continue;
+                auto& e = model.enc[il];
+                ggml_backend_tensor_set(e.conv_dw_w_f32, all_w_f32[il].data(), 0, all_w_f32[il].size() * sizeof(float));
+            }
+        }
+    }
+
+    fprintf(stderr, "canary_ctc: BN folded into conv_dw weights for %u layers\n", n_layers);
 }
 
 // ===========================================================================
@@ -377,6 +610,7 @@ static bool cc_load_model(cc_model& model, canary_ctc_vocab& vocab, const char* 
         hp.blank_id = core_gguf::kv_u32(gctx, "canary_ctc.blank_id", hp.blank_id);
         hp.frame_dur_cs = core_gguf::kv_u32(gctx, "canary_ctc.frame_dur_cs", hp.frame_dur_cs);
         hp.xscaling = core_gguf::kv_u32(gctx, "canary_ctc.xscaling", hp.xscaling);
+        hp.conv_norm_layer = core_gguf::kv_u32(gctx, "canary_ctc.conv_norm_layer", hp.conv_norm_layer);
 
         auto tokens = core_gguf::kv_str_array(gctx, "tokenizer.ggml.tokens");
         if (!tokens.empty()) {
@@ -456,8 +690,15 @@ static bool cc_load_model(cc_model& model, canary_ctc_vocab& vocab, const char* 
         e.conv_pw2_b = get_opt("conv.pw2.bias");
         e.conv_bn_w = get("conv.bn.weight");
         e.conv_bn_b = get("conv.bn.bias");
-        e.conv_bn_rm = get("conv.bn.running_mean");
-        e.conv_bn_rv = get("conv.bn.running_var");
+        if (model.hparams.conv_norm_layer) {
+            // conv_norm_type=layer_norm: the "bn" tensors are the LN affine
+            // params (no running stats exist); apply in-graph, no folding.
+            e.conv_ln_w = e.conv_bn_w;
+            e.conv_ln_b = e.conv_bn_b;
+        } else {
+            e.conv_bn_rm = get("conv.bn.running_mean");
+            e.conv_bn_rv = get("conv.bn.running_var");
+        }
         e.norm_ff2_w = get("norm_ff2.weight");
         e.norm_ff2_b = get("norm_ff2.bias");
         e.ff2_l1_w = get("ff2.linear1.weight");
@@ -481,7 +722,7 @@ static bool cc_load_model(cc_model& model, canary_ctc_vocab& vocab, const char* 
 // ===========================================================================
 
 static ggml_backend_t cc_pick_backend() {
-    ggml_backend_t b = ggml_backend_init_best();
+    ggml_backend_t b = crispasr_init_gpu_backend();
     return b ? b : ggml_backend_cpu_init();
 }
 
@@ -516,7 +757,23 @@ extern "C" struct canary_ctc_context* canary_ctc_init_from_file(const char* path
         canary_ctc_free(ctx);
         return nullptr;
     }
-    cc_fold_batchnorm(ctx->model);
+    ctx->manual_attn = core_conformer::fc_gpu_manual_attn(ctx->backend);
+    if (ctx->manual_attn)
+        fprintf(stderr, "canary_ctc: manual attention on %s (CRISPASR_FC_GPU_MANUAL_ATTN)\n",
+                ggml_backend_name(ctx->backend));
+    cc_fold_batchnorm(ctx->model, ctx->backend);
+
+    // Repack F16 conv pw1/pw2 to Q8_0 (issue #81 — the 3D conv layout dodges
+    // crispasr-quantize, and the CPU F16 mul_mat path is ~6x slower than Q8_0).
+    {
+        auto& m = ctx->model;
+        std::vector<core_conformer::BlockWeights*> layers;
+        for (auto& e : m.enc)
+            layers.push_back(&e);
+        const bool quantized = !m.enc.empty() && m.enc[0].attn_q_w && ggml_is_quantized(m.enc[0].attn_q_w->type);
+        core_conformer::repack_conv_pw_q8(layers, ctx->backend, quantized, m.pw_q8, "canary_ctc");
+        core_conformer::fuse_qkv(layers, ctx->backend, m.qkv_fused, "canary_ctc");
+    }
     return ctx;
 }
 
@@ -525,6 +782,12 @@ extern "C" void canary_ctc_free(struct canary_ctc_context* ctx) {
         return;
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
+    ctx->model.pw_q8.free();
+    ctx->model.qkv_fused.free();
+    if (ctx->model.buf_f32)
+        ggml_backend_buffer_free(ctx->model.buf_f32);
+    if (ctx->model.ctx_f32)
+        ggml_free(ctx->model.ctx_f32);
     if (ctx->model.buf)
         ggml_backend_buffer_free(ctx->model.buf);
     if (ctx->model.ctx)
@@ -538,6 +801,14 @@ extern "C" void canary_ctc_free(struct canary_ctc_context* ctx) {
 
 extern "C" int canary_ctc_n_vocab(struct canary_ctc_context* ctx) {
     return (int)ctx->model.hparams.vocab_size;
+}
+// SentencePiece piece string for a token id (the id_to_token loaded from the GGUF); "" when the id is
+// out of range or the GGUF carried no token strings. The CTC blank is a separate appended index
+// (blank_id), not a piece, so it is not addressable here — consumers iterate [0, n_vocab).
+extern "C" const char* canary_ctc_token_text(struct canary_ctc_context* ctx, int id) {
+    if (!ctx || id < 0 || id >= (int)ctx->vocab.id_to_token.size())
+        return "";
+    return ctx->vocab.id_to_token[id].c_str();
 }
 extern "C" int canary_ctc_blank_id(struct canary_ctc_context* ctx) {
     return (int)ctx->model.hparams.blank_id;
@@ -588,7 +859,14 @@ extern "C" int canary_ctc_compute_logits_from_mel_debug(struct canary_ctc_contex
     if (ctx->compute_meta.empty()) {
         ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
     }
+    // #215e UAF fix: rebuild every invocation (sched gallocr regrow frees cached
+    // tensor buffers). Same fix as canary/moss_transcribe.
+    ctx->cached_meta.assign(ctx->compute_meta.size(), 0);
+    std::swap(ctx->compute_meta, ctx->cached_meta);
     ggml_cgraph* gf = cc_build_graph(ctx, T_mel);
+    std::swap(ctx->compute_meta, ctx->cached_meta);
+    ctx->cached_gf = gf;
+    ctx->cached_T_mel = T_mel;
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
         return -2;
@@ -620,9 +898,22 @@ extern "C" int canary_ctc_compute_logits_from_mel_debug(struct canary_ctc_contex
 extern "C" int canary_ctc_compute_logits(struct canary_ctc_context* ctx, const float* samples, int n_samples,
                                          float** out_logits, int* out_T_enc, int* out_vocab_total) {
     int T_mel = 0;
-    auto mel = cc_compute_mel(ctx, samples, n_samples, T_mel);
+    std::vector<float> mel;
+    {
+        canary_ctc_bench_stage _b("mel");
+        mel = cc_compute_mel(ctx, samples, n_samples, T_mel);
+    }
     if (mel.empty())
         return -1;
+
+    // Bucketed padding (CRISPASR_FC_BUCKET, issue #81 GPU phase): pad T_mel up
+    // to the bucket so the graph topology is stable across utterances and the
+    // cached graph + allocation (and CUDA-graph capture) are reused.
+    const int bucket = cc_fc_bucket();
+    const bool bucketed = bucket > 0;
+    const int T_mel_g = bucketed ? ((T_mel + bucket - 1) / bucket) * bucket : T_mel;
+    if (bucketed)
+        mel.resize((size_t)ctx->model.hparams.n_mels * T_mel_g, 0.0f); // zero pad columns
 
     if (!ctx->sched) {
         int n_backends = 1;
@@ -637,14 +928,38 @@ extern "C" int canary_ctc_compute_logits(struct canary_ctc_context* ctx, const f
         ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
     }
 
-    ggml_cgraph* gf = cc_build_graph(ctx, T_mel);
+    canary_ctc_bench_stage _b_enc("encoder+ctc");
+    ggml_cgraph* gf;
+    if (bucketed && ctx->cached_gf && ctx->cached_T_mel == T_mel_g) {
+        // Same bucket → same shapes → the sched re-alloc cannot regrow (the
+        // #215e UAF only bit when a differently-shaped graph resized the
+        // pool), and an identical topology lets ggml-cuda replay its
+        // captured graph instead of re-launching every kernel.
+        gf = ctx->cached_gf;
+    } else {
+        // #215e UAF fix: rebuild on any shape change (sched gallocr regrow
+        // frees cached tensor buffers). Same fix as canary/moss_transcribe.
+        ctx->cached_meta.assign(ctx->compute_meta.size(), 0);
+        std::swap(ctx->compute_meta, ctx->cached_meta);
+        gf = cc_build_graph(ctx, T_mel_g, bucketed);
+        std::swap(ctx->compute_meta, ctx->cached_meta);
+        ctx->cached_gf = gf;
+        ctx->cached_T_mel = T_mel_g;
+    }
+
+    cc_prof_state prof;
+    if (canary_ctc_profile_enabled())
+        ggml_backend_sched_set_eval_callback(ctx->sched, cc_prof_cb, &prof);
 
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
         return -2;
 
+    // Re-set ALL inputs on every call — gallocr may hand an input's buffer to
+    // a later intermediate op after that input's last use, so no input value
+    // survives across computes (the §234 aliasing gotcha).
     ggml_tensor* mel_in = ggml_graph_get_tensor(gf, "mel");
-    ggml_backend_tensor_set(mel_in, mel.data(), 0, (size_t)ctx->model.hparams.n_mels * T_mel * sizeof(float));
+    ggml_backend_tensor_set(mel_in, mel.data(), 0, (size_t)ctx->model.hparams.n_mels * T_mel_g * sizeof(float));
 
     ggml_tensor* pos_in = ggml_graph_get_tensor(gf, "pos_enc");
     int T_enc = (int)pos_in->ne[1];
@@ -652,15 +967,55 @@ extern "C" int canary_ctc_compute_logits(struct canary_ctc_context* ctx, const f
     auto pe = core_conformer::make_pos_enc((int)ctx->model.hparams.d_model, T_enc);
     ggml_backend_tensor_set(pos_in, pe.data(), 0, pe.size() * sizeof(float));
 
+    const int T_enc_true = bucketed ? cc_sub_len(T_mel) : T_enc;
+    if (bucketed) {
+        ggml_tensor* pm = ggml_graph_get_tensor(gf, "pad_mask");
+        ggml_tensor* tm = ggml_graph_get_tensor(gf, "time_mask");
+        if (!pm || !tm || T_enc_true > T_enc)
+            return -5;
+        // Pre-encode stage masks: valid = true subsampled length per stage.
+        for (auto [name, t_true] : {std::pair<const char*, int>{"stage_mask_t0", (T_mel - 1) / 2 + 1},
+                                    std::pair<const char*, int>{"stage_mask_t1", ((T_mel - 1) / 2 + 1 - 1) / 2 + 1}}) {
+            ggml_tensor* sm = ggml_graph_get_tensor(gf, name);
+            if (!sm)
+                return -5;
+            std::vector<float> v((size_t)sm->ne[1], 0.0f);
+            for (int t = 0; t < t_true && t < (int)sm->ne[1]; t++)
+                v[t] = 1.0f;
+            ggml_backend_tensor_set(sm, v.data(), 0, v.size() * sizeof(float));
+        }
+        // -INFINITY, not -1e9: pad-column garbage grows with depth and its
+        // QK scores can reach the same magnitude as a finite mask constant,
+        // giving pad keys nonzero softmax weight (bisected: exact through
+        // 2 blocks, leaking from ~block 3-6). -inf dominates any finite score.
+        std::vector<float> pmv((size_t)T_enc * T_enc, 0.0f);
+        for (int q = 0; q < T_enc; q++)
+            for (int k = T_enc_true; k < T_enc; k++)
+                pmv[(size_t)q * T_enc + k] = -INFINITY;
+        ggml_backend_tensor_set(pm, pmv.data(), 0, pmv.size() * sizeof(float));
+        std::vector<float> tmv((size_t)T_enc, 1.0f);
+        for (int t = T_enc_true; t < T_enc; t++)
+            tmv[t] = 0.0f;
+        ggml_backend_tensor_set(tm, tmv.data(), 0, tmv.size() * sizeof(float));
+    }
+
+    if (canary_ctc_profile_enabled())
+        prof.last = std::chrono::steady_clock::now();
+
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS)
         return -3;
+
+    if (canary_ctc_profile_enabled()) {
+        ggml_backend_sched_set_eval_callback(ctx->sched, nullptr, nullptr);
+        prof.dump();
+    }
 
     ggml_tensor* out = ggml_graph_get_tensor(gf, "ctc_logits");
     if (!out)
         return -4;
 
     const int V = (int)out->ne[0];
-    const int Te = (int)out->ne[1];
+    const int Te = bucketed ? T_enc_true : (int)out->ne[1]; // trim pad columns
 
     *out_T_enc = Te;
     *out_vocab_total = V;

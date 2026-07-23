@@ -51,6 +51,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Install clang-format
         # Pin the version so the same formatting verdict is produced here and
@@ -134,14 +136,22 @@ jobs:
   # ---------------------------------------------------------------------------
   cppcheck:
     name: cppcheck (static analysis)
-    runs-on: ubuntu-latest
+    # Pin the runner image, not ubuntu-latest: cppcheck is apt-installed and its
+    # version tracks the image, so `ubuntu-latest` flipping (e.g. 22.04 -> 24.04)
+    # silently changes which findings fire and can turn Lint red with NO code
+    # change (clang-format is version-pinned for exactly this reason). 22.04
+    # ships cppcheck 2.7; bump this line deliberately when adopting a new version.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Install cppcheck
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends cppcheck
+          cppcheck --version   # record the pinned version in the log
 
       - name: Run cppcheck
         # --error-exitcode=1: fail on any error-level finding.
@@ -182,6 +192,44 @@ jobs:
   # in the README's model table and asserts our language column matches
   # the upstream card's `language:` frontmatter.
   # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Every tools/kaggle/<kernel>/ bundles its own kaggle_harness.py as the
+  # clone-failure fallback (CPU workers have no internet). Nothing kept them in
+  # sync: on 2026-07-20 there were 4 distinct versions across 53 files. The
+  # drift only bites when the in-kernel git clone fails, so it stays invisible
+  # until the one run that needs the fallback. Pure file hashing — no build.
+  # ---------------------------------------------------------------------------
+  kaggle-harness-sync:
+    name: kaggle_harness bundled-copy sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Check bundled harness copies match canonical
+        run: python tools/check-kaggle-harness-sync.py
+
+  # The wiring audit checks a registry ROW EXISTS; nothing checked the URL
+  # resolves. A registry entry naming a HuggingFace repo that had never been
+  # created shipped to main and `-m auto` would have 404'd (tabcnn, 2026-07-20).
+  # Network-dependent and third-party, so soft-fire like readme-langs: a flaky
+  # HF API should not block a PR.
+  registry-urls:
+    name: model-registry URLs resolve
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: HEAD every registry download URL
+        run: python tools/check-registry-urls.py --jobs 8 --timeout 25
+
   readme-langs:
     name: README language metadata
     runs-on: ubuntu-latest
@@ -190,6 +238,8 @@ jobs:
     # network errors degrade to "skip" without failing the lint.
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Set up Python
         uses: actions/setup-python@v6

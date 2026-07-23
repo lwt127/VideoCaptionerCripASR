@@ -14,11 +14,20 @@
 
 #include "titanet.h"
 #include "core/gguf_loader.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "ggml.h"
 #include "gguf.h"
 
+#if defined(HAVE_ACCELERATE)
+#include <Accelerate/Accelerate.h>
+#endif
+
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -27,9 +36,48 @@
 #include <string>
 #include <vector>
 
+// The TitaNet speaker-embedding forward is entirely hand-rolled CPU scalar
+// math. The pointwise convs (1×1 matmuls) + the ASP TDNN/attention matmuls are
+// the dominant cost. PLAN: Accelerate cblas_sgemm; set TITANET_FORCE_SCALAR=1
+// to validate scalar == GEMM or run on non-Apple.
+static bool titanet_use_scalar() {
+#if defined(HAVE_ACCELERATE)
+    static const bool force_scalar = crispasr_env::get("CRISPASR_TITANET_FORCE_SCALAR") != nullptr;
+    return force_scalar;
+#else
+    return true;
+#endif
+}
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+// ===========================================================================
+// Bench instrumentation — `TITANET_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool titanet_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_TITANET_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct titanet_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit titanet_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~titanet_bench_stage() {
+        if (!titanet_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  titanet_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ============================================================================
 // Helpers
@@ -160,6 +208,39 @@ struct titanet_model_cache {
     ASPCache asp;
 };
 
+// ggml-path weight handles — folded/preprocessed weights uploaded once at
+// init into a CPU backend buffer (layouts chosen so conv_1d/conv_1d_dw/
+// mul_mat consume them without transposes; see titanet_upload_ggml_weights).
+struct SubBlockGgml {
+    ggml_tensor* dw = nullptr;   // (K, 1, C)      — ggml_conv_1d_dw kernel
+    ggml_tensor* pw = nullptr;   // (1, Cin, Cout) — ggml_conv_1d k=1 kernel
+    ggml_tensor* bn_g = nullptr; // (Cout,)
+    ggml_tensor* bn_b = nullptr; // (Cout,)
+};
+struct BlockGgml {
+    std::vector<SubBlockGgml> subs;
+    ggml_tensor* se_fc1 = nullptr;   // (C, se_ch)
+    ggml_tensor* se_fc2 = nullptr;   // (se_ch, C)
+    ggml_tensor* res_pw = nullptr;   // (1, Cin, Cout)
+    ggml_tensor* res_bn_g = nullptr; // (Cout,)
+    ggml_tensor* res_bn_b = nullptr;
+};
+struct TitanetGgml {
+    ggml_context* ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    std::vector<BlockGgml> blocks;
+    ggml_tensor* tdnn = nullptr; // (1, 9216, 128)
+    ggml_tensor* tdnn_b = nullptr;
+    ggml_tensor* tdnn_bn_g = nullptr;
+    ggml_tensor* tdnn_bn_b = nullptr;
+    ggml_tensor* aconv = nullptr; // (1, 128, 3072)
+    ggml_tensor* aconv_b = nullptr;
+    ggml_tensor* pool_bn_g = nullptr; // (6144,)
+    ggml_tensor* pool_bn_b = nullptr;
+    ggml_tensor* fc = nullptr; // (6144, 192)
+    ggml_tensor* fc_b = nullptr;
+};
+
 struct titanet_context {
     titanet_model_cache cache;
     int n_threads = 4;
@@ -167,6 +248,9 @@ struct titanet_context {
     ggml_backend_buffer_t buf = nullptr;
     ggml_context* weight_ctx = nullptr;
     std::map<std::string, ggml_tensor*> tensors;
+
+    ggml_backend_t backend_cpu = nullptr; // ggml-path compute backend
+    TitanetGgml g;
 };
 
 // ============================================================================
@@ -289,6 +373,220 @@ static void init_cache(titanet_context* ctx) {
     c.initialised = true;
 }
 
+// ===========================================================================
+// ggml forward (default) — the whole encoder + ASP as one CPU-backend graph
+// (threaded SIMD matmuls). CRISPASR_TITANET_LEGACY=1 selects the original
+// scalar/Accelerate path (A/B ground truth; the ggml path is validated
+// embedding-for-embedding against it).
+// ===========================================================================
+
+// Inverse-default regime (see crispasr-crispembed-dev.md): the ggml path is
+// embedding-identical (cos=1.000000 vs legacy) and ~10× faster than the
+// scalar loops on non-Apple CPUs, but on Apple the legacy path's Accelerate
+// GEMMs run on the AMX (~5× faster than ggml's F32 NEON matmul: 0.7 s vs
+// 3.4 s per embed on M1). So: default ggml WITHOUT Accelerate, default
+// legacy WITH it. CRISPASR_TITANET_GGML=1 / CRISPASR_TITANET_LEGACY=1
+// force either way.
+static bool titanet_use_legacy() {
+    static const bool v = [] {
+        if (const char* e = std::getenv("CRISPASR_TITANET_LEGACY"); e && *e && *e != '0')
+            return true;
+        if (const char* e = std::getenv("CRISPASR_TITANET_GGML"); e && *e && *e != '0')
+            return false;
+#if defined(HAVE_ACCELERATE)
+        return true;
+#else
+        return false;
+#endif
+    }();
+    return v;
+}
+
+// TITANET_DUMP=<path>: append each L2-normalized embedding as raw F32 —
+// A/B comparison between the ggml and legacy paths.
+static void titanet_dump_emb(const float* emb, int dim) {
+    const char* p = crispasr_env::get("CRISPASR_TITANET_DUMP");
+    if (!p)
+        return;
+    if (FILE* f = fopen(p, "ab")) {
+        fwrite(emb, sizeof(float), (size_t)dim, f);
+        fclose(f);
+    }
+}
+
+// Upload the pre-folded host cache into ggml tensors on the CPU backend.
+// Layout notes (host flat data → ggml ne, no reordering needed):
+//   dw   (C,K) row-major        → ne (K, 1, C)      for ggml_conv_1d_dw
+//   pw   (Cout,Cin) row-major   → ne (1, Cin, Cout) for ggml_conv_1d k=1
+//   fc   (Rows,Cols) row-major  → ne (Cols, Rows)   for ggml_mul_mat direct
+static bool titanet_upload_ggml_weights(titanet_context* ctx) {
+    auto& c = ctx->cache;
+    auto& g = ctx->g;
+
+    size_t n_tensors = 16;
+    for (auto& blk : c.blocks)
+        n_tensors += blk.subs.size() * 4 + 5;
+    ggml_init_params ip = {n_tensors * ggml_tensor_overhead(), nullptr, true};
+    g.ctx = ggml_init(ip);
+    if (!g.ctx)
+        return false;
+
+    std::vector<std::pair<ggml_tensor*, const float*>> uploads;
+    auto mk1 = [&](const std::vector<float>& v) {
+        if (v.empty())
+            return (ggml_tensor*)nullptr;
+        ggml_tensor* t = ggml_new_tensor_1d(g.ctx, GGML_TYPE_F32, (int64_t)v.size());
+        uploads.emplace_back(t, v.data());
+        return t;
+    };
+    auto mk = [&](const std::vector<float>& v, int64_t ne0, int64_t ne1, int64_t ne2) {
+        if (v.empty())
+            return (ggml_tensor*)nullptr;
+        ggml_tensor* t = ggml_new_tensor_3d(g.ctx, GGML_TYPE_F32, ne0, ne1, ne2);
+        uploads.emplace_back(t, v.data());
+        return t;
+    };
+
+    g.blocks.resize(c.blocks.size());
+    for (size_t bi = 0; bi < c.blocks.size(); bi++) {
+        auto& blk = c.blocks[bi];
+        auto& gb = g.blocks[bi];
+        gb.subs.resize(blk.subs.size());
+        for (size_t si = 0; si < blk.subs.size(); si++) {
+            auto& sub = blk.subs[si];
+            auto& gs = gb.subs[si];
+            gs.dw = mk(sub.dw_w, sub.dw_K, 1, sub.dw_C);
+            gs.pw = mk(sub.pw_w, 1, sub.pw_in, sub.pw_out);
+            gs.bn_g = mk1(sub.dw_bn.gamma);
+            gs.bn_b = mk1(sub.dw_bn.beta);
+        }
+        if (!blk.se.fc1_w.empty()) {
+            gb.se_fc1 = mk(blk.se.fc1_w, blk.se.C, blk.se.se_ch, 1);
+            gb.se_fc2 = mk(blk.se.fc2_w, blk.se.se_ch, blk.se.C, 1);
+        }
+        if (blk.has_residual) {
+            gb.res_pw = mk(blk.res.conv_w, 1, blk.res.in_ch, blk.res.out_ch);
+            gb.res_bn_g = mk1(blk.res.bn.gamma);
+            gb.res_bn_b = mk1(blk.res.bn.beta);
+        }
+    }
+    auto& a = c.asp;
+    const int asp_in = c.epilog_channels * 3;
+    g.tdnn = mk(a.tdnn_w, 1, asp_in, 128);
+    g.tdnn_b = mk1(a.tdnn_b);
+    g.tdnn_bn_g = mk1(a.tdnn_bn.gamma);
+    g.tdnn_bn_b = mk1(a.tdnn_bn.beta);
+    g.aconv = mk(a.conv_w, 1, 128, c.epilog_channels);
+    g.aconv_b = mk1(a.conv_b);
+    g.pool_bn_g = mk1(a.pool_bn.gamma);
+    g.pool_bn_b = mk1(a.pool_bn.beta);
+    g.fc = mk(a.fc_w, c.epilog_channels * 2, c.emb_dim, 1);
+    g.fc_b = mk1(a.fc_b);
+
+    g.buf = ggml_backend_alloc_ctx_tensors(g.ctx, ctx->backend_cpu);
+    if (!g.buf)
+        return false;
+    for (auto& [t, data] : uploads)
+        ggml_backend_tensor_set(t, data, 0, ggml_nbytes(t));
+    return true;
+}
+
+// Encoder + ASP as one graph. `mel` is row-major (T, n_mels); writes the
+// un-normalized embedding (emb_dim floats) to `emb`.
+static bool titanet_embed_ggml(titanet_context* ctx, const float* mel, int T, float* emb) {
+    titanet_bench_stage _bs("encoder_ggml");
+    auto& c = ctx->cache;
+    auto& g = ctx->g;
+
+    const size_t GRAPH_NODES = 1024;
+    ggml_init_params ip = {GRAPH_NODES * ggml_tensor_overhead() + ggml_graph_overhead_custom(GRAPH_NODES, false),
+                           nullptr, true};
+    ggml_context* c0 = ggml_init(ip);
+    if (!c0)
+        return false;
+    ggml_cgraph* gf = ggml_new_graph_custom(c0, GRAPH_NODES, false);
+
+    ggml_tensor* mel_in = ggml_new_tensor_2d(c0, GGML_TYPE_F32, c.n_mels, T); // row-major (T, n_mels)
+    ggml_set_input(mel_in);
+    ggml_tensor* x = ggml_cont(c0, ggml_transpose(c0, mel_in)); // (T, C) time-fastest
+
+    auto bn = [&](ggml_tensor* t, ggml_tensor* gam, ggml_tensor* bet) {
+        const int64_t C = t->ne[1];
+        return ggml_add(c0, ggml_mul(c0, t, ggml_reshape_2d(c0, gam, 1, C)), ggml_reshape_2d(c0, bet, 1, C));
+    };
+
+    for (size_t bi = 0; bi < g.blocks.size(); bi++) {
+        auto& gb = g.blocks[bi];
+        ggml_tensor* blk_in = x;
+        for (size_t si = 0; si < gb.subs.size(); si++) {
+            auto& gs = gb.subs[si];
+            const int K = (int)gs.dw->ne[0];
+            ggml_tensor* h = ggml_conv_1d_dw(c0, gs.dw, x, 1, (K - 1) / 2, 1);
+            h = ggml_reshape_2d(c0, h, x->ne[0], gs.dw->ne[2]);
+            h = ggml_conv_1d(c0, gs.pw, h, 1, 0, 1); // (T, Cout)
+            h = bn(h, gs.bn_g, gs.bn_b);
+            if (si + 1 < gb.subs.size())
+                h = ggml_relu(c0, h);
+            x = h;
+        }
+        if (gb.se_fc1) {
+            ggml_tensor* pooled = ggml_mean(c0, x); // over T → (1, C)
+            const int64_t C = x->ne[1];
+            ggml_tensor* hse = ggml_relu(c0, ggml_mul_mat(c0, gb.se_fc1, ggml_reshape_2d(c0, pooled, C, 1)));
+            ggml_tensor* s = ggml_sigmoid(c0, ggml_mul_mat(c0, gb.se_fc2, hse)); // (C, 1)
+            x = ggml_mul(c0, x, ggml_reshape_2d(c0, s, 1, C));
+        }
+        if (gb.res_pw) {
+            ggml_tensor* r = ggml_conv_1d(c0, gb.res_pw, blk_in, 1, 0, 1);
+            r = bn(r, gb.res_bn_g, gb.res_bn_b);
+            x = ggml_add(c0, x, r);
+        }
+        x = ggml_relu(c0, x);
+    }
+
+    // ---- ASP ----
+    // x is (T, 3072). Stats over time; softmax over time per channel.
+    ggml_tensor* mean = ggml_mean(c0, x); // (1, C)
+    ggml_tensor* var = ggml_sub(c0, ggml_mean(c0, ggml_sqr(c0, x)), ggml_sqr(c0, mean));
+    ggml_tensor* stdv = ggml_sqrt(c0, ggml_clamp(c0, var, 1e-10f, 3.4e38f));
+    ggml_tensor* xcat = ggml_concat(c0, x, ggml_repeat(c0, mean, x), 1);
+    xcat = ggml_concat(c0, xcat, ggml_repeat(c0, stdv, x), 1); // (T, 9216)
+
+    ggml_tensor* h = ggml_conv_1d(c0, g.tdnn, xcat, 1, 0, 1); // (T, 128)
+    h = ggml_add(c0, h, ggml_reshape_2d(c0, g.tdnn_b, 1, 128));
+    h = ggml_tanh(c0, bn(h, g.tdnn_bn_g, g.tdnn_bn_b));
+
+    ggml_tensor* attn = ggml_conv_1d(c0, g.aconv, h, 1, 0, 1); // (T, 3072)
+    attn = ggml_add(c0, attn, ggml_reshape_2d(c0, g.aconv_b, 1, (int64_t)c.epilog_channels));
+    attn = ggml_soft_max(c0, attn); // over ne[0]=T per channel
+
+    ggml_tensor* wm = ggml_sum_rows(c0, ggml_mul(c0, attn, x));                // (1, C)
+    ggml_tensor* wm2 = ggml_sum_rows(c0, ggml_mul(c0, attn, ggml_sqr(c0, x))); // (1, C)
+    ggml_tensor* wstd = ggml_sqrt(c0, ggml_clamp(c0, ggml_sub(c0, wm2, ggml_sqr(c0, wm)), 1e-10f, 3.4e38f));
+
+    ggml_tensor* pool = ggml_concat(c0, wm, wstd, 1); // (1, 6144)
+    const int64_t P = (int64_t)c.epilog_channels * 2;
+    pool = ggml_add(c0, ggml_mul(c0, pool, ggml_reshape_2d(c0, g.pool_bn_g, 1, P)),
+                    ggml_reshape_2d(c0, g.pool_bn_b, 1, P));
+
+    ggml_tensor* out = ggml_mul_mat(c0, ggml_reshape_2d(c0, g.fc, P, c.emb_dim), ggml_reshape_2d(c0, pool, P, 1));
+    out = ggml_add(c0, out, ggml_reshape_2d(c0, g.fc_b, (int64_t)c.emb_dim, 1)); // (emb_dim, 1)
+    ggml_set_output(out);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend_cpu));
+    bool ok = ggml_gallocr_alloc_graph(ga, gf);
+    if (ok) {
+        ggml_backend_tensor_set(mel_in, mel, 0, (size_t)T * c.n_mels * sizeof(float));
+        ok = ggml_backend_graph_compute(ctx->backend_cpu, gf) == GGML_STATUS_SUCCESS;
+    }
+    if (ok)
+        ggml_backend_tensor_get(out, emb, 0, (size_t)c.emb_dim * sizeof(float));
+    ggml_gallocr_free(ga);
+    ggml_free(c0);
+    return ok;
+}
+
 extern "C" struct titanet_context* titanet_init(const char* model_path, int n_threads) {
     auto* ctx = new titanet_context();
     ctx->n_threads = n_threads > 0 ? n_threads : 4;
@@ -337,7 +635,7 @@ extern "C" struct titanet_context* titanet_init(const char* model_path, int n_th
             c.n_blocks);
 
     // Phase 2: load weights
-    ctx->backend = ggml_backend_init_best();
+    ctx->backend = crispasr_init_gpu_backend();
     if (!ctx->backend) {
         delete ctx;
         return nullptr;
@@ -356,12 +654,37 @@ extern "C" struct titanet_context* titanet_init(const char* model_path, int n_th
     // Pre-fold BN and cache all weights
     init_cache(ctx);
 
+    // ggml compute path (default): upload the folded cache to a CPU backend
+    // buffer once. On failure fall back to the legacy scalar path.
+    if (!titanet_use_legacy()) {
+        ctx->backend_cpu = ggml_backend_cpu_init();
+        if (ctx->backend_cpu) {
+            ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+            if (!titanet_upload_ggml_weights(ctx)) {
+                fprintf(stderr, "titanet: ggml weight upload failed, using legacy path\n");
+                if (ctx->g.buf)
+                    ggml_backend_buffer_free(ctx->g.buf);
+                if (ctx->g.ctx)
+                    ggml_free(ctx->g.ctx);
+                ctx->g = TitanetGgml{};
+                ggml_backend_free(ctx->backend_cpu);
+                ctx->backend_cpu = nullptr;
+            }
+        }
+    }
+
     return ctx;
 }
 
 extern "C" void titanet_free(struct titanet_context* ctx) {
     if (!ctx)
         return;
+    if (ctx->g.buf)
+        ggml_backend_buffer_free(ctx->g.buf);
+    if (ctx->g.ctx)
+        ggml_free(ctx->g.ctx);
+    if (ctx->backend_cpu)
+        ggml_backend_free(ctx->backend_cpu);
     if (ctx->weight_ctx)
         ggml_free(ctx->weight_ctx);
     if (ctx->buf)
@@ -543,6 +866,14 @@ static std::vector<float> depthwise_conv1d(const float* input, int C, int T, con
 // Pointwise Conv1d (k=1): matmul. Input [C_in, T], weight [C_out, C_in] → [C_out, T]
 static std::vector<float> pointwise_conv1d(const float* input, int C_in, int T, const float* weight, int C_out) {
     std::vector<float> out((size_t)C_out * T, 0.0f);
+#if defined(HAVE_ACCELERATE)
+    if (!titanet_use_scalar()) {
+        // out[C_out, T] = W[C_out, C_in] @ input[C_in, T]
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, C_out, T, C_in, 1.0f, weight, C_in, input, T, 0.0f,
+                    out.data(), T);
+        return out;
+    }
+#endif
     for (int co = 0; co < C_out; co++) {
         const float* wrow = weight + (size_t)co * C_in;
         float* orow = out.data() + (size_t)co * T;
@@ -601,6 +932,8 @@ extern "C" int titanet_embed(struct titanet_context* ctx, const float* pcm_16k, 
     if (!c.initialised)
         return 0;
 
+    titanet_bench_stage _bs_total("embed_total");
+
     // 1. Mel spectrogram
     int T = 0;
     auto mel = compute_mel_spectrogram(c, pcm_16k, n_samples, T);
@@ -608,7 +941,7 @@ extern "C" int titanet_embed(struct titanet_context* ctx, const float* pcm_16k, 
         return 0;
 
     // Debug: optionally load reference mel features
-    const char* ref_path = getenv("TITANET_REF_MEL");
+    const char* ref_path = crispasr_env::get("CRISPASR_TITANET_REF_MEL");
     if (ref_path && *ref_path) {
         FILE* f = fopen(ref_path, "rb");
         if (f) {
@@ -616,6 +949,20 @@ extern "C" int titanet_embed(struct titanet_context* ctx, const float* pcm_16k, 
             fclose(f);
             fprintf(stderr, "titanet: LOADED ref mel from %s (%d frames)\n", ref_path, T);
         }
+    }
+
+    // ggml path: encoder + ASP as one CPU-backend graph, then shared L2 norm.
+    if (ctx->backend_cpu && ctx->g.ctx) {
+        if (!titanet_embed_ggml(ctx, mel.data(), T, out))
+            return 0;
+        float norm = 0.0f;
+        for (int i = 0; i < c.emb_dim; i++)
+            norm += out[i] * out[i];
+        norm = 1.0f / (std::sqrt(norm) + 1e-12f);
+        for (int i = 0; i < c.emb_dim; i++)
+            out[i] *= norm;
+        titanet_dump_emb(out, c.emb_dim);
+        return c.emb_dim;
     }
 
     // Transpose mel from (T, n_mels) to (n_mels, T) for channel-first processing
@@ -698,15 +1045,42 @@ extern "C" int titanet_embed(struct titanet_context* ctx, const float* pcm_16k, 
     auto& asp = c.asp;
     int asp_in = C_enc * 3; // 9216
     std::vector<float> asp_h(128 * T, 0.0f);
-    for (int i = 0; i < 128; i++) {
-        for (int t = 0; t < T; t++) {
-            double s = asp.tdnn_b.empty() ? 0.0 : asp.tdnn_b[i];
-            for (int c_ = 0; c_ < C_enc; c_++) {
-                s += x[(size_t)c_ * T + t] * asp.tdnn_w[(size_t)i * asp_in + c_];
-                s += h_mean[c_] * asp.tdnn_w[(size_t)i * asp_in + C_enc + c_];
-                s += h_std[c_] * asp.tdnn_w[(size_t)i * asp_in + 2 * C_enc + c_];
+#if defined(HAVE_ACCELERATE)
+    if (!titanet_use_scalar()) {
+        // asp_h[128, T] = W[128, 9216] @ X[9216, T], X = [x; mean⊗1; std⊗1].
+        std::vector<float> X((size_t)asp_in * T);
+        std::memcpy(X.data(), x.data(), (size_t)C_enc * T * sizeof(float));
+        for (int c_ = 0; c_ < C_enc; c_++) {
+            float* rm = X.data() + (size_t)(C_enc + c_) * T;
+            float* rs = X.data() + (size_t)(2 * C_enc + c_) * T;
+            float vm = h_mean[c_], vs = h_std[c_];
+            for (int t = 0; t < T; t++) {
+                rm[t] = vm;
+                rs[t] = vs;
             }
-            asp_h[(size_t)i * T + t] = (float)s;
+        }
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, 128, T, asp_in, 1.0f, asp.tdnn_w.data(), asp_in,
+                    X.data(), T, 0.0f, asp_h.data(), T);
+        if (!asp.tdnn_b.empty())
+            for (int i = 0; i < 128; i++) {
+                float b = asp.tdnn_b[i];
+                float* row = asp_h.data() + (size_t)i * T;
+                for (int t = 0; t < T; t++)
+                    row[t] += b;
+            }
+    } else
+#endif
+    {
+        for (int i = 0; i < 128; i++) {
+            for (int t = 0; t < T; t++) {
+                double s = asp.tdnn_b.empty() ? 0.0 : asp.tdnn_b[i];
+                for (int c_ = 0; c_ < C_enc; c_++) {
+                    s += x[(size_t)c_ * T + t] * asp.tdnn_w[(size_t)i * asp_in + c_];
+                    s += h_mean[c_] * asp.tdnn_w[(size_t)i * asp_in + C_enc + c_];
+                    s += h_std[c_] * asp.tdnn_w[(size_t)i * asp_in + 2 * C_enc + c_];
+                }
+                asp_h[(size_t)i * T + t] = (float)s;
+            }
         }
     }
 
@@ -719,12 +1093,28 @@ extern "C" int titanet_embed(struct titanet_context* ctx, const float* pcm_16k, 
 
     // Attention conv: 128 → 3072
     std::vector<float> attn((size_t)C_enc * T, 0.0f);
-    for (int c_ = 0; c_ < C_enc; c_++) {
-        for (int t = 0; t < T; t++) {
-            double s = asp.conv_b.empty() ? 0.0 : asp.conv_b[c_];
-            for (int k = 0; k < 128; k++)
-                s += asp_h[(size_t)k * T + t] * asp.conv_w[(size_t)c_ * 128 + k];
-            attn[(size_t)c_ * T + t] = (float)s;
+#if defined(HAVE_ACCELERATE)
+    if (!titanet_use_scalar()) {
+        // attn[C_enc, T] = W[C_enc, 128] @ asp_h[128, T]
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, C_enc, T, 128, 1.0f, asp.conv_w.data(), 128,
+                    asp_h.data(), T, 0.0f, attn.data(), T);
+        if (!asp.conv_b.empty())
+            for (int c_ = 0; c_ < C_enc; c_++) {
+                float b = asp.conv_b[c_];
+                float* row = attn.data() + (size_t)c_ * T;
+                for (int t = 0; t < T; t++)
+                    row[t] += b;
+            }
+    } else
+#endif
+    {
+        for (int c_ = 0; c_ < C_enc; c_++) {
+            for (int t = 0; t < T; t++) {
+                double s = asp.conv_b.empty() ? 0.0 : asp.conv_b[c_];
+                for (int k = 0; k < 128; k++)
+                    s += asp_h[(size_t)k * T + t] * asp.conv_w[(size_t)c_ * 128 + k];
+                attn[(size_t)c_ * T + t] = (float)s;
+            }
         }
     }
 
@@ -784,6 +1174,7 @@ extern "C" int titanet_embed(struct titanet_context* ctx, const float* pcm_16k, 
     for (int i = 0; i < emb_dim; i++)
         out[i] *= norm;
 
+    titanet_dump_emb(out, emb_dim);
     return emb_dim;
 }
 

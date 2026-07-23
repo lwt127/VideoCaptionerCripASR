@@ -18,7 +18,10 @@ from pathlib import Path
 from typing import Iterable
 
 import gradio as gr
+import httpx
 import requests
+import uvicorn
+from fastapi import FastAPI, Request, Response
 
 
 SERVER_URL = os.environ.get("CRISPASR_SERVER_URL", "http://127.0.0.1:8080").rstrip("/")
@@ -54,11 +57,25 @@ ASR_MODELS = [
      "Cohere Labs. Punctuation + casing. Slowest of the small set."),
     ("Qwen3 ASR 0.6B — 30 langs + 22 Chinese dialects",      "qwen3",              "auto", "auto", "~500 MB",
      "Speech-LLM (Whisper enc + Qwen3 0.6B). Native language ID."),
+    ("Canary — multilingual + translation",                   "canary",             "auto", "auto", "~800 MB",
+     "NVIDIA Canary 1B. Native speech translation. 25+ langs."),
+    ("HuBERT CTC — English",                                  "hubert",             "auto", "en",   "~380 MB",
+     "Self-supervised CTC. Lightweight encoder, no punctuation."),
+    ("Data2Vec CTC — English",                                "data2vec",           "auto", "en",   "~380 MB",
+     "Meta Data2Vec CTC. Similar to HuBERT."),
 ]
 
 TTS_MODELS = [
     ("Kokoro 82M — multilingual StyleTTS2",                  "kokoro",             "auto", "en",   "~85 MB",
      "9 langs (EN/ES/FR/HI/IT/JA/PT/ZH/DE). Apache-2.0. Only TTS realistic on free-tier CPU."),
+    ("VibeVoice 0.5B — EN/DE/ZH StyleTTS",                  "vibevoice",          "auto", "en",   "~200 MB",
+     "VibeVoice encoder-decoder TTS. EN/DE/ZH. Apache-2.0."),
+    ("Orpheus 0.5B — English expressive TTS",                "orpheus",            "auto", "en",   "~400 MB",
+     "SNAC codec + LLM decoder. Expressive speech with emotion tags."),
+    ("Chatterbox — English voice cloning",                   "chatterbox",         "auto", "en",   "~450 MB",
+     "Resemble AI. Zero-shot voice cloning from a reference clip. Apache-2.0."),
+    ("Chatterbox Turbo — faster voice cloning",              "chatterbox-turbo",   "auto", "en",   "~350 MB",
+     "Faster Chatterbox variant. Same voice cloning, 2× speed."),
 ]
 
 # (display, model arg passed to `-m`, blurb)
@@ -67,6 +84,18 @@ LID_MODELS = [
     ("GlotLID-V3 — 2102 ISO-639-3 + script", "auto:glotlid",          "cis-lmu fastText. Max language coverage."),
     ("LID-176 — 176 ISO-639-1 (CC-BY-SA)",   "auto:lid-fasttext176",  "Facebook fastText. Output GGUF inherits CC-BY-SA-3.0."),
 ]
+
+# (display, backend, model_arg, approx_size, blurb)
+NMT_MODELS = [
+    ("M2M-100 418M — 100 langs, any→any",    "m2m100",     "auto", "~800 MB",
+     "Facebook M2M-100. 100 language pairs. Best general-purpose NMT."),
+    ("WMT21 Dense — en↔X, 14 high-resource",  "m2m100-wmt21", "auto", "~800 MB",
+     "WMT21 competition model. Higher quality for en↔de, en↔zh, etc."),
+    ("MADLAD-400 — 419 langs (CC-BY-SA)",     "madlad",     "auto", "~500 MB",
+     "Google T5-based. Widest language coverage. Output inherits CC-BY-SA."),
+]
+
+CRISPASR_CLI_BIN = shutil.which("crispasr-cli") or shutil.which("crispasr") or "crispasr-cli"
 
 
 def log(msg: str) -> None:
@@ -296,12 +325,57 @@ def detect_text_language(text, model_choice, top_k):
     return rows, (proc.stdout or "") + ("\n--- stderr ---\n" + proc.stderr if proc.stderr else "")
 
 
+def translate_text(text, model_choice, src_lang, tgt_lang):
+    text = (text or "").strip()
+    if not text:
+        raise gr.Error("Enter some text to translate.")
+    spec = _spec_by_label(NMT_MODELS, model_choice) or NMT_MODELS[0]
+    _, backend, model_arg, _, _ = spec
+    src = (src_lang or "en").strip()
+    tgt = (tgt_lang or "de").strip()
+    cmd = [
+        CRISPASR_CLI_BIN,
+        "--backend", backend,
+        "-m", model_arg,
+        "--auto-download",
+        "--cache-dir", str(CACHE_DIR),
+        "--text", text,
+        "-sl", src,
+        "-tl", tgt,
+    ]
+    log(f"translate: backend={backend} {src}→{tgt} chars={len(text)}")
+    env = {**os.environ, "CRISPASR_CACHE_DIR": str(CACHE_DIR)}
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            env=env,
+        )
+    except FileNotFoundError:
+        raise gr.Error(f"crispasr not found at '{CRISPASR_CLI_BIN}'.")
+    if proc.returncode != 0:
+        raise gr.Error(
+            f"Translation failed (exit {proc.returncode}): {(proc.stderr or '').strip()[:400]}"
+        )
+    result = proc.stdout.strip()
+    if not result:
+        raise gr.Error("Translation returned empty output.")
+    return result
+
+
+def select_nmt(choice):
+    spec = _spec_by_label(NMT_MODELS, choice) or NMT_MODELS[0]
+    return f"{spec[4]}\n\nApprox. download: {spec[3]}"
+
+
 def list_sample_files() -> list[str]:
     if not SAMPLES_DIR.exists():
         return []
     out = []
     for p in sorted(SAMPLES_DIR.iterdir()):
-        if p.suffix.lower() in {".wav", ".mp3", ".flac", ".ogg", ".m4a"}:
+        if p.suffix.lower() in {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus", ".webm", ".wma"}:
             out.append(str(p))
     return out
 
@@ -342,12 +416,20 @@ CAPABILITY_TABLE_MD = """### Free-tier ASR backends in this Space
 | `parakeet-ctc-0.6b` | | | | Fast English CTC |
 | `cohere` | ✔ | LID | | Lowest English WER |
 | `qwen3` | | ✔ | ✔ | 30 langs + 22 Chinese dialects |
+| `canary` | ✔ | ✔ | ✔ | Multilingual + translation |
+| `hubert` | | | | Self-supervised English CTC |
+| `data2vec` | | | | Meta English CTC |
 
 ### TTS
-* `kokoro` — 82M StyleTTS2, multilingual. The only TTS engine that's realistically usable on the free-tier CPU.
+* `kokoro` — 82M StyleTTS2, multilingual (9 langs). Apache-2.0. Only TTS realistic on free-tier CPU.
+* `vibevoice` — 0.5B encoder-decoder. EN/DE/ZH. Apache-2.0. ~200 MB.
+* `orpheus` — 0.5B SNAC + LLM. Expressive EN with emotion tags. ~400 MB.
+* `chatterbox` / `chatterbox-turbo` — Zero-shot voice cloning from a reference clip. Apache-2.0.
 
 ### Why not the big speech-LLMs?
-Voxtral (2.5 GB), MiMo-V2.5-ASR (4.5 GB), Granite-4.1 (3 GB) and friends all run in CrispASR but exceed the free-tier 16 GB ceiling once tokenizer / KV cache / Gradio overhead is accounted for. Run them locally:
+Voxtral (2.5 GB), MiMo-V2.5-ASR (4.5 GB), Granite-4.1 (3 GB), Qwen3-TTS (1.5 GB),
+IndexTTS (2 GB), CosyVoice3 (1.5 GB), and VoxCPM2-TTS (2 GB) all run in CrispASR
+but exceed the free-tier 16 GB ceiling. Run them locally:
 
 ```bash
 docker build -f hf-space/Dockerfile -t crispasr-hf-space .
@@ -486,7 +568,34 @@ Each tab loads its own backend through the server's `/load` endpoint; the server
                 label="Top-K predictions",
                 interactive=False,
             )
-            lid_raw = gr.Code(label="Raw output", language="text")
+            lid_raw = gr.Code(label="Raw output")
+
+        # --- Text translation ------------------------------------------
+        with gr.Tab("Translate text (NMT)"):
+            gr.Markdown(
+                "Text → text translation via M2M-100, WMT21, or MADLAD-400 NMT backends. "
+                "Uses the `crispasr` CLI's `--text` mode — the model downloads on first use."
+            )
+            with gr.Row():
+                nmt_choice = gr.Dropdown(
+                    [e[0] for e in NMT_MODELS], value=NMT_MODELS[0][0], label="NMT model", scale=3
+                )
+            nmt_info = gr.Textbox(
+                value=f"{NMT_MODELS[0][4]}\n\nApprox. download: {NMT_MODELS[0][3]}",
+                label="Notes",
+                interactive=False,
+                lines=2,
+            )
+            with gr.Row():
+                nmt_src_lang = gr.Textbox(value="en", label="Source language", placeholder="en / de / fr / zh …")
+                nmt_tgt_lang = gr.Textbox(value="de", label="Target language", placeholder="de / en / fr / zh …")
+            nmt_input = gr.Textbox(
+                label="Source text",
+                value="The quick brown fox jumps over the lazy dog.",
+                lines=4,
+            )
+            nmt_submit = gr.Button("Translate", variant="primary")
+            nmt_output = gr.Textbox(label="Translation", lines=4)
 
         # --- Backends info --------------------------------------------
         with gr.Tab("About & backends"):
@@ -500,6 +609,7 @@ Each tab loads its own backend through the server's `/load` endpoint; the server
 
     tts_choice.change(select_tts, inputs=[tts_choice], outputs=[tts_info])
     tts_load_btn.click(load_tts, inputs=[tts_choice], outputs=[status_box, backends_box])
+    nmt_choice.change(select_nmt, inputs=[nmt_choice], outputs=[nmt_info])
     tts_voices_btn.click(list_voices, outputs=[tts_voices_list])
 
     lid_choice.change(select_lid, inputs=[lid_choice], outputs=[lid_info])
@@ -513,8 +623,97 @@ Each tab loads its own backend through the server's `/load` endpoint; the server
     )
     tts_submit.click(synthesize, inputs=[tts_text, tts_voice, tts_speed], outputs=[tts_audio])
     lid_run.click(detect_text_language, inputs=[lid_text, lid_choice, lid_topk], outputs=[lid_table, lid_raw])
+    nmt_submit.click(
+        translate_text,
+        inputs=[nmt_input, nmt_choice, nmt_src_lang, nmt_tgt_lang],
+        outputs=[nmt_output],
+    )
 
     demo.load(wait_for_server, outputs=[status_box, backends_box])
+
+
+# ── OpenAI-compatible REST proxy in front of Gradio ──────────────────
+# HF Spaces only route the public port (7860) to the Gradio app, so the
+# CrispASR HTTP server's OpenAI-compatible API on :8080 was unreachable
+# from outside the container — `/v1/*`, `/health`, `/backends`, `/load`
+# all 404'd publicly. Mount a thin reverse proxy so those endpoints are
+# served on the public URL (with CORS), for HTTP API consumers like the
+# CrisperWeaver web/PWA app. The Gradio UI stays mounted at "/".
+
+_PROXY_TIMEOUT = httpx.Timeout(900.0, connect=15.0)
+_HOP_BY_HOP = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade", "content-length",
+    "host", "content-encoding",
+}
+
+
+def _cors(headers: dict) -> dict:
+    headers["Access-Control-Allow-Origin"] = "*"
+    headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    headers["Access-Control-Allow-Headers"] = "*"
+    headers["Access-Control-Max-Age"] = "86400"
+    return headers
+
+
+def _build_app():
+    """FastAPI reverse proxy for the CrispASR server, with Gradio at '/'."""
+    api = FastAPI(title="CrispASR API proxy", docs_url=None, redoc_url=None)
+    client = httpx.AsyncClient(timeout=_PROXY_TIMEOUT)
+
+    async def _forward(request: Request, path: str) -> Response:
+        # Preflight: answer here so the browser never reaches the backend.
+        if request.method == "OPTIONS":
+            return Response(status_code=204, headers=_cors({}))
+        body = await request.body()
+        headers = {
+            k: v for k, v in request.headers.items()
+            if k.lower() not in _HOP_BY_HOP and k.lower() != "origin"
+        }
+        if API_KEY and "authorization" not in {k.lower() for k in headers}:
+            headers["Authorization"] = f"Bearer {API_KEY}"
+        try:
+            upstream = await client.request(
+                request.method, f"{SERVER_URL}{path}", content=body,
+                headers=headers, params=request.query_params,
+            )
+        except httpx.HTTPError as exc:
+            return Response(
+                content=json.dumps({"error": f"upstream unavailable: {exc}"}),
+                status_code=502, media_type="application/json",
+                headers=_cors({}),
+            )
+        out = _cors({
+            k: v for k, v in upstream.headers.items()
+            if k.lower() not in _HOP_BY_HOP
+        })
+        return Response(
+            content=upstream.content, status_code=upstream.status_code,
+            headers=out, media_type=upstream.headers.get("content-type"),
+        )
+
+    @api.api_route("/v1/{path:path}",
+                   methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+    async def _proxy_v1(path: str, request: Request):
+        return await _forward(request, f"/v1/{path}")
+
+    @api.api_route("/health", methods=["GET", "OPTIONS"])
+    async def _proxy_health(request: Request):
+        return await _forward(request, "/health")
+
+    @api.api_route("/backends", methods=["GET", "OPTIONS"])
+    async def _proxy_backends(request: Request):
+        return await _forward(request, "/backends")
+
+    @api.api_route("/load", methods=["POST", "OPTIONS"])
+    async def _proxy_load(request: Request):
+        return await _forward(request, "/load")
+
+    # Gradio UI at the root; the explicit API routes above take precedence.
+    return gr.mount_gradio_app(api, demo, path="/")
+
+
+app = _build_app()
 
 
 if __name__ == "__main__":
@@ -522,7 +721,8 @@ if __name__ == "__main__":
         f"launch: server_url={SERVER_URL} samples={SAMPLES_DIR} "
         f"lid_bin={CRISPASR_LID_BIN} cache={CACHE_DIR}"
     )
-    demo.launch(
-        server_name=os.environ.get("GRADIO_SERVER_NAME", "0.0.0.0"),
-        server_port=int(os.environ.get("GRADIO_SERVER_PORT", "7860")),
+    uvicorn.run(
+        app,
+        host=os.environ.get("GRADIO_SERVER_NAME", "0.0.0.0"),
+        port=int(os.environ.get("GRADIO_SERVER_PORT", "7860")),
     )

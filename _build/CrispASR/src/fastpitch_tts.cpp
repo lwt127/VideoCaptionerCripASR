@@ -10,6 +10,8 @@
 #include "core/align.h"
 #include "core/gguf_loader.h"
 #include "core/hifigan.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -18,6 +20,7 @@
 #include "gguf.h"
 
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -25,6 +28,32 @@
 #include <map>
 #include <string>
 #include <vector>
+
+// ===========================================================================
+// Bench instrumentation — `FASTPITCH_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool fastpitch_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_FASTPITCH_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct fastpitch_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit fastpitch_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~fastpitch_bench_stage() {
+        if (!fastpitch_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  fastpitch_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ── Dump helpers (env-gated: FASTPITCH_DUMP_DIR) ────────────────────
 
@@ -138,6 +167,11 @@ struct fastpitch_tts_context {
     // Pitch normalization (from training data stats)
     float pitch_mean = 0.0f;
     float pitch_std = 1.0f;
+
+    // Pre-permuted HiFi-GAN upsample weights for decomposed col2im path
+    std::vector<ggml_tensor*> ups_w_perm;
+    ggml_context* ctx_perm = nullptr;
+    ggml_backend_buffer_t buf_perm = nullptr;
 };
 
 // ── GGUF loading ─────────────────────────────────────────────────────
@@ -305,7 +339,7 @@ static fastpitch_tts_context* load_model(const char* path, fastpitch_tts_params 
     }
     ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads);
 
-    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ctx->backend_cpu;
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (!ctx->backend)
         ctx->backend = ctx->backend_cpu;
 
@@ -340,6 +374,22 @@ static fastpitch_tts_context* load_model(const char* path, fastpitch_tts_params 
             delete ctx;
             return nullptr;
         }
+    }
+
+    // Permute HiFi-GAN upsample ConvTranspose1d weights
+    {
+        const int n = hp.voc_hp.num_upsamples();
+        std::vector<ggml_tensor*> srcs(n);
+        std::vector<ggml_tensor**> dsts(n);
+        ctx->ups_w_perm.resize(n, nullptr);
+        for (int i = 0; i < n; i++) {
+            std::string wname = "voc.ups." + std::to_string(i) + ".weight";
+            auto it2 = ctx->tensors.find(wname);
+            srcs[i] = (it2 != ctx->tensors.end()) ? it2->second : nullptr;
+            dsts[i] = &ctx->ups_w_perm[i];
+        }
+        core_convt::permute_convt1d_weights_batch(srcs.data(), dsts.data(), n, ctx->backend, &ctx->ctx_perm,
+                                                  &ctx->buf_perm);
     }
 
     // Infer vocab size from embedding tensor
@@ -751,13 +801,13 @@ static ggml_tensor* build_decoder_graph(ggml_context* gctx, const fastpitch_tts_
 static int synthesize_internal(fastpitch_tts_context* ctx, const char* text, float** pcm_out, int* sample_rate_out) {
     const auto& hp = ctx->hp;
     const int D = hp.symbols_embedding_dim;
-    const char* dump_dir = getenv("FASTPITCH_DUMP_DIR");
+    const char* dump_dir = crispasr_env::get("CRISPASR_FASTPITCH_DUMP_DIR");
 
     // ── Step 1: Tokenize ──
     std::vector<int> token_ids;
 
     // Allow teacher-forcing tokens from file (for diff testing)
-    const char* force_tokens_path = getenv("FASTPITCH_FORCE_TOKENS");
+    const char* force_tokens_path = crispasr_env::get("CRISPASR_FASTPITCH_FORCE_TOKENS");
     if (force_tokens_path) {
         FILE* f = fopen(force_tokens_path, "rb");
         if (f) {
@@ -790,6 +840,7 @@ static int synthesize_internal(fastpitch_tts_context* ctx, const char* text, flo
 
     // ── Step 2: Build and run encoder + predictors graph ──
     {
+        fastpitch_bench_stage _b("encoder+predictors");
         mini_graph mg;
         auto* gc = mg.ctx;
 
@@ -975,6 +1026,7 @@ static int synthesize_internal(fastpitch_tts_context* ctx, const char* text, flo
 
         std::vector<float> dec_out_data;
         {
+            fastpitch_bench_stage _b("decoder");
             mini_graph mg_dec;
             auto* gc3 = mg_dec.ctx;
 
@@ -1023,7 +1075,12 @@ static int synthesize_internal(fastpitch_tts_context* ctx, const char* text, flo
                 ggml_backend_tensor_set(dec_spk_input, &sid, 0, sizeof(int32_t));
             }
 
-            ggml_backend_graph_compute(ctx->backend_cpu, gf3);
+            // Compute through the scheduler (not the raw CPU backend): the graph
+            // was allocated via ggml_backend_sched_alloc_graph and the weights
+            // live on the active backend (GPU buffer when use_gpu). Running it on
+            // ctx->backend_cpu would dereference GPU device pointers — harmless on
+            // unified-memory Metal but an illegal access on CUDA.
+            ggml_backend_sched_graph_compute(ctx->sched, gf3);
 
             // Read mel output: (n_mel, T_frames)
             dec_out_data.resize((size_t)hp.n_mel_channels * T_frames);
@@ -1037,6 +1094,7 @@ static int synthesize_internal(fastpitch_tts_context* ctx, const char* text, flo
 
         int T_mel = T_frames;
         {
+            fastpitch_bench_stage _b("hifigan_vocoder");
             mini_graph mg_voc;
             auto* gc4 = mg_voc.ctx;
 
@@ -1051,7 +1109,7 @@ static int synthesize_internal(fastpitch_tts_context* ctx, const char* text, flo
             ggml_set_input(mel_in);
 
             // Run shared HiFi-GAN forward
-            ggml_tensor* audio = core_hifigan::forward(gc4, mel_in, ctx->tensors, "voc", hp.voc_hp);
+            ggml_tensor* audio = core_hifigan::forward(gc4, mel_in, ctx->tensors, "voc", hp.voc_hp, ctx->ups_w_perm);
 
             ggml_set_name(audio, "audio_out");
             ggml_set_output(audio);
@@ -1078,7 +1136,9 @@ static int synthesize_internal(fastpitch_tts_context* ctx, const char* text, flo
                 ggml_backend_tensor_set(mel_in, mel_voc.data(), 0, mel_voc.size() * sizeof(float));
             }
 
-            ggml_backend_graph_compute(ctx->backend_cpu, gf4);
+            // Scheduler compute (see decoder note above): keeps GPU-resident
+            // vocoder weights on their owning backend — CUDA-safe.
+            ggml_backend_sched_graph_compute(ctx->sched, gf4);
 
             // Read audio output
             int T_audio = (int)audio->ne[0];
@@ -1135,6 +1195,10 @@ struct fastpitch_tts_context* fastpitch_tts_init_from_file(const char* path_mode
 void fastpitch_tts_free(struct fastpitch_tts_context* ctx) {
     if (!ctx)
         return;
+    if (ctx->buf_perm)
+        ggml_backend_buffer_free(ctx->buf_perm);
+    if (ctx->ctx_perm)
+        ggml_free(ctx->ctx_perm);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->buf_w)

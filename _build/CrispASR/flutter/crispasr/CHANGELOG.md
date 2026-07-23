@@ -1,5 +1,101 @@
 # Changelog
 
+## 0.8.21
+
+- **`--max-new-tokens` is honored across all ASR backends.** Ten backends
+  (moss-diarize, canary, canary-qwen, glm-asr, funasr, mimo-asr, moss-transcribe,
+  mini-omni2, higgs-stt, higgs) previously hardcoded their decode cap, so a long
+  single-pass transcription truncated. Each now forwards the value while keeping
+  its own default, so nothing regresses.
+- **MOSS TTS synthesis params wired** — moss-tts / moss-tts-local now honor
+  max-new-tokens, duration (max-speech-tokens), top-p, top-k, and
+  repetition-penalty instead of staying at hardcoded defaults.
+- **Chunk-local speaker scope** — diarized segments now carry a `chunk_id`;
+  `(Speaker N)` labels are chunk-local, so a consumer uses `chunk_id` to tell
+  continuity from an ID swap.
+- No Dart API changes.
+
+## 0.8.20
+
+- **iOS is now supported.** The release ships an Apple `crispasr.xcframework`
+  (device + simulator slices for iOS, plus macOS/tvOS/visionOS) for the first
+  time, so a Flutter iOS app can link the native library. Earlier releases
+  shipped no iOS artifact at all.
+- **Prebuilt native library bundles load as delivered.** The macOS and Linux
+  `libcrispasr` bundles had a broken embedded run-path and could not be
+  `dlopen`ed after extraction; they now resolve their bundled `ggml` libraries
+  relative to their own location. Android and the desktop bundles are laid out
+  as a flat `lib/` directory.
+- **canary-qwen long audio fixed.** Clips longer than ~30 s no longer skip
+  chunking, return near-empty transcripts, or grow memory without bound — the
+  backend had advertised an internal chunker it did not implement (#290).
+- No Dart API changes; existing code upgrades untouched.
+
+## 0.8.19
+
+- Beat and downbeat tracking: `CrispasrSession.beats()` returns a beat grid
+  from mono 22050 Hz float32 PCM, backed by the Beat This! backend. Adds the
+  `Beat` record typedef (`timeS`, `isDownbeat`), a `beatsSampleRate`
+  capability probe and a `beatsTempoBpm` median-interval tempo estimate.
+  Previously beat tracking was reachable only from the CLI and the C ABI.
+- Every downbeat is also reported as a beat: the postprocessor snaps each
+  downbeat onto its nearest detected beat, so downbeats are a strict subset —
+  filter on `isDownbeat` for the bar grid, and never merge two lists.
+- Beat This! is **MIT for code and weights** and uses **no DBN** (postprocessing
+  is peak-picking only), so unlike most beat trackers this arm carries none of
+  madmom's patent-encumbered, non-commercially-licensed machinery.
+- The native GGUF architecture auto-detect recognises `beat-this`, so plain
+  `CrispasrSession.open()` works for beat models; `backend: 'beat-this'`
+  remains valid and is required against an older native library.
+
+## 0.8.17
+
+- Source separation: `CrispasrSession.separate()` splits interleaved stereo
+  PCM into named stems (`drums`/`bass`/`other`/`vocals` for htdemucs), with
+  the `Stem` record typedef and a `separateSampleRate` capability probe.
+  Previously separation was reachable only from the CLI, the C ABI and
+  Python — never from Dart.
+- Note the input contract: `separate()` takes **interleaved** stereo
+  (`L,R,L,R,…`) at 44100 Hz, and the native side counts samples *per
+  channel*. To feed a stem to `pitch()`, downmix to mono and resample to
+  16 kHz first — the dartdoc has the recipe.
+- Piano transcription: `CrispasrSession.pianoNotes()` returns structured
+  note events — `PianoNote = ({int midi, double onMs, double offMs, int
+  velocity})` — plus a `pianoSampleRate` probe. Previously the only route
+  out of the piano backend was `transcribe()`, whose segment text reads
+  like `"C4 v=80"`; parsing that back was lossy.
+- Native fixes that ship with this release: htdemucs now segments long
+  audio (7.8 s windows, 25% overlap, weighted overlap-add), so separating a
+  full song no longer needs tens of GB — peak memory is flat instead of
+  growing with length. And the htdemucs loader no longer silently zero-fills
+  quantized tensors it cannot read, which had made the q4_k model produce
+  garbage; unreadable weights are now fatal.
+
+## 0.8.16
+
+- Pitch (F0) estimation: `CrispasrSession.pitch()` returns a monophonic
+  pitch track from mono 16 kHz float32 PCM, backed by the CREPE backend.
+  Adds the `PitchFrame` record typedef (`timeMs`, `f0Hz`, `voicedProb`)
+  and the `pitchSampleRate` capability probe.
+- The native GGUF architecture auto-detect now recognises `crepe` (and
+  `htdemucs`), so plain `CrispasrSession.open()` works for those models;
+  previously only the CLI auto-detected them and every binding had to name
+  the backend. Passing `backend: 'crepe'` explicitly remains valid and is
+  required against an older native library.
+
+## 0.8.11
+
+- Session introspection accessors: CTC vocab, Whisper `no_speech_prob`, and
+  `detected_language`, mirrored across the language bindings.
+- Docs/quality: add an example, enable `lints/core`, and apply the resulting
+  fixes (flow-control braces + FFI typedef casing).
+
+## 0.8.10
+
+- Initial pub.dev release for the current CrispASR 0.8 line.
+- Exposes Dart FFI bindings for the unified CrispASR session API, Whisper-shaped legacy API, audio decode helpers, language detection, diarization, chat/text helpers, grammar support and alt-token capture.
+- Keeps the package pure Dart FFI: native `libcrispasr` must be installed or bundled separately.
+
 ## 0.5.13
 
 - **Whisper alt-token capture (`--alt N` parity)** — per-token

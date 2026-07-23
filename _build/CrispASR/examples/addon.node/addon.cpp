@@ -3,6 +3,7 @@
 #include "common-crispasr.h"
 
 #include "crispasr.h"
+#include "crispasr_session.h" // session C-ABI for the backend-agnostic transcribeSession() path
 
 #include <string>
 #include <thread>
@@ -47,6 +48,22 @@ struct whisper_params {
     std::string language = "en";
     std::string prompt;
     std::string model = "../../ggml-large.bin";
+
+    // Session-path options (transcribeSession): reach any backend + the
+    // session post-processors, beyond the whisper-only whisper() entry point.
+    std::string backend;      // "" = auto-detect from the GGUF
+    std::string source_lang;  // canary/cohere/voxtral AST source
+    std::string target_lang;  // AST target (≠ source ⇒ translate)
+    std::string punc_model;   // --punc-model: auto|firered|fullstop|punctuate-all|pcs|path
+    bool punctuation = true;  // session punctuation gate
+    uint64_t seed = 0;        // sampling seed (paired with temperature)
+    float temperature = 0.0f; // 0 = greedy / backend default
+    // issue #208: chunked-encode long-form path. chunk_seconds >= 0 forces the
+    // bounded overlapping-window Parakeet path (inert on other backends);
+    // chunk_seconds == 0 keeps the per-model default window, overlap < 0 the
+    // default overlap. -1 = don't force (plain transcribe).
+    int chunk_seconds = -1;
+    int overlap_seconds = -1;
 
     std::vector<std::string> fname_inp = {};
     std::vector<std::string> fname_out = {};
@@ -321,7 +338,7 @@ private:
                 wparams.audio_ctx = params.audio_ctx;
 
                 wparams.greedy.best_of = params.best_of;
-                wparams.beam_search.beam_size = params.beam_size;
+                wparams.beam_search.beam_size = params.beam_size > 0 ? params.beam_size : 5;
 
                 wparams.initial_prompt = params.prompt.c_str();
 
@@ -547,8 +564,168 @@ Napi::Value whisper(const Napi::CallbackInfo& info) {
 }
 
 
+// ---------------------------------------------------------------------------
+// Session-based transcription via the crispasr_session C-ABI. Unlike whisper()
+// above (whisper-only), this reaches every ASR backend and the session
+// post-processors — punctuation restoration (puncModel), beam search,
+// translation — matching the CLI/server/Python/Go/Dart surface. Returns the
+// same { language, transcription: [[t0, t1, text], ...] } shape.
+// ---------------------------------------------------------------------------
+static int run_session(whisper_params& params, whisper_result& result) {
+    if (params.no_prints)
+        whisper_log_set(cb_log_disable, NULL);
+    if (params.fname_inp.empty() && params.pcmf32.empty()) {
+        fprintf(stderr, "error: no input file or audio buffer specified\n");
+        return 2;
+    }
+
+    crispasr_session* s =
+        params.backend.empty()
+            ? crispasr_session_open(params.model.c_str(), params.n_threads)
+            : crispasr_session_open_explicit(params.model.c_str(), params.backend.c_str(), params.n_threads);
+    if (!s) {
+        fprintf(stderr, "error: failed to open crispasr session (model '%s', backend '%s')\n", params.model.c_str(),
+                params.backend.c_str());
+        return 3;
+    }
+
+    if (!params.source_lang.empty())
+        crispasr_session_set_source_language(s, params.source_lang.c_str());
+    if (!params.target_lang.empty())
+        crispasr_session_set_target_language(s, params.target_lang.c_str());
+    crispasr_session_set_punctuation(s, params.punctuation ? 1 : 0);
+    if (!params.punc_model.empty())
+        crispasr_session_set_punc_model(s, params.punc_model.c_str());
+    crispasr_session_set_translate(s, params.translate ? 1 : 0);
+    if (params.beam_size > 0)
+        crispasr_session_set_beam_size(s, params.beam_size);
+    if (params.temperature > 0.0f)
+        crispasr_session_set_temperature(s, params.temperature, params.seed);
+
+    std::vector<float> pcmf32;
+    std::vector<std::vector<float>> pcmf32s;
+    if (!params.pcmf32.empty()) {
+        pcmf32 = params.pcmf32;
+    } else if (!::read_audio_data(params.fname_inp[0], pcmf32, pcmf32s, /*stereo=*/false)) {
+        fprintf(stderr, "error: failed to read audio file '%s'\n", params.fname_inp[0].c_str());
+        crispasr_session_close(s);
+        return 4;
+    }
+
+    const char* lang =
+        (params.language.empty() || params.language == "auto") ? nullptr : params.language.c_str();
+    // issue #208: chunk_seconds >= 0 forces the bounded chunked long-form path
+    // (poll crispasr_get_progress() for a progress bar); otherwise plain.
+    crispasr_session_result* r =
+        params.chunk_seconds >= 0
+            ? crispasr_session_transcribe_chunked_lang(s, pcmf32.data(), (int)pcmf32.size(), params.chunk_seconds,
+                                                       params.overlap_seconds, lang)
+            : crispasr_session_transcribe_lang(s, pcmf32.data(), (int)pcmf32.size(), lang);
+    if (!r) {
+        crispasr_session_close(s);
+        return 5;
+    }
+
+    // The session API has no post-hoc LID accessor; echo the requested language.
+    result.language = (lang ? params.language : std::string("auto"));
+    const int n = crispasr_session_result_n_segments(r);
+    result.segments.resize(n);
+    for (int i = 0; i < n; ++i) {
+        const int64_t t0 = crispasr_session_result_segment_t0(r, i);
+        const int64_t t1 = crispasr_session_result_segment_t1(r, i);
+        const char* text = crispasr_session_result_segment_text(r, i);
+        result.segments[i].emplace_back(to_timestamp(t0, params.comma_in_time));
+        result.segments[i].emplace_back(to_timestamp(t1, params.comma_in_time));
+        result.segments[i].emplace_back(text ? text : "");
+    }
+    crispasr_session_result_free(r);
+    crispasr_session_close(s);
+    return 0;
+}
+
+class SessionWorker : public Napi::AsyncWorker {
+  public:
+    SessionWorker(Napi::Function& callback, whisper_params params)
+        : Napi::AsyncWorker(callback), params(std::move(params)) {}
+    void Execute() override { run_session(params, result); }
+    void OnOK() override {
+        Napi::HandleScope scope(Env());
+        Napi::Object returnObj = Napi::Object::New(Env());
+        if (!result.language.empty())
+            returnObj.Set("language", Napi::String::New(Env(), result.language));
+        Napi::Array arr = Napi::Array::New(Env(), result.segments.size());
+        for (uint64_t i = 0; i < result.segments.size(); ++i) {
+            Napi::Array seg = Napi::Array::New(Env(), 3);
+            for (uint64_t j = 0; j < result.segments[i].size(); ++j)
+                seg[j] = Napi::String::New(Env(), result.segments[i][j]);
+            arr[i] = seg;
+        }
+        returnObj.Set("transcription", arr);
+        Callback().Call({Env().Null(), returnObj});
+    }
+
+  private:
+    whisper_params params;
+    whisper_result result;
+};
+
+Napi::Value transcribeSession(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsObject() || !info[1].IsFunction()) {
+        Napi::TypeError::New(env, "expected (params: object, callback: function)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    Napi::Object o = info[0].As<Napi::Object>();
+    whisper_params params;
+    auto getS = [&](const char* k, std::string& dst) {
+        if (o.Has(k) && o.Get(k).IsString())
+            dst = o.Get(k).As<Napi::String>().Utf8Value();
+    };
+    auto getB = [&](const char* k, bool& dst) {
+        if (o.Has(k) && o.Get(k).IsBoolean())
+            dst = o.Get(k).As<Napi::Boolean>();
+    };
+    auto getI = [&](const char* k, int32_t& dst) {
+        if (o.Has(k) && o.Get(k).IsNumber())
+            dst = o.Get(k).As<Napi::Number>().Int32Value();
+    };
+    getS("model", params.model);
+    getS("backend", params.backend);
+    getS("language", params.language);
+    getS("source_lang", params.source_lang);
+    getS("target_lang", params.target_lang);
+    getS("punc_model", params.punc_model);
+    getB("punctuation", params.punctuation);
+    getB("translate", params.translate);
+    getB("use_gpu", params.use_gpu);
+    getB("flash_attn", params.flash_attn);
+    getB("no_prints", params.no_prints);
+    getB("comma_in_time", params.comma_in_time);
+    getI("beam_size", params.beam_size);
+    getI("n_threads", params.n_threads);
+    getI("chunk_seconds", params.chunk_seconds);   // issue #208: >=0 forces chunked long-form
+    getI("overlap_seconds", params.overlap_seconds);
+    if (o.Has("temperature") && o.Get("temperature").IsNumber())
+        params.temperature = o.Get("temperature").As<Napi::Number>().FloatValue();
+    std::string fname_inp;
+    getS("fname_inp", fname_inp);
+    if (!fname_inp.empty())
+        params.fname_inp.emplace_back(fname_inp);
+    if (o.Has("pcmf32") && o.Get("pcmf32").IsTypedArray()) {
+        Napi::Float32Array a = o.Get("pcmf32").As<Napi::Float32Array>();
+        params.pcmf32.assign(a.Data(), a.Data() + a.ElementLength());
+    }
+
+    Napi::Function callback = info[1].As<Napi::Function>();
+    (new SessionWorker(callback, params))->Queue();
+    return env.Undefined();
+}
+
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "whisper"), Napi::Function::New(env, whisper));
+    // Backend-agnostic, session-based transcription (parakeet, canary, …) with
+    // punctuation / punc-model / beam / translate. callback-style: (params, cb).
+    exports.Set(Napi::String::New(env, "transcribeSession"), Napi::Function::New(env, transcribeSession));
     return exports;
 }
 

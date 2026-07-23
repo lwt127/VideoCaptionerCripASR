@@ -24,6 +24,70 @@ TEST_CASE("registry: lookup unknown backend returns false", "[unit][registry]") 
     REQUIRE_FALSE(found);
 }
 
+TEST_CASE("registry: default bundle reports the exact canonical artifacts", "[unit][registry]") {
+    CrispasrRegistryBundle bundle;
+    REQUIRE(crispasr_registry_default_bundle("omnivoice", bundle));
+    REQUIRE(bundle.backend == "omnivoice");
+    REQUIRE_FALSE(bundle.requires_license_acceptance);
+    REQUIRE(bundle.artifacts.size() == 2);
+    REQUIRE(bundle.artifacts[0].kind == CrispasrRegistryArtifactKind::Primary);
+    REQUIRE(bundle.artifacts[0].filename == "omnivoice-f16.gguf");
+    REQUIRE(bundle.artifacts[1].kind == CrispasrRegistryArtifactKind::Companion);
+    REQUIRE(bundle.artifacts[1].filename == "omnivoice-tokenizer-f16.gguf");
+}
+
+TEST_CASE("registry: default bundle resolves aliases and includes extras", "[unit][registry]") {
+    CrispasrRegistryBundle bundle;
+    REQUIRE(crispasr_registry_default_bundle("cosyvoice3", bundle));
+    REQUIRE(bundle.backend == "cosyvoice3-tts");
+    REQUIRE(bundle.artifacts.size() == 6);
+    REQUIRE(bundle.artifacts[0].kind == CrispasrRegistryArtifactKind::Primary);
+    REQUIRE(bundle.artifacts[1].kind == CrispasrRegistryArtifactKind::Companion);
+    for (size_t i = 2; i < bundle.artifacts.size(); ++i) {
+        REQUIRE(bundle.artifacts[i].kind == CrispasrRegistryArtifactKind::Extra);
+        REQUIRE(bundle.artifacts[i].approx_size.empty());
+    }
+}
+
+TEST_CASE("registry: default bundle preserves license metadata", "[unit][registry]") {
+    CrispasrRegistryBundle bundle;
+    REQUIRE(crispasr_registry_default_bundle("voxtral-tts", bundle));
+    REQUIRE_FALSE(bundle.license.empty());
+    REQUIRE(bundle.requires_license_acceptance);
+}
+
+TEST_CASE("registry: default bundle rejects unknown backends", "[unit][registry]") {
+    CrispasrRegistryBundle bundle;
+    REQUIRE_FALSE(crispasr_registry_default_bundle("nonexistent-backend-xyz", bundle));
+}
+
+TEST_CASE("registry: every default bundle starts with its lookup result", "[unit][registry]") {
+    for (int i = 0; i < crispasr_registry_count(); ++i) {
+        CrispasrRegistryEntry entry;
+        REQUIRE(crispasr_registry_get_at(i, entry));
+
+        CrispasrRegistryEntry canonical;
+        REQUIRE(crispasr_registry_lookup(entry.backend, canonical));
+        CrispasrRegistryBundle bundle;
+        REQUIRE(crispasr_registry_default_bundle(entry.backend, bundle));
+        REQUIRE_FALSE(bundle.artifacts.empty());
+        REQUIRE(bundle.backend == canonical.backend);
+        REQUIRE(bundle.license == canonical.license);
+        REQUIRE(bundle.requires_license_acceptance == crispasr_license_requires_acceptance(canonical.license));
+        REQUIRE(bundle.artifacts[0].kind == CrispasrRegistryArtifactKind::Primary);
+        REQUIRE(bundle.artifacts[0].filename == canonical.filename);
+        REQUIRE(bundle.artifacts[0].url == canonical.url);
+        REQUIRE(bundle.artifacts[0].approx_size == canonical.approx_size);
+        if (!canonical.companion_filename.empty()) {
+            REQUIRE(bundle.artifacts.size() >= 2);
+            REQUIRE(bundle.artifacts[1].kind == CrispasrRegistryArtifactKind::Companion);
+            REQUIRE(bundle.artifacts[1].filename == canonical.companion_filename);
+            REQUIRE(bundle.artifacts[1].url == canonical.companion_url);
+            REQUIRE(bundle.artifacts[1].approx_size == canonical.companion_approx_size);
+        }
+    }
+}
+
 TEST_CASE("registry: parakeet entry has correct filename", "[unit][registry]") {
     CrispasrRegistryEntry e;
     bool found = crispasr_registry_lookup("parakeet", e);
@@ -184,6 +248,22 @@ TEST_CASE("registry: companion_approx_size populated for chatterbox", "[unit][re
     REQUIRE(e.companion_approx_size != e.approx_size);
 }
 
+TEST_CASE("registry: chatterbox family keeps multilingual and finetunes separate", "[unit][registry]") {
+    CrispasrRegistryEntry e;
+
+    REQUIRE(crispasr_registry_lookup("chatterbox", e));
+    REQUIRE(e.filename == "chatterbox-t3-q8_0.gguf");
+    REQUIRE(e.companion_filename == "chatterbox-s3gen-q8_0.gguf");
+
+    REQUIRE(crispasr_registry_lookup("kartoffelbox-turbo", e));
+    REQUIRE(e.filename.find("kartoffelbox-turbo-t3") != std::string::npos);
+    REQUIRE(e.companion_filename == "chatterbox-turbo-s3gen-f16.gguf");
+
+    REQUIRE(crispasr_registry_lookup("lahgtna-chatterbox", e));
+    REQUIRE(e.filename == "chatterbox-t3-f16.gguf");
+    REQUIRE(e.companion_filename == "chatterbox-s3gen-q8_0.gguf");
+}
+
 TEST_CASE("registry: companion_approx_size empty for backends without companion", "[unit][registry]") {
     CrispasrRegistryEntry e;
     REQUIRE(crispasr_registry_lookup("whisper", e));
@@ -212,7 +292,8 @@ TEST_CASE("registry: all entries with companions have companion_approx_size set"
     const int n = crispasr_registry_count();
     for (int i = 0; i < n; ++i) {
         CrispasrRegistryEntry e;
-        if (!crispasr_registry_get_at(i, e)) continue;
+        if (!crispasr_registry_get_at(i, e))
+            continue;
         if (!e.companion_filename.empty()) {
             REQUIRE(!e.companion_approx_size.empty());
         }
@@ -276,6 +357,16 @@ TEST_CASE("registry: cosyvoice3-tts has entry", "[unit][registry]") {
     REQUIRE(crispasr_registry_lookup("cosyvoice3-tts", e));
 }
 
+// The CLI / kaggle benchmark pass the short `--backend cosyvoice3` alias to
+// `-m auto`; the registry must resolve it to the canonical `cosyvoice3-tts`
+// entry via the `-tts`-suffix fallback (else `-m auto` fails instantly with
+// "no default model registered" — full-backend-sweep cosyvoice3 FAIL).
+TEST_CASE("registry: cosyvoice3 short alias resolves via -tts fallback", "[unit][registry]") {
+    CrispasrRegistryEntry e;
+    REQUIRE(crispasr_registry_lookup("cosyvoice3", e));
+    REQUIRE(e.filename == "cosyvoice3-llm-q4_k.gguf");
+}
+
 TEST_CASE("registry: dia has entry", "[unit][registry]") {
     CrispasrRegistryEntry e;
     REQUIRE(crispasr_registry_lookup("dia", e));
@@ -329,6 +420,11 @@ TEST_CASE("registry: voxcpm2-tts has entry", "[unit][registry]") {
 TEST_CASE("registry: moss-audio has entry", "[unit][registry]") {
     CrispasrRegistryEntry e;
     REQUIRE(crispasr_registry_lookup("moss-audio", e));
+}
+
+TEST_CASE("registry: moss-transcribe has entry", "[unit][registry]") {
+    CrispasrRegistryEntry e;
+    REQUIRE(crispasr_registry_lookup("moss-transcribe", e));
 }
 
 TEST_CASE("registry: sensevoice has entry", "[unit][registry]") {

@@ -25,8 +25,15 @@ This is the **base model** (not the streaming variant). It supports voice clonin
 | File | Quant | Size | Notes |
 |------|-------|------|-------|
 | `vibevoice-1.5b-tts-f16.gguf` | F16 | 5.1 GB | Full precision |
-| `vibevoice-1.5b-tts-q8_0.gguf` | Q8_0 | 2.8 GB | Near-lossless |
-| `vibevoice-1.5b-tts-q4_k.gguf` | Q4_K | 1.6 GB | Smallest, perfect ASR round-trip |
+| `vibevoice-1.5b-tts-q8_0.gguf` | Q8_0 | 3.1 GB | Near-lossless |
+| `vibevoice-1.5b-tts-q4_k.gguf` | Q4_K | 1.9 GB | Smallest, perfect ASR round-trip |
+
+> The Q8_0/Q4_K files keep the diffusion prediction head, connectors and
+> EOS classifier at full precision (only the LM backbone is quantized). The
+> head runs under classifier-free guidance, so quantizing it could push the
+> first frames onto a wrong trajectory that decodes as a brief non-speech
+> "music"/hum onset before the voice; keeping it full-precision avoids that
+> at a small size cost.
 
 ## Usage
 

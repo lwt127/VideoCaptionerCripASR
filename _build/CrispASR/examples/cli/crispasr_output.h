@@ -75,6 +75,9 @@ bool crispasr_write_json(const std::string& path, const std::vector<crispasr_seg
                          const std::string& backend_name, const std::string& model_path, const std::string& language,
                          bool full, const crispasr_lid_info* lid = nullptr);
 
+bool crispasr_write_ctc_logits_json(const std::string& path, const crispasr_ctc_logits& logits,
+                                    const std::string& backend_name);
+
 bool crispasr_write_lrc(const std::string& path, const std::vector<crispasr_disp_segment>& segs);
 
 // Print segments to stdout. If show_timestamps is true, each line is
@@ -85,6 +88,11 @@ void crispasr_print_stdout(const std::vector<crispasr_disp_segment>& segs, bool 
 // Print per-token alternatives (--alt mode). Shows each token with its
 // confidence and top-N alternative candidates, inspired by antirez/voxtral.c.
 void crispasr_print_alternatives(const std::vector<crispasr_segment>& segs, int n_alt);
+
+// Print each segment's transcript with an inline per-token confidence
+// annotation (`--print-confidence`). One line per segment: `word[95%]
+// word[88%] ...`. Segments with no token-level info print their plain text.
+void crispasr_print_confidence(const std::vector<crispasr_segment>& segs);
 
 // ---------------------------------------------------------------------------
 // String-based formatters (for HTTP server responses, in-memory use).
@@ -113,9 +121,17 @@ std::string crispasr_segments_to_openai_verbose_json(const std::vector<crispasr_
                                                      const std::string& language, const std::string& task,
                                                      float temperature);
 
+// Diarized JSON: OpenAI-compatible verbose JSON extended with speaker labels.
+// Speaker strings like "(speaker 0) " are normalised to single letters "A", "B", …
+// Matches the diarized_json schema requested in issue #206.
+std::string crispasr_segments_to_diarized_json(const std::vector<crispasr_segment>& segs, double duration_s,
+                                               const std::string& language, const std::string& task, float temperature);
+
 // CrispASR native JSON (the format returned by /inference).
 std::string crispasr_segments_to_native_json(const std::vector<crispasr_segment>& segs, const std::string& backend_name,
                                              double duration_s);
+
+std::string crispasr_ctc_logits_to_json(const crispasr_ctc_logits& logits);
 
 // Remove punctuation from a segment in-place: from seg.text, each
 // seg.words[i].text, and each seg.tokens[i].text. Called by the

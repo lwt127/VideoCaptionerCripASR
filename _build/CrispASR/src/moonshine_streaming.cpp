@@ -13,7 +13,10 @@
 
 #include "moonshine_streaming.h"
 #include "core/beam_decode.h"
+#include "core/cpu_ops.h" // core_cpu::to_f32 (quantized-safe weight read)
 #include "core/gguf_loader.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 #include "moonshine-tokenizer.h"
 
 #include "ggml.h"
@@ -22,6 +25,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -29,6 +33,32 @@
 #include <map>
 #include <string>
 #include <vector>
+
+// ===========================================================================
+// Bench instrumentation — `MOONSHINE_STREAM_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool moonshine_stream_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_MOONSHINE_STREAM_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct moonshine_stream_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit moonshine_stream_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~moonshine_stream_bench_stage() {
+        if (!moonshine_stream_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  moonshine_stream_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ── Hyperparameters ─────────────────────────────────────────────────────────
 
@@ -94,10 +124,20 @@ struct ms_dec_layer {
     ggml_tensor* ffn_fc2_b = nullptr;
 };
 
+// §232 hybrid placement: encoder weights on GPU, decoder weights on CPU. The
+// per-token decode graph is CPU-pinned (KV cache is a CPU buffer), so keeping
+// the decoder weights CPU-resident avoids a per-token GPU->CPU weight re-copy.
+// Mirrors the moonshine (offline) fix. See PLAN §232 / LEARNINGS 25.
+static bool ms_is_gpu_tensor(const char* tensor_name, void* /*user*/) {
+    return tensor_name && std::strncmp(tensor_name, "encoder.", 8) == 0;
+}
+
 struct ms_model {
     ms_hparams hp;
     ggml_context* ctx_w = nullptr;
     ggml_backend_buffer_t buf_w = nullptr;
+    // §232: CPU partition for decoder weights under the hybrid (split) load.
+    ggml_backend_buffer_t buf_w_cpu = nullptr;
 
     // Audio frontend
     ggml_tensor* embedder_log_k = nullptr;
@@ -158,6 +198,11 @@ struct moonshine_streaming_context {
     bool use_gpu = false;
     float temperature = 0.0f;
     int beam_size = 1;
+
+    // §176s: cached encoder graph — reused when T_enc matches.
+    ggml_cgraph* cached_enc_gf = nullptr;
+    ggml_context* cached_enc_ctx = nullptr;
+    int cached_enc_T = 0;
 };
 
 // ── GGUF helpers ────────────────────────────────────────────────────────────
@@ -255,18 +300,29 @@ extern "C" struct moonshine_streaming_context* moonshine_streaming_init_from_fil
     }
     ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
 
-    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ctx->backend_cpu;
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (!ctx->backend)
         ctx->backend = ctx->backend_cpu;
     ctx->use_gpu = (ctx->backend != ctx->backend_cpu);
 
-    // Load weights via core_gguf (mmap, backend buffer)
+    // Load weights via core_gguf (mmap, backend buffer). §232: on GPU, split
+    // encoder->GPU / decoder->CPU (opt out with MOONSHINE_ALL_GPU=1).
     core_gguf::WeightLoad wl;
-    if (!core_gguf::load_weights(path_model, ctx->backend, "moonshine_streaming", wl)) {
+    const char* all_gpu_env = crispasr_env::get("CRISPASR_MOONSHINE_ALL_GPU");
+    const bool all_gpu = all_gpu_env && all_gpu_env[0] == '1';
+    bool loaded;
+    if (ctx->use_gpu && !all_gpu) {
+        loaded = core_gguf::load_weights_split(path_model, ctx->backend, ctx->backend_cpu, ms_is_gpu_tensor, nullptr,
+                                               "moonshine_streaming", wl);
+    } else {
+        loaded = core_gguf::load_weights(path_model, ctx->backend, "moonshine_streaming", wl);
+    }
+    if (!loaded) {
         fprintf(stderr, "moonshine_streaming: failed to load weights from '%s'\n", path_model);
         delete ctx;
         return nullptr;
     }
+    m.buf_w_cpu = wl.buf_cpu; // non-null only for the split (hybrid) load
     m.ctx_w = wl.ctx;
     m.buf_w = wl.buf;
 
@@ -402,17 +458,8 @@ extern "C" struct moonshine_streaming_context* moonshine_streaming_init_from_fil
 static void tensor_get_as_f32(const ggml_tensor* t, float* dst, size_t n_elems) {
     if (!t)
         return;
-    if (t->type == GGML_TYPE_F32) {
-        ggml_backend_tensor_get(t, dst, 0, n_elems * sizeof(float));
-    } else if (t->type == GGML_TYPE_F16) {
-        std::vector<ggml_fp16_t> tmp(n_elems);
-        ggml_backend_tensor_get(t, tmp.data(), 0, n_elems * sizeof(ggml_fp16_t));
-        for (size_t i = 0; i < n_elems; i++)
-            dst[i] = ggml_fp16_to_fp32(tmp[i]);
-    } else {
-        fprintf(stderr, "moonshine_streaming: unsupported tensor dtype %d for CPU frontend\n", (int)t->type);
-        memset(dst, 0, n_elems * sizeof(float));
-    }
+    std::vector<float> v = core_cpu::to_f32(t); // F32/F16/quantized-safe
+    std::memcpy(dst, v.data(), n_elems * sizeof(float));
 }
 
 static void audio_frontend_cpu(const float* pcm, int n_samples, const ms_model& m, std::vector<float>& out,
@@ -553,7 +600,14 @@ static int run_encoder(moonshine_streaming_context* ctx, const float* frontend_o
     int head_dim = (int)hp.enc_head_dim;
     int kv_heads = (int)hp.enc_kv_heads;
     float ln_eps = 1e-5f;
-    bool verbose = ctx->verbosity >= 2 || getenv("MOONSHINE_STREAMING_BENCH");
+    bool verbose = ctx->verbosity >= 2 || crispasr_env::get("CRISPASR_MOONSHINE_STREAMING_BENCH");
+
+    // #215e UAF fix: always rebuild (sched gallocr regrow frees cached buffers).
+    if (ctx->cached_enc_ctx) {
+        ggml_free(ctx->cached_enc_ctx);
+        ctx->cached_enc_ctx = nullptr;
+        ctx->cached_enc_gf = nullptr;
+    }
 
     const size_t n_tensors = hp.enc_n_layers * 30 + 50;
     const size_t mem_size = ggml_tensor_overhead() * n_tensors + ggml_graph_overhead_custom(16384, false);
@@ -567,7 +621,11 @@ static int run_encoder(moonshine_streaming_context* ctx, const float* frontend_o
     ggml_set_name(cur, "enc_input");
     ggml_set_input(cur);
 
-    // Per-layer masks
+    // Per-layer sliding-window masks. Required for correctness — the model
+    // was trained with specific window sizes and produces garbage without them.
+    // §232 note: removing masks for offline-mode was tested and produces
+    // degenerate output (repeating tokens). The masks ARE the computational
+    // bottleneck (~550² × 6 layers) but cannot be skipped.
     std::vector<ggml_tensor*> masks(hp.enc_n_layers, nullptr);
     for (uint32_t li = 0; li < hp.enc_n_layers; li++) {
         auto [wl, wr] = hp.sliding_windows[li];
@@ -680,7 +738,10 @@ static int run_encoder(moonshine_streaming_context* ctx, const float* frontend_o
                 enc_output[2], enc_output[3], enc_output[4], enc_output[5], enc_output[6], enc_output[7]);
     }
 
-    ggml_free(ctx0);
+    // §176s: save graph for reuse on next call with same T_enc.
+    ctx->cached_enc_ctx = ctx0;
+    ctx->cached_enc_gf = gf;
+    ctx->cached_enc_T = T_enc;
     return 0;
 }
 
@@ -693,7 +754,9 @@ static int run_encoder(moonshine_streaming_context* ctx, const float* frontend_o
 // `moonshine_streaming_transcribe` calls this with nullptr out-vectors.
 static char* moonshine_streaming_transcribe_impl(struct moonshine_streaming_context* ctx, const float* pcm,
                                                  int n_samples, std::vector<int32_t>* out_token_ids,
-                                                 std::vector<float>* out_token_probs) {
+                                                 std::vector<float>* out_token_probs,
+                                                 moonshine_streaming_token_cb on_tok = nullptr,
+                                                 void* on_tok_ud = nullptr) {
     if (!ctx || !pcm || n_samples <= 0)
         return nullptr;
 
@@ -708,7 +771,10 @@ static char* moonshine_streaming_transcribe_impl(struct moonshine_streaming_cont
     // Step 1: Audio frontend
     std::vector<float> frontend_out;
     int T_enc = 0;
-    audio_frontend_cpu(pcm, n_samples, m, frontend_out, T_enc);
+    {
+        moonshine_stream_bench_stage _b("audio_frontend");
+        audio_frontend_cpu(pcm, n_samples, m, frontend_out, T_enc);
+    }
     if (T_enc <= 0)
         return nullptr;
 
@@ -724,8 +790,11 @@ static char* moonshine_streaming_transcribe_impl(struct moonshine_streaming_cont
 
     // Step 2: Encoder
     std::vector<float> enc_output;
-    if (run_encoder(ctx, frontend_out.data(), T_enc, enc_output) != 0) {
-        return nullptr;
+    {
+        moonshine_stream_bench_stage _b("encoder");
+        if (run_encoder(ctx, frontend_out.data(), T_enc, enc_output) != 0) {
+            return nullptr;
+        }
     }
 
     if (ctx->verbosity >= 2) {
@@ -735,6 +804,7 @@ static char* moonshine_streaming_transcribe_impl(struct moonshine_streaming_cont
 
     // Step 3: Decoder — adapted from moonshine.cpp's decoder pattern.
     // Uses ggml tensor KV caches with gallocr per step.
+    moonshine_stream_bench_stage _b_dec("decoder");
     auto& hp = m.hp;
     int enc_h = (int)hp.enc_hidden;
     int dec_h = (int)hp.dec_hidden;
@@ -1053,13 +1123,19 @@ static char* moonshine_streaming_transcribe_impl(struct moonshine_streaming_cont
             if (best == (int)hp.eos_token_id)
                 break;
             tokens.push_back(best);
-            if (capture_probs) {
+            float tok_prob = 0.0f;
+            if (capture_probs || on_tok) {
                 float s = 0.f;
                 for (int i = 0; i < vocab; i++)
                     s += expf(logits_data[i] - bv);
-                out_token_ids->push_back(best);
-                out_token_probs->push_back((s > 0.f) ? (1.0f / s) : 0.0f);
+                tok_prob = (s > 0.f) ? (1.0f / s) : 0.0f;
+                if (capture_probs) {
+                    out_token_ids->push_back(best);
+                    out_token_probs->push_back(tok_prob);
+                }
             }
+            if (on_tok)
+                on_tok(best, tok_prob, on_tok_ud);
             cur_token = best;
 
             if (ctx->verbosity >= 2 && step < 3)
@@ -1088,10 +1164,14 @@ static char* moonshine_streaming_transcribe_impl(struct moonshine_streaming_cont
 extern "C" void moonshine_streaming_free(struct moonshine_streaming_context* ctx) {
     if (!ctx)
         return;
+    if (ctx->cached_enc_ctx)
+        ggml_free(ctx->cached_enc_ctx);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->model.buf_w)
         ggml_backend_buffer_free(ctx->model.buf_w);
+    if (ctx->model.buf_w_cpu)
+        ggml_backend_buffer_free(ctx->model.buf_w_cpu);
     if (ctx->model.ctx_w)
         ggml_free(ctx->model.ctx_w);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)
@@ -1142,6 +1222,14 @@ extern "C" int moonshine_streaming_encode(struct moonshine_streaming_context* ct
 extern "C" char* moonshine_streaming_transcribe(struct moonshine_streaming_context* ctx, const float* pcm,
                                                 int n_samples) {
     return moonshine_streaming_transcribe_impl(ctx, pcm, n_samples, nullptr, nullptr);
+}
+
+extern "C" void moonshine_streaming_transcribe_cb(struct moonshine_streaming_context* ctx, const float* pcm,
+                                                  int n_samples, moonshine_streaming_token_cb cb, void* userdata) {
+    if (!ctx || !pcm || n_samples <= 0 || !cb)
+        return;
+    char* s = moonshine_streaming_transcribe_impl(ctx, pcm, n_samples, nullptr, nullptr, cb, userdata);
+    free(s);
 }
 
 extern "C" struct moonshine_streaming_result* moonshine_streaming_transcribe_with_probs(

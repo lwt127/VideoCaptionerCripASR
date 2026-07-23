@@ -10,14 +10,14 @@ import 'package:test/test.dart';
 void main() {
   final libEnv = Platform.environment['CRISPASR_LIB'];
   final modelEnv = Platform.environment['CRISPASR_MODEL'];
-  final libPath = (libEnv != null && libEnv.isNotEmpty && File(libEnv).existsSync())
-      ? libEnv
-      : null;
-  final modelPath = (modelEnv != null &&
-          modelEnv.isNotEmpty &&
-          File(modelEnv).existsSync())
-      ? modelEnv
-      : '${Directory.current.parent.parent.path}/models/ggml-tiny.en.bin';
+  final libPath =
+      (libEnv != null && libEnv.isNotEmpty && File(libEnv).existsSync())
+          ? libEnv
+          : null;
+  final modelPath =
+      (modelEnv != null && modelEnv.isNotEmpty && File(modelEnv).existsSync())
+          ? modelEnv
+          : '${Directory.current.parent.parent.path}/models/ggml-tiny.en.bin';
   final canRun = libPath != null && File(modelPath).existsSync();
   final skipReason = canRun
       ? null
@@ -25,8 +25,7 @@ void main() {
           'into ../../models/) to run grammar smoke tests';
 
   group('CrispasrSession.setGrammar', () {
-    test('parses + binds a simple GBNF, then clears via empty string',
-        () {
+    test('parses + binds a simple GBNF, then clears via empty string', () {
       // Open against a tiny whisper model — grammar is whisper-only
       // and this is the smallest model that exercises the dispatch.
       final s = CrispasrSession.open(modelPath, libPath: libPath);
@@ -64,8 +63,7 @@ void main() {
         const gbnf = 'root ::= "hello"\n';
         // Valid grammar but root rule name doesn't exist — same
         // failure mode (rc=-2) as a parse failure.
-        expect(
-            () => s.setGrammar(gbnf, rootRule: 'nonexistent'),
+        expect(() => s.setGrammar(gbnf, rootRule: 'nonexistent'),
             throwsA(isA<ArgumentError>()));
       } finally {
         s.close();

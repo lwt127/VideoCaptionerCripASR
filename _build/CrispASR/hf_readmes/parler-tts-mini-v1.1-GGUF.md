@@ -31,6 +31,7 @@ Single GGUF contains all three components (T5 encoder + decoder + DAC codec).
 | `parler-tts-mini-v1.1-f16.gguf`  | F16  | 1.8 GB | Reference quality |
 | `parler-tts-mini-v1.1-q8_0.gguf` | Q8_0 | 979 MB | Recommended |
 | `parler-tts-mini-v1.1-q4_k.gguf` | Q4_K | 569 MB | Smallest (DAC codec kept at F16) |
+| `parler-mini-v1.1-ref.gguf`      | —    | 286 KB | CrispASR `crispasr-diff` per-stage F32 PyTorch reference (not a model) |
 
 ## Quick start
 

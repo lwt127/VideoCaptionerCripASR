@@ -29,9 +29,12 @@
 // so the raw SnakeBeta (x + sin(αx)²/β) gives full GPU offload.
 
 #include "indextts_voc.h"
+#include "core/conv.h"
 #include "core/fft.h"
 #include "core/gguf_loader.h"
 #include "core/mel.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -52,6 +55,32 @@
 #ifdef __APPLE__
 #include <Accelerate/Accelerate.h> // vDSP_conv, vvsinf, vDSP_vsq — Step C-1
 #endif
+
+// ===========================================================================
+// Bench instrumentation — `INDEXTTS_VOC_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool indextts_voc_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_INDEXTTS_VOC_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct indextts_voc_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit indextts_voc_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~indextts_voc_bench_stage() {
+        if (!indextts_voc_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  indextts_voc_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 namespace {
 
@@ -123,6 +152,12 @@ struct indextts_voc_context {
     ggml_backend_sched_t sched = nullptr;
     std::vector<uint8_t> compute_meta;
 
+    // Pre-permuted ConvTranspose1d weights for decomposed mul_mat + col2im_1d.
+    static constexpr int kMaxUps = 4;
+    ggml_tensor* ups_w_perm[kMaxUps] = {};
+    ggml_context* ctx_perm = nullptr;
+    ggml_backend_buffer_t buf_perm = nullptr;
+
     int n_threads = 4;
     int verbosity = 1;
     // BigVGAN v2 needs anti-aliased SnakeBeta — the raw `x + sin(αx)²/β`
@@ -145,6 +180,12 @@ struct indextts_voc_context {
         clear_aa_params();
         if (sched) {
             ggml_backend_sched_free(sched);
+        }
+        if (buf_perm) {
+            ggml_backend_buffer_free(buf_perm);
+        }
+        if (ctx_perm) {
+            ggml_free(ctx_perm);
         }
         if (ctx_w) {
             ggml_free(ctx_w);
@@ -224,7 +265,7 @@ static void aa_snake_beta_op(struct ggml_tensor* dst, const struct ggml_tensor* 
     auto& snake_tmp = p->scratch_snake[ith];
     // Step C-1 A/B knob — INDEXTTS_AA_SCALAR=1 forces the scalar paths for the
     // SnakeBeta and downsample stages so we can bench Accelerate's contribution.
-    static const bool s_force_scalar = getenv("INDEXTTS_AA_SCALAR") != nullptr;
+    static const bool s_force_scalar = crispasr_env::get("CRISPASR_INDEXTTS_AA_SCALAR") != nullptr;
     if ((int)padded.size() < T_padded)
         padded.resize(T_padded);
     if ((int)upsampled.size() < T_up)
@@ -521,11 +562,11 @@ static ggml_tensor* aa_snake_beta_native(ggml_context* ctx, ggml_tensor* x, ggml
 // op (Step C-2); anything else (or unset) stays on the proven CPU custom-op
 // path.
 static bool aa_use_native() {
-    const char* v = getenv("INDEXTTS_AA_BACKEND");
+    const char* v = crispasr_env::get("CRISPASR_INDEXTTS_AA_BACKEND");
     return v && (v[0] == 'n' || v[0] == 'N');
 }
 static bool aa_use_opvariant() {
-    const char* v = getenv("INDEXTTS_AA_BACKEND");
+    const char* v = crispasr_env::get("CRISPASR_INDEXTTS_AA_BACKEND");
     // Match "op", "Op", "metal", "Metal".
     return v && (v[0] == 'o' || v[0] == 'O' || v[0] == 'm' || v[0] == 'M');
 }
@@ -1013,18 +1054,24 @@ static ggml_cgraph* build_bigvgan_graph(indextts_voc_context* c, int T_in) {
             ggml_tensor* up_w = T(ts, wn);
             ggml_tensor* up_b = T(ts, bn);
             if (up_w) {
-                int T_cur = (int)x->ne[0];
-                x = ggml_conv_transpose_1d(ctx0, up_w, x, s, 0, 1);
-                // Crop padding: output with p=0 is (T-1)*s+k, we want T*s
                 int p = (k - s) / 2;
-                if (p > 0) {
-                    int T_want = T_cur * s;
-                    int C_out_t = (int)x->ne[1];
-                    x = ggml_view_2d(ctx0, x, T_want, C_out_t, x->nb[1], (size_t)p * x->nb[0]);
-                    x = ggml_cont(ctx0, x);
-                }
-                if (up_b) {
-                    x = ggml_add(ctx0, x, ggml_reshape_2d(ctx0, up_b, 1, (int)up_b->ne[0]));
+                ggml_tensor* wp = (i < indextts_voc_context::kMaxUps) ? c->ups_w_perm[i] : nullptr;
+                if (wp) {
+                    // Decomposed path: mul_mat + col2im_1d (time-first convention)
+                    x = core_convt::convt1d_decomp_tf(ctx0, x, wp, up_b, s, k, p, p);
+                } else {
+                    // Old path
+                    int T_cur = (int)x->ne[0];
+                    x = ggml_conv_transpose_1d(ctx0, up_w, x, s, 0, 1);
+                    if (p > 0) {
+                        int T_want = T_cur * s;
+                        int C_out_t = (int)x->ne[1];
+                        x = ggml_view_2d(ctx0, x, T_want, C_out_t, x->nb[1], (size_t)p * x->nb[0]);
+                        x = ggml_cont(ctx0, x);
+                    }
+                    if (up_b) {
+                        x = ggml_add(ctx0, x, ggml_reshape_2d(ctx0, up_b, 1, (int)up_b->ne[0]));
+                    }
                 }
             }
         }
@@ -1208,8 +1255,8 @@ extern "C" struct indextts_voc_context* indextts_voc_init(const char* path, int 
     //   INDEXTTS_VOCODER_RAW=1 → force raw SnakeBeta (legacy path; aliased)
     //   INDEXTTS_VOCODER_AA=0  → same, alternate spelling
     //   INDEXTTS_VOCODER_AA=1  → force AA (also the default)
-    const char* raw_env = getenv("INDEXTTS_VOCODER_RAW");
-    const char* aa_env = getenv("INDEXTTS_VOCODER_AA");
+    const char* raw_env = crispasr_env::get("CRISPASR_INDEXTTS_VOCODER_RAW");
+    const char* aa_env = crispasr_env::get("CRISPASR_INDEXTTS_VOCODER_AA");
     if (raw_env && raw_env[0] == '1') {
         c->use_aa = false;
     } else if (aa_env && aa_env[0] == '0') {
@@ -1309,13 +1356,14 @@ extern "C" struct indextts_voc_context* indextts_voc_init(const char* path, int 
         delete c;
         return nullptr;
     }
-    const bool force_gpu_with_aa = getenv("INDEXTTS_VOC_FORCE_GPU") && getenv("INDEXTTS_VOC_FORCE_GPU")[0] == '1';
+    const bool force_gpu_with_aa = crispasr_env::get("CRISPASR_INDEXTTS_VOC_FORCE_GPU") &&
+                                   crispasr_env::get("CRISPASR_INDEXTTS_VOC_FORCE_GPU")[0] == '1';
     // Native-ops AA (Step B) and the new ggml_aa_snake_beta op (Step C-2) both
     // run on whichever backend owns the graph — no Metal↔CPU sync at each AA
     // site. The auto-CPU fallback only applies to the legacy map_custom1 path.
     const bool aa_blocks_gpu = c->use_aa && !aa_use_native() && !aa_use_opvariant() && !force_gpu_with_aa;
     const bool effective_use_gpu = use_gpu && !aa_blocks_gpu;
-    c->backend = effective_use_gpu ? ggml_backend_init_best() : c->backend_cpu;
+    c->backend = effective_use_gpu ? crispasr_init_gpu_backend() : c->backend_cpu;
     if (!c->backend) {
         c->backend = c->backend_cpu;
     }
@@ -1336,6 +1384,31 @@ extern "C" struct indextts_voc_context* indextts_voc_init(const char* path, int 
         c->ctx_w = wl.ctx;
         c->buf_w = wl.buf;
         c->tensors = std::move(wl.tensors);
+    }
+
+    // Permute ConvTranspose1d weights for decomposed mul_mat + col2im_1d.
+    {
+        const int n_ups = c->hp.num_upsamples;
+        const size_t meta_bytes = ggml_tensor_overhead() * (size_t)n_ups + 4096;
+        struct ggml_init_params pp = {meta_bytes, nullptr, true};
+        c->ctx_perm = ggml_init(pp);
+        std::unique_ptr<float[]> perm_bufs[indextts_voc_context::kMaxUps];
+        for (int i = 0; i < n_ups && i < indextts_voc_context::kMaxUps; i++) {
+            char wn[32];
+            std::snprintf(wn, sizeof(wn), "ups.%d.0.weight", i);
+            auto it = c->tensors.find(wn);
+            if (it == c->tensors.end())
+                continue;
+            ggml_tensor* src = it->second;
+            perm_bufs[i] = core_convt::permute_convt1d_weight(src);
+            c->ups_w_perm[i] =
+                ggml_new_tensor_2d(c->ctx_perm, GGML_TYPE_F32, (int)src->ne[2], (int)src->ne[0] * (int)src->ne[1]);
+        }
+        c->buf_perm = ggml_backend_alloc_ctx_tensors(c->ctx_perm, c->backend);
+        for (int i = 0; i < n_ups && i < indextts_voc_context::kMaxUps; i++) {
+            if (c->ups_w_perm[i] && perm_bufs[i])
+                ggml_backend_tensor_set(c->ups_w_perm[i], perm_bufs[i].get(), 0, ggml_nbytes(c->ups_w_perm[i]));
+        }
     }
 
     // Verify critical tensors exist
@@ -1383,8 +1456,14 @@ extern "C" float* indextts_voc_generate(struct indextts_voc_context* ctx, const 
                 (float)T_audio / hp.sampling_rate);
     }
 
+    indextts_voc_bench_stage _bs_total("generate");
+
     // Build graph
-    ggml_cgraph* gf = build_bigvgan_graph(ctx, T_in);
+    ggml_cgraph* gf;
+    {
+        indextts_voc_bench_stage _bs("graph_build");
+        gf = build_bigvgan_graph(ctx, T_in);
+    }
 
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
@@ -1416,6 +1495,7 @@ extern "C" float* indextts_voc_generate(struct indextts_voc_context* ctx, const 
     }
 
     // Compute
+    indextts_voc_bench_stage _bs_compute("compute");
     auto t0 = std::chrono::high_resolution_clock::now();
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "indextts-voc: BigVGAN compute failed\n");
@@ -1424,7 +1504,7 @@ extern "C" float* indextts_voc_generate(struct indextts_voc_context* ctx, const 
     }
     ctx->clear_aa_params();
     auto t1 = std::chrono::high_resolution_clock::now();
-    const bool bench = getenv("INDEXTTS_BENCH") != nullptr;
+    const bool bench = crispasr_env::get("CRISPASR_INDEXTTS_BENCH") != nullptr;
     if (ctx->verbosity >= 1 || bench) {
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         const char* mode = ctx->use_aa ? (ctx->backend == ctx->backend_cpu ? "AA/CPU" : "AA/mixed") : "raw/GPU";

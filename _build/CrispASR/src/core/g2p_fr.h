@@ -82,6 +82,7 @@ inline std::string lts_word_to_ipa(const std::string& word) {
             int idx = i + offset;
             return (idx + 1 < len && (unsigned char)w[idx] == 0xC3 && (unsigned char)w[idx + 1] == byte2);
         };
+        (void)is_utf8_2;
         char c = at(0), c1 = at(1), c2 = at(2), c3 = at(3);
 
         // --- 4-char ---

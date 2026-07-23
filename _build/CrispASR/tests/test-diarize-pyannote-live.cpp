@@ -18,10 +18,12 @@
 
 #include "../src/crispasr_speaker_cluster.h"
 #include "../src/crispasr_diarize.h"
+#include "../src/speaker_db.h"
 #include "../src/titanet.h"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -30,6 +32,15 @@
 #include <set>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+#include <direct.h>
+#include <process.h>
+#include <windows.h>
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -99,6 +110,33 @@ const char* getenv_or_null(const char* name) {
     const char* v = std::getenv(name);
     return (v && *v) ? v : nullptr;
 }
+
+// Scratch dir for the speaker-db enrollment test below. Same pattern as
+// tests/test-speaker-db.cpp: honor CRISPASR_SCRATCH_DIR when set (worktree
+// convention), fall back to a local .scratch dir. Not cleaned up afterward,
+// matching the unit-test precedent.
+#ifdef _WIN32
+std::string make_temp_dir() {
+    char buf[MAX_PATH];
+    GetTempPathA(MAX_PATH, buf);
+    std::string base = buf;
+    if (!base.empty() && (base.back() == '\\' || base.back() == '/'))
+        base.pop_back();
+    std::string dir = base + "/crispasr_spkdb_live_" + std::to_string(_getpid());
+    _mkdir(dir.c_str());
+    return dir;
+}
+#else
+std::string make_temp_dir() {
+    const char* env = std::getenv("CRISPASR_SCRATCH_DIR");
+    std::string base = (env && *env) ? env : ".scratch";
+    mkdir(base.c_str(), 0755);
+    std::string pattern = base + "/crispasr_spkdb_live_XXXXXX";
+    std::string writable = pattern;
+    char* buf = writable.data();
+    return mkdtemp(buf) ? std::string(buf) : base;
+}
+#endif
 
 } // namespace
 
@@ -291,4 +329,147 @@ TEST_CASE("apply_embedder live: TitaNet clusters fixture JFK vs TTS regions", "[
     // share a cluster. If this fails the embedder is collapsing real
     // voice differences.
     REQUIRE(jfk_a_cluster != baker_cluster);
+}
+
+// ----------------------------------------------------------------------
+// Speaker-db identification live test (issue #266, PLAN F3).
+// ----------------------------------------------------------------------
+// Mirrors the real pipeline (crispasr_apply_global_speaker_stages() in
+// examples/cli/crispasr_run.cpp): cluster the fixture's embeddings exactly
+// like the embedder test above, enroll a clean single-speaker span as a
+// named profile (consent attested, synthetic/local use), narrow the loaded
+// db to that one claimed name, then match each cluster CENTROID against it
+// via speaker_db_match — the same call crispasr_identify_speaker_clusters()
+// makes. Asserts the named cluster (JFK region) matches while the other
+// physical speaker (TTS-baker region) stays unmatched, i.e. named and
+// anonymous clusters coexist on one recording — the target #266 behavior.
+//
+//   CRISPASR_TEST_DIARIZE_WAV     - the same 2-speaker WAV as above
+//   CRISPASR_TEST_TITANET_MODEL   - titanet-large GGUF
+//
+// Enrollment writes to a throwaway temp dir created by this test (see
+// make_temp_dir() above) — the consent attestation is this test's own, for
+// a synthetic/local fixture, not a real enrolled person.
+TEST_CASE("speaker-db identify live: named + anonymous clusters coexist on multi-speaker WAV",
+          "[live][diarize][speaker-db]") {
+    const char* wav_path = getenv_or_null("CRISPASR_TEST_DIARIZE_WAV");
+    const char* titanet_path = getenv_or_null("CRISPASR_TEST_TITANET_MODEL");
+    if (!wav_path || !titanet_path) {
+        SKIP("set CRISPASR_TEST_DIARIZE_WAV + CRISPASR_TEST_TITANET_MODEL to run this "
+             "live test (speaker-db identification on a multi-speaker WAV)");
+    }
+
+    std::vector<float> mono;
+    int sr = 0;
+    REQUIRE(load_wav_mono_16k(wav_path, mono, sr));
+    REQUIRE(sr == 16000);
+    REQUIRE(mono.size() > (size_t)sr * 5);
+
+    struct SegRange {
+        int64_t t0_cs;
+        int64_t t1_cs;
+    };
+    std::vector<SegRange> ranges;
+    const int64_t dur_cs = (int64_t)(mono.size() * 100 / 16000);
+    constexpr int64_t kSegCs = 100;
+    for (int64_t t = 0; t + kSegCs <= dur_cs; t += kSegCs)
+        ranges.push_back({t, t + kSegCs});
+    REQUIRE(ranges.size() >= 5);
+
+    titanet_context* tctx = titanet_init(titanet_path, 4);
+    REQUIRE(tctx != nullptr);
+
+    constexpr int DIM = 192;
+    std::vector<float> embeddings;
+    embeddings.reserve(ranges.size() * (size_t)DIM);
+    std::vector<size_t> kept_indices;
+    kept_indices.reserve(ranges.size());
+
+    std::vector<float> tmp(DIM);
+    for (size_t i = 0; i < ranges.size(); i++) {
+        const int s0 = (int)(ranges[i].t0_cs * 160);
+        const int s1 = (int)(ranges[i].t1_cs * 160);
+        if (s1 - s0 < 4000)
+            continue;
+        const int got = titanet_embed(tctx, mono.data() + s0, s1 - s0, tmp.data());
+        if (got != DIM)
+            continue;
+        embeddings.insert(embeddings.end(), tmp.begin(), tmp.end());
+        kept_indices.push_back(i);
+    }
+    REQUIRE(kept_indices.size() >= 5);
+
+    // Same clustering settings the CLI uses by default (--diarize-cluster-
+    // threshold 0.5, --diarize-max-speakers 8).
+    std::vector<int> labels = crispasr_agglomerative_cluster(embeddings, (int)kept_indices.size(), DIM,
+                                                             /*merge_threshold=*/0.5f,
+                                                             /*max_speakers=*/8);
+    REQUIRE(labels.size() == kept_indices.size());
+    const int n_clusters = *std::max_element(labels.begin(), labels.end()) + 1;
+    REQUIRE(n_clusters >= 2); // both physical speakers must be distinct clusters
+
+    // Which cluster does the JFK region (fixture t=0-10s, see layout note
+    // above) land in? Reuse the region-majority approach from the embedder
+    // test above: 1s fixed windows (no turn-aware segmentation) are noisier
+    // than the real pipeline's pyannote-segment-based embeds, so a single
+    // window's raw label can be an outlier — majority vote over the region
+    // is the same robustness fix that test relies on.
+    std::map<int, int> jfk_counts;
+    for (size_t k = 0; k < kept_indices.size(); k++) {
+        const auto& r = ranges[kept_indices[k]];
+        if (r.t0_cs >= 0 && r.t1_cs <= 1000 && labels[k] >= 0)
+            jfk_counts[labels[k]]++;
+    }
+    int jfk_cluster = -1, jfk_best_count = 0;
+    for (const auto& kv : jfk_counts)
+        if (kv.second > jfk_best_count) {
+            jfk_cluster = kv.first;
+            jfk_best_count = kv.second;
+        }
+    REQUIRE(jfk_cluster >= 0);
+
+    // Enroll a clean 2-9s span of the JFK region directly (not from the 1s
+    // clustering embeddings — a single longer embed call, matching how the
+    // CLI's --enroll-speaker path works on a hand-picked clean span).
+    const int e0 = 2 * 16000, e1 = 9 * 16000;
+    std::vector<float> enroll_emb(DIM);
+    REQUIRE(titanet_embed(tctx, mono.data() + e0, e1 - e0, enroll_emb.data()) == DIM);
+    titanet_free(tctx);
+
+    const std::string db_dir = make_temp_dir();
+    REQUIRE(speaker_db_enroll(db_dir.c_str(), "F3Speaker", enroll_emb.data(), DIM, /*consent_attested=*/true));
+
+    speaker_db* db = speaker_db_load(db_dir.c_str());
+    REQUIRE(db != nullptr);
+    REQUIRE(speaker_db_count(db) == 1);
+    REQUIRE(speaker_db_retain(db, "F3Speaker") == 1); // closed-roster narrowing (#266)
+
+    const auto centroids = crispasr_cluster_centroids(embeddings, labels, (int)kept_indices.size(), DIM);
+    REQUIRE((int)centroids.size() == n_clusters * DIM);
+
+    int n_named = 0, n_unmatched = 0;
+    bool jfk_matched = false;
+    for (int c = 0; c < n_clusters; c++) {
+        float score = 0.0f;
+        const char* name = speaker_db_match(db, centroids.data() + (size_t)c * DIM, DIM,
+                                            /*threshold=*/0.7f, &score);
+        INFO("cluster " << c << " -> " << (name ? name : "(unmatched)") << " (cos " << score << ")");
+        if (name) {
+            n_named++;
+            if (c == jfk_cluster) {
+                REQUIRE(std::string(name) == "F3Speaker");
+                jfk_matched = true;
+            }
+        } else {
+            n_unmatched++;
+        }
+    }
+    speaker_db_free(db);
+
+    // Target #266 behavior: the enrolled JFK cluster is named, and at
+    // least one other cluster (the TTS-baker / second physical speaker)
+    // stays anonymous — named + anonymous coexist on one recording.
+    REQUIRE(jfk_matched);
+    REQUIRE(n_named >= 1);
+    REQUIRE(n_unmatched >= 1);
 }

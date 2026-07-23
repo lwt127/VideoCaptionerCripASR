@@ -21,6 +21,8 @@
 #include "core/bpe.h"
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 #include "outetts_wavtok.h"
 
 #include "ggml-backend.h"
@@ -29,7 +31,9 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -41,6 +45,32 @@
 #include <vector>
 
 namespace {
+
+// ===========================================================================
+// Bench instrumentation — `OUTETTS_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool outetts_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_OUTETTS_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct outetts_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit outetts_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~outetts_bench_stage() {
+        if (!outetts_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  outetts_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 struct outetts_hp {
     uint32_t n_layers = 16;
@@ -138,6 +168,18 @@ struct outetts_context {
     ggml_tensor* kv_v = nullptr;
     int kv_max_ctx = 0;
 
+    // §176b: Lk-bucketed single-step AR graph cache.
+    struct OutettsBucket {
+        int lk = 0;
+        ggml_context* ctx = nullptr;
+        std::vector<uint8_t> meta;
+        ggml_cgraph* gf = nullptr;
+    };
+    static constexpr int kBucketN = 4;
+    static constexpr int kBucketLks[kBucketN] = {512, 1024, 2048, 4096};
+    std::array<OutettsBucket, kBucketN> ar_buckets{};
+    ggml_backend_sched_t ar_step_sched = nullptr;
+
     // WavTokenizer decoder
     std::string wavtok_codec_path;
     wavtok_decoder_ctx* wavtok_dec = nullptr;
@@ -149,6 +191,11 @@ struct outetts_context {
         if (wavtok_dec) {
             wavtok_decoder_free(wavtok_dec);
         }
+        if (ar_step_sched)
+            ggml_backend_sched_free(ar_step_sched);
+        for (auto& bk : ar_buckets)
+            if (bk.ctx)
+                ggml_free(bk.ctx);
         if (sched) {
             ggml_backend_sched_free(sched);
         }
@@ -319,7 +366,13 @@ static ggml_cgraph* build_graph_embed(outetts_context* c, int n_tokens) {
 }
 
 // OLMo block stack (Llama-compatible: RMSNorm -> attn -> RMSNorm -> SwiGLU).
-static ggml_cgraph* build_graph_talker_kv(outetts_context* c, int n_past, int n_tokens) {
+//
+// fixed_kv_len > 0: pin Lk to a constant (bucket mode). kv_indices=positions
+//   makes the KV write position a runtime input, keeping graph topology
+//   invariant across decode steps (§176b).
+// arena_ctx != nullptr: graph nodes allocated in caller's arena; caller owns it.
+static ggml_cgraph* build_graph_talker_kv(outetts_context* c, int n_past, int n_tokens, int fixed_kv_len = 0,
+                                          ggml_context* arena_ctx = nullptr) {
     const auto& hp = c->hp;
     const int d = (int)hp.d_model;
     const int n_q = (int)hp.n_heads;
@@ -330,12 +383,12 @@ static ggml_cgraph* build_graph_talker_kv(outetts_context* c, int n_past, int n_
     const float theta = hp.rope_theta;
     const float attn_scale = 1.0f / std::sqrt((float)hd);
     const int T = n_tokens;
-    const int Lk = n_past + T;
+    const int Lk = fixed_kv_len > 0 ? fixed_kv_len : (n_past + T);
 
     GGML_ASSERT(c->kv_k && c->kv_v && Lk <= c->kv_max_ctx);
 
     ggml_init_params ip = {c->compute_meta.size(), c->compute_meta.data(), true};
-    ggml_context* ctx0 = ggml_init(ip);
+    ggml_context* ctx0 = arena_ctx ? arena_ctx : ggml_init(ip);
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
 
     ggml_tensor* embeds = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d, T);
@@ -345,7 +398,7 @@ static ggml_cgraph* build_graph_talker_kv(outetts_context* c, int n_past, int n_
     ggml_set_name(positions, "positions");
     ggml_set_input(positions);
     ggml_tensor* causal_mask = nullptr;
-    if (T > 1) {
+    if (T > 1 || fixed_kv_len > 0) {
         causal_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, Lk, T);
         ggml_set_name(causal_mask, "causal_mask");
         ggml_set_input(causal_mask);
@@ -365,6 +418,8 @@ static ggml_cgraph* build_graph_talker_kv(outetts_context* c, int n_past, int n_
         /*gqa_mode*/ core_attn::GQA_MANUAL_CONT,
     };
 
+    ggml_tensor* eff_kv_indices = fixed_kv_len > 0 ? positions : nullptr;
+
     ggml_tensor* cur = embeds;
     for (uint32_t il = 0; il < hp.n_layers; il++) {
         const auto& b = c->talker.blocks[il];
@@ -374,9 +429,11 @@ static ggml_cgraph* build_graph_talker_kv(outetts_context* c, int n_past, int n_
         ggml_tensor* x = ggml_norm(ctx0, cur, eps);
 
         // Self-attention with KV cache
-        ggml_tensor* attn = core_attn::kv_self_attn(ctx0, gf, x, b.attn_q_w, b.attn_k_w, b.attn_v_w, b.attn_output_w,
-                                                    nullptr, nullptr, positions, (T == 1) ? nullptr : causal_mask,
-                                                    c->kv_k, c->kv_v, (int)il, n_past, kvp);
+        ggml_tensor* attn = core_attn::kv_self_attn(
+            ctx0, gf, x, b.attn_q_w, b.attn_k_w, b.attn_v_w, b.attn_output_w, nullptr, nullptr, positions,
+            (T == 1 && !fixed_kv_len) ? nullptr : causal_mask, c->kv_k, c->kv_v, (int)il, n_past, kvp,
+            /*qkv_w=*/nullptr, /*fixed_kv_len=*/fixed_kv_len,
+            /*kv_indices=*/eff_kv_indices);
         cur = ggml_add(ctx0, residual, attn);
 
         // FFN
@@ -387,8 +444,6 @@ static ggml_cgraph* build_graph_talker_kv(outetts_context* c, int n_past, int n_
     }
 
     // Final norm + lm_head
-    // OLMo uses parameter-free LayerNorm (no weight/bias) everywhere,
-    // including the final norm before the lm_head.
     cur = ggml_norm(ctx0, cur, eps);
     if (T > 1) {
         cur = ggml_view_2d(ctx0, cur, d, 1, cur->nb[1], (size_t)(T - 1) * cur->nb[1]);
@@ -396,7 +451,8 @@ static ggml_cgraph* build_graph_talker_kv(outetts_context* c, int n_past, int n_
     cur = ggml_mul_mat(ctx0, c->talker.output_w, cur);
     ggml_set_name(cur, "logits");
     ggml_build_forward_expand(gf, cur);
-    ggml_free(ctx0);
+    if (!arena_ctx)
+        ggml_free(ctx0);
     return gf;
 }
 
@@ -404,8 +460,28 @@ static ggml_cgraph* build_graph_talker_kv(outetts_context* c, int n_past, int n_
 // Compute helpers
 // ---------------------------------------------------------------------------
 
+// Direct CPU dequant for a single token — avoids building a full ggml
+// graph + sched cycle just for one ggml_get_rows op (§176o). Falls back
+// to the graph path for batched prefill (n > 1).
 static float* embed_tokens(outetts_context* c, const int32_t* ids, int n) {
     const int d = (int)c->hp.d_model;
+
+    if (n == 1) {
+        const ggml_tensor* w = c->talker.token_embd_w;
+        const size_t row_bytes = ggml_row_size(w->type, d);
+        static thread_local std::vector<uint8_t> raw;
+        if (raw.size() < row_bytes)
+            raw.resize(row_bytes);
+        ggml_backend_tensor_get(w, raw.data(), (size_t)ids[0] * row_bytes, row_bytes);
+        float* r = (float*)malloc((size_t)d * sizeof(float));
+        if (w->type == GGML_TYPE_F32) {
+            std::memcpy(r, raw.data(), (size_t)d * sizeof(float));
+        } else {
+            ggml_get_type_traits(w->type)->to_float(raw.data(), r, d);
+        }
+        return r;
+    }
+
     ggml_cgraph* gf = build_graph_embed(c, n);
     ggml_backend_sched_reset(c->sched);
     if (!ggml_backend_sched_alloc_graph(c->sched, gf)) {
@@ -421,7 +497,88 @@ static float* embed_tokens(outetts_context* c, const int32_t* ids, int n) {
     return r;
 }
 
+// §176b: Lk-bucketed single-step AR decode helpers.
+static int outetts_pick_bucket(outetts_context* c, int needed_lk) {
+    for (int i = 0; i < outetts_context::kBucketN; i++) {
+        const int bk_lk = outetts_context::kBucketLks[i];
+        if (bk_lk >= needed_lk && bk_lk <= c->kv_max_ctx)
+            return i;
+    }
+    return -1;
+}
+
+static ggml_backend_sched_t outetts_step_sched_lazy(outetts_context* c) {
+    if (c->ar_step_sched)
+        return c->ar_step_sched;
+    ggml_backend_t backends[2] = {c->backend, c->backend_cpu};
+    int n_be = (c->backend && c->backend != c->backend_cpu) ? 2 : 1;
+    c->ar_step_sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+    return c->ar_step_sched;
+}
+
+static ggml_cgraph* outetts_get_or_build_bucket(outetts_context* c, int idx) {
+    auto& bk = c->ar_buckets[idx];
+    if (bk.gf)
+        return bk.gf;
+    bk.lk = outetts_context::kBucketLks[idx];
+    bk.meta.assign(c->compute_meta.size(), 0);
+    ggml_init_params ip = {bk.meta.size(), bk.meta.data(), true};
+    bk.ctx = ggml_init(ip);
+    if (!bk.ctx) {
+        fprintf(stderr, "outetts: ar_bucket[%d] arena init failed\n", idx);
+        return nullptr;
+    }
+    bk.gf = build_graph_talker_kv(c, /*n_past=*/0, /*n_tokens=*/1,
+                                  /*fixed_kv_len=*/bk.lk, /*arena_ctx=*/bk.ctx);
+    return bk.gf;
+}
+
+static float* run_talker_kv_bucket(outetts_context* c, const float* embeds, int n_past) {
+    const int idx = outetts_pick_bucket(c, n_past + 1);
+    if (idx < 0)
+        return nullptr;
+
+    ggml_cgraph* gf = outetts_get_or_build_bucket(c, idx);
+    if (!gf)
+        return nullptr;
+
+    ggml_backend_sched_t step_sched = outetts_step_sched_lazy(c);
+    ggml_backend_sched_reset(step_sched);
+    if (!ggml_backend_sched_alloc_graph(step_sched, gf))
+        return nullptr;
+
+    const int d = (int)c->hp.d_model;
+    const int Lk = c->ar_buckets[idx].lk;
+
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "inputs_embeds"), embeds, 0, (size_t)d * sizeof(float));
+    int32_t pos = n_past;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "positions"), &pos, 0, sizeof(int32_t));
+
+    // Causal mask: allow attending [0..n_past], mask [n_past+1..Lk-1].
+    std::vector<ggml_fp16_t> mask((size_t)Lk);
+    const ggml_fp16_t zero_h = ggml_fp32_to_fp16(0.0f);
+    const ggml_fp16_t ninf_h = ggml_fp32_to_fp16(-INFINITY);
+    for (int k = 0; k < Lk; k++)
+        mask[k] = (k <= n_past) ? zero_h : ninf_h;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "causal_mask"), mask.data(), 0,
+                            mask.size() * sizeof(ggml_fp16_t));
+
+    if (ggml_backend_sched_graph_compute(step_sched, gf) != GGML_STATUS_SUCCESS)
+        return nullptr;
+
+    const int vocab = (int)c->hp.vocab_size;
+    float* r = (float*)malloc((size_t)vocab * sizeof(float));
+    ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "logits"), r, 0, (size_t)vocab * sizeof(float));
+    return r;
+}
+
 static float* run_talker_kv(outetts_context* c, const float* embeds, int n_tokens, int n_past) {
+    // §176b: Lk-bucketed fast path for single-step decode.
+    if (n_tokens == 1) {
+        if (float* r = run_talker_kv_bucket(c, embeds, n_past))
+            return r;
+    }
+
     if (n_past + n_tokens > c->kv_max_ctx) {
         fprintf(stderr, "outetts: kv overflow (%d+%d > %d)\n", n_past, n_tokens, c->kv_max_ctx);
         return nullptr;
@@ -729,7 +886,7 @@ extern "C" struct outetts_context* outetts_init_from_file(const char* path_model
         return nullptr;
     }
     ggml_backend_cpu_set_n_threads(c->backend_cpu, c->n_threads);
-    c->backend = params.use_gpu ? ggml_backend_init_best() : c->backend_cpu;
+    c->backend = params.use_gpu ? crispasr_init_gpu_backend() : c->backend_cpu;
     if (!c->backend) {
         c->backend = c->backend_cpu;
     }
@@ -1161,13 +1318,23 @@ extern "C" float* outetts_synthesize(struct outetts_context* ctx, const char* te
         }
     }
 
+    outetts_bench_stage _bs_synth("synthesize");
+
     int n_codes = 0;
-    int32_t* codes = outetts_synthesize_codes(ctx, text, &n_codes);
+    int32_t* codes;
+    {
+        outetts_bench_stage _bs("ar_decode");
+        codes = outetts_synthesize_codes(ctx, text, &n_codes);
+    }
     if (!codes || n_codes <= 0)
         return nullptr;
 
     int n_pcm = 0;
-    float* pcm = wavtok_decoder_decode(ctx->wavtok_dec, codes, n_codes, &n_pcm);
+    float* pcm;
+    {
+        outetts_bench_stage _bs("wavtok_decode");
+        pcm = wavtok_decoder_decode(ctx->wavtok_dec, codes, n_codes, &n_pcm);
+    }
     free(codes);
 
     if (!pcm || n_pcm <= 0)

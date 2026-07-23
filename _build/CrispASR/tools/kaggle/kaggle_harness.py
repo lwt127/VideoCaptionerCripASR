@@ -213,10 +213,154 @@ _HAS_MOLD = False
 _HAS_NINJA = False
 
 
+def _warm_ccache_from_dataset(ccache_dir: Path) -> None:
+    """Copy a ccache seed from an attached Kaggle dataset into the build
+    ccache directory. Looks for `crispasr-ccache/ccache.tar` (a tar of the
+    ccache dir) or a bare `crispasr-ccache/.ccache/` tree at the standard
+    Kaggle mount paths. Silently no-ops if no dataset is attached.
+
+    To create/update the dataset, call export_ccache_tar() at the end of a
+    kernel and upload the single /kaggle/working/ccache.tar it writes. Attach
+    via kernel-metadata.json (SAME account as the kernel — cross-account
+    attach is rejected):
+        "dataset_sources": ["chr1str/crispasr-ccache", ...]
+    Shaves ~15 min off incremental CUDA builds.
+
+    Kaggle AUTO-EXTRACTS archives uploaded to a dataset, so the ccache.tar you
+    upload arrives mounted as a bare `.ccache/` tree. That is the normal case
+    and it is handled correctly; the tar branch below only fires for a tar that
+    somehow survives unextracted. What signals a broken seed is the file COUNT,
+    not the layout — see the warning."""
+    import tarfile
+    # Owner-agnostic scan. The hard-coded owner list this replaced is the same
+    # bug already fixed in kaggle_token_from_dataset(): it silently missed any
+    # account not named in the list, and a missing ccache reads as a slow build
+    # rather than an error. Probe for the artifact, don't guess the path.
+    search_paths = [Path("/kaggle/input/crispasr-ccache")]
+    inp = Path("/kaggle/input")
+    if inp.exists():
+        for sub in inp.iterdir():
+            if not sub.is_dir():
+                continue
+            if sub.name == "datasets":
+                for owner in sub.iterdir():  # /kaggle/input/datasets/<owner>/<slug>
+                    if owner.is_dir():
+                        search_paths.extend(s for s in owner.iterdir() if s.is_dir())
+            else:
+                search_paths.append(sub)  # /kaggle/input/<slug>
+    for base in search_paths:
+        tar_path = base / "ccache.tar"
+        if tar_path.exists():
+            try:
+                with tarfile.open(tar_path, "r") as tf:
+                    # The tar roots everything at ".ccache/" (both the documented
+                    # `tar cf ccache.tar .ccache/` recipe and export_ccache_tar).
+                    # ccache_dir is ITSELF the .ccache directory, so a plain
+                    # extractall(ccache_dir) lands the objects at
+                    # <ccache_dir>/.ccache/... — one level too deep, and ccache
+                    # then sees an empty cache. This is why the tar path never
+                    # worked and why both seed datasets ended up as loose trees
+                    # (the fallback that then hit the 500-file page cap).
+                    # Strip the leading component; a tar without it passes through.
+                    members = []
+                    for m in tf.getmembers():
+                        if m.name in (".ccache", "./.ccache"):
+                            continue
+                        for pre in (".ccache/", "./.ccache/"):
+                            if m.name.startswith(pre):
+                                m.name = m.name[len(pre):]
+                                break
+                        if m.name and m.name != ".":
+                            members.append(m)
+                    tf.extractall(str(ccache_dir), members=members)
+                n = sum(1 for _ in ccache_dir.rglob("*") if _.is_file())
+                print(f"  ccache: warmed from {tar_path} ({n} files)", flush=True)
+                if n == 0:
+                    print("  ccache: ⚠ WARNING — tar extracted to 0 files; the seed "
+                          "is empty or wrongly rooted (expect a cold build).",
+                          flush=True)
+                return
+            except Exception as e:
+                print(f"  ccache: failed to extract {tar_path}: {e}", flush=True)
+        bare_dir = base / ".ccache"
+        if bare_dir.is_dir():
+            try:
+                shutil.copytree(str(bare_dir), str(ccache_dir), dirs_exist_ok=True)
+                n = sum(1 for _ in ccache_dir.rglob("*") if _.is_file())
+                print(f"  ccache: warmed from {bare_dir} ({n} files)", flush=True)
+                # A bare tree is NORMAL, not a defect: Kaggle auto-extracts any
+                # archive uploaded to a dataset, so a ccache.tar you upload
+                # arrives here already unpacked to .ccache/. copytree lands it
+                # at the right depth, so this branch is the usual path.
+                #
+                # What IS diagnostic is the file COUNT. `kaggle kernels output`
+                # pages at 500 files with no auto-continue, so a dataset built
+                # by downloading a kernel's loose /kaggle/working tree gets
+                # truncated at exactly that boundary. Both account copies were
+                # found stuck at ~500 objects on 2026-07-20, silently costing
+                # every CUDA build a near-cold start. A healthy CrispASR cache
+                # is a few thousand objects.
+                if n <= 501:
+                    print(f"  ccache: ⚠ WARNING — only {n} files, at/below the "
+                          "500-file kernels-output page cap. This seed is almost "
+                          "certainly TRUNCATED; expect a near-cold build. Rebuild "
+                          "it with tools/kaggle/ccache-refresh.", flush=True)
+                return
+            except Exception as e:
+                print(f"  ccache: failed to copy {bare_dir}: {e}", flush=True)
+    print("  ccache: no seed dataset found (cold build)", flush=True)
+
+
+def export_ccache_tar(dest: str | os.PathLike = "/kaggle/working/ccache.tar") -> str | None:
+    """Tar CCACHE_DIR into a SINGLE file for refreshing the ccache dataset.
+
+    Call at the end of a kernel that did a real build, then upload `dest` as
+    chr1str/crispasr-ccache (and the chr1s4 copy — cross-account attach is
+    blocked, so each account needs its own).
+
+    One file is the whole point: `kaggle kernels output` stops at 500 files
+    with no auto-continue, so anything that writes a loose tree into
+    /kaggle/working makes the artifact you actually want unreachable."""
+    import tarfile
+    src = Path(os.environ.get("CCACHE_DIR", "/kaggle/temp/.ccache"))
+    if not src.is_dir():
+        print(f"  ccache: nothing to export, {src} missing", flush=True)
+        return None
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    n = sum(1 for _ in src.rglob("*") if _.is_file())
+    try:
+        with tarfile.open(dest, "w") as tf:
+            tf.add(str(src), arcname=".ccache")
+    except Exception as e:
+        print(f"  ccache: export failed: {e}", flush=True)
+        return None
+    mb = dest.stat().st_size / 1e6
+    print(f"  ccache: exported {n} files -> {dest} ({mb:.1f} MB)", flush=True)
+    if n <= 501:
+        print("  ccache: ⚠ only %d files — did the build actually run?" % n, flush=True)
+    return str(dest)
+
+
 def install_build_toolchain() -> dict:
-    """apt-install ninja + ccache + mold (best effort) and prime the
-    ccache at /kaggle/working/.ccache (the only dir Kaggle persists
-    across runs). Returns {'ninja','ccache','mold': bool}."""
+    """apt-install ninja + ccache + mold (best effort) and prime the ccache.
+
+    CCACHE_DIR goes on the EPHEMERAL layer (/kaggle/temp), never inside
+    /kaggle/working. ccache writes thousands of loose files, and
+    /kaggle/working is the kernel-output mount, which `kaggle kernels output`
+    serves 500 files at a time with no auto-continue. Keeping the cache there
+    was self-perpetuating breakage: the loose tree buried ccache.tar past the
+    page cap, so refreshing the dataset downloaded a truncated tree, which was
+    then uploaded as the seed, so the next build warmed from a truncated tree
+    and ran near-cold — and so on. Both account copies of crispasr-ccache were
+    found broken exactly this way (2026-07-20).
+
+    Nothing is lost by moving it: a script kernel starts fresh every run, so
+    /kaggle/working's persistence never helped the cache anyway — the seed
+    comes from the attached dataset. Call export_ccache_tar() at the end to
+    write ONE /kaggle/working/ccache.tar for refreshing that dataset.
+
+    Returns {'ninja','ccache','mold': bool}."""
     global _HAS_CCACHE, _HAS_MOLD, _HAS_NINJA
     sh("apt-get update -qq && apt-get install -y --no-install-recommends "
        "cmake ninja-build g++ ccache mold || true", check=False)
@@ -225,11 +369,15 @@ def install_build_toolchain() -> dict:
     _HAS_NINJA = shutil.which("ninja") is not None
     _HAS_CCACHE = shutil.which("ccache") is not None
     _HAS_MOLD = shutil.which("mold") is not None
-    ccache_dir = Path("/kaggle/working/.ccache")
+    _scratch = Path("/kaggle/temp") if Path("/kaggle/temp").is_dir() else Path("/tmp")
+    ccache_dir = Path(os.environ.get("CRISPASR_CCACHE_DIR", str(_scratch / ".ccache")))
     try:
         ccache_dir.mkdir(parents=True, exist_ok=True)
         os.environ["CCACHE_DIR"] = str(ccache_dir)
         os.environ["CCACHE_MAXSIZE"] = "5G"
+        # Warm ccache from attached dataset (chr1s4/crispasr-ccache or
+        # chr1str/crispasr-ccache). Shaves ~15 min off incremental builds.
+        _warm_ccache_from_dataset(ccache_dir)
         if _HAS_CCACHE:
             subprocess.run("ccache -M 5G && ccache -z", shell=True,
                            capture_output=True)
@@ -240,11 +388,35 @@ def install_build_toolchain() -> dict:
     return {"ninja": _HAS_NINJA, "ccache": _HAS_CCACHE, "mold": _HAS_MOLD}
 
 
+def crispasr_cmake_flags() -> list[str]:
+    """CrispASR-specific cmake flags every Kaggle kernel wants.
+
+    `-DCRISPASR_NO_C2PA_NATIVE=ON`: src/CMakeLists.txt builds the native C2PA
+    signer from the `third_party/c2pa-audio` **git submodule**. Most kernels
+    clone with `--depth 1` and init only `ggml` (or no submodule at all), so
+    cmake generate dies with:
+
+        Cannot find source file: .../third_party/c2pa-audio/src/c2pa_native.cpp
+        No SOURCES given to target: crispasr_c2pa_native
+
+    C2PA provenance signing is irrelevant to a benchmark / conversion / A-B
+    kernel, and disabling it skips the target entirely — cheaper than fetching
+    another submodule. Kernels that DO want C2PA should clone `--recursive`
+    instead. (Confirmed fix on chr1str/crispasr-issue81-onnx-bench, 2026-07-18.)
+    """
+    return ["-DCRISPASR_NO_C2PA_NATIVE=ON"]
+
+
 def cache_and_link_flags() -> list[str]:
     """ccache compiler-launcher flags + mold linker flags, for whatever
     install_build_toolchain() detected. Safe to call even if it wasn't —
-    returns [] for anything unavailable."""
-    flags: list[str] = []
+    returns [] for anything unavailable.
+
+    Also folds in crispasr_cmake_flags() so the ~20 existing kernels that
+    already call this get the c2pa-submodule fix without an edit each. New
+    kernels should call crispasr_cmake_flags() explicitly for clarity.
+    """
+    flags: list[str] = list(crispasr_cmake_flags())
     if _HAS_CCACHE:
         flags += [
             "-DCMAKE_C_COMPILER_LAUNCHER=ccache",
@@ -372,23 +544,29 @@ def kaggle_token_from_dataset(filename: str = "hf_token.txt") -> str | None:
     candidates: list[Path] = [
         Path("/kaggle/input/crispasr-hf-token") / filename,
     ]
-    # Scan all known mount roots
-    roots = [
-        Path("/kaggle/input"),
-        Path("/kaggle/input/datasets"),
-        Path("/kaggle/input/datasets/chr1str"),
-    ]
-    for root in roots:
-        if not root.exists():
-            continue
-        for sub in root.iterdir():
-            if "hf-token" in sub.name or "hf_token" in sub.name:
-                p = sub / filename
-                if p not in candidates:
-                    candidates.append(p)
-            # Also check for the token file directly in the subdir
-            p = sub / filename
-            if p not in candidates and sub.is_dir():
+    # Owner-agnostic scan: probe <filename> in EVERY mounted dataset dir, at
+    # both the classic depth (/kaggle/input/<slug>/) and the newer nested depth
+    # (/kaggle/input/datasets/<owner>/<slug>/). The old code only matched owner
+    # names containing "hf-token" and hard-coded chr1str, so a chr1s4 kernel on
+    # the newer mount path (/kaggle/input/datasets/chr1s4/crispasr-hf-token/)
+    # never had its token file scanned → token silently unresolved (the
+    # 2026-06-20 v2/v3 full-sweep runs). Don't filter by dir name — probe the file.
+    dataset_dirs: list[Path] = []
+    inp = Path("/kaggle/input")
+    if inp.exists():
+        for sub in inp.iterdir():
+            if not sub.is_dir():
+                continue
+            if sub.name == "datasets":
+                for owner in sub.iterdir():  # nested <owner>/<slug>
+                    if owner.is_dir():
+                        dataset_dirs.extend(s for s in owner.iterdir() if s.is_dir())
+            else:
+                dataset_dirs.append(sub)  # classic /kaggle/input/<slug>
+    for d in dataset_dirs:
+        for fn in (filename, "hf_token.txt", "token", "access_token"):
+            p = d / fn
+            if p not in candidates:
                 candidates.append(p)
     # Also try the flat file variants
     candidates.append(Path("/kaggle/input/crispasr-hf-token") / "token")

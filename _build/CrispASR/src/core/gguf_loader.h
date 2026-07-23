@@ -83,9 +83,33 @@ std::string kv_str(gguf_context* gctx, const char* key, const char* default_val)
 // vector when the key is missing or has the wrong type.
 std::vector<std::string> kv_str_array(gguf_context* gctx, const char* key);
 
+// Read a float32 array (e.g. tokenizer.ggml.scores). Returns an empty vector
+// when the key is missing or has the wrong type.
+std::vector<float> kv_f32_array(gguf_context* gctx, const char* key);
+
 // ---------------------------------------------------------------------------
 // Pass 2: tensor allocation + weight data copy.
 // ---------------------------------------------------------------------------
+
+// CROSS-REPO TENSOR-MAP CONTRACT (read before changing the map type!)
+// ------------------------------------------------------------------
+// `core/gguf_loader.{h,cpp}` exists in BOTH CrispASR and CrispEmbed. When
+// CrispEmbed builds, it compiles CrispASR's `crisp_audio`/`crisp_lid` sources
+// against CrispEmbed's copy of this header (they link `crispembed-core`).
+// CrispASR standalone prefers `std::map`; CrispEmbed prefers
+// `std::unordered_map` (faster). A consumer doing
+// `ctx.tensors = std::move(wl.tensors)` needs its field to be the SAME type as
+// `WeightLoad::tensors` — but that type differs per repo. Hard-coding either
+// type in the consumer broke the other build, causing the repeated
+// std::map<->unordered_map flip-flop (commits e6693b23/ad869798/d1bd3b91/
+// 1e4f1184/844f89d3, …).
+//
+// FIX: expose the type as a single alias `core_gguf::tensor_map`. Each repo's
+// header defines it as its own choice; consumers (crisp_audio/audio_tower,
+// crisp_lid/lid_cld3) declare `core_gguf::tensor_map tensors;` so it tracks
+// whichever gguf_loader.h is compiled. Do NOT hard-code the map type in those
+// consumer structs again — change this alias instead.
+using tensor_map = std::map<std::string, ggml_tensor*>;
 
 struct WeightLoad {
     ggml_context* ctx = nullptr;
@@ -93,7 +117,12 @@ struct WeightLoad {
     // PLAN #69a layer offload: optional second backend buffer for tensors
     // routed off-GPU. Non-null only when load_weights_split() was used.
     ggml_backend_buffer_t buf_cpu = nullptr;
-    std::map<std::string, ggml_tensor*> tensors;
+    // Issue #276: extra buffers from chunked allocation in load_weights_split().
+    // AMD Vulkan (proprietary driver) caps per-allocation at 2 GiB; models
+    // larger than that are split across multiple backend buffers. The first
+    // GPU/CPU buffer is in buf/buf_cpu; any overflow chunks live here.
+    std::vector<ggml_backend_buffer_t> split_bufs;
+    tensor_map tensors;
 };
 
 // Load all tensor metadata + weights into a new ggml_context backed by
@@ -103,6 +132,18 @@ struct WeightLoad {
 //
 // model_tag is used only in error messages ("parakeet: ...").
 bool load_weights(const char* path, ggml_backend_t backend, const char* model_tag, WeightLoad& out);
+
+// Load only tensors accepted by `include_tensor`. Metadata keys remain
+// available through the caller's separate open_metadata() pass, while the
+// returned ggml context and any allocated backend buffers contain only the
+// selected tensors. This is intended for independently usable components
+// embedded in a larger GGUF (for example an audio codec stored alongside an
+// LLM), where loading the parent model would waste RAM/VRAM. Whole-file
+// preload, readahead, and mlock hints are deliberately suppressed for this
+// path so excluded parent tensors do not become resident as a side effect.
+using IncludeTensor = bool (*)(const char* tensor_name, void* user);
+bool load_weights_filtered(const char* path, ggml_backend_t backend, IncludeTensor include_tensor, void* user,
+                           const char* model_tag, WeightLoad& out);
 
 // PLAN #69a: layer-residency-aware weight loader. Tensors for which
 // `is_gpu(tensor_name, user) == true` go on the GPU backend; the rest
@@ -174,12 +215,14 @@ void mmap_advise_random(ggml_backend_buffer_t buf);
 // ---------------------------------------------------------------------------
 
 // Look up a tensor by name. Returns nullptr (silently) if missing.
-ggml_tensor* try_get(const std::map<std::string, ggml_tensor*>& tensors, const char* name);
+// Uses `tensor_map` (see the cross-repo contract note above) so the signature
+// tracks the per-repo map choice automatically.
+ggml_tensor* try_get(const tensor_map& tensors, const char* name);
 
 // Look up a tensor by name. Prints an error to stderr if missing but
 // still returns nullptr — the caller decides whether a missing tensor
 // is fatal.
-ggml_tensor* require(const std::map<std::string, ggml_tensor*>& tensors, const char* name, const char* model_tag);
+ggml_tensor* require(const tensor_map& tensors, const char* name, const char* model_tag);
 
 // Build a shell command that produces the formatted tensor name for a
 // per-layer lookup. Avoids the snprintf(buf, sizeof(buf), "...", i) line

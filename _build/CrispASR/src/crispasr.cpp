@@ -5,7 +5,9 @@
 #include "ggml-cpp.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "crispasr_imatrix.h"
 #include "ggml-cpu.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #ifdef CRISPASR_USE_COREML
 #include "coreml/whisper-encoder.h"
@@ -232,6 +234,22 @@ static void whisper_ensure_cpu_threadpool(ggml_backend_sched_t sched, int n_thre
             ggml_backend_cpu_set_threadpool(backend, entry.pool);
         }
     }
+}
+
+// Release the persistent threadpool owned for `backend`, if any. Called
+// before ggml_backend_free so a dead backend's pool (and its worker threads)
+// don't outlive it — and so a later backend allocated at the same address
+// can't inherit a stale entry.
+static void whisper_release_cpu_threadpool(ggml_backend_t backend) {
+    std::lock_guard<std::mutex> lock(g_cpu_pools_mtx);
+    auto it = g_cpu_pools.find(backend);
+    if (it == g_cpu_pools.end())
+        return;
+    if (it->second.pool) {
+        ggml_backend_cpu_set_threadpool(backend, nullptr);
+        ggml_threadpool_free(it->second.pool);
+    }
+    g_cpu_pools.erase(it);
 }
 
 static bool ggml_graph_compute_helper(ggml_backend_sched_t sched, struct ggml_cgraph* graph, int n_threads,
@@ -903,9 +921,12 @@ struct whisper_vocab {
     id token_not = 50362; // no timestamps
     id token_beg = 50363; // begin timestamps
 
-    bool is_multilingual() const { return n_vocab >= 51865; }
+    bool multilingual = false;
+    int n_lang = 0;
 
-    int num_languages() const { return n_vocab - 51765 - (is_multilingual() ? 1 : 0); }
+    bool is_multilingual() const { return multilingual; }
+
+    int num_languages() const { return n_lang; }
 };
 
 struct whisper_segment {
@@ -1020,6 +1041,7 @@ static bool whisper_sched_graph_init(struct whisper_sched& allocr, std::vector<g
     auto& meta = allocr.meta;
 
     sched = ggml_backend_sched_new(backends.data(), nullptr, backends.size(), CRISPASR_MAX_NODES, false, true);
+    crispasr_imatrix_install(sched); // no-op unless CRISPASR_IMATRIX_OUT is set
 
     meta.resize(ggml_tensor_overhead() * CRISPASR_MAX_NODES + ggml_graph_overhead());
 
@@ -1748,6 +1770,9 @@ static size_t aheads_masks_nbytes(struct whisper_aheads_masks& aheads_masks) {
 static ggml_backend_t whisper_backend_init_gpu(const whisper_context_params& params) {
     ggml_log_set(g_state.log_callback, g_state.log_callback_user_data);
 
+    // Issue #214 — respect --gpu-backend preference.
+    const std::string pref = crispasr_get_gpu_backend_pref();
+
     ggml_backend_dev_t dev = nullptr;
 
     int cnt = 0;
@@ -1758,6 +1783,12 @@ static ggml_backend_t whisper_backend_init_gpu(const whisper_context_params& par
             const char* dev_name = ggml_backend_dev_name(dev_cur);
             CRISPASR_LOG_INFO("%s: device %zu: %s (type: %d)\n", __func__, i, dev_name, dev_type);
             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                // If a gpu_backend preference is set, skip devices that
+                // don't match (e.g. skip CUDA devices when vulkan is wanted).
+                if (!pref.empty() && !ci_starts_with(dev_name, pref.c_str())) {
+                    CRISPASR_LOG_INFO("%s: skipping %s (--gpu-backend %s)\n", __func__, dev_name, pref.c_str());
+                    continue;
+                }
                 CRISPASR_LOG_INFO("%s: found GPU device %zu: %s (type: %d, cnt: %d)\n", __func__, i, dev_name, dev_type,
                                   cnt);
                 if (cnt == params.gpu_device) {
@@ -2085,7 +2116,48 @@ static bool whisper_model_load(struct whisper_model_loader* loader, whisper_cont
         }
 
         vocab.n_vocab = model.hparams.n_vocab;
-        if (vocab.is_multilingual()) {
+
+        auto set_token_id = [&](whisper_vocab::id& dst, const char* token) {
+            const auto it = vocab.token_to_id.find(token);
+            if (it != vocab.token_to_id.end()) {
+                dst = it->second;
+                return true;
+            }
+            return false;
+        };
+
+        const bool has_serialized_specials =
+            set_token_id(vocab.token_eot, "<|endoftext|>") && set_token_id(vocab.token_sot, "<|startoftranscript|>");
+
+        if (has_serialized_specials) {
+            set_token_id(vocab.token_translate, "<|translate|>");
+            set_token_id(vocab.token_transcribe, "<|transcribe|>");
+            set_token_id(vocab.token_solm, "<|startoflm|>");
+            set_token_id(vocab.token_prev, "<|startofprev|>");
+            if (!set_token_id(vocab.token_nosp, "<|nospeech|>")) {
+                set_token_id(vocab.token_nosp, "<|nocaptions|>");
+            }
+            set_token_id(vocab.token_not, "<|notimestamps|>");
+            set_token_id(vocab.token_beg, "<|0.00|>");
+
+            if (vocab.token_translate > vocab.token_sot) {
+                vocab.n_lang = vocab.token_translate - vocab.token_sot - 1;
+            }
+            bool has_lang_token = false;
+            for (const auto& kv : g_lang) {
+                if (vocab.token_to_id.find("<|" + kv.first + "|>") != vocab.token_to_id.end()) {
+                    has_lang_token = true;
+                    break;
+                }
+            }
+            vocab.multilingual = vocab.n_lang > 0 && has_lang_token &&
+                                 vocab.token_to_id.find("<|transcribe|>") != vocab.token_to_id.end();
+        } else {
+            vocab.multilingual = vocab.n_vocab >= 51865;
+            vocab.n_lang = std::max(0, vocab.n_vocab - 51765 - (vocab.multilingual ? 1 : 0));
+        }
+
+        if (!has_serialized_specials && vocab.is_multilingual()) {
             vocab.token_eot++;
             vocab.token_sot++;
 
@@ -4221,6 +4293,7 @@ void whisper_free_state(struct whisper_state* state) {
         ggml_backend_sched_free(state->sched_decode.sched);
 
         for (auto& backend : state->backends) {
+            whisper_release_cpu_threadpool(backend);
             ggml_backend_free(backend);
         }
 
@@ -5833,6 +5906,7 @@ void whisper_vad_free(whisper_vad_context* ctx) {
         ggml_backend_sched_free(ctx->sched.sched);
 
         for (auto& backend : ctx->backends) {
+            whisper_release_cpu_threadpool(backend);
             ggml_backend_free(backend);
         }
 

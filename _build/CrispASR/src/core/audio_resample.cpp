@@ -92,7 +92,6 @@ std::vector<float> resample_polyphase(const float* in, int n_in, int src_rate, i
 
     auto h = build_filter(L, M, num_zeros, kaiser_beta);
     const int half_len = ((int)h.size() - 1) / 2;
-    const int up = std::max(L, M);
 
     // For each output sample at index `i` (in dst_rate samples), the
     // corresponding fractional position in the upsampled stream
@@ -122,7 +121,7 @@ std::vector<float> resample_polyphase(const float* in, int n_in, int src_rate, i
         // Compensate for the implicit factor-L upsample (zero-stuffing
         // multiplies the spectrum by 1/L; a corresponding factor-L gain
         // restores unity DC).
-        out[(size_t)i] = (float)(s * (double)up);
+        out[(size_t)i] = (float)(s * (double)L);
     }
     return out;
 }

@@ -27,6 +27,9 @@ public:
                CAP_WORD_TIMESTAMPS | CAP_PUNCTUATION_TOGGLE | CAP_FLASH_ATTN | CAP_DIARIZE;
     }
 
+    // Kyutai's Mimi codec operates at 24 kHz.
+    int input_sample_rate() const override { return 24000; }
+
     bool init(const whisper_params& params) override {
         kyutai_stt_context_params cp = kyutai_stt_context_default_params();
         cp.n_threads = params.n_threads;
@@ -34,6 +37,7 @@ public:
         cp.use_gpu = crispasr_backend_should_use_gpu(params);
         cp.temperature = params.temperature;
         cp.beam_size = params.beam_size > 0 ? params.beam_size : 1;
+        cp.input_sample_rate = 24000;
         ctx_ = kyutai_stt_init_from_file(params.model.c_str(), cp);
         return ctx_ != nullptr;
     }
@@ -44,6 +48,10 @@ public:
         if (!ctx_)
             return out;
 
+        if (!params.language.empty() && params.language != "auto" && params.language != "en")
+            fprintf(stderr, "crispasr[kyutai-stt]: English-only model; language='%s' ignored\n",
+                    params.language.c_str());
+
         // PLAN #125 P6b: kyutai's batch path scales superlinearly with
         // n_samples (~14 s/s on the 50 min file vs 1.36 s/s on JFK, per
         // reports 05 + 11). KV grows O(N) per emitted token, attention
@@ -52,11 +60,12 @@ public:
         // produces its own segment and the silence-tail flush from P6a
         // applies per-chunk so chunk boundaries close cleanly. Linear
         // wallclock + a predictable progress for callers.
-        constexpr int kChunkSamples = 30 * 16000;
+        const int sr = input_sample_rate();
+        const int kChunkSamples = 30 * sr;
         if (n_samples > kChunkSamples) {
             for (int start = 0; start < n_samples; start += kChunkSamples) {
                 const int this_n = std::min(kChunkSamples, n_samples - start);
-                const int64_t chunk_offset_cs = t_offset_cs + (int64_t)((double)start / 16000.0 * 100.0);
+                const int64_t chunk_offset_cs = t_offset_cs + (int64_t)((double)start / (double)sr * 100.0);
                 auto chunk_segs = transcribe_one(samples + start, this_n, chunk_offset_cs, params);
                 for (auto& s : chunk_segs)
                     out.push_back(std::move(s));
@@ -69,6 +78,7 @@ public:
     std::vector<crispasr_segment> transcribe_one(const float* samples, int n_samples, int64_t t_offset_cs,
                                                  const whisper_params& params) {
         std::vector<crispasr_segment> out;
+        const int sr = input_sample_rate();
 
         // PLAN #61c: use the _ex API to get per-token + word-level
         // timestamps. The kyutai LM emits one text token per Mimi frame
@@ -81,12 +91,16 @@ public:
         // its final-token state. The batch wrapper passes raw samples and
         // stops, so the model emits the partial token id for the last word
         // (e.g. "c" for "country") but never receives the audio it needs
-        // to commit "ountry." + EOS. Append ~500 ms of zero-frame silence
-        // so the LM walks forward and finishes the word. Tokens emitted
-        // during the silence-tail keep their t_offset_cs arithmetic and
-        // simply land a few cs past the original input end — acceptable
-        // for word-timestamps. Pre-allocate once; reuse across best-of-N.
-        constexpr int kTailSilenceSamples = 8000; // 500 ms @ 16 kHz
+        // to commit "ountry." + EOS. Append silence equal to the model's
+        // total lookahead (audio_delay_seconds + silence_prefix_seconds)
+        // so the LM walks forward and finishes all pending words.
+        // Tokens emitted during the silence-tail keep their t_offset_cs
+        // arithmetic and simply land a few cs past the original input end
+        // — acceptable for word-timestamps.
+        // Default 500 ms for models where the accessor isn't available yet;
+        // stt-2.6b-en uses 2.5+1.0 = 3.5s → 56000 samples.
+        const float lookahead_s = kyutai_stt_total_lookahead_seconds(ctx_);
+        const int kTailSilenceSamples = std::max(sr / 2, (int)(lookahead_s * (float)sr));
         std::vector<float> padded;
         padded.reserve((size_t)n_samples + kTailSilenceSamples);
         padded.assign(samples, samples + n_samples);
@@ -138,7 +152,7 @@ public:
             seg.t1 = r->words[r->n_words - 1].t1;
         } else {
             seg.t0 = t_offset_cs;
-            seg.t1 = t_offset_cs + (int64_t)((double)n_samples / 16000.0 * 100.0);
+            seg.t1 = t_offset_cs + (int64_t)((double)n_samples / (double)sr * 100.0);
         }
 
         seg.tokens.reserve((size_t)r->n_tokens);
@@ -183,6 +197,43 @@ public:
         if (!seg.text.empty())
             out.push_back(std::move(seg));
         return out;
+    }
+
+    void transcribe_streaming(const float* samples, int n_samples, int64_t /*t_offset_cs*/,
+                              const whisper_params& params, crispasr_stream_callback on_text) override {
+        if (!ctx_) {
+            CrispasrBackend::transcribe_streaming(samples, n_samples, 0, params, on_text);
+            return;
+        }
+        std::string accumulated;
+        bool first_tok = true;
+        // emit_token in kyutai_stt_transcribe_impl already filters padding tokens
+        // and fires on_tok only for valid non-pad text tokens.
+        auto cb = [&](int tok_id, float /*prob*/, void* /*ud*/) {
+            const char* raw = kyutai_stt_token_text(ctx_, tok_id);
+            if (!raw || !*raw)
+                return;
+            std::string piece(raw);
+            size_t pos = 0;
+            while ((pos = piece.find("\xe2\x96\x81", pos)) != std::string::npos) {
+                piece.replace(pos, 3, " ");
+                pos++;
+            }
+            if (first_tok) {
+                size_t sp = 0;
+                while (sp < piece.size() && (piece[sp] == ' ' || piece[sp] == '\n'))
+                    sp++;
+                piece = piece.substr(sp);
+                if (!piece.empty())
+                    first_tok = false;
+            }
+            accumulated += piece;
+            if (!accumulated.empty())
+                on_text(accumulated.c_str(), false);
+        };
+        auto cb_fn = [](int id, float p, void* ud) { (*static_cast<decltype(cb)*>(ud))(id, p, nullptr); };
+        kyutai_stt_transcribe_cb(ctx_, samples, n_samples, cb_fn, &cb);
+        on_text(accumulated.c_str(), true);
     }
 
     void shutdown() override {

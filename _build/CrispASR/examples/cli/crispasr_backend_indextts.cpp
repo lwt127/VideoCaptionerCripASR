@@ -29,6 +29,7 @@ static bool file_exists(const std::string& path) {
     return stat(path.c_str(), &st) == 0;
 }
 
+
 // Look for a sibling BigVGAN vocoder file next to the GPT model.
 static std::string discover_vocoder(const std::string& model_path) {
     auto dir_of = [](const std::string& p) -> std::string {
@@ -123,28 +124,28 @@ public:
         indextts_set_temperature(ctx_, params.temperature);
         indextts_set_seed(ctx_, params.seed);
 
-        // Load reference audio if specified
+        // Load + resample the reference on the first chunk only; the runtime
+        // (indextts_synthesize) content-addresses and caches the expensive
+        // Conformer/Perceiver + ECAPA encode across runs and consumers, and
+        // marks the context so later chunks reuse it in-session (we pass a null
+        // reference after the first). Disable the cache with CRISPASR_TTS_REF_CACHE=0.
         const float* ref_pcm = nullptr;
         int ref_n_samples = 0;
         std::vector<float> ref_audio;
-
-        if (!voice_path_.empty()) {
+        if (!voice_path_.empty() && !ref_ready_) {
             int sr = 0;
             if (crispasr::core::read_wav_mono_pcm16(voice_path_, ref_audio, sr)) {
-                // IndexTTS API expects 24kHz mono float32 PCM. Resample if needed.
                 if (sr != 24000 && sr > 0) {
                     ref_audio = core_audio::resample_polyphase(ref_audio.data(), (int)ref_audio.size(), sr, 24000);
-                    if (!params.no_prints) {
+                    if (!params.no_prints)
                         fprintf(stderr, "crispasr[indextts]: resampled reference audio from %d Hz to 24000 Hz\n", sr);
-                    }
                     sr = 24000;
                 }
                 ref_pcm = ref_audio.data();
                 ref_n_samples = (int)ref_audio.size();
-                if (!params.no_prints) {
+                if (!params.no_prints)
                     fprintf(stderr, "crispasr[indextts]: loaded reference audio '%s' (%d samples, %d Hz)\n",
                             voice_path_.c_str(), ref_n_samples, sr);
-                }
             } else {
                 fprintf(stderr, "crispasr[indextts]: failed to load reference audio '%s'\n", voice_path_.c_str());
             }
@@ -152,6 +153,11 @@ public:
 
         int n = 0;
         float* pcm = indextts_synthesize(ctx_, text.c_str(), ref_pcm, ref_n_samples, &n);
+
+        // The runtime has now set + cached the conditioning — stop re-loading the
+        // reference for later chunks of this request.
+        if (!voice_path_.empty() && pcm && n > 0)
+            ref_ready_ = true;
         if (!pcm || n <= 0) {
             fprintf(stderr, "crispasr[indextts]: synthesis failed\n");
             return {};
@@ -171,6 +177,7 @@ public:
 private:
     indextts_context* ctx_ = nullptr;
     std::string voice_path_;
+    bool ref_ready_ = false; // conditioning set on ctx_ (from cache or a prior encode)
 };
 
 } // namespace

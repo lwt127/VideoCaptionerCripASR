@@ -178,8 +178,15 @@ std::vector<float> compute_fbank(const float* pcm, int n_samples, const FbankPar
     }
 
     std::vector<float> features((size_t)T * (size_t)n_mels);
-    std::vector<float> fft_re((size_t)n_fft), fft_im((size_t)n_fft);
-    std::vector<float> frame((size_t)win);
+    // Thread-local scratch avoids per-call heap allocation for the FFT
+    // buffers and windowed frame (§176f).
+    static thread_local std::vector<float> fft_re, fft_im, frame;
+    if ((int)fft_re.size() < n_fft) {
+        fft_re.resize((size_t)n_fft);
+        fft_im.resize((size_t)n_fft);
+    }
+    if ((int)frame.size() < win)
+        frame.resize((size_t)win);
 
     for (int t = 0; t < T; t++) {
         const int offset = t * hop;

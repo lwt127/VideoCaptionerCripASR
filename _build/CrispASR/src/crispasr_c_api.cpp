@@ -12,14 +12,29 @@
 // published — these are part of CrispASR's published ABI contract shared
 // across all four consumers above.
 
+#include "crispasr_session.h"
+#include "core/win_compat.h"
+#include "core/bpe.h"
+#include "core/asr_segment_group.h" // issue #257: output-segment grouping (parakeet --chunk-seconds)
+#include "core/audio_chunking.h"    // fix/session-long-audio: energy-minima slicing for session auto-chunk
+#include "session_autochunk.h"      // fix/session-long-audio: pure auto-chunk applicability decision
+#include "core/ngram_loop_fix.h"    // fix/session-long-audio: collapse decode loops in merged chunks (issue #218)
+#include "parakeet_orchestrate.h"   // improvements Phase 1: shared parakeet transcribe orchestration
+#include "core/gpu_backend_pref.h"  // crispasr_set_gpu_backend_pref (#214)
+#include "core/audio_resample.h"    // Sidon S2S input-rate conversion
+
 #include <atomic>
+#include <climits> // INT_MIN (parakeet att_context_* sentinels) — issue #257
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
 #include <algorithm>
+#include <mutex>
 #include <string>
+#include <sstream>
+#include <utility>
 #include <vector>
 
 #include "crispasr.h"
@@ -29,13 +44,18 @@
 #if defined(CRISPASR_RNNOISE)
 #include "crispasr_enhance.h" // RNNoise audio enhancement (shared with CLI)
 #endif
-#include "text_lid_dispatch.h"       // Text-LID backend-agnostic façade (CLD3 + fastText)
-#include "crispasr_aligner.h"        // CTC / forced-aligner word timings (shared with CLI)
-#include "crispasr_cache.h"          // HF download + filesystem cache (shared with CLI)
-#include "crispasr_model_registry.h" // Known-model lookup (shared with CLI)
-#include "core/beam_decode.h"        // Shared autoregressive beam-search decode helper
-#include "core/greedy_decode.h"      // Shared autoregressive greedy decode helper
-#include "grammar-parser.h"          // GBNF parser for grammar-constrained sampling
+#include "text_lid_dispatch.h"        // Text-LID backend-agnostic façade (CLD3 + fastText)
+#include "crispasr_aligner.h"         // CTC / forced-aligner word timings (shared with CLI)
+#include "crispasr_cache.h"           // HF download + filesystem cache (shared with CLI)
+#include "crispasr_model_registry.h"  // Known-model lookup (shared with CLI)
+#include "crispasr_punc_model.h"      // shared --punc-model alias resolution (CLI/server/C-ABI parity)
+#include "core/beam_decode.h"         // Shared autoregressive beam-search decode helper
+#include "core/greedy_decode.h"       // Shared autoregressive greedy decode helper
+#include "core/lang_names.h"          // Shared ISO-639-1 → English language-name map
+#include "core/ngram_loop_fix.h"      // core_ngram::fix_loops (issue #218, mirrors CLI adapters)
+#include "core/crispasr_c2pa.h"       // C2PA Content Credentials signing (shared with CLI; #260)
+#include "core/crispasr_wav_writer.h" // WAV container + AI-provenance INFO tag (interop floor)
+#include "grammar-parser.h"           // GBNF parser for grammar-constrained sampling
 // Non-Whisper backend headers. Each of these lives in `src/` and is built as
 // its own shared library — we link them into libwhisper privately so Dart
 // only has to open one library to reach every backend. Any missing header
@@ -44,13 +64,37 @@
 #include "parakeet.h"
 #define CA_HAVE_PARAKEET 1
 #endif
+#if __has_include("nemotron.h")
+#include "nemotron.h"
+#define CA_HAVE_NEMOTRON 1
+#endif
 #if __has_include("canary.h")
 #include "canary.h"
 #define CA_HAVE_CANARY 1
 #endif
+#if __has_include("canary_qwen.h")
+#include "canary_qwen.h"
+#define CA_HAVE_CANARY_QWEN 1
+#endif
+#if __has_include("lfm2_audio.h")
+#include "lfm2_audio.h"
+#define CA_HAVE_LFM2_AUDIO 1
+#endif
+#if __has_include("mini_omni2.h")
+#include "mini_omni2.h"
+#define CA_HAVE_MINI_OMNI2 1
+#endif
+#if __has_include("sidon.h")
+#include "sidon.h"
+#define CA_HAVE_SIDON 1
+#endif
 #if __has_include("qwen3_asr.h")
 #include "qwen3_asr.h"
 #define CA_HAVE_QWEN3 1
+#endif
+#if __has_include("higgs_stt.h")
+#include "higgs_stt.h"
+#define CA_HAVE_HIGGS_STT 1
 #endif
 #if __has_include("cohere.h")
 #include "cohere.h"
@@ -88,6 +132,10 @@
 #include "voxtral4b.h"
 #define CA_HAVE_VOXTRAL4B 1
 #endif
+#if __has_include("voxtral_tts.h")
+#include "voxtral_tts.h"
+#define CA_HAVE_VOXTRAL_TTS 1
+#endif
 #if __has_include("wav2vec2-ggml.h")
 #include "wav2vec2-ggml.h"
 #define CA_HAVE_WAV2VEC2 1
@@ -108,6 +156,26 @@
 #include "qwen3_tts.h"
 #define CA_HAVE_QWEN3_TTS 1
 #endif
+#if __has_include("miotts.h")
+#include "miotts.h"
+#define CA_HAVE_MIOTTS 1
+#endif
+#if __has_include("piano_transcription.h")
+#include "piano_transcription.h"
+#define CA_HAVE_PIANO_TRANSCRIPTION 1
+#endif
+#if __has_include("moss_tts.h")
+#include "moss_tts.h"
+#define CA_HAVE_MOSS_TTS 1
+#endif
+#if __has_include("moss_tts_local.h")
+#include "moss_tts_local.h"
+#define CA_HAVE_MOSS_TTS_LOCAL 1
+#endif
+#if __has_include("omnivoice.h")
+#include "omnivoice.h"
+#define CA_HAVE_OMNIVOICE 1
+#endif
 #if __has_include("kokoro.h")
 #include "kokoro.h"
 #define CA_HAVE_KOKORO 1
@@ -124,6 +192,10 @@
 #include "chatterbox.h"
 #define CA_HAVE_CHATTERBOX 1
 #endif
+#if __has_include("bananamind_tts.h")
+#include "bananamind_tts.h"
+#define CA_HAVE_BANANAMIND_TTS 1
+#endif
 #if __has_include("outetts.h")
 #include "outetts.h"
 #define CA_HAVE_OUTETTS 1
@@ -135,6 +207,10 @@
 #if __has_include("dia_tts.h")
 #include "dia_tts.h"
 #define CA_HAVE_DIA 1
+#endif
+#if __has_include("dots_tts.h")
+#include "dots_tts.h"
+#define CA_HAVE_DOTS_TTS 1
 #endif
 #if __has_include("pocket_tts.h")
 #include "pocket_tts.h"
@@ -164,6 +240,10 @@
 #include "voxcpm2_tts.h"
 #define CA_HAVE_VOXCPM2 1
 #endif
+#if __has_include("voxcpm2_vae.h")
+#include "voxcpm2_vae.h"
+#define CA_HAVE_VOXCPM2_VAE 1
+#endif
 #if __has_include("cosyvoice3_tts.h")
 #include "cosyvoice3_tts.h"
 #define CA_HAVE_COSYVOICE3 1
@@ -175,6 +255,10 @@
 #if __has_include("f5_tts.h")
 #include "f5_tts.h"
 #define CA_HAVE_F5TTS 1
+#endif
+#if __has_include("irodori_tts.h")
+#include "irodori_tts.h"
+#define CA_HAVE_IRODORI_TTS 1
 #endif
 #if __has_include("m2m100.h")
 #include "m2m100.h"
@@ -196,13 +280,53 @@
 #include "mimo_asr.h"
 #define CA_HAVE_MIMO_ASR 1
 #endif
+#if __has_include("ark_asr.h")
+#include "ark_asr.h"
+#define CA_HAVE_ARK_ASR 1
+#endif
 #if __has_include("moss_audio.h")
 #include "moss_audio.h"
 #define CA_HAVE_MOSS_AUDIO 1
 #endif
+#if __has_include("moss_transcribe.h")
+#include "moss_transcribe.h"
+#define CA_HAVE_MOSS_TRANSCRIBE 1
+#endif
+#if __has_include("moss_transcribe_diarize.h")
+#include "moss_transcribe_diarize.h"
+#define CA_HAVE_MOSS_DIARIZE 1
+#endif
 #if __has_include("glm_asr.h")
 #include "glm_asr.h"
 #define CA_HAVE_GLMASR 1
+#endif
+#if __has_include("mel_band_roformer.h")
+#include "mel_band_roformer.h"
+#define CA_HAVE_MEL_BAND_ROFORMER 1
+#endif
+#if __has_include("htdemucs.h")
+#include "htdemucs.h"
+#define CA_HAVE_HTDEMUCS 1
+#endif
+#if __has_include("rvc_svc.h")
+#include "rvc_svc.h"
+#define CA_HAVE_RVC_SVC 1
+#endif
+#if __has_include("btc_chords.h")
+#include "btc_chords.h"
+#define CA_HAVE_BTC_CHORDS 1
+#endif
+#if __has_include("tabcnn.h")
+#include "tabcnn.h"
+#define CA_HAVE_TABCNN 1
+#endif
+#if __has_include("beat_this.h")
+#include "beat_this.h"
+#define CA_HAVE_BEAT_THIS 1
+#endif
+#if __has_include("crepe.h")
+#include "crepe.h"
+#define CA_HAVE_CREPE 1
 #endif
 #if __has_include("kyutai_stt.h")
 #include "kyutai_stt.h"
@@ -754,10 +878,70 @@ CA_EXPORT void crispasr_watermark_embed(float* pcm, int n_samples, float alpha) 
             return;
         }
     }
-    ::crispasr_watermark_embed_impl(pcm, n_samples, alpha > 0.0f ? alpha : 0.005f);
+    // alpha <= 0 → the robust, band-limited default (see wm_params / #260). The
+    // old 0.005 fallback was too faint to reliably detect on real speech, so it
+    // did not robustly satisfy EU AI Act Art. 50 "detectable" marking.
+    ::crispasr_watermark_embed_impl(pcm, n_samples, alpha > 0.0f ? alpha : -1.0f);
+}
+
+// C2PA (Content Credentials) signing of an in-memory audio CONTAINER (WAV/MP3
+// bytes — not raw PCM). Exposes the CLI's provenance signing through the C ABI so
+// wasm / bindings / server can sign too. Signs with the user cert/key (PEM file
+// paths) when both are given, else the bundled self-signed default cert (baked
+// in — works with no filesystem, incl. the browser). Returns malloc'd signed
+// bytes (free with crispasr_c2pa_free) and sets *out_len, or NULL when C2PA is
+// unavailable, the format can't embed a manifest (e.g. AAC/Opus), or signing
+// fails. `format` is a C2PA MIME string, e.g. "audio/wav" or "audio/mpeg".
+CA_EXPORT unsigned char* crispasr_c2pa_sign(const unsigned char* data, size_t len, const char* format,
+                                            const char* cert_path, const char* key_path, size_t* out_len) {
+    if (out_len)
+        *out_len = 0;
+    if (!data || len == 0 || !format || !*format)
+        return nullptr;
+    std::string buf(reinterpret_cast<const char*>(data), len);
+    std::string cert = cert_path ? cert_path : "";
+    std::string key = key_path ? key_path : "";
+    if (!::crispasr_c2pa_sign_auto(buf, format, cert, key, std::string()))
+        return nullptr;
+    unsigned char* out = static_cast<unsigned char*>(malloc(buf.size()));
+    if (!out)
+        return nullptr;
+    memcpy(out, buf.data(), buf.size());
+    if (out_len)
+        *out_len = buf.size();
+    return out;
+}
+
+// Free a buffer returned by crispasr_c2pa_sign.
+CA_EXPORT void crispasr_c2pa_free(unsigned char* p) {
+    free(p);
+}
+
+// Wrap float32 mono PCM into a 16-bit WAV container that carries the AI-generated
+// provenance metadata tag (a standard WAV LIST/INFO chunk: ISFT="CrispASR
+// (AI-generated audio)" + ICMT notice). This is the interoperable, zero-cost
+// provenance floor for consumers that only get raw PCM from synthesis (wasm /
+// bindings): the INFO tag is a standard container field any tool can read,
+// complementing the (always-on) inaudible watermark. Returns malloc'd WAV bytes
+// (free with crispasr_c2pa_free) and sets *out_len, or NULL on bad input.
+// Feed the result to crispasr_c2pa_sign() to additionally embed a C2PA manifest.
+CA_EXPORT unsigned char* crispasr_pcm_to_wav(const float* pcm, int n_samples, int sample_rate, size_t* out_len) {
+    if (out_len)
+        *out_len = 0;
+    if (!pcm || n_samples <= 0 || sample_rate <= 0)
+        return nullptr;
+    std::string wav = ::crispasr_make_wav_int16(pcm, n_samples, sample_rate);
+    unsigned char* out = static_cast<unsigned char*>(malloc(wav.size()));
+    if (!out)
+        return nullptr;
+    memcpy(out, wav.data(), wav.size());
+    if (out_len)
+        *out_len = wav.size();
+    return out;
 }
 
 #include "core/crispasr_lcs.h"
+#include "core/crispasr_env.h"
 
 CA_EXPORT int crispasr_lcs_dedup_prefix_count(const int32_t* prev_tail_tokens, int n_prev, const int32_t* curr_tokens,
                                               int n_curr, int min_lcs_length) {
@@ -1139,6 +1323,40 @@ CA_EXPORT void crispasr_parakeet_result_free(parakeet_result* r) {
 
 #endif // CA_HAVE_PARAKEET
 
+#ifdef CA_HAVE_NEMOTRON
+
+// Forward decl — the lazy dynamic-plugin loader is defined further down (next
+// to the session-open TLS state). Direct C-ABI inits that take their own
+// use_gpu flag must load GPU plugins too (multi-surface dispatch: the unified
+// session path is not the only GPU entry point). Defined once via call_once.
+static void ensure_dynamic_backends_loaded();
+
+CA_EXPORT nemotron_context* crispasr_nemotron_init(const char* model_path, int n_threads, int use_gpu) {
+    if (!model_path)
+        return nullptr;
+    if (use_gpu)
+        ensure_dynamic_backends_loaded();
+    nemotron_context_params p = nemotron_context_default_params();
+    p.n_threads = n_threads > 0 ? n_threads : 4;
+    p.use_gpu = use_gpu != 0;
+    p.verbosity = 0;
+    return nemotron_init_from_file(model_path, p);
+}
+
+CA_EXPORT void crispasr_nemotron_free(nemotron_context* ctx) {
+    if (ctx)
+        nemotron_free(ctx);
+}
+
+CA_EXPORT nemotron_result* crispasr_nemotron_transcribe(nemotron_context* ctx, const float* pcm, int n_samples,
+                                                        int64_t t_offset_cs) {
+    if (!ctx || !pcm || n_samples <= 0)
+        return nullptr;
+    return nemotron_transcribe_ex(ctx, pcm, n_samples, t_offset_cs);
+}
+
+#endif // CA_HAVE_NEMOTRON
+
 // =========================================================================
 // Backend auto-detection from GGUF metadata
 // =========================================================================
@@ -1149,6 +1367,9 @@ CA_EXPORT void crispasr_parakeet_result_free(parakeet_result* r) {
 // the architecture is unknown.
 
 #include "ggml.h"
+// ggml_backend_load_all() lives here; include it explicitly rather than relying
+// on the transitive include via wav2vec2-ggml.h (which is behind __has_include).
+#include "ggml-backend.h"
 #include "gguf.h"
 
 CA_EXPORT int crispasr_detect_backend_from_gguf(const char* path, char* out_name, int out_cap) {
@@ -1180,14 +1401,24 @@ CA_EXPORT int crispasr_detect_backend_from_gguf(const char* path, char* out_name
         backend = "parakeet";
     else if (strcmp(arch, "canary") == 0)
         backend = "canary";
+    else if (strcmp(arch, "canary_qwen") == 0 || strcmp(arch, "canary-qwen") == 0)
+        backend = "canary-qwen";
+    else if (strcmp(arch, "lfm2-audio") == 0)
+        backend = "lfm2-audio";
+    else if (strcmp(arch, "sidon") == 0)
+        backend = "sidon";
     else if (strcmp(arch, "cohere-transcribe") == 0)
         backend = "cohere";
     else if (strcmp(arch, "qwen3-asr") == 0 || strcmp(arch, "qwen3asr") == 0)
         backend = "qwen3";
+    else if (strcmp(arch, "higgs-stt") == 0)
+        backend = "higgs-stt";
     else if (strcmp(arch, "voxtral") == 0)
         backend = "voxtral";
     else if (strcmp(arch, "voxtral4b") == 0)
         backend = "voxtral4b";
+    else if (strcmp(arch, "arkasr") == 0)
+        backend = "ark-asr";
     else if (strcmp(arch, "granite-speech") == 0)
         backend = "granite";
     else if (strcmp(arch, "granite_nle") == 0 || strcmp(arch, "granite-nle") == 0)
@@ -1198,10 +1429,25 @@ CA_EXPORT int crispasr_detect_backend_from_gguf(const char* path, char* out_name
         backend = "canary-ctc";
     else if (strcmp(arch, "wav2vec2") == 0)
         backend = "wav2vec2";
+    else if (strcmp(arch, "firered-asr") == 0 || strcmp(arch, "firered") == 0)
+        backend = "firered-asr";
+    // Both the Omni ASR CTC and LLM converters write general.architecture="omniasr-ctc"
+    // (see models/convert-omniasr-{ctc,llm}-to-gguf.py); the "omniasr" backend prefix-matches
+    // every omniasr-* variant and reads model_type from the GGUF to route CTC vs LLM.
+    else if (strcmp(arch, "omniasr-ctc") == 0 || strcmp(arch, "omniasr-llm") == 0 || strcmp(arch, "omniasr") == 0)
+        backend = "omniasr";
     else if (strcmp(arch, "vibevoice-asr") == 0 || strcmp(arch, "vibevoice") == 0 || strcmp(arch, "vibevoice-tts") == 0)
         backend = "vibevoice";
     else if (strcmp(arch, "qwen3-tts") == 0 || strcmp(arch, "qwen3_tts") == 0)
         backend = "qwen3-tts";
+    else if (strcmp(arch, "moss-tts-local") == 0 || strcmp(arch, "moss_tts_local") == 0)
+        backend = "moss-tts-local";
+    else if (strcmp(arch, "miotts") == 0 || strcmp(arch, "mio-tts") == 0)
+        backend = "miotts";
+    else if (strcmp(arch, "moss-tts") == 0 || strcmp(arch, "moss_tts") == 0 || strcmp(arch, "moss-tts-delay") == 0)
+        backend = "moss-tts";
+    else if (strcmp(arch, "omnivoice") == 0 || strcmp(arch, "omnivoice-tts") == 0)
+        backend = "omnivoice";
     else if (strcmp(arch, "orpheus") == 0)
         backend = "orpheus";
     else if (strcmp(arch, "chatterbox") == 0 || strcmp(arch, "chatterbox_turbo") == 0 ||
@@ -1209,6 +1455,8 @@ CA_EXPORT int crispasr_detect_backend_from_gguf(const char* path, char* out_name
         backend = "chatterbox";
     else if (strcmp(arch, "outetts") == 0)
         backend = "outetts";
+    else if (strcmp(arch, "voxcpm2-vae") == 0 || strcmp(arch, "voxcpm2_vae") == 0)
+        backend = "voxcpm2-vae";
     else if (strcmp(arch, "voxcpm2") == 0 || strcmp(arch, "voxcpm2-tts") == 0)
         backend = "voxcpm2-tts";
     else if (strcmp(arch, "cosyvoice3-llm") == 0 || strcmp(arch, "cosyvoice3") == 0 ||
@@ -1218,18 +1466,46 @@ CA_EXPORT int crispasr_detect_backend_from_gguf(const char* path, char* out_name
         backend = "indextts";
     else if (strcmp(arch, "f5-tts") == 0 || strcmp(arch, "f5tts") == 0)
         backend = "f5-tts";
+    else if (strcmp(arch, "irodori-tts") == 0 || strcmp(arch, "irodori_tts") == 0)
+        backend = "irodori-tts";
     else if (strcmp(arch, "m2m100") == 0)
         backend = "m2m100";
     else if (strcmp(arch, "parler-tts") == 0 || strcmp(arch, "parler_tts") == 0 || strcmp(arch, "parlertts") == 0)
         backend = "parler-tts";
+    else if (strcmp(arch, "tada") == 0 || strcmp(arch, "tada-tts") == 0 || strcmp(arch, "tada-1b") == 0 ||
+             strcmp(arch, "tada-tts-1b") == 0 || strcmp(arch, "tada-3b-ml") == 0)
+        backend = "tada";
     else if (strcmp(arch, "t5") == 0)
         backend = "madlad";
     else if (strcmp(arch, "moss_audio") == 0 || strcmp(arch, "moss-audio") == 0)
         backend = "moss-audio";
+    else if (strcmp(arch, "moss_transcribe") == 0 || strcmp(arch, "moss-transcribe") == 0)
+        backend = "moss-transcribe";
+    else if (strcmp(arch, "moss_transcribe_diarize") == 0 || strcmp(arch, "moss-transcribe-diarize") == 0 ||
+             strcmp(arch, "moss_diarize") == 0 || strcmp(arch, "moss-diarize") == 0)
+        backend = "moss-diarize";
     else if (strcmp(arch, "kugelaudio") == 0 || strcmp(arch, "kugelaudio-tts") == 0)
         backend = "kugelaudio";
     else if (strcmp(arch, "zonos") == 0 || strcmp(arch, "zonos-tts") == 0)
         backend = "zonos";
+    else if (strcmp(arch, "dots-tts") == 0 || strcmp(arch, "dots_tts") == 0 || strcmp(arch, "dots.tts") == 0)
+        backend = "dots-tts";
+    // Non-transcribe task backends. These were auto-detected in the CLI
+    // (examples/cli/crispasr_backend.cpp) but never here, so every binding
+    // (Dart, Python, Go, wasm) got 0 from detect and a null session unless it
+    // passed the backend explicitly — the multi-surface dispatch trap again.
+    else if (strcmp(arch, "crepe") == 0)
+        backend = "crepe";
+    else if (strcmp(arch, "htdemucs") == 0)
+        backend = "htdemucs";
+    else if (strcmp(arch, "mel-band-roformer") == 0)
+        backend = "mel-band-roformer";
+    else if (strcmp(arch, "btc") == 0)
+        backend = "btc-chords";
+    else if (strcmp(arch, "rvc") == 0)
+        backend = "rvc-svc";
+    else if (strcmp(arch, "beat-this") == 0)
+        backend = "beat-this";
 
     std::strncpy(out_name, backend, out_cap - 1);
     out_name[out_cap - 1] = '\0';
@@ -1290,10 +1566,61 @@ static thread_local int g_open_n_gpu_layers_tls = -1;
 static thread_local float g_open_temperature_tls = 0.0f;
 static thread_local uint64_t g_open_seed_tls = 0;
 
+// CLI entry points load dynamic GGML plugins during startup, but direct C ABI
+// consumers (Python, Dart, Rust, Go) have no CLI main(). Load them lazily on
+// the first GPU session open, once across all caller threads.
+static std::once_flag g_dynamic_backends_once;
+
+static void ensure_dynamic_backends_loaded() {
+    std::call_once(g_dynamic_backends_once, []() { ggml_backend_load_all(); });
+}
+
+// Defined ahead of crispasr_session so the session can hold its own
+// streamed-segment polling buffer (see the Dart FFI polling API below).
+struct crispasr_session_seg {
+    std::string text;
+    int64_t t0 = 0; // centiseconds absolute
+    int64_t t1 = 0;
+    // Whisper's per-segment probability that the segment is non-speech (the
+    // <|nospeech|> token posterior). Only the whisper branch populates it;
+    // every other backend leaves the -1.0 sentinel ("no signal", never a
+    // real [0,1] probability) so a consumer can tell "unavailable" apart
+    // from a genuine low no-speech probability.
+    float no_speech_prob = -1.0f;
+    struct word_alt {
+        std::string text;
+        float p = 0.0f;
+    };
+    struct word {
+        std::string text;
+        int64_t t0 = 0; // centiseconds absolute
+        int64_t t1 = 0;
+        float p = 1.0f;
+        // Top-N alternative candidates for the first content token of
+        // this word (whisper greedy decode only, when alt_n > 0).
+        // Empty when alts weren't captured or the backend doesn't
+        // produce them. Ordered descending by p.
+        std::vector<word_alt> alts;
+    };
+    std::vector<word> words;
+};
+
 struct crispasr_session {
     std::string backend; // "whisper", "parakeet", ...
     std::string model_path;
     int n_threads = 4;
+    bool use_gpu = true; // plumbed to backend init (issue: firered-asr use_gpu)
+
+    // Sample rate of the PCM the caller is about to pass to transcribe.
+    // Set via crispasr_session_set_pcm_sample_rate() so backends that
+    // normally resample from 16 kHz can skip the step when the audio is
+    // already at their native rate.  Defaults to 16000 for back-compat.
+    int pcm_sample_rate = 16000;
+
+    // Last synthesize error — populated by synthesize_raw_impl when it
+    // returns nullptr so callers can surface a meaningful reason instead
+    // of the generic "no audio produced". Cleared on every synthesize call.
+    std::string last_synth_error;
 
     // Sticky session-level state (PLAN #59 partial unblock — the
     // capabilities matrix items that were previously CLI-only). Per-call
@@ -1302,6 +1629,21 @@ struct crispasr_session {
     std::string target_language; // canary/cohere/voxtral target-lang (≠ source ⇒ translate)
     bool punctuation = true;     // canary/cohere per-call arg + post-process gate
     bool translate = false;      // whisper sticky --translate (others: use src/tgt mismatch)
+
+    // Acoustic language detected by the last transcribe (whisper only —
+    // whisper_full_lang_id → whisper_lang_str, an ISO-639-1 code). Set on
+    // every whisper dispatch; empty for other backends, where
+    // crispasr_session_detected_language falls back to the source-language
+    // hint or "unknown". This is the in-decode acoustic signal, distinct
+    // from the backend-agnostic text-LID pass (crispasr_text_detect_language).
+    std::string detected_lang;
+
+    // --punc-model post-processor (set via crispasr_session_set_punc_model).
+    // Held as void* so the struct doesn't depend on the optionally-compiled
+    // fireredpunc/pcs headers; at most one is non-null. Applied per segment
+    // after transcription (gated on `punctuation`), mirroring the CLI/server.
+    void* punc_ctx = nullptr; // fireredpunc_context*
+    void* pcs_ctx = nullptr;  // pcs_context*
     // Free-form audio Q&A prompt for instruct-tuned audio-LLM backends
     // (voxtral / voxtral4b / qwen3-asr). When non-empty, replaces the
     // standard "lang:<X>[TRANSCRIBE]" suffix with `[/INST]<prompt>`,
@@ -1333,6 +1675,13 @@ struct crispasr_session {
     // Silent no-op for: voxtral4b (streaming, no beam hook), CTC/NAR backends.
     // Default 1 preserves greedy bit-identical output (no-regression contract).
     int beam_size = 1;
+
+    // Opt-in capture of the per-frame CTC logits on backends that produce a
+    // dense CTC grid (Omni CTC, wav2vec2/hubert/data2vec, canary-ctc), via
+    // crispasr_session_set_return_logits. Off by default so the normal path
+    // doesn't pay the [vocab × frames] copy; when on, the result carries the
+    // logit grid for downstream forced alignment.
+    bool return_logits = false;
 
     // Whisper text-suppression + prompt-carry extras (whisper-only).
     // Map 1-to-1 onto wparams.suppress_nst / suppress_regex /
@@ -1388,16 +1737,87 @@ struct crispasr_session {
     uint32_t grammar_root_rule_id = 0;
     bool grammar_active = false;
 
+    // Session-level hotwords for contextual biasing (PLAN §5.26.2).
+    // Stored as a comma-separated string; parsed into per-backend form
+    // on the next transcribe call. For parakeet CTC/TDT, the parsed
+    // words are fed to parakeet_set_hotwords(); for LLM backends, they
+    // are injected into the ask prompt.
+    std::string hotwords;
+    float hotwords_boost = 1.5f;
+
+    // Issue #208: explicit chunked-encode override for the Parakeet backend.
+    // crispasr_session_transcribe_chunked[_lang] sets these for the duration
+    // of a single call (restored by a scope guard) to force the bounded
+    // long-form path (overlapping-window merge for non-JA, streamed encoder
+    // for JA) with caller-chosen window sizes, bypassing the length-based
+    // auto-selection in transcribe_single. -1 = unset. chunk == 0 (when
+    // forced) means "keep the per-model defaults".
+    int parakeet_force_chunk_seconds = -1;
+    int parakeet_force_overlap_seconds = -1;
+    // Issue #257: parakeet/canary local-attention window (encoder frames) —
+    // NeMo rel_pos_local_attn, bounds long-audio encoder VRAM. INT_MIN = unset
+    // (keep the model default). Applied to parakeet_ctx before each transcribe.
+    int parakeet_att_context_left = INT_MIN;
+    int parakeet_att_context_right = INT_MIN;
+
+    // Issue #208: per-session progress callback for long-form (chunked)
+    // transcription. Fired once per finished window from the chunked merge
+    // path with (processed_samples, total_samples). nullptr = disabled.
+    crispasr_progress_callback progress_cb = nullptr;
+    void* progress_ud = nullptr;
+
+    // Per-segment streaming callback — fired for every committed segment
+    // at the end of each transcribe call. Defaults to _default_segment_cb
+    // which feeds the global polling buffer for Dart FFI.
+    crispasr_segment_callback segment_cb = nullptr;
+    void* segment_ud = nullptr;
+
+    // Per-token streaming callback — fired for every decoded text token
+    // during LLM-based ASR. Defaults to _default_token_cb which feeds
+    // the global polling buffer for Dart FFI.
+    crispasr_token_callback token_cb = nullptr;
+    void* token_ud = nullptr;
+
+    // Per-session polling buffers fed by the default segment/token callbacks
+    // (Dart FFI path; ud = the owning session). Scoped to the session so two
+    // sessions can't interleave or drain each other's output. The session-less
+    // polling API (crispasr_drain_streamed_segments etc.) delegates to the
+    // session that most recently streamed via the default callbacks.
+    std::mutex stream_mutex;
+    std::vector<crispasr_session_seg> streamed_segments;
+    std::vector<std::string> streamed_tokens;
+    std::atomic<int> streamed_seg_count{0};
+    std::atomic<int> streamed_tok_count{0};
+    std::string token_drain_buf; // backing store for crispasr_drain_streamed_tokens
+
     // Exactly one of these pointers is non-null based on `backend`.
     whisper_context* whisper_ctx = nullptr;
 #ifdef CA_HAVE_PARAKEET
     parakeet_context* parakeet_ctx = nullptr;
 #endif
+#ifdef CA_HAVE_NEMOTRON
+    nemotron_context* nemotron_ctx = nullptr;
+#endif
 #ifdef CA_HAVE_CANARY
     canary_context* canary_ctx = nullptr;
 #endif
+#ifdef CA_HAVE_CANARY_QWEN
+    canary_qwen_context* canary_qwen_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_LFM2_AUDIO
+    lfm2_audio_context* lfm2_audio_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_MINI_OMNI2
+    mini_omni2_context* mini_omni2_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_SIDON
+    sidon_context* sidon_ctx = nullptr;
+#endif
 #ifdef CA_HAVE_QWEN3
     qwen3_asr_context* qwen3_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_HIGGS_STT
+    higgs_stt_context* higgs_ctx = nullptr;
 #endif
 #ifdef CA_HAVE_COHERE
     cohere_context* cohere_ctx = nullptr;
@@ -1451,8 +1871,68 @@ struct crispasr_session {
     qwen3_tts_context* qwen3_tts_ctx = nullptr;
     bool qwen3_tts_voice_loaded = false;
 #endif
+#ifdef CA_HAVE_MIOTTS
+    miotts_context* miotts_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_PIANO_TRANSCRIPTION
+    piano_transcription_ctx* piano_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_MOSS_TTS
+    moss_tts_context* moss_tts_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_MOSS_TTS_LOCAL
+    moss_tts_local_context* moss_tts_local_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_OMNIVOICE
+    omnivoice_context* omnivoice_ctx = nullptr;
+#endif
 #ifdef CA_HAVE_GLMASR
     void* glmasr_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_MEL_BAND_ROFORMER
+    mel_band_roformer_context* mbr_ctx = nullptr;
+    mel_band_roformer_result* mbr_last_result = nullptr;
+#endif
+#ifdef CA_HAVE_HTDEMUCS
+    htdemucs_context* htdemucs_ctx = nullptr;
+    htdemucs_result* htdemucs_last_result = nullptr;
+#endif
+#ifdef CA_HAVE_RVC_SVC
+    rvc_svc_context* rvc_ctx = nullptr;
+    rvc_svc_result* rvc_last = nullptr;
+#endif
+#ifdef CA_HAVE_TABCNN
+    // Emission scores from the last crispasr_session_tab() call, kept alive so
+    // the flat view below stays valid until the next call or session close.
+    tabcnn_context* tabcnn_ctx = nullptr;
+    std::vector<float> tabcnn_last_logp;
+    int tabcnn_last_frames = 0;
+#endif
+#ifdef CA_HAVE_BTC_CHORDS
+    btc_chords_context* btc_ctx = nullptr;
+    // Flat {start_ms, end_ms, label, confidence} per span. Built once per
+    // recognize() so crispasr_session_chords_spans can hand out a typed-array
+    // view, for the same reason piano_notes is flat: a mixed int/float struct
+    // read through a float view misreads the int lane.
+    std::vector<float> btc_last_spans;
+    std::vector<std::string> btc_last_names;
+#endif
+#ifdef CA_HAVE_BEAT_THIS
+    beat_this_context* beat_ctx = nullptr;
+    // Flat {time_s, is_downbeat} per beat, for the same reason btc_last_spans
+    // is flat: a mixed int/float struct read through a float view misreads the
+    // int lane. is_downbeat is therefore 0.0f or 1.0f, not an int.
+    std::vector<float> beat_last_events;
+#endif
+#ifdef CA_HAVE_CREPE
+    crepe_context* crepe_ctx = nullptr;
+    std::vector<crepe_frame> crepe_last_frames;
+#ifdef CA_HAVE_PIANO_TRANSCRIPTION
+    // Flattened {onset_ms, offset_ms, midi, velocity} per note. Flattened
+    // rather than kept as piano_note_event[] so the C ABI can hand out one
+    // contiguous float view (see crispasr_session_piano_notes).
+    std::vector<float> piano_last_notes;
+#endif
 #endif
 #ifdef CA_HAVE_KYUTAI
     void* kyutai_ctx = nullptr;
@@ -1478,12 +1958,24 @@ struct crispasr_session {
 #endif
 #ifdef CA_HAVE_TADA
     tada_context* tada_ctx = nullptr;
+    // #201: optional explicit encoder/aligner GGUF paths for on-the-fly voice
+    // cloning from a WAV + transcript. When empty, set_voice auto-resolves them
+    // next to the model / in the cache dir.
+    std::string tada_makeref_encoder;
+    std::string tada_makeref_aligner;
 #endif
 #ifdef CA_HAVE_KOKORO
     kokoro_context* kokoro_ctx = nullptr;
 #endif
+#ifdef CA_HAVE_VOXTRAL_TTS
+    voxtral_tts_context* voxtral_tts_ctx = nullptr;
+    std::string voxtral_tts_voice; // preset voice name (set via set_voice)
+#endif
 #ifdef CA_HAVE_CHATTERBOX
     chatterbox_context* chatterbox_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_BANANAMIND_TTS
+    bananamind_tts_context* bananamind_tts_ctx = nullptr;
 #endif
 #ifdef CA_HAVE_OUTETTS
     outetts_context* outetts_ctx = nullptr;
@@ -1493,6 +1985,9 @@ struct crispasr_session {
 #endif
 #ifdef CA_HAVE_DIA
     dia_tts_context* dia_tts_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_DOTS_TTS
+    dots_tts_context* dots_tts_ctx = nullptr;
 #endif
 #ifdef CA_HAVE_POCKET
     pocket_tts_context* pocket_tts_ctx = nullptr;
@@ -1518,10 +2013,17 @@ struct crispasr_session {
     voxcpm2_context* voxcpm2_ctx = nullptr;
     std::vector<float> voxcpm2_ref_pcm; // 16 kHz mono cloning reference
 #endif
+#ifdef CA_HAVE_VOXCPM2_VAE
+    voxcpm2_vae_context* voxcpm2_vae_ctx = nullptr;
+#endif
 #ifdef CA_HAVE_COSYVOICE3
     cosyvoice3_tts_context* cosyvoice3_ctx = nullptr;
     std::string cosyvoice3_voice;    // bank voice name OR *.wav clone path (set_voice)
     std::string cosyvoice3_ref_text; // ref transcription for *.wav cloning
+    std::string cosyvoice3_camp_path;
+    std::string cosyvoice3_s3tok_path;
+    bool cosyvoice3_cloning_models_loaded = false;
+    std::mutex cosyvoice3_cloning_mutex;
 #endif
 #ifdef CA_HAVE_INDEXTTS
     indextts_context* indextts_ctx = nullptr;
@@ -1529,6 +2031,9 @@ struct crispasr_session {
 #endif
 #ifdef CA_HAVE_F5TTS
     f5_tts_context* f5tts_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_IRODORI_TTS
+    irodori_tts_context* irodori_ctx = nullptr;
 #endif
 #ifdef CA_HAVE_PIPER
     piper_tts_context* piper_ctx = nullptr;
@@ -1545,41 +2050,186 @@ struct crispasr_session {
 #ifdef CA_HAVE_MIMO_ASR
     mimo_asr_context* mimo_asr_ctx = nullptr;
 #endif
+#ifdef CA_HAVE_ARK_ASR
+    ark_asr_context* ark_asr_ctx = nullptr;
+#endif
 #ifdef CA_HAVE_MOSS_AUDIO
     moss_audio_context* moss_audio_ctx = nullptr;
 #endif
-};
-
-struct crispasr_session_seg {
-    std::string text;
-    int64_t t0 = 0; // centiseconds absolute
-    int64_t t1 = 0;
-    struct word_alt {
-        std::string text;
-        float p = 0.0f;
-    };
-    struct word {
-        std::string text;
-        int64_t t0 = 0; // centiseconds absolute
-        int64_t t1 = 0;
-        float p = 1.0f;
-        // Top-N alternative candidates for the first content token of
-        // this word (whisper greedy decode only, when alt_n > 0).
-        // Empty when alts weren't captured or the backend doesn't
-        // produce them. Ordered descending by p.
-        std::vector<word_alt> alts;
-    };
-    std::vector<word> words;
+#ifdef CA_HAVE_MOSS_TRANSCRIBE
+    moss_transcribe_context* moss_transcribe_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_MOSS_DIARIZE
+    moss_diarize_context* moss_diarize_ctx = nullptr;
+#endif
 };
 
 struct crispasr_session_result {
     std::vector<crispasr_session_seg> segments;
     std::string backend;
+    // Per-frame CTC logits, populated only when the session opted in via
+    // crispasr_session_set_return_logits and the backend produces a dense CTC
+    // grid (Omni CTC, wav2vec2/hubert/data2vec, canary-ctc). Frame-major:
+    // logits[t * n_logit_vocab + v]. Raw pre-softmax for Omni & wav2vec2;
+    // log-probabilities for canary-ctc (log-softmax is idempotent on it, so a
+    // consumer can log-softmax uniformly). Empty otherwise.
+    std::vector<float> logits;
+    int n_logit_vocab = 0;
+    int n_logit_frames = 0;
 };
+
+// ── Streamed-segment/token polling (Dart FFI path) ──────────────────────
+// The default callbacks push into the OWNING SESSION's buffers (ud = the
+// session), so two sessions — concurrent or sequential — can't interleave
+// or drain each other's output. The session-less polling API below keeps
+// its historical signatures by delegating to the session that most
+// recently streamed via the default callbacks.
+//
+// Lock order: g_stream_session_mtx before s->stream_mutex. session_close
+// unregisters under g_stream_session_mtx before tearing down, so a drain
+// holding that mutex can never race a concurrent free.
+static std::mutex g_stream_session_mtx;
+static crispasr_session* g_stream_session = nullptr;
+
+static void _register_stream_session(crispasr_session* s) {
+    std::lock_guard<std::mutex> reg(g_stream_session_mtx);
+    g_stream_session = s;
+}
+
+// Cap on each per-session polling buffer. Non-polling consumers (Go/Java/C#
+// bindings call session_transcribe with the default callbacks but never
+// drain) would otherwise grow a long-lived session's buffer without bound.
+// On overflow the OLDEST half is dropped — a polling consumer that lags this
+// far behind loses history, not recent segments. 4096 segments/tokens is far
+// beyond any real polling lag (Dart drains every few hundred ms).
+static constexpr size_t CA_STREAM_BUF_CAP = 4096;
+
+template <typename T> static void _trim_stream_buffer(std::vector<T>& buf) {
+    if (buf.size() >= CA_STREAM_BUF_CAP)
+        buf.erase(buf.begin(), buf.begin() + (long)(buf.size() / 2));
+}
+
+static void _default_segment_cb(const char* text, int64_t t0, int64_t t1, int /*idx*/, void* ud) {
+    auto* s = (crispasr_session*)ud;
+    if (!s)
+        return;
+    _register_stream_session(s);
+    std::lock_guard<std::mutex> lk(s->stream_mutex);
+    _trim_stream_buffer(s->streamed_segments);
+    crispasr_session_seg seg;
+    seg.text = text;
+    seg.t0 = t0;
+    seg.t1 = t1;
+    s->streamed_segments.push_back(std::move(seg));
+    s->streamed_seg_count.store((int)s->streamed_segments.size(), std::memory_order_relaxed);
+}
+
+static void _default_token_cb(const char* text, int /*idx*/, void* ud) {
+    auto* s = (crispasr_session*)ud;
+    if (!s)
+        return;
+    _register_stream_session(s);
+    std::lock_guard<std::mutex> lk(s->stream_mutex);
+    _trim_stream_buffer(s->streamed_tokens);
+    s->streamed_tokens.push_back(text);
+    s->streamed_tok_count.store((int)s->streamed_tokens.size(), std::memory_order_relaxed);
+}
+
+CA_EXPORT int crispasr_get_streamed_segment_count(void) {
+    std::lock_guard<std::mutex> reg(g_stream_session_mtx);
+    return g_stream_session ? g_stream_session->streamed_seg_count.load(std::memory_order_relaxed) : 0;
+}
+
+CA_EXPORT crispasr_session_result* crispasr_drain_streamed_segments(void) {
+    std::lock_guard<std::mutex> reg(g_stream_session_mtx);
+    crispasr_session* s = g_stream_session;
+    if (!s)
+        return nullptr;
+    std::lock_guard<std::mutex> lk(s->stream_mutex);
+    if (s->streamed_segments.empty())
+        return nullptr;
+    auto* r = new crispasr_session_result;
+    r->segments = std::move(s->streamed_segments);
+    s->streamed_segments.clear();
+    s->streamed_seg_count.store(0, std::memory_order_relaxed);
+    return r;
+}
+
+CA_EXPORT void crispasr_reset_streamed_segments(void) {
+    std::lock_guard<std::mutex> reg(g_stream_session_mtx);
+    crispasr_session* s = g_stream_session;
+    if (!s)
+        return;
+    std::lock_guard<std::mutex> lk(s->stream_mutex);
+    s->streamed_segments.clear();
+    s->streamed_seg_count.store(0, std::memory_order_relaxed);
+}
+
+CA_EXPORT int crispasr_get_streamed_token_count() {
+    std::lock_guard<std::mutex> reg(g_stream_session_mtx);
+    return g_stream_session ? g_stream_session->streamed_tok_count.load(std::memory_order_relaxed) : 0;
+}
+
+CA_EXPORT const char* crispasr_drain_streamed_tokens(int* out_count) {
+    std::lock_guard<std::mutex> reg(g_stream_session_mtx);
+    crispasr_session* s = g_stream_session;
+    if (!s) {
+        if (out_count)
+            *out_count = 0;
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lk(s->stream_mutex);
+    if (s->streamed_tokens.empty()) {
+        if (out_count)
+            *out_count = 0;
+        return nullptr;
+    }
+    // Concatenate all tokens into a single string, separated by null bytes.
+    // Caller reads N strings from the returned buffer, which stays valid
+    // until the next drain on this session or the session is closed.
+    std::string& buf = s->token_drain_buf;
+    buf.clear();
+    for (const auto& t : s->streamed_tokens) {
+        buf += t;
+        buf += '\0';
+    }
+    if (out_count)
+        *out_count = (int)s->streamed_tokens.size();
+    s->streamed_tokens.clear();
+    s->streamed_tok_count.store(0, std::memory_order_relaxed);
+    // `buf` is a reference to the persistent session member `s->token_drain_buf`
+    // (not a local), so the returned pointer stays valid until the next drain or
+    // session close, as documented above. cppcheck's stlcstr heuristic can't see
+    // the alias — this is a false positive, not a dangling pointer.
+    // cppcheck-suppress stlcstr
+    return buf.c_str();
+}
+
+CA_EXPORT void crispasr_reset_streamed_tokens() {
+    std::lock_guard<std::mutex> reg(g_stream_session_mtx);
+    crispasr_session* s = g_stream_session;
+    if (!s)
+        return;
+    std::lock_guard<std::mutex> lk(s->stream_mutex);
+    s->streamed_tokens.clear();
+    s->streamed_tok_count.store(0, std::memory_order_relaxed);
+}
+
+// Fire the session's segment callback for every segment in `r`.
+// Called from the public transcribe entry points after the result is built.
+static void _fire_segment_callbacks(crispasr_session* s, crispasr_session_result* r) {
+    if (!s || !r || !s->segment_cb)
+        return;
+    for (int i = 0; i < (int)r->segments.size(); ++i) {
+        const auto& seg = r->segments[i];
+        s->segment_cb(seg.text.c_str(), seg.t0, seg.t1, i, s->segment_ud);
+    }
+}
 
 // Per-token data fed into emit_words_from_tokens. Backends with their own
 // token-prob APIs project into this shape so the word-grouping logic stays
-// in one place.
+// in one place. Defined before _fire_token_callbacks so that function can
+// dereference its members (MSVC rejects an incomplete type there).
 struct ca_token_record {
     std::string text;
     int64_t t0;
@@ -1593,80 +2243,20 @@ struct ca_token_record {
     std::vector<crispasr_session_seg::word_alt> alts;
 };
 
-// GPT-2 byte-level BPE decoder. Mirrors HF's bytes_to_unicode reverse map.
-// Used by qwen3 / granite tokenizers and any GPT-2 / Llama-3 family.
-static const std::vector<int>& gpt2_byte_decoder() {
-    static std::vector<int> dec;
-    static bool initialized = false;
-    if (initialized)
-        return dec;
-    dec.assign(0x200, -1);
-    std::vector<int> bs, cs;
-    for (int b = 0x21; b <= 0x7e; b++) {
-        bs.push_back(b);
-        cs.push_back(b);
+// Fire the session's per-token callback for a vector of ca_token_record
+// entries. Called from the transcribe paths after a segment's tokens have
+// been decoded and detokenised.
+static void _fire_token_callbacks(crispasr_session* s, const std::vector<ca_token_record>& toks) {
+    if (!s || !s->token_cb)
+        return;
+    for (int i = 0; i < (int)toks.size(); ++i) {
+        s->token_cb(toks[i].text.c_str(), i, s->token_ud);
     }
-    for (int b = 0xa1; b <= 0xac; b++) {
-        bs.push_back(b);
-        cs.push_back(b);
-    }
-    for (int b = 0xae; b <= 0xff; b++) {
-        bs.push_back(b);
-        cs.push_back(b);
-    }
-    int n = 0;
-    for (int b = 0; b < 256; b++) {
-        bool present = false;
-        for (int x : bs)
-            if (x == b) {
-                present = true;
-                break;
-            }
-        if (!present) {
-            bs.push_back(b);
-            cs.push_back(256 + n);
-            n++;
-        }
-    }
-    for (size_t i = 0; i < bs.size(); i++)
-        if ((size_t)cs[i] < dec.size())
-            dec[cs[i]] = bs[i];
-    initialized = true;
-    return dec;
 }
 
+// Thin alias — delegates to core_bpe::token_bytes_to_utf8() (§175 DRY).
 static std::string gpt2_byte_decode(const std::string& s) {
-    const auto& dec = gpt2_byte_decoder();
-    std::string out;
-    size_t i = 0;
-    while (i < s.size()) {
-        unsigned char c = (unsigned char)s[i];
-        int cp = 0, len = 1;
-        if (c < 0x80) {
-            cp = c;
-            len = 1;
-        } else if ((c & 0xE0) == 0xC0) {
-            cp = c & 0x1F;
-            len = 2;
-        } else if ((c & 0xF0) == 0xE0) {
-            cp = c & 0x0F;
-            len = 3;
-        } else if ((c & 0xF8) == 0xF0) {
-            cp = c & 0x07;
-            len = 4;
-        } else {
-            i++;
-            continue;
-        }
-        if (i + len > s.size())
-            break;
-        for (int k = 1; k < len; k++)
-            cp = (cp << 6) | (s[i + k] & 0x3F);
-        i += len;
-        if (cp >= 0 && cp < (int)dec.size() && dec[cp] >= 0)
-            out.push_back((char)dec[cp]);
-    }
-    return out;
+    return core_bpe::token_bytes_to_utf8(s);
 }
 
 // SentencePiece-style word grouping. Each token's `text` either starts with a
@@ -1745,15 +2335,53 @@ static std::vector<crispasr_session_seg::word> emit_words_from_tokens(const std:
     return out;
 }
 
+// issue #218 follow-up: fix_loops() cleans a segment's flat `seg.text`, but
+// `seg.words` (built independently, e.g. via emit_words_from_tokens() above)
+// still carries every repeated word from the raw token stream. Filter
+// `words` in place with the same collapse decision fix_loops() made on the
+// corresponding text, so word-level consumers (SRT/VTT, JSON `words`) don't
+// still show duplicates once the flat text looks clean.
+static void filter_words_by_ngram_collapse(std::vector<crispasr_session_seg::word>& words) {
+    if (words.empty())
+        return;
+    std::vector<std::string> word_texts;
+    word_texts.reserve(words.size());
+    for (const auto& w : words)
+        word_texts.push_back(w.text);
+    const std::vector<int> keep = core_ngram::fix_loops_keep_indices(word_texts);
+    if (keep.size() == words.size())
+        return;
+    std::vector<crispasr_session_seg::word> filtered;
+    filtered.reserve(keep.size());
+    for (int idx : keep)
+        filtered.push_back(std::move(words[idx]));
+    words = std::move(filtered);
+}
+
 CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_path, const char* backend_name,
                                                            int n_threads) {
     if (!model_path || !backend_name)
         return nullptr;
 
+    if (g_open_use_gpu_tls)
+        ensure_dynamic_backends_loaded();
+
     auto* s = new crispasr_session();
     s->model_path = model_path;
     s->backend = backend_name;
     s->n_threads = n_threads > 0 ? n_threads : 4;
+
+    // Register the default segment callback so the Dart polling buffer
+    // is populated out of the box. Users can override via
+    // crispasr_session_set_segment_callback after open. ud is the session
+    // itself: the default callbacks push into its per-session buffers.
+    s->segment_cb = _default_segment_cb;
+    s->segment_ud = s;
+
+    // Register the default token callback so the Dart polling buffer
+    // is populated out of the box for per-token streaming.
+    s->token_cb = _default_token_cb;
+    s->token_ud = s;
 
     if (s->backend == "whisper") {
         whisper_context_params cparams = whisper_context_default_params();
@@ -1767,7 +2395,7 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         return s;
     }
 #ifdef CA_HAVE_PARAKEET
-    if (s->backend == "parakeet") {
+    if (s->backend == "parakeet" || s->backend == "reazonspeech") {
         parakeet_context_params pp = parakeet_context_default_params();
         pp.n_threads = s->n_threads;
         pp.verbosity = g_open_verbosity_tls;
@@ -1784,6 +2412,23 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         return s;
     }
 #endif
+#ifdef CA_HAVE_NEMOTRON
+    if (s->backend == "nemotron") {
+        nemotron_context_params np = nemotron_context_default_params();
+        np.n_threads = s->n_threads;
+        np.verbosity = g_open_verbosity_tls;
+        np.use_gpu = g_open_use_gpu_tls;
+        np.use_flash = g_open_flash_attn_tls;
+        s->nemotron_ctx = nemotron_init_from_file(model_path, np);
+        if (!s->nemotron_ctx) {
+            delete s;
+            return nullptr;
+        }
+        if (!s->source_language.empty())
+            nemotron_set_language(s->nemotron_ctx, s->source_language.c_str());
+        return s;
+    }
+#endif
 #ifdef CA_HAVE_CANARY
     if (s->backend == "canary") {
         canary_context_params p = canary_context_default_params();
@@ -1793,6 +2438,63 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         p.use_flash = g_open_flash_attn_tls;
         s->canary_ctx = canary_init_from_file(model_path, p);
         if (!s->canary_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_CANARY_QWEN
+    if (s->backend == "canary-qwen") {
+        canary_qwen_context_params p = canary_qwen_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        p.flash_attn = g_open_flash_attn_tls;
+        s->canary_qwen_ctx = canary_qwen_init_from_file(model_path, p);
+        if (!s->canary_qwen_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_LFM2_AUDIO
+    if (s->backend == "lfm2-audio") {
+        lfm2_audio_context_params p = lfm2_audio_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        s->lfm2_audio_ctx = lfm2_audio_init_from_file(model_path, p);
+        if (!s->lfm2_audio_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_MINI_OMNI2
+    if (s->backend == "mini-omni2" || s->backend == "mini_omni2" || s->backend == "miniomni2") {
+        mini_omni2_context_params p = mini_omni2_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        s->mini_omni2_ctx = mini_omni2_init_from_file(model_path, p);
+        if (!s->mini_omni2_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_SIDON
+    if (s->backend == "sidon") {
+        sidon_context_params p = sidon_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        s->sidon_ctx = sidon_init_from_file(model_path, p);
+        if (!s->sidon_ctx) {
             delete s;
             return nullptr;
         }
@@ -1812,6 +2514,21 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         p.flash_attn = g_open_flash_attn_tls;
         s->qwen3_ctx = qwen3_asr_init_from_file(model_path, p);
         if (!s->qwen3_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_HIGGS_STT
+    if (s->backend == "higgs-stt" || s->backend == "higgs_stt" || s->backend == "higgs-audio-v3-stt") {
+        higgs_stt_context_params p = higgs_stt_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        p.flash_attn = g_open_flash_attn_tls;
+        s->higgs_ctx = higgs_stt_init_from_file(model_path, p);
+        if (!s->higgs_ctx) {
             delete s;
             return nullptr;
         }
@@ -1882,6 +2599,7 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         p.n_threads = s->n_threads;
         p.verbosity = g_open_verbosity_tls;
         p.flash_attn = g_open_flash_attn_tls;
+        p.use_gpu = g_open_use_gpu_tls;
         s->paraformer_ctx = paraformer_init_from_file(model_path, p);
         if (!s->paraformer_ctx) {
             delete s;
@@ -2040,6 +2758,166 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         return s;
     }
 #endif
+#ifdef CA_HAVE_MIOTTS
+    if (s->backend == "miotts" || s->backend == "mio-tts") {
+        miotts_context_params p = miotts_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = s->use_gpu;
+        p.temperature = 0.8f;
+        s->miotts_ctx = miotts_init_from_file(model_path, p);
+        if (!s->miotts_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_PIANO_TRANSCRIPTION
+    if (s->backend == "piano-transcription" || s->backend == "piano_transcription") {
+        piano_transcription_params p = piano_transcription_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = s->use_gpu;
+        s->piano_ctx = piano_transcription_init_from_file(model_path, p);
+        if (!s->piano_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_MOSS_TTS
+    if (s->backend == "moss-tts" || s->backend == "moss_tts" || s->backend == "mosstts") {
+        moss_tts_context_params p = moss_tts_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        p.flash_attn = g_open_flash_attn_tls;
+        s->moss_tts_ctx = moss_tts_init_from_file(model_path, p);
+        if (!s->moss_tts_ctx) {
+            delete s;
+            return nullptr;
+        }
+        // Codec loaded via `crispasr_session_set_codec_path` after open.
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_MOSS_TTS_LOCAL
+    if (s->backend == "moss-tts-local" || s->backend == "moss_tts_local") {
+        moss_tts_local_context_params p = moss_tts_local_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        p.flash_attn = g_open_flash_attn_tls;
+        s->moss_tts_local_ctx = moss_tts_local_init_from_file(model_path, p);
+        if (!s->moss_tts_local_ctx) {
+            delete s;
+            return nullptr;
+        }
+        // Codec loaded via `crispasr_session_set_codec_path` after open.
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_OMNIVOICE
+    if (s->backend == "omnivoice" || s->backend == "omnivoice-tts" || s->backend == "omnivoice-singing") {
+        omnivoice_context_params p = omnivoice_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        p.flash_attn = g_open_flash_attn_tls;
+        p.seed = g_open_seed_tls;
+        s->omnivoice_ctx = omnivoice_init_from_file(model_path, p);
+        if (!s->omnivoice_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_MEL_BAND_ROFORMER
+    // The CLI's --separate dispatcher reads the GGUF arch itself, so
+    // mel-band-roformer worked there while being absent from BOTH arch-detect
+    // tables and from every session arm -- separation from any binding was
+    // htdemucs-only. Multi-surface trap; see docs/contributing.md section 7.
+    if (s->backend == "mel-band-roformer" || s->backend == "mel_band_roformer" || s->backend == "melbandroformer" ||
+        s->backend == "mbr") {
+        s->mbr_ctx = mel_band_roformer_init_from_file(model_path, mel_band_roformer_default_params());
+        if (!s->mbr_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_HTDEMUCS
+    if (s->backend == "htdemucs" || s->backend == "demucs") {
+        htdemucs_params hp = htdemucs_default_params();
+        hp.n_threads = s->n_threads;
+        hp.use_gpu = g_open_use_gpu_tls; // crispasr_session has no use_gpu member; use the open-time TLS flag
+        s->htdemucs_ctx = htdemucs_init_from_file(model_path, hp);
+        if (!s->htdemucs_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_RVC_SVC
+    if (s->backend == "rvc" || s->backend == "rvc-svc" || s->backend == "svc") {
+        rvc_svc_params p = rvc_svc_default_params();
+        p.n_threads = s->n_threads;
+        p.use_gpu = g_open_use_gpu_tls;
+        s->rvc_ctx = rvc_svc_init_from_file(model_path, p);
+        if (!s->rvc_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_TABCNN
+    if (s->backend == "tabcnn" || s->backend == "tab" || s->backend == "tablature") {
+        s->tabcnn_ctx = tabcnn_init(model_path, s->n_threads);
+        if (!s->tabcnn_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_BTC_CHORDS
+    if (s->backend == "btc" || s->backend == "btc-chords" || s->backend == "chords") {
+        btc_chords_params p = btc_chords_default_params();
+        p.n_threads = s->n_threads;
+        s->btc_ctx = btc_chords_init_from_file(model_path, p);
+        if (!s->btc_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_BEAT_THIS
+    if (s->backend == "beat-this" || s->backend == "beatthis" || s->backend == "beats") {
+        s->beat_ctx = beat_this_init(model_path, s->n_threads);
+        if (!s->beat_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_CREPE
+    if (s->backend == "crepe" || s->backend == "crepe-tiny" || s->backend == "crepe-full") {
+        s->crepe_ctx = crepe_init(model_path, s->n_threads);
+        if (!s->crepe_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
 #ifdef CA_HAVE_GLMASR
     if (s->backend == "glm-asr" || s->backend == "glmasr" || s->backend == "glm" || s->backend == "glm_asr") {
         glm_asr_context_params p = glm_asr_context_default_params();
@@ -2053,7 +2931,8 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
     }
 #endif
 #ifdef CA_HAVE_KYUTAI
-    if (s->backend == "kyutai-stt" || s->backend == "kyutai" || s->backend == "moshi-stt") {
+    if (s->backend == "kyutai-stt" || s->backend == "kyutai" || s->backend == "moshi-stt" ||
+        s->backend == "kyutai-stt-2.6b") {
         kyutai_stt_context_params p = kyutai_stt_context_default_params();
         p.n_threads = s->n_threads;
         s->kyutai_ctx = kyutai_stt_init_from_file(model_path, p);
@@ -2068,6 +2947,7 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
     if (s->backend == "firered-asr" || s->backend == "firered") {
         firered_asr_context_params p = firered_asr_context_default_params();
         p.n_threads = s->n_threads;
+        p.use_gpu = g_open_use_gpu_tls;
         s->firered_ctx = firered_asr_init_from_file(model_path, p);
         if (!s->firered_ctx) {
             delete s;
@@ -2163,6 +3043,21 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         return s;
     }
 #endif
+#ifdef CA_HAVE_VOXTRAL_TTS
+    if (s->backend == "voxtral-tts") {
+        voxtral_tts_context_params p = voxtral_tts_context_default_params();
+        p.n_threads = s->n_threads;
+        p.use_gpu = g_open_use_gpu_tls;
+        s->voxtral_tts_ctx = voxtral_tts_init_from_file(model_path, p);
+        if (!s->voxtral_tts_ctx) {
+            delete s;
+            return nullptr;
+        }
+        // Voice is an optional preset name applied via crispasr_session_set_voice;
+        // synthesize() falls back to the default voice when unset.
+        return s;
+    }
+#endif
 #ifdef CA_HAVE_CHATTERBOX
     if (s->backend == "chatterbox" || s->backend == "chatterbox-tts" || s->backend == "kartoffelbox" ||
         s->backend == "chatterbox_turbo") {
@@ -2184,13 +3079,56 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         return s;
     }
 #endif
+#ifdef CA_HAVE_BANANAMIND_TTS
+    if (s->backend == "bananamind-tts" || s->backend == "bananamind_tts" || s->backend == "bananamind" ||
+        s->backend == "banana-tts") {
+        s->backend = "bananamind-tts";
+        bananamind_tts_params p = bananamind_tts_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        s->bananamind_tts_ctx = bananamind_tts_init_from_file(model_path, p);
+        if (!s->bananamind_tts_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
 #ifdef CA_HAVE_TADA
-    if (s->backend == "tada" || s->backend == "tada-tts" || s->backend == "tada-3b" || s->backend == "tada-3b-ml") {
+    if (s->backend == "tada" || s->backend == "tada-tts" || s->backend == "tada-1b" || s->backend == "tada-tts-1b" ||
+        s->backend == "tada-3b" || s->backend == "tada-3b-ml") {
         s->backend = "tada";
         tada_context_params p = tada_context_default_params();
         p.n_threads = s->n_threads;
         p.verbosity = g_open_verbosity_tls > 0 ? g_open_verbosity_tls : 1;
         p.use_gpu = g_open_use_gpu_tls;
+        // num_acoustic_candidates INHERITS the library default (1) from
+        // tada_context_default_params() above — do NOT re-hardcode it here. The
+        // upstream default is 1; a redundant override is exactly how #192 shipped
+        // a 4 (best-of-N with the reconstruction scorer mangles "…four hours" →
+        // "…and forth"). Keeping a single source of truth means the defaults-audit
+        // test (which checks the library default) also guards this path. Opt in
+        // to >1 with TADA_NUM_CANDIDATES for A/B only.
+        if (const char* env = crispasr_env::get("CRISPASR_TADA_NUM_CANDIDATES"); env && *env) {
+            int n = atoi(env);
+            if (n >= 1)
+                p.num_acoustic_candidates = n;
+        }
+        // Talker text-decoder sampling — mirror the CLI: sample by default with
+        // upstream InferenceOptions values so bindings/server don't loop or
+        // hallucinate (#197). Honour the same env overrides.
+        p.text_do_sample = true;
+        if (const char* e = crispasr_env::get("CRISPASR_TADA_DO_SAMPLE"); e && *e)
+            p.text_do_sample = !(e[0] == '0' || e[0] == 'f' || e[0] == 'F' || e[0] == 'n' || e[0] == 'N');
+        if (const char* e = crispasr_env::get("CRISPASR_TADA_TEMPERATURE"); e && *e)
+            p.temperature = (float)atof(e);
+        if (const char* e = crispasr_env::get("CRISPASR_TADA_TOP_P"); e && *e)
+            p.text_top_p = (float)atof(e);
+        if (const char* e = crispasr_env::get("CRISPASR_TADA_TOP_K"); e && *e)
+            p.text_top_k = atoi(e);
+        if (const char* e = crispasr_env::get("CRISPASR_TADA_REPETITION_PENALTY"); e && *e)
+            p.text_repetition_penalty = (float)atof(e);
         s->tada_ctx = tada_init_from_file(model_path, p);
         if (!s->tada_ctx) {
             fprintf(stderr, "crispasr: failed to init tada from '%s'\n", model_path);
@@ -2280,6 +3218,51 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
                 if (f) {
                     fclose(f);
                     dia_tts_set_codec_path(s->dia_tts_ctx, cp.c_str());
+                    break;
+                }
+            }
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_DOTS_TTS
+    if (s->backend == "dots" || s->backend == "dots-tts" || s->backend == "dots_tts" || s->backend == "dots.tts") {
+        s->backend = "dots-tts";
+        dots_tts_context_params p = dots_tts_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        p.temperature = (g_open_temperature_tls > 0.0f) ? g_open_temperature_tls : 0.7f;
+        p.seed = g_open_seed_tls;
+        s->dots_tts_ctx = dots_tts_init_from_file(model_path, p);
+        if (!s->dots_tts_ctx) {
+            delete s;
+            return nullptr;
+        }
+        // Auto-resolve vocoder + speaker-encoder GGUFs next to the model. The
+        // speaker encoder is optional (only needed for voice cloning via
+        // crispasr_session_set_voice); load it eagerly so set_voice just applies
+        // the reference WAV.
+        {
+            std::string mp = model_path ? model_path : "";
+            auto sep = mp.find_last_of("/\\");
+            std::string dir = (sep == std::string::npos) ? std::string(".") : mp.substr(0, sep);
+            for (const char* name :
+                 {"dots-tts-soar-vocoder-f16.gguf", "dots-tts-vocoder-f16.gguf", "dots-tts-vocoder.gguf"}) {
+                std::string cp = dir + "/" + name;
+                FILE* f = fopen(cp.c_str(), "rb");
+                if (f) {
+                    fclose(f);
+                    dots_tts_set_vocoder_path(s->dots_tts_ctx, cp.c_str());
+                    break;
+                }
+            }
+            for (const char* name : {"dots-tts-soar-spk-f16.gguf", "dots-tts-soar-spk.gguf", "dots-tts-spk-f16.gguf"}) {
+                std::string cp = dir + "/" + name;
+                FILE* f = fopen(cp.c_str(), "rb");
+                if (f) {
+                    fclose(f);
+                    dots_tts_set_speaker_path(s->dots_tts_ctx, cp.c_str());
                     break;
                 }
             }
@@ -2405,6 +3388,21 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         return s;
     }
 #endif
+#ifdef CA_HAVE_VOXCPM2_VAE
+    if (s->backend == "voxcpm2-vae" || s->backend == "voxcpm2_vae" || s->backend == "voxcpm2-upscaler") {
+        s->backend = "voxcpm2-vae";
+        voxcpm2_vae_context_params p = voxcpm2_vae_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        s->voxcpm2_vae_ctx = voxcpm2_vae_init_from_file(model_path, p);
+        if (!s->voxcpm2_vae_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
 #ifdef CA_HAVE_COSYVOICE3
     if (s->backend == "cosyvoice3-tts" || s->backend == "cosyvoice3" || s->backend == "cosyvoice3-llm") {
         s->backend = "cosyvoice3-tts";
@@ -2415,8 +3413,11 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         p.flash_attn = g_open_flash_attn_tls;
         // CV3 greedy decode (temperature 0) falls into a documented
         // silent_tokens loop within ~5 AR steps and emits silence; the RAS
-        // sampler needs temperature > 0. Mirror the CLI's 0->0.8 default.
-        p.temperature = 0.8f;
+        // sampler needs temperature > 0. Honour the session temperature when
+        // set, else fall back to 0.8 (mirrors the CLI's 0->0.8 default). The
+        // library default stays 0.0 (greedy) for diff-harness byte-parity;
+        // hardcoding 0.8 here silently ignored crispasr_session_set_temperature.
+        p.temperature = (g_open_temperature_tls > 0.0f) ? g_open_temperature_tls : 0.8f;
         s->cosyvoice3_ctx = cosyvoice3_tts_init_from_file(model_path, p);
         if (!s->cosyvoice3_ctx) {
             delete s;
@@ -2466,10 +3467,8 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
             delete s;
             return nullptr;
         }
-        if (!cv3_camp.empty())
-            cosyvoice3_tts_init_campplus_from_file(s->cosyvoice3_ctx, cv3_camp.c_str());
-        if (!cv3_s3tok.empty())
-            cosyvoice3_tts_init_s3tok_from_file(s->cosyvoice3_ctx, cv3_s3tok.c_str());
+        s->cosyvoice3_camp_path = std::move(cv3_camp);
+        s->cosyvoice3_s3tok_path = std::move(cv3_s3tok);
         return s;
     }
 #endif
@@ -2499,9 +3498,27 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         p.n_threads = s->n_threads;
         p.verbosity = g_open_verbosity_tls;
         p.use_gpu = g_open_use_gpu_tls;
-        p.seed = 42;
+        // Honour the session seed when set; else keep f5's deterministic
+        // default of 42 (0 = non-deterministic in f5_tts). Hardcoding 42
+        // silently ignored crispasr_session's seed for f5-tts only.
+        p.seed = (g_open_seed_tls != 0) ? (int)g_open_seed_tls : 42;
         s->f5tts_ctx = f5_tts_init_from_file(model_path, p);
         if (!s->f5tts_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_IRODORI_TTS
+    if (s->backend == "irodori-tts" || s->backend == "irodori_tts" || s->backend == "irodori") {
+        s->backend = "irodori-tts";
+        irodori_tts_params p = irodori_tts_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        s->irodori_ctx = irodori_tts_init_from_file(model_path, p);
+        if (!s->irodori_ctx) {
             delete s;
             return nullptr;
         }
@@ -2541,7 +3558,7 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         // Try to load BERT companion from MELOTTS_BERT env var or
         // bert-base-uncased.gguf next to the model.
         {
-            const char* bert_env = std::getenv("MELOTTS_BERT");
+            const char* bert_env = crispasr_env::get("CRISPASR_MELOTTS_BERT");
             std::string bert_path;
             if (bert_env && *bert_env) {
                 bert_path = bert_env;
@@ -2575,6 +3592,7 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         m2m100_context_params p = m2m100_context_default_params();
         p.n_threads = s->n_threads;
         p.verbosity = 1;
+        p.use_gpu = g_open_use_gpu_tls;
         s->m2m100_ctx = m2m100_init_from_file(model_path, p);
         if (!s->m2m100_ctx) {
             delete s;
@@ -2619,6 +3637,21 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         return s;
     }
 #endif
+#ifdef CA_HAVE_ARK_ASR
+    if (s->backend == "ark-asr" || s->backend == "ark_asr" || s->backend == "arkasr" || s->backend == "ark") {
+        s->backend = "ark-asr";
+        ark_asr_context_params p = ark_asr_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        s->ark_asr_ctx = ark_asr_init_from_file(model_path, p);
+        if (!s->ark_asr_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
 #ifdef CA_HAVE_MOSS_AUDIO
     if (s->backend == "moss-audio" || s->backend == "moss_audio" || s->backend == "mossaudio") {
         s->backend = "moss-audio";
@@ -2628,6 +3661,37 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         p.use_gpu = g_open_use_gpu_tls;
         s->moss_audio_ctx = moss_audio_init_from_file(model_path, p);
         if (!s->moss_audio_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_MOSS_TRANSCRIBE
+    if (s->backend == "moss-transcribe" || s->backend == "moss_transcribe" || s->backend == "mosstranscribe") {
+        s->backend = "moss-transcribe";
+        moss_transcribe_context_params p = moss_transcribe_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        s->moss_transcribe_ctx = moss_transcribe_init_from_file(model_path, p);
+        if (!s->moss_transcribe_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_MOSS_DIARIZE
+    if (s->backend == "moss-diarize" || s->backend == "moss_diarize" || s->backend == "moss-transcribe-diarize" ||
+        s->backend == "moss_transcribe_diarize") {
+        s->backend = "moss-diarize";
+        moss_diarize_params p = moss_diarize_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        s->moss_diarize_ctx = moss_diarize_init_from_file(model_path, p);
+        if (!s->moss_diarize_ctx) {
             delete s;
             return nullptr;
         }
@@ -2675,6 +3739,14 @@ CA_EXPORT crispasr_session* crispasr_session_open(const char* model_path, int n_
 // `backend` may be "" / NULL to delegate to GGUF arch detection
 // (same path as `crispasr_session_open`).
 // ─────────────────────────────────────────────────────────────────
+
+// Issue #214 — process-global GPU backend preference. Call before any
+// session open to force a specific GPU backend (e.g. "vulkan" when both
+// CUDA and Vulkan are compiled in).
+CA_EXPORT void crispasr_set_gpu_backend(const char* name) {
+    crispasr_set_gpu_backend_pref(name);
+}
+
 struct crispasr_open_params_v1 {
     int abi_version; // = 1 or 2
     int n_threads;
@@ -2761,6 +3833,120 @@ CA_EXPORT const char* crispasr_session_backend(crispasr_session* s) {
     return s ? s->backend.c_str() : "";
 }
 
+// Acoustic language detected by the last transcribe, written into `out_buf` as
+// an ISO-639-1 code (e.g. "en"). Only whisper decodes an in-session acoustic
+// language; other backends (and whisper before its first pass) fall back to
+// the session's source-language hint, then "unknown". Returns the code length
+// (bytes, not counting NUL) or -1 on bad args. This is distinct from the
+// backend-agnostic text-LID pass (crispasr_text_detect_language), which runs
+// CLD3 + fastText over the transcript.
+CA_EXPORT int crispasr_session_detected_language(crispasr_session* s, char* out_buf, int out_cap) {
+    if (!s || !out_buf || out_cap <= 0)
+        return -1;
+    std::string lang;
+    if (!s->detected_lang.empty())
+        lang = s->detected_lang;
+    else if (!s->source_language.empty())
+        lang = s->source_language;
+    else
+        lang = "unknown";
+    std::strncpy(out_buf, lang.c_str(), out_cap - 1);
+    out_buf[out_cap - 1] = '\0';
+    return (int)lang.size();
+}
+
+// Return the sample rate the backend expects for input PCM. Callers should
+// use this with crispasr_audio_load_at_rate() to decode audio directly at
+// the model's native rate, avoiding a lossy down-then-up resample.
+CA_EXPORT int crispasr_session_input_sample_rate(crispasr_session* s) {
+    if (!s)
+        return 0;
+        // Backends that operate at 24 kHz internally.
+#ifdef CA_HAVE_VIBEVOICE
+    if (s->backend.find("vibevoice") == 0 && s->vibevoice_ctx)
+        return 24000;
+#endif
+#ifdef CA_HAVE_KYUTAI_STT
+    if (s->kyutai_ctx)
+        return 24000;
+#endif
+        // Backends with model-level sample_rate hparams.
+#ifdef CA_HAVE_PARAKEET
+    if (s->parakeet_ctx)
+        return parakeet_sample_rate(s->parakeet_ctx);
+#endif
+#ifdef CA_HAVE_CANARY
+    if (s->canary_ctx)
+        return canary_sample_rate(s->canary_ctx);
+#endif
+#ifdef CA_HAVE_CANARY_QWEN
+    if (s->canary_qwen_ctx)
+        return canary_qwen_sample_rate(s->canary_qwen_ctx);
+#endif
+#ifdef CA_HAVE_LFM2_AUDIO
+    if (s->lfm2_audio_ctx)
+        return lfm2_audio_sample_rate(s->lfm2_audio_ctx);
+#endif
+#ifdef CA_HAVE_NEMOTRON
+    if (s->nemotron_ctx)
+        return nemotron_sample_rate(s->nemotron_ctx);
+#endif
+#ifdef CA_HAVE_CTC
+    if (s->ctc_ctx)
+        return canary_ctc_sample_rate(s->ctc_ctx);
+#endif
+    // Default: Whisper-family and all other backends expect 16 kHz.
+    return CRISPASR_SAMPLE_RATE;
+}
+
+CA_EXPORT int crispasr_session_set_pcm_sample_rate(crispasr_session* s, int rate) {
+    if (!s || rate <= 0)
+        return -1;
+    s->pcm_sample_rate = rate;
+    return 0;
+}
+
+// CTC vocabulary access (Omni CTC backend). Surfaces the SentencePiece pieces
+// already loaded from the GGUF so callers can detokenize a greedy CTC decode
+// over crispasr_session_result_logits. Returns 0 / "" for other backends.
+CA_EXPORT int crispasr_session_n_vocab(crispasr_session* s) {
+    if (!s)
+        return 0;
+#ifdef CA_HAVE_OMNIASR
+    if ((s->backend.rfind("omniasr", 0) == 0) && s->omniasr_ctx)
+        return omniasr_n_vocab((omniasr_context*)s->omniasr_ctx);
+#endif
+#ifdef CA_HAVE_WAV2VEC2
+    if ((s->backend == "wav2vec2" || s->backend == "hubert" || s->backend == "data2vec") && s->wav2vec2_ctx)
+        return (int)s->wav2vec2_ctx->vocab.size();
+#endif
+#ifdef CA_HAVE_CTC
+    if ((s->backend == "canary-ctc" || s->backend == "fastconformer-ctc") && s->ctc_ctx)
+        return canary_ctc_n_vocab(s->ctc_ctx);
+#endif
+    return 0;
+}
+
+CA_EXPORT const char* crispasr_session_token_text(crispasr_session* s, int id) {
+    if (!s || id < 0)
+        return "";
+#ifdef CA_HAVE_OMNIASR
+    if ((s->backend.rfind("omniasr", 0) == 0) && s->omniasr_ctx)
+        return omniasr_token_text((omniasr_context*)s->omniasr_ctx, id);
+#endif
+#ifdef CA_HAVE_WAV2VEC2
+    if ((s->backend == "wav2vec2" || s->backend == "hubert" || s->backend == "data2vec") && s->wav2vec2_ctx) {
+        const auto& v = s->wav2vec2_ctx->vocab;
+        return (id < (int)v.size()) ? v[id].c_str() : "";
+    }
+#endif
+#ifdef CA_HAVE_CTC
+    if ((s->backend == "canary-ctc" || s->backend == "fastconformer-ctc") && s->ctc_ctx)
+        return canary_ctc_token_text(s->ctc_ctx, id);
+#endif
+    return "";
+}
+
 /// Comma-separated list of backend names compiled into this libwhisper.
 /// e.g. "whisper,parakeet". Slim builds expose fewer. Used by language
 /// bindings to show the user which formats are runtime-ready.
@@ -2769,13 +3955,31 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
         return -1;
     std::string list = "whisper";
 #ifdef CA_HAVE_PARAKEET
-    list += ",parakeet";
+    list += ",parakeet,reazonspeech";
+#endif
+#ifdef CA_HAVE_NEMOTRON
+    list += ",nemotron";
 #endif
 #ifdef CA_HAVE_CANARY
     list += ",canary";
 #endif
+#ifdef CA_HAVE_CANARY_QWEN
+    list += ",canary-qwen";
+#endif
+#ifdef CA_HAVE_LFM2_AUDIO
+    list += ",lfm2-audio";
+#endif
+#ifdef CA_HAVE_MINI_OMNI2
+    list += ",mini-omni2";
+#endif
+#ifdef CA_HAVE_SIDON
+    list += ",sidon";
+#endif
 #ifdef CA_HAVE_QWEN3
     list += ",qwen3";
+#endif
+#ifdef CA_HAVE_HIGGS_STT
+    list += ",higgs-stt";
 #endif
 #ifdef CA_HAVE_COHERE
     list += ",cohere";
@@ -2792,6 +3996,9 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #ifdef CA_HAVE_VOXTRAL4B
     list += ",voxtral4b";
 #endif
+#ifdef CA_HAVE_VOXTRAL_TTS
+    list += ",voxtral-tts";
+#endif
 #ifdef CA_HAVE_WAV2VEC2
     list += ",wav2vec2";
 #endif
@@ -2807,8 +4014,44 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #ifdef CA_HAVE_QWEN3_TTS
     list += ",qwen3-tts";
 #endif
+#ifdef CA_HAVE_MIOTTS
+    list += ",miotts";
+#endif
+#ifdef CA_HAVE_PIANO_TRANSCRIPTION
+    list += ",piano-transcription";
+#endif
+#ifdef CA_HAVE_MOSS_TTS
+    list += ",moss-tts";
+#endif
+#ifdef CA_HAVE_MOSS_TTS_LOCAL
+    list += ",moss-tts-local";
+#endif
+#ifdef CA_HAVE_OMNIVOICE
+    list += ",omnivoice";
+#endif
 #ifdef CA_HAVE_GLMASR
     list += ",glm-asr";
+#endif
+#ifdef CA_HAVE_HTDEMUCS
+    list += ",htdemucs";
+#endif
+#ifdef CA_HAVE_MEL_BAND_ROFORMER
+    list += ",mel-band-roformer";
+#endif
+#ifdef CA_HAVE_CREPE
+    list += ",crepe";
+#endif
+#ifdef CA_HAVE_BEAT_THIS
+    list += ",beat-this";
+#endif
+#ifdef CA_HAVE_BTC_CHORDS
+    list += ",btc-chords";
+#endif
+#ifdef CA_HAVE_TABCNN
+    list += ",tabcnn";
+#endif
+#ifdef CA_HAVE_RVC_SVC
+    list += ",rvc-svc";
 #endif
 #ifdef CA_HAVE_KYUTAI
     list += ",kyutai-stt";
@@ -2843,8 +4086,11 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #ifdef CA_HAVE_CHATTERBOX
     list += ",chatterbox";
 #endif
+#ifdef CA_HAVE_BANANAMIND_TTS
+    list += ",bananamind-tts";
+#endif
 #ifdef CA_HAVE_TADA
-    list += ",tada";
+    list += ",tada,tada-1b,tada-tts-1b,tada-3b-ml";
 #endif
 #ifdef CA_HAVE_OUTETTS
     list += ",outetts";
@@ -2854,6 +4100,9 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #endif
 #ifdef CA_HAVE_DIA
     list += ",dia";
+#endif
+#ifdef CA_HAVE_DOTS_TTS
+    list += ",dots-tts";
 #endif
 #ifdef CA_HAVE_POCKET
     list += ",pocket-tts";
@@ -2876,6 +4125,9 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #ifdef CA_HAVE_VOXCPM2
     list += ",voxcpm2-tts";
 #endif
+#ifdef CA_HAVE_VOXCPM2_VAE
+    list += ",voxcpm2-vae";
+#endif
 #ifdef CA_HAVE_COSYVOICE3
     list += ",cosyvoice3-tts";
 #endif
@@ -2884,6 +4136,9 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #endif
 #ifdef CA_HAVE_F5TTS
     list += ",f5-tts";
+#endif
+#ifdef CA_HAVE_IRODORI_TTS
+    list += ",irodori-tts";
 #endif
 #ifdef CA_HAVE_PIPER
     list += ",piper";
@@ -2903,8 +4158,17 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #ifdef CA_HAVE_MIMO_ASR
     list += ",mimo-asr";
 #endif
+#ifdef CA_HAVE_ARK_ASR
+    list += ",ark-asr";
+#endif
 #ifdef CA_HAVE_MOSS_AUDIO
     list += ",moss-audio";
+#endif
+#ifdef CA_HAVE_MOSS_TRANSCRIBE
+    list += ",moss-transcribe";
+#endif
+#ifdef CA_HAVE_MOSS_DIARIZE
+    list += ",moss-diarize";
 #endif
 #ifdef CA_HAVE_QWEN3
     // mega-asr is a Qwen3-ASR variant (LoRA merged offline) — dispatch
@@ -3171,14 +4435,111 @@ static crispasr_session_result* run_voxtral_family(Ctx* ctx, const VoxtralFamily
 // Language-aware session transcribe. `language` is an ISO 639-1 code
 // ("en", "de", "ja", ...). Passing NULL or empty keeps each backend's
 // historical default (usually "en") so this is a strict superset of
-// `crispasr_session_transcribe`. Backends that don't take a language
-// input (parakeet, qwen3, granite, wav2vec2, fastconformer-ctc) ignore
-// the hint silently — parakeet/qwen3 auto-detect, granite is instruction-
-// tuned with its own prompt, wav2vec2 is usually mono-lingual.
+// `crispasr_session_transcribe`. The instruction-tuned audio-LLM backends
+// (qwen3, granite, glm-asr, moss-audio, mimo-asr) inject a "transcribe in
+// <language>" prompt when a language is set; parakeet/wav2vec2 auto-detect
+// or are mono-lingual and ignore the hint silently.
 // ---------------------------------------------------------------------------
+
+// Map an ISO-639-1 code to a plain English language name for prompt
+// injection in the audio-LLM session dispatch. Thin alias over the shared
+// core_lang::iso_to_english() (src/core/lang_names.h); kept as a named
+// helper so the session dispatch call sites are unchanged.
+static std::string ca_iso_to_english_lang(const std::string& code) {
+    return core_lang::iso_to_english(code);
+}
+
 // Internal single-pass transcribe (used by best-of-N wrapper below).
 static crispasr_session_result* transcribe_single(crispasr_session* s, const float* pcm, int n_samples,
                                                   const char* language);
+
+// Long-audio auto-chunking for the session API (fix/session-long-audio).
+//
+// The raw session transcribe is otherwise a single pass over the whole buffer;
+// for short-segment models (moonshine, whisper, …) that degrades and slows
+// badly past ~30 s, while the CLI/server dispatcher chunks long audio. This
+// wraps transcribe_single so the session behaves like the CLI: slice long audio
+// at energy minima (quiet cuts → no boundary dedup needed, PLAN #80b) and
+// transcribe each piece, shifting timestamps back to the absolute timeline.
+//
+// Skipped for: backends that already chunk internally (parakeet/reazonspeech
+// self-chunk in transcribe_single); an explicit chunked request
+// (parakeet_force_chunk_seconds >= 0); return_logits sessions (per-slice CTC
+// grids can't be merged meaningfully); and audio at/under the window. Gate:
+// CRISPASR_SESSION_AUTOCHUNK=0 disables (default on — it fixes a degradation and
+// matches the CLI); CRISPASR_SESSION_CHUNK_SECONDS overrides the window. The
+// default window is a flat 30 s for every backend; CRISPASR_SESSION_PERBACKEND_CHUNK=1
+// opts into per-backend windows (F4: moonshine 20 s) — kept gated because it needs
+// more A/B (regressed the one long clip measured; see session_default_chunk_seconds).
+static crispasr_session_result* transcribe_autochunk(crispasr_session* s, const float* pcm, int n_samples,
+                                                     const char* language) {
+    const int SR = 16000;
+    bool enabled = true;
+    if (const char* e = getenv("CRISPASR_SESSION_AUTOCHUNK"))
+        enabled = atoi(e) != 0;
+    bool perbackend = false;
+    if (const char* e = getenv("CRISPASR_SESSION_PERBACKEND_CHUNK"))
+        perbackend = atoi(e) != 0;
+    int chunk_s = core_session::session_default_chunk_seconds(s->backend, perbackend);
+    if (const char* e = getenv("CRISPASR_SESSION_CHUNK_SECONDS"))
+        chunk_s = std::max(5, atoi(e));
+
+    const bool already_chunking = (s->parakeet_force_chunk_seconds >= 0);
+    if (!core_session::session_autochunk_applicable(enabled, s->backend, n_samples, SR, chunk_s, s->return_logits,
+                                                    already_chunking))
+        return transcribe_single(s, pcm, n_samples, language);
+
+    const auto ranges =
+        audio_chunking::split_at_energy_minima(pcm, (size_t)n_samples, (size_t)chunk_s * SR, (size_t)(5 * SR));
+    if (ranges.size() <= 1)
+        return transcribe_single(s, pcm, n_samples, language);
+
+    auto* merged = new crispasr_session_result();
+    for (const auto& range : ranges) {
+        const size_t b = range.first, e = range.second;
+        crispasr_session_result* part = transcribe_single(s, pcm + b, (int)(e - b), language);
+        if (!part)
+            continue;
+        if (merged->backend.empty())
+            merged->backend = part->backend;
+        const int64_t off_cs = (int64_t)((double)b / SR * 100.0);
+        for (auto& seg : part->segments) {
+            seg.t0 += off_cs;
+            seg.t1 += off_cs;
+            for (auto& w : seg.words) {
+                w.t0 += off_cs;
+                w.t1 += off_cs;
+            }
+            // Chunked long audio can send a short-segment model (moonshine) into
+            // an n-gram repetition loop on a hard slice ("I'm sorry, I'm sorry,
+            // …"). Collapse it like the cohere/granite adapters do (issue #218);
+            // fix_loops is identity on clean text, so this is safe for every
+            // backend. Prune the looped words too so text and words stay aligned.
+            if (!seg.words.empty()) {
+                std::vector<std::string> wtexts;
+                wtexts.reserve(seg.words.size());
+                for (const auto& w : seg.words)
+                    wtexts.push_back(w.text);
+                const std::vector<int> keep = core_ngram::fix_loops_keep_indices(wtexts);
+                if (keep.size() < seg.words.size()) {
+                    std::vector<crispasr_session_seg::word> kept;
+                    kept.reserve(keep.size());
+                    for (int i : keep)
+                        kept.push_back(std::move(seg.words[i]));
+                    seg.words = std::move(kept);
+                }
+            }
+            seg.text = core_ngram::fix_loops(seg.text);
+            merged->segments.push_back(std::move(seg));
+        }
+        delete part;
+    }
+    return merged;
+}
+
+// Applies the session's resident --punc-model (if any) to a result in place.
+// Defined further down next to crispasr_session_set_punc_model.
+static void apply_session_punc_model(crispasr_session* s, crispasr_session_result* r);
 
 CA_EXPORT crispasr_session_result* crispasr_session_transcribe_lang(crispasr_session* s, const float* pcm,
                                                                     int n_samples, const char* language) {
@@ -3189,13 +4550,17 @@ CA_EXPORT crispasr_session_result* crispasr_session_transcribe_lang(crispasr_ses
     // highest average per-token confidence. Whisper handles best_of internally
     // via greedy.best_of, so we only loop externally for non-whisper backends.
     const int n_runs = (s->best_of > 1 && s->backend != "whisper") ? s->best_of : 1;
-    if (n_runs <= 1)
-        return transcribe_single(s, pcm, n_samples, language);
+    if (n_runs <= 1) {
+        crispasr_session_result* r = transcribe_autochunk(s, pcm, n_samples, language);
+        apply_session_punc_model(s, r);
+        _fire_segment_callbacks(s, r);
+        return r;
+    }
 
     crispasr_session_result* best = nullptr;
     double best_avg_p = -1.0;
     for (int run = 0; run < n_runs; run++) {
-        crispasr_session_result* candidate = transcribe_single(s, pcm, n_samples, language);
+        crispasr_session_result* candidate = transcribe_autochunk(s, pcm, n_samples, language);
         if (!candidate)
             continue;
         // Compute average per-word confidence
@@ -3217,13 +4582,293 @@ CA_EXPORT crispasr_session_result* crispasr_session_transcribe_lang(crispasr_ses
             delete candidate;
         }
     }
+    apply_session_punc_model(s, best);
+    _fire_segment_callbacks(s, best);
     return best;
+}
+
+#ifdef CA_HAVE_PARAKEET
+// Issue #208 / #89: silence-cut finder + non-JA long-form splitter, ported
+// from the CLI adapter (examples/cli/crispasr_backend_parakeet.cpp) so the
+// session path bounds the FastConformer encode on long audio instead of
+// building one O(T^2) full-length graph.
+
+// Normalize a word for boundary-dedup comparison: lowercase + drop ASCII
+// punctuation. Non-ASCII bytes (JA / accented text) are kept verbatim.
+static std::string parakeet_norm_word(const char* s) {
+    std::string o;
+    for (const char* p = s; *p; ++p) {
+        unsigned char c = (unsigned char)*p;
+        if (c < 0x80) {
+            if (std::isalnum(c))
+                o += (char)std::tolower(c);
+        } else {
+            o += (char)c;
+        }
+    }
+    return o;
+}
+
+// Long-audio transcription that loses no words and adds no duplicates.
+//
+// Parakeet's bidirectional FastConformer encoder + TDT decoder silently
+// DROP whole sections when fed more than ~30 s in one pass — the decoder
+// loses track across topic / silence changes (reproducible even at 60 s on
+// content that shifts topic). A single full-length pass therefore omits
+// large spans of speech. We instead transcribe the audio in short
+// OVERLAPPING windows, each well within the reliable range, and merge them:
+//
+//   * window i covers [pos, pos+chunk]; the next starts `overlap` before the
+//     previous window's end, so every instant is covered and every seam
+//     region by two windows.
+//   * consecutive windows are spliced at the MIDPOINT of their overlap, so
+//     each boundary word comes from the window that saw it with the most
+//     surrounding context — no section is dropped at a seam.
+//   * a final adjacent-duplicate pass removes the at-most-one word that
+//     timestamp jitter can double at a splice (genuine immediate repeats,
+//     which are >~0.3 s apart, are kept).
+//
+// Result: one merged segment whose word set is the union of all windows
+// (nothing dropped) with no boundary duplication.
+static void parakeet_session_chunked_merge(parakeet_context* ctx, const float* samples, int n_samples,
+                                           int chunk_samples, int overlap_samples,
+                                           std::vector<crispasr_session_seg>& out,
+                                           crispasr_progress_callback prog_cb = nullptr, void* prog_ud = nullptr) {
+    const int SR = 16000;
+    if (chunk_samples < SR)
+        chunk_samples = SR; // 1 s floor
+    if (overlap_samples < 0)
+        overlap_samples = 0;
+    if (overlap_samples >= chunk_samples)
+        overlap_samples = chunk_samples / 3;
+    const int stride = std::max(SR / 2, chunk_samples - overlap_samples);
+
+    struct MWord {
+        std::string text;
+        int64_t t0, t1;
+        float p;
+    };
+    std::vector<MWord> merged;
+    int64_t prev_end_cs = -1;
+
+    for (int pos = 0; pos < n_samples; pos += stride) {
+        const int end = std::min(n_samples, pos + chunk_samples);
+        const int64_t pos_cs = (int64_t)((double)pos / SR * 100.0);
+        parakeet_result* r = parakeet_transcribe_ex(ctx, samples + pos, end - pos, pos_cs);
+        if (r) {
+            if (merged.empty()) {
+                for (int i = 0; i < r->n_words; ++i)
+                    merged.push_back({r->words[i].text, r->words[i].t0, r->words[i].t1,
+                                      r->words[i].p > 0.0f ? r->words[i].p : 1.0f});
+            } else {
+                // Splice at the midpoint of the overlap [pos_cs, prev_end_cs]:
+                // drop merged's tail past the midpoint (the new window saw it
+                // with more right-context), then CONTINUE from the end of the
+                // last word still committed — take new words that end after it
+                // (t1 > cont). Continuing by the committed word's end, rather
+                // than a strict `t0 >= mid` cut, avoids dropping the one word
+                // that can straddle the midpoint. Any resulting near-duplicate
+                // is removed by the adjacent-dedup pass below.
+                const int64_t mid_cs = (pos_cs + prev_end_cs) / 2;
+                while (!merged.empty() && merged.back().t0 >= mid_cs)
+                    merged.pop_back();
+                const int64_t cont_cs = merged.empty() ? mid_cs : merged.back().t1;
+                for (int i = 0; i < r->n_words; ++i) {
+                    if (r->words[i].t1 > cont_cs)
+                        merged.push_back({r->words[i].text, r->words[i].t0, r->words[i].t1,
+                                          r->words[i].p > 0.0f ? r->words[i].p : 1.0f});
+                }
+            }
+            prev_end_cs = (int64_t)((double)end / SR * 100.0);
+            parakeet_result_free(r);
+        }
+        // Issue #208: report progress after each finished window. `end` is the
+        // last input sample this window covered, so it is monotonically
+        // non-decreasing and reaches n_samples on the final window. Mirror it
+        // into the module-level atomic so pollers (Dart FFI) also see it.
+        g_progress.store((int)((int64_t)end * 100 / n_samples), std::memory_order_relaxed);
+        if (prog_cb)
+            prog_cb(end, n_samples, prog_ud);
+        if (end >= n_samples)
+            break;
+    }
+
+    // Adjacent-duplicate removal (jitter safety at splices).
+    std::vector<MWord> dedup;
+    dedup.reserve(merged.size());
+    for (auto& w : merged) {
+        if (!dedup.empty()) {
+            const auto& prev = dedup.back();
+            if (llabs(w.t0 - prev.t0) < 30 &&
+                parakeet_norm_word(prev.text.c_str()) == parakeet_norm_word(w.text.c_str()))
+                continue;
+        }
+        dedup.push_back(std::move(w));
+    }
+    if (dedup.empty())
+        return;
+
+    crispasr_session_seg seg;
+    std::string text;
+    seg.words.reserve(dedup.size());
+    for (auto& w : dedup) {
+        if (!text.empty())
+            text += ' ';
+        text += w.text;
+        crispasr_session_seg::word sw;
+        sw.text = w.text;
+        sw.t0 = w.t0;
+        sw.t1 = w.t1;
+        sw.p = w.p;
+        seg.words.push_back(std::move(sw));
+    }
+    seg.text = std::move(text);
+    seg.t0 = dedup.front().t0;
+    seg.t1 = dedup.back().t1;
+    out.push_back(std::move(seg));
+}
+
+// Issue #257: split ONE coherent parakeet decode into ~seg_seconds session
+// segments, snapped to word boundaries. Mirrors the CLI adapter's
+// split_result_into_segments so the session API (server / language bindings)
+// emits per-segment offsets for an explicit `--chunk-seconds`, instead of one
+// giant segment. session_seg carries words only (no per-token array), so we
+// group words; text is re-joined with single spaces (non-JA path).
+static void parakeet_result_to_session_segs(const parakeet_result* pr, int seg_seconds,
+                                            std::vector<crispasr_session_seg>& out) {
+    if (!pr)
+        return;
+    if (pr->n_words <= 0) {
+        // No word timings → one segment with whatever text we have.
+        crispasr_session_seg seg;
+        seg.text = pr->text ? pr->text : "";
+        if (!seg.text.empty())
+            out.push_back(std::move(seg));
+        return;
+    }
+    std::vector<int64_t> word_t0;
+    word_t0.reserve(pr->n_words);
+    for (int i = 0; i < pr->n_words; ++i)
+        word_t0.push_back(pr->words[i].t0);
+    const std::vector<int> starts = core_segment::group_by_window(word_t0, (int64_t)seg_seconds * 100);
+    for (size_t si = 0; si < starts.size(); ++si) {
+        const int w_begin = starts[si];
+        const int w_end = (si + 1 < starts.size()) ? starts[si + 1] : pr->n_words;
+        crispasr_session_seg seg;
+        std::string text;
+        seg.words.reserve(w_end - w_begin);
+        for (int wi = w_begin; wi < w_end; ++wi) {
+            if (!text.empty())
+                text += ' ';
+            text += pr->words[wi].text;
+            crispasr_session_seg::word sw;
+            sw.text = pr->words[wi].text;
+            sw.t0 = pr->words[wi].t0;
+            sw.t1 = pr->words[wi].t1;
+            sw.p = pr->words[wi].p > 0.0f ? pr->words[wi].p : 1.0f;
+            seg.words.push_back(std::move(sw));
+        }
+        seg.text = std::move(text);
+        seg.t0 = seg.words.front().t0;
+        seg.t1 = seg.words.back().t1;
+        out.push_back(std::move(seg));
+    }
+}
+#endif
+
+// Issue #208: explicit chunked-encode transcribe for batch callers.
+//
+// Forces the Parakeet backend through the bounded long-form path (overlapping
+// short-window transcribe-and-merge for non-JA models, streamed encoder for
+// the JA-only model) regardless of audio length, so long files transcribe in
+// bounded time AND recover the sections a single full-length pass drops.
+// `chunk_seconds <= 0` keeps the per-model defaults; otherwise it sets the
+// non-JA window length / the JA streamed window. `overlap_seconds < 0` uses
+// the default.
+//
+// For every NON-Parakeet backend the chunk parameters are inert and this is
+// exactly equivalent to crispasr_session_transcribe_lang — callers can use
+// the chunked entry point uniformly without backend-specific branching.
+CA_EXPORT crispasr_session_result* crispasr_session_transcribe_chunked_lang(crispasr_session* s, const float* pcm,
+                                                                            int n_samples, int chunk_seconds,
+                                                                            int overlap_seconds, const char* language) {
+    if (!s || !pcm || n_samples <= 0)
+        return nullptr;
+    // Set the per-call override and restore it on every exit path so a
+    // forced-chunked call never leaks into later auto-path transcribes.
+    const int saved_chunk = s->parakeet_force_chunk_seconds;
+    const int saved_overlap = s->parakeet_force_overlap_seconds;
+    s->parakeet_force_chunk_seconds = chunk_seconds > 0 ? chunk_seconds : 0;
+    s->parakeet_force_overlap_seconds = overlap_seconds >= 0 ? overlap_seconds : -1;
+    struct ChunkGuard {
+        crispasr_session* s;
+        int chunk, overlap;
+        ~ChunkGuard() {
+            s->parakeet_force_chunk_seconds = chunk;
+            s->parakeet_force_overlap_seconds = overlap;
+        }
+    } guard{s, saved_chunk, saved_overlap};
+    return crispasr_session_transcribe_lang(s, pcm, n_samples, language);
+}
+
+// Language-default convenience wrapper for the chunked entry point.
+CA_EXPORT crispasr_session_result* crispasr_session_transcribe_chunked(crispasr_session* s, const float* pcm,
+                                                                       int n_samples, int chunk_seconds,
+                                                                       int overlap_seconds) {
+    return crispasr_session_transcribe_chunked_lang(s, pcm, n_samples, chunk_seconds, overlap_seconds, nullptr);
+}
+
+// Issue #208: register a per-session progress callback for long-form
+// (chunked) transcription. See crispasr_session.h for the contract.
+CA_EXPORT void crispasr_session_set_progress_callback(crispasr_session* s, crispasr_progress_callback cb,
+                                                      void* user_data) {
+    if (!s)
+        return;
+    s->progress_cb = cb;
+    s->progress_ud = cb ? user_data : nullptr;
+}
+
+CA_EXPORT void crispasr_session_set_segment_callback(crispasr_session* s, crispasr_segment_callback cb,
+                                                     void* user_data) {
+    if (!s)
+        return;
+    s->segment_cb = cb ? cb : _default_segment_cb;
+    s->segment_ud = cb ? user_data : s;
+}
+
+CA_EXPORT void crispasr_session_set_token_callback(crispasr_session* s, crispasr_token_callback cb, void* user_data) {
+    if (!s)
+        return;
+    s->token_cb = cb ? cb : _default_token_cb;
+    s->token_ud = cb ? user_data : s;
 }
 
 static crispasr_session_result* transcribe_single(crispasr_session* s, const float* pcm, int n_samples,
                                                   const char* language) {
     const std::string lang = (language && *language) ? language : "en";
     const bool lang_set = (language && *language);
+
+    // §5.26.2 — Hotword injection for LLM backends. Temporarily prepend
+    // the hotword phrasing to s->ask so every LLM dispatch path picks it
+    // up through the existing ask-prompt injection. Parakeet CTC/TDT
+    // hotwords are applied directly via parakeet_set_hotwords() in
+    // crispasr_session_set_hotwords() — no ask-prompt injection needed.
+    std::string saved_ask;
+    if (!s->hotwords.empty()) {
+        saved_ask = s->ask;
+        const std::string hw_hint = "The following words may appear in the audio: " + s->hotwords + ". ";
+        s->ask = s->ask.empty() ? hw_hint : hw_hint + s->ask;
+    }
+    // Scope guard: restore original ask on all exit paths.
+    struct AskGuard {
+        crispasr_session* s;
+        std::string* saved;
+        bool active;
+        ~AskGuard() {
+            if (active)
+                s->ask = std::move(*saved);
+        }
+    } ask_guard{s, &saved_ask, !s->hotwords.empty()};
 
     auto* r = new crispasr_session_result();
     r->backend = s->backend;
@@ -3330,6 +4975,7 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
                 seg.text = t;
             seg.t0 = whisper_full_get_segment_t0(s->whisper_ctx, i);
             seg.t1 = whisper_full_get_segment_t1(s->whisper_ctx, i);
+            seg.no_speech_prob = whisper_full_get_segment_no_speech_prob(s->whisper_ctx, i);
 
             // Convert whisper's per-token output into the unified
             // ca_token_record shape and run it through
@@ -3371,14 +5017,316 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
                 }
                 toks.push_back(std::move(rec));
             }
+            _fire_token_callbacks(s, toks);
             seg.words = emit_words_from_tokens(toks);
             r->segments.push_back(std::move(seg));
+        }
+        // Record the acoustic language whisper auto-detected on this pass so
+        // crispasr_session_detected_language can surface it (ISO-639-1). The
+        // id indexes whisper's static language table; whisper_lang_str returns
+        // a pointer into that table (nothing to free).
+        {
+            const int lang_id = whisper_full_lang_id(s->whisper_ctx);
+            const char* code = lang_id >= 0 ? whisper_lang_str(lang_id) : nullptr;
+            s->detected_lang = code ? code : "";
         }
         return r;
     }
 #ifdef CA_HAVE_PARAKEET
     if (s->backend == "parakeet" && s->parakeet_ctx) {
-        parakeet_result* pr = parakeet_transcribe_ex(s->parakeet_ctx, pcm, n_samples, 0);
+        // Issue #257: apply the caller-chosen local-attention window (NeMo
+        // rel_pos_local_attn) before decoding. INT_MIN = unset (model default).
+        if (s->parakeet_att_context_left != INT_MIN && s->parakeet_att_context_right != INT_MIN) {
+            parakeet_set_att_context(s->parakeet_ctx, s->parakeet_att_context_left, s->parakeet_att_context_right);
+        }
+        // Improvements Phase 1: unified dispatch — run the SAME orchestration as
+        // the CLI backend adapter (parakeet_transcribe_segments) rather than the
+        // divergent inline path below, so a fix/feature lands on every surface at
+        // once. Default ON (F3) — verified byte-identical to the inline path on
+        // parakeet (short + 225 s). CRISPASR_SESSION_UNIFIED_DISPATCH=0 selects the
+        // legacy inline path for A/B.
+        const bool _unified = [] {
+            const char* e = getenv("CRISPASR_SESSION_UNIFIED_DISPATCH");
+            return !(e && e[0] == '0'); // default on; only an explicit "0" disables
+        }();
+        if (_unified) {
+            const bool is_ja = parakeet_vocab_is_japanese(s->parakeet_ctx) != 0;
+            parakeet_orchestrate_opts oo;
+            oo.chunk_seconds_explicit = s->parakeet_force_chunk_seconds > 0;
+            oo.chunk_seconds = s->parakeet_force_chunk_seconds > 0 ? s->parakeet_force_chunk_seconds : 0;
+            oo.chunk_overlap_seconds =
+                s->parakeet_force_overlap_seconds >= 0 ? (float)s->parakeet_force_overlap_seconds : 2.0f;
+            oo.no_prints = false;
+            for (auto& ps : parakeet_transcribe_segments(s->parakeet_ctx, pcm, n_samples, 0, is_ja, oo)) {
+                crispasr_session_seg seg;
+                seg.text = std::move(ps.text);
+                seg.t0 = ps.t0;
+                seg.t1 = ps.t1;
+                seg.words.reserve(ps.words.size());
+                for (auto& w : ps.words) {
+                    crispasr_session_seg::word sw;
+                    sw.text = std::move(w.text);
+                    sw.t0 = w.t0;
+                    sw.t1 = w.t1;
+                    sw.p = w.p > 0.0f ? w.p : 1.0f;
+                    seg.words.push_back(std::move(sw));
+                }
+                r->segments.push_back(std::move(seg));
+            }
+            return r;
+        }
+        // Issue #89 (JA long audio): mirror of the CLI default — energy-minima
+        // slices at most `cap_s` long (the JA encoder collapses past ~12 s of
+        // context on real speech), one exact single pass per slice, then a
+        // gap-fill second pass re-transcribing any span >=1 s the first pass
+        // left empty inside a slice (the encoder blanks an utterance whenever
+        // enough context follows it; the same span decodes verbatim in
+        // isolation). See examples/cli/crispasr_run.cpp gap-fill for the
+        // measured numbers (97/97/96 % recall vs 53-62 % streamed).
+        auto transcribe_ja_sliced = [&](const float* audio, int n, int sr, int cap_s) -> crispasr_session_seg {
+            int64_t min_gap_cs = 100;
+            if (const char* e = getenv("CRISPASR_GAP_FILL_MIN_CS"))
+                min_gap_cs = std::max((int64_t)30, (int64_t)atoi(e));
+            bool gap_fill = true;
+            if (const char* e = getenv("CRISPASR_GAP_FILL"))
+                gap_fill = atoi(e) != 0;
+            constexpr int64_t kEdgePadCs = 20;
+            constexpr int64_t kCoverSlopCs = 30;
+
+            const auto slices = crispasr_energy_chunk_slices(audio, n, sr, cap_s, 2.0f);
+            std::vector<crispasr_session_seg::word> words;
+            auto run_window = [&](int w0, int w1, int64_t t0_cs, std::vector<crispasr_session_seg::word>& out) {
+                parakeet_result* pr = parakeet_transcribe_ex(s->parakeet_ctx, audio + w0, w1 - w0, t0_cs);
+                if (!pr)
+                    return;
+                for (int i = 0; i < pr->n_words; ++i) {
+                    crispasr_session_seg::word w;
+                    w.text = pr->words[i].text;
+                    w.t0 = pr->words[i].t0;
+                    w.t1 = pr->words[i].t1;
+                    w.p = pr->words[i].p > 0.0f ? pr->words[i].p : 1.0f;
+                    out.push_back(std::move(w));
+                }
+                parakeet_result_free(pr);
+            };
+            for (size_t si = 0; si < slices.size(); ++si) {
+                const auto& sl = slices[si];
+                std::vector<crispasr_session_seg::word> sw;
+                run_window(sl.start, sl.end, sl.t0_cs, sw);
+                // Gap-fill rounds within this slice.
+                for (int round = 0; gap_fill && round < 2; ++round) {
+                    std::vector<std::pair<int64_t, int64_t>> merged;
+                    {
+                        std::vector<std::pair<int64_t, int64_t>> cov;
+                        for (const auto& w : sw)
+                            cov.push_back({w.t0, std::max(w.t1, w.t0 + 1)});
+                        std::sort(cov.begin(), cov.end());
+                        for (auto& iv : cov) {
+                            if (!merged.empty() && iv.first <= merged.back().second + kCoverSlopCs)
+                                merged.back().second = std::max(merged.back().second, iv.second);
+                            else
+                                merged.push_back(iv);
+                        }
+                    }
+                    std::vector<std::pair<int64_t, int64_t>> gaps;
+                    int64_t cursor = sl.t0_cs;
+                    for (auto& iv : merged) {
+                        if (iv.first - cursor >= min_gap_cs)
+                            gaps.push_back({cursor, iv.first});
+                        cursor = std::max(cursor, iv.second);
+                    }
+                    if (sl.t1_cs - cursor >= min_gap_cs)
+                        gaps.push_back({cursor, sl.t1_cs});
+                    if (gaps.empty())
+                        break;
+                    bool recovered = false;
+                    for (auto& g : gaps) {
+                        const int64_t win0_cs = std::max(sl.t0_cs, g.first - kEdgePadCs);
+                        const int64_t win1_cs = std::min(sl.t1_cs, g.second + kEdgePadCs);
+                        const int w0 = std::max(0, (int)(win0_cs * sr / 100));
+                        const int w1 = std::min(n, (int)(win1_cs * sr / 100));
+                        if (w1 - w0 < sr / 4)
+                            continue;
+                        std::vector<crispasr_session_seg::word> fw;
+                        run_window(w0, w1, win0_cs, fw);
+                        for (auto& w : fw) {
+                            const int64_t mid = (w.t0 + w.t1) / 2;
+                            if (mid < g.first - kCoverSlopCs || mid >= g.second + kCoverSlopCs)
+                                continue;
+                            bool covered = false;
+                            for (const auto& iv : merged)
+                                if (mid >= iv.first && mid < iv.second) {
+                                    covered = true;
+                                    break;
+                                }
+                            if (!covered) {
+                                sw.push_back(std::move(w));
+                                recovered = true;
+                            }
+                        }
+                    }
+                    if (!recovered)
+                        break;
+                    std::sort(sw.begin(), sw.end(),
+                              [](const crispasr_session_seg::word& a, const crispasr_session_seg::word& b) {
+                                  return a.t0 < b.t0;
+                              });
+                }
+                for (auto& w : sw)
+                    words.push_back(std::move(w));
+                if (s->progress_cb)
+                    s->progress_cb((int)si + 1, (int)slices.size(), s->progress_ud);
+            }
+            std::sort(
+                words.begin(), words.end(),
+                [](const crispasr_session_seg::word& a, const crispasr_session_seg::word& b) { return a.t0 < b.t0; });
+            crispasr_session_seg seg;
+            for (const auto& w : words) {
+                if (w.text.empty())
+                    continue;
+                if (!seg.text.empty()) {
+                    const unsigned char prev_last = (unsigned char)seg.text.back();
+                    const unsigned char cur_first = (unsigned char)w.text[0];
+                    // CJK boundaries take no space (>= 0xE0 lead byte = 3-byte
+                    // UTF-8: kana / CJK / hangul); latin words usually carry a
+                    // leading space from the tokenizer already.
+                    if (cur_first != ' ' && prev_last < 0xE0 && cur_first < 0xE0)
+                        seg.text += ' ';
+                }
+                seg.text += w.text;
+            }
+            if (!seg.text.empty() && seg.text[0] == ' ')
+                seg.text.erase(0, 1);
+            if (!words.empty()) {
+                seg.t0 = words.front().t0;
+                seg.t1 = words.back().t1;
+            }
+            seg.words = std::move(words);
+            return seg;
+        };
+
+        // Issue #208: the session path used to call parakeet_transcribe_ex,
+        // routing the WHOLE buffer through one full-length FastConformer
+        // encode. Two problems on long audio: (1) the encoder's
+        // relative-position self-attention is O(T^2) in T_enc, so the single
+        // graph grinds for minutes on Metal (looks like a hang); (2) far worse
+        // for accuracy, the TDT decoder silently DROPS whole sections of
+        // speech once the input exceeds ~30 s — it loses track across topic /
+        // silence changes (reproducible even at 60 s), so a single pass omits
+        // large spans of words.
+        //
+        // Fix: transcribe long audio in short OVERLAPPING windows that stay in
+        // the model's reliable range and merge them
+        // (parakeet_session_chunked_merge) — every section is covered, seams
+        // are spliced at the overlap midpoint, and a dedup pass removes any
+        // jitter-doubled boundary word. JA-only models (single-pass collapses
+        // on long audio, #89) use the overlapping streamed encoder instead.
+        // Audio up to one window is a single exact pass (unchanged).
+        const int SR = 16000;
+        // JA-model detection matches the CLI adapter (is_ja_model_). Issue #257:
+        // detect by vocab CONTENT, not size — small-vocab English models
+        // (parakeet-tdt-1.1b, vocab 1024) were misclassified as Japanese.
+        const bool is_ja = parakeet_vocab_is_japanese(s->parakeet_ctx) != 0;
+        int chunk_s = 20;       // non-JA overlapping-window length (s)
+        int overlap_s = 8;      // window overlap (s)
+        int stream_chunk_s = 0; // JA streamed window (s); 0 = library per-model default
+        int stream_overlap_s = 2;
+        int single_pass_max_s = 0; // escape hatch: force one exact pass up to N s (0 = off)
+        if (const char* e = getenv("CRISPASR_PARAKEET_CHUNK_SECONDS"))
+            chunk_s = std::max(4, atoi(e));
+        if (const char* e = getenv("CRISPASR_PARAKEET_CHUNK_OVERLAP"))
+            overlap_s = std::max(0, atoi(e));
+        if (const char* e = getenv("CRISPASR_PARAKEET_STREAM_CHUNK"))
+            stream_chunk_s = std::max(2, atoi(e));
+        if (const char* e = getenv("CRISPASR_PARAKEET_STREAM_OVERLAP"))
+            stream_overlap_s = std::max(0, atoi(e));
+        if (const char* e = getenv("CRISPASR_PARAKEET_STREAM_THRESHOLD"))
+            single_pass_max_s = std::max(0, atoi(e));
+
+        // Explicit per-call chunked request (issue #208 option 1, via
+        // crispasr_session_transcribe_chunked[_lang]) forces the bounded path
+        // regardless of length and sizes the window (chunk_seconds → window
+        // length / JA streamed window; overlap_seconds → window overlap).
+        const bool force_chunked = s->parakeet_force_chunk_seconds >= 0;
+        if (force_chunked) {
+            if (s->parakeet_force_chunk_seconds > 0) {
+                chunk_s = std::max(4, s->parakeet_force_chunk_seconds);
+                stream_chunk_s = s->parakeet_force_chunk_seconds;
+            }
+            if (s->parakeet_force_overlap_seconds >= 0) {
+                overlap_s = s->parakeet_force_overlap_seconds;
+                stream_overlap_s = s->parakeet_force_overlap_seconds;
+            }
+        }
+
+        // A single exact pass is used only for audio that fits in one window
+        // (or up to the explicit single_pass_max_s escape hatch). Anything
+        // longer is chunked, since the decoder drops sections past ~one window.
+        const int64_t chunk_samp = (int64_t)chunk_s * SR;
+        bool use_single_pass;
+        if (force_chunked)
+            use_single_pass = false;
+        else if (single_pass_max_s > 0)
+            use_single_pass = (int64_t)n_samples <= (int64_t)single_pass_max_s * SR;
+        else
+            use_single_pass = (int64_t)n_samples <= chunk_samp;
+
+        // Issue #257: an EXPLICIT --chunk-seconds request via the session API
+        // (crispasr_session_transcribe_chunked → server / language bindings)
+        // mirrors the CLI adapter: one coherent internal-streamed decode at the
+        // model's quality window (complete text, bounded VRAM — small encoder
+        // windows degrade this full-attention FastConformer), then group the
+        // words into ~N-second OUTPUT segments. This replaces the one-merged-
+        // segment overlapping-window path for the explicit non-JA case, so the
+        // wrappers get per-segment offsets like the CLI. STREAM_CHUNK still
+        // overrides the encoder window for power users.
+        if (force_chunked && !is_ja && s->parakeet_force_chunk_seconds > 0) {
+            int enc_window = 0; // 0 → library quality default (30 s non-JA)
+            if (const char* e = getenv("CRISPASR_PARAKEET_STREAM_CHUNK"))
+                enc_window = std::max(2, atoi(e));
+            const int ov = s->parakeet_force_overlap_seconds >= 0 ? s->parakeet_force_overlap_seconds : 2;
+            g_progress.store(0, std::memory_order_relaxed);
+            parakeet_result* pr = parakeet_transcribe_streamed(s->parakeet_ctx, pcm, n_samples, 0, enc_window, ov);
+            g_progress.store(-1, std::memory_order_relaxed);
+            if (!pr) {
+                delete r;
+                return nullptr;
+            }
+            parakeet_result_to_session_segs(pr, s->parakeet_force_chunk_seconds, r->segments);
+            parakeet_result_free(pr);
+            return r;
+        }
+
+        // non-JA long audio (no explicit --chunk-seconds) → overlapping-window
+        // merge (no dropped sections, no boundary duplicates). Emits one merged
+        // segment (the #208 batch-caller contract).
+        if (!use_single_pass && !is_ja) {
+            g_progress.store(0, std::memory_order_relaxed); // issue #208: pollers see "started"
+            parakeet_session_chunked_merge(s->parakeet_ctx, pcm, n_samples, chunk_s * SR, overlap_s * SR, r->segments,
+                                           s->progress_cb, s->progress_ud);
+            g_progress.store(-1, std::memory_order_relaxed); // back to idle
+            return r;
+        }
+
+        // JA long audio → capped-slice single-pass + gap-fill (issue #89
+        // mirror of the CLI default; CRISPASR_PARAKEET_VAD_SLICE_CAP=0
+        // reverts to the old streamed path, an explicit chunked request via
+        // crispasr_session_transcribe_chunked keeps the caller's sizing).
+        int ja_cap_s = 12;
+        if (const char* e = getenv("CRISPASR_PARAKEET_VAD_SLICE_CAP"))
+            ja_cap_s = std::max(0, atoi(e));
+        if (!use_single_pass && is_ja && ja_cap_s > 0 && !force_chunked) {
+            g_progress.store(0, std::memory_order_relaxed);
+            r->segments.push_back(transcribe_ja_sliced(pcm, n_samples, SR, ja_cap_s));
+            g_progress.store(-1, std::memory_order_relaxed);
+            return r;
+        }
+
+        // JA long audio (streamed fallback); short audio → the exact single pass.
+        parakeet_result* pr =
+            (!use_single_pass && is_ja)
+                ? parakeet_transcribe_streamed(s->parakeet_ctx, pcm, n_samples, 0, stream_chunk_s, stream_overlap_s)
+                : parakeet_transcribe_ex(s->parakeet_ctx, pcm, n_samples, 0);
         if (!pr) {
             delete r;
             return nullptr;
@@ -3409,6 +5357,39 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         return r;
     }
 #endif
+#ifdef CA_HAVE_NEMOTRON
+    if (s->backend == "nemotron" && s->nemotron_ctx) {
+        if (lang_set)
+            nemotron_set_language(s->nemotron_ctx, lang.c_str());
+        nemotron_result* nr = nemotron_transcribe_ex(s->nemotron_ctx, pcm, n_samples, 0);
+        if (!nr) {
+            delete r;
+            return nullptr;
+        }
+
+        // Nemotron produces one logical segment covering the whole input;
+        // we package word-level timings into a single segment for the
+        // unified shape.
+        crispasr_session_seg seg;
+        seg.text = nr->text ? nr->text : "";
+        if (nr->n_words > 0) {
+            seg.t0 = nr->words[0].t0;
+            seg.t1 = nr->words[nr->n_words - 1].t1;
+            seg.words.reserve(nr->n_words);
+            for (int i = 0; i < nr->n_words; ++i) {
+                crispasr_session_seg::word w;
+                w.text = nr->words[i].text;
+                w.t0 = nr->words[i].t0;
+                w.t1 = nr->words[i].t1;
+                w.p = nr->words[i].p > 0.0f ? nr->words[i].p : 1.0f;
+                seg.words.push_back(std::move(w));
+            }
+        }
+        r->segments.push_back(std::move(seg));
+        nemotron_result_free(nr);
+        return r;
+    }
+#endif
 
     // Backends below all return a `char * malloc`'d transcript — we package
     // the whole thing into a single segment with no word timings. They're
@@ -3427,6 +5408,7 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         const std::string tgt = !s->target_language.empty() ? s->target_language : src;
         if (s->beam_size > 1)
             canary_set_beam_size(s->canary_ctx, s->beam_size);
+        canary_set_max_new_tokens(s->canary_ctx, s->max_new_tokens); // #292
         canary_result* cr =
             canary_transcribe_ex(s->canary_ctx, pcm, n_samples, src.c_str(), tgt.c_str(), s->punctuation, 0);
         if (!cr) {
@@ -3448,8 +5430,127 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             tk.p = cr->tokens[i].p;
             toks.push_back(std::move(tk));
         }
+        _fire_token_callbacks(s, toks);
         seg.words = emit_words_from_tokens(toks);
         canary_result_free(cr);
+        r->segments.push_back(std::move(seg));
+        return r;
+    }
+#endif
+#ifdef CA_HAVE_CANARY_QWEN
+    if (s->backend == "canary-qwen" && s->canary_qwen_ctx) {
+        if (s->beam_size > 1)
+            canary_qwen_set_beam_size(s->canary_qwen_ctx, s->beam_size);
+        canary_qwen_set_max_new_tokens(s->canary_qwen_ctx, s->max_new_tokens); // #292
+        canary_qwen_result* cqr = canary_qwen_transcribe_ex(s->canary_qwen_ctx, pcm, n_samples);
+        if (!cqr) {
+            delete r;
+            return nullptr;
+        }
+        crispasr_session_seg seg;
+        seg.text = core_ngram::fix_loops(cqr->text ? cqr->text : "");
+        seg.t0 = 0;
+        seg.t1 = (int64_t)((double)n_samples * 100.0 / 16000.0);
+        // #218: keep the tokens array consistent with the loop-fixed text —
+        // drop the same duplicate tokens fix_loops removes (mirrors the CLI
+        // adapter's fix_loops_keep_indices path; the inline session ABI
+        // previously emitted the un-deduplicated tokens).
+        std::vector<std::string> tok_texts;
+        tok_texts.reserve((size_t)cqr->n_tokens);
+        for (int i = 0; i < cqr->n_tokens; i++)
+            tok_texts.push_back(cqr->tokens[i].text ? cqr->tokens[i].text : "");
+        const std::vector<int> keep = core_ngram::fix_loops_keep_indices(tok_texts);
+        std::vector<ca_token_record> toks;
+        toks.reserve(keep.size());
+        for (int ki : keep) {
+            if (ki < 0 || ki >= cqr->n_tokens)
+                continue;
+            ca_token_record tk;
+            tk.text = cqr->tokens[ki].text;
+            tk.t0 = 0;
+            tk.t1 = seg.t1;
+            tk.p = cqr->tokens[ki].p;
+            toks.push_back(std::move(tk));
+        }
+        _fire_token_callbacks(s, toks);
+        seg.words = emit_words_from_tokens(toks);
+        filter_words_by_ngram_collapse(seg.words);
+        canary_qwen_result_free(cqr);
+        r->segments.push_back(std::move(seg));
+        return r;
+    }
+#endif
+#ifdef CA_HAVE_LFM2_AUDIO
+    if (s->backend == "lfm2-audio" && s->lfm2_audio_ctx) {
+        // Forward language hint or ask prompt; fall back to the session language
+        const char* lfm2_prompt = nullptr;
+        if (!s->ask.empty())
+            lfm2_prompt = s->ask.c_str();
+        else if (lang_set)
+            lfm2_prompt = lang.c_str();
+        char* text = lfm2_audio_transcribe(s->lfm2_audio_ctx, pcm, n_samples, lfm2_prompt, 0);
+        if (!text) {
+            delete r;
+            return nullptr;
+        }
+        crispasr_session_seg seg;
+        seg.text = text;
+        seg.t0 = 0;
+        seg.t1 = (int64_t)((double)n_samples * 100.0 / 16000.0);
+        free(text);
+        r->segments.push_back(std::move(seg));
+        return r;
+    }
+#endif
+#ifdef CA_HAVE_MINI_OMNI2
+    if ((s->backend == "mini-omni2" || s->backend == "mini_omni2" || s->backend == "miniomni2") && s->mini_omni2_ctx) {
+        mini_omni2_set_ask(s->mini_omni2_ctx, s->ask.empty() ? nullptr : s->ask.c_str());
+        mini_omni2_set_max_new_tokens(s->mini_omni2_ctx, s->max_new_tokens); // #292
+        char* text = mini_omni2_transcribe(s->mini_omni2_ctx, pcm, n_samples);
+        if (!text) {
+            delete r;
+            return nullptr;
+        }
+        crispasr_session_seg seg;
+        seg.text = text;
+        seg.t0 = 0;
+        seg.t1 = (int64_t)((double)n_samples * 100.0 / 16000.0);
+        free(text);
+        r->segments.push_back(std::move(seg));
+        return r;
+    }
+#endif
+#ifdef CA_HAVE_HIGGS_STT
+    if ((s->backend == "higgs-stt" || s->backend == "higgs_stt" || s->backend == "higgs-audio-v3-stt") &&
+        s->higgs_ctx) {
+        // Whole-file chunked encode + ChatML greedy decode lives in
+        // higgs_stt_transcribe(). `set_ask` overrides the user-turn prompt:
+        // an explicit `s->ask` (custom task) wins; otherwise a per-call /
+        // sticky language injects a "Transcribe the speech in <lang>." hint;
+        // empty restores the default. Mirrors the CLI adapter.
+        if (!s->ask.empty()) {
+            higgs_stt_set_ask(s->higgs_ctx, s->ask.c_str());
+        } else {
+            const std::string eff_lang = lang_set ? lang : s->source_language;
+            if (!eff_lang.empty() && eff_lang != "auto") {
+                const std::string instr = "Transcribe the speech in " + ca_iso_to_english_lang(eff_lang) +
+                                          ". Output only the spoken words in lowercase with no punctuation.";
+                higgs_stt_set_ask(s->higgs_ctx, instr.c_str());
+            } else {
+                higgs_stt_set_ask(s->higgs_ctx, nullptr);
+            }
+        }
+        higgs_stt_set_max_new_tokens(s->higgs_ctx, s->max_new_tokens); // #292
+        char* text = higgs_stt_transcribe(s->higgs_ctx, pcm, n_samples);
+        if (!text) {
+            delete r;
+            return nullptr;
+        }
+        crispasr_session_seg seg;
+        seg.text = text;
+        seg.t0 = 0;
+        seg.t1 = (int64_t)((double)n_samples * 100.0 / 16000.0);
+        free(text);
         r->segments.push_back(std::move(seg));
         return r;
     }
@@ -3478,15 +5579,33 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             return nullptr;
         }
 
-        // ChatML prompt: <|im_start|>system\n<|im_end|>\n<|im_start|>user\n
+        // ChatML prompt: <|im_start|>system\n{sys}<|im_end|>\n<|im_start|>user\n
         // <|audio_start|><|audio_pad|>×N<|audio_end|>{question}<|im_end|>\n
-        // <|im_start|>assistant\n
+        // <|im_start|>assistant\n[PREFILL]
         //
         // When `s->ask` is set, inject the question between the audio
         // close token and the user-turn end so the LLM answers it
-        // instead of producing a verbatim transcript. Empty ask keeps
-        // the historical transcribe-only template.
-        std::string text = "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|audio_start|>";
+        // instead of producing a verbatim transcript. Otherwise, when a
+        // language is set (per-call or sticky source_language), follow
+        // the blueprint contract (qwen_asr _build_text_prompt): append
+        // an assistant-turn prefill "language <Name><asr_text>" so the
+        // model emits transcript text only and cannot answer "language
+        // none" (issue #218 empty-output escape). Mirrors the CLI
+        // adapter (crispasr_backend_qwen3.cpp); the legacy system-turn
+        // instruction stays behind CRISPASR_QWEN3_SYSPROMPT_LANG=1.
+        std::string sys_instruction;
+        std::string assistant_prefill;
+        if (s->ask.empty()) {
+            const std::string eff_lang = lang_set ? lang : s->source_language;
+            if (!eff_lang.empty() && eff_lang != "auto") {
+                const char* legacy_env = getenv("CRISPASR_QWEN3_SYSPROMPT_LANG");
+                if (legacy_env && atoi(legacy_env) != 0)
+                    sys_instruction = "Transcribe the speech in " + ca_iso_to_english_lang(eff_lang) + ".";
+                else
+                    assistant_prefill = "language " + ca_iso_to_english_lang(eff_lang) + "<asr_text>";
+            }
+        }
+        std::string text = "<|im_start|>system\n" + sys_instruction + "<|im_end|>\n<|im_start|>user\n<|audio_start|>";
         text.reserve(text.size() + (size_t)N_enc * 13 + 64 + s->ask.size());
         for (int i = 0; i < N_enc; i++)
             text += "<|audio_pad|>";
@@ -3496,6 +5615,7 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             text += s->ask;
         }
         text += "<|im_end|>\n<|im_start|>assistant\n";
+        text += assistant_prefill;
 
         int n_prompt = 0;
         int32_t* raw_ids = qwen3_asr_tokenize(s->qwen3_ctx, text.c_str(), &n_prompt);
@@ -3532,7 +5652,11 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         }
         std::free(audio_embeds);
 
-        if (!qwen3_asr_kv_init(s->qwen3_ctx, 4096)) {
+        // Blueprint default max_new_tokens=512; KV sized to prompt + decode
+        // budget so unchunked long audio isn't capped at 4096 ctx (mirrors
+        // the CLI adapter's dynamic sizing).
+        const int q3_max_new = s->max_new_tokens > 0 ? s->max_new_tokens : 512;
+        if (!qwen3_asr_kv_init(s->qwen3_ctx, std::max(4096, (int)ids.size() + q3_max_new + 16))) {
             std::free(text_embeds);
             delete r;
             return nullptr;
@@ -3569,7 +5693,7 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
                 return lg;
             };
             core_beam_decode::Config bcfg;
-            bcfg.max_new_tokens = s->max_new_tokens > 0 ? s->max_new_tokens : 256;
+            bcfg.max_new_tokens = q3_max_new;
             bcfg.eos_id = eos_id;
             bcfg.vocab_size = vocab;
             bcfg.beam_size = s->beam_size;
@@ -3583,7 +5707,7 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             const float first_p =
                 core_greedy_decode::softmax_of(logits + last_off, vocab, first_tok, logits[last_off + first_tok]);
             core_greedy_decode::Config dec_cfg;
-            dec_cfg.max_new_tokens = s->max_new_tokens > 0 ? s->max_new_tokens : 256;
+            dec_cfg.max_new_tokens = q3_max_new;
             dec_cfg.eos_id = eos_id;
             dec_cfg.vocab_size = vocab;
             dec_cfg.frequency_penalty = s->frequency_penalty;
@@ -3636,10 +5760,12 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             transcript.erase(transcript.begin());
 
         crispasr_session_seg seg;
-        seg.text = transcript;
+        seg.text = core_ngram::fix_loops(transcript);
         seg.t0 = 0;
         seg.t1 = (int64_t)((double)n_samples * 100.0 / 16000.0);
+        _fire_token_callbacks(s, toks);
         seg.words = emit_words_from_tokens(toks);
+        filter_words_by_ngram_collapse(seg.words);
         r->segments.push_back(std::move(seg));
         return r;
     }
@@ -3658,7 +5784,7 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             return nullptr;
         }
         crispasr_session_seg seg;
-        seg.text = cr->text ? cr->text : "";
+        seg.text = core_ngram::fix_loops(cr->text ? cr->text : "");
         seg.t0 = 0;
         seg.t1 = (int64_t)((double)n_samples * 100.0 / 16000.0);
 
@@ -3672,7 +5798,9 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             tk.p = cr->tokens[i].p;
             toks.push_back(std::move(tk));
         }
+        _fire_token_callbacks(s, toks);
         seg.words = emit_words_from_tokens(toks);
+        filter_words_by_ngram_collapse(seg.words);
         cohere_result_free(cr);
         r->segments.push_back(std::move(seg));
         return r;
@@ -3716,14 +5844,24 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         // granite-3.x uses control-token chat template; granite-4.0 uses
         // "USER: …\n ASSISTANT:". Discriminator: audio_token < 50000 ⇒ v3.
         const bool use_v3_template = (audio_tok < 50000);
+        // Language steering (mirrors crispasr_backend_granite.cpp): when a
+        // language is set and no explicit ask overrides it, replace the
+        // default "transcribe into a written format" instruction with
+        // "transcribe into <language>".
+        const std::string eff_lang = lang_set ? lang : s->source_language;
+        const bool want_lang = s->ask.empty() && !eff_lang.empty() && eff_lang != "auto";
         std::vector<int32_t> prefix_ids, suffix_ids;
         if (use_v3_template) {
             const std::string prefix_str = "<|start_of_role|>user<|end_of_role|>";
-            const std::string suffix_str = (!s->ask.empty() ? s->ask
-                                                            : std::string("can you transcribe the speech into a "
-                                                                          "written format?")) +
-                                           "<|end_of_text|>\n"
-                                           "<|start_of_role|>assistant<|end_of_role|>";
+            std::string suffix_core;
+            if (!s->ask.empty())
+                suffix_core = s->ask;
+            else if (want_lang)
+                suffix_core = "can you transcribe the speech into " + ca_iso_to_english_lang(eff_lang) + "?";
+            else
+                suffix_core = "can you transcribe the speech into a written format?";
+            const std::string suffix_str = suffix_core + "<|end_of_text|>\n"
+                                                         "<|start_of_role|>assistant<|end_of_role|>";
             int n = 0;
             int32_t* a = granite_speech_tokenize(s->granite_ctx, prefix_str.c_str(), &n);
             if (a && n > 0) {
@@ -3741,8 +5879,11 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             // granite-4.0-1b legacy hardcoded ids: "USER: " + transcription request.
             static const int32_t kPrefix4[] = {6584, 25, 220};
             prefix_ids.assign(kPrefix4, kPrefix4 + (sizeof(kPrefix4) / sizeof(kPrefix4[0])));
-            if (!s->ask.empty()) {
-                const std::string suffix4_str = s->ask + "\nASSISTANT:";
+            if (!s->ask.empty() || want_lang) {
+                const std::string instr =
+                    !s->ask.empty() ? s->ask
+                                    : "can you transcribe the speech into " + ca_iso_to_english_lang(eff_lang) + "?";
+                const std::string suffix4_str = instr + "\nASSISTANT:";
                 int n = 0;
                 int32_t* a = granite_speech_tokenize(s->granite_ctx, suffix4_str.c_str(), &n);
                 if (a && n > 0) {
@@ -3847,6 +5988,7 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             std::free(batch_text);
         while (!transcript.empty() && (transcript.front() == ' ' || transcript.front() == '\n'))
             transcript.erase(transcript.begin());
+        transcript = core_ngram::fix_loops(transcript);
 
         std::vector<ca_token_record> toks;
         toks.reserve(dec.tokens.size());
@@ -3868,7 +6010,9 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         seg.text = transcript;
         seg.t0 = 0;
         seg.t1 = (int64_t)((double)n_samples * 100.0 / 16000.0);
+        _fire_token_callbacks(s, toks);
         seg.words = emit_words_from_tokens(toks);
+        filter_words_by_ngram_collapse(seg.words);
         r->segments.push_back(std::move(seg));
         return r;
     }
@@ -3887,7 +6031,15 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         ops.token_text = &voxtral_token_text;
         ops.audio_pad_id = 24; // Tekken <audio_pad>
         ops.eos_id = 2;        // Tekken </s>
-        return run_voxtral_family(s->voxtral_ctx, ops, pcm, n_samples, lang, s->ask, s->beam_size);
+        auto* vr = run_voxtral_family(s->voxtral_ctx, ops, pcm, n_samples, lang, s->ask, s->beam_size);
+        // Fire per-token callbacks from the voxtral result words.
+        if (vr && s->token_cb) {
+            int tok_idx = 0;
+            for (const auto& seg : vr->segments)
+                for (const auto& w : seg.words)
+                    s->token_cb(w.text.c_str(), tok_idx++, s->token_ud);
+        }
+        return vr;
     }
 #endif
 #ifdef CA_HAVE_VOXTRAL4B
@@ -3941,6 +6093,14 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         }
         const int V = (int)s->wav2vec2_ctx->hparams.vocab_size;
         const int T = (int)(logits.size() / (size_t)V);
+        // Opt-in raw-logits capture for forced alignment (see
+        // crispasr_session_set_return_logits). Raw pre-softmax grid, frame-major
+        // [n_frames × n_vocab]; copy so the decode below still consumes `logits`.
+        if (s->return_logits) {
+            r->logits.assign(logits.begin(), logits.end());
+            r->n_logit_vocab = V;
+            r->n_logit_frames = T;
+        }
         auto emits = (s->beam_size > 1)
                          ? wav2vec2_beam_decode_with_probs(*s->wav2vec2_ctx, logits.data(), T, s->beam_size, 2.3f)
                          : wav2vec2_greedy_decode_with_probs(*s->wav2vec2_ctx, logits.data(), T);
@@ -3969,6 +6129,7 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         seg.text = text;
         seg.t0 = 0;
         seg.t1 = (int64_t)((double)n_samples * 100.0 / 16000.0);
+        _fire_token_callbacks(s, toks);
         seg.words = emit_words_from_tokens(toks);
         r->segments.push_back(std::move(seg));
         return r;
@@ -3976,29 +6137,34 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
 #endif
 #ifdef CA_HAVE_VIBEVOICE
     if (s->backend == "vibevoice" && s->vibevoice_ctx) {
-        auto resample_16k_to_24k = [](const float* in, int n_in) {
-            std::vector<float> out;
-            if (!in || n_in <= 0)
-                return out;
-
-            const int n_out = (int)((double)n_in * 24000.0 / 16000.0);
-            out.resize((size_t)n_out);
+        // vibevoice expects 24 kHz. Resample only if the caller supplied
+        // 16 kHz (legacy default); skip if already at 24 kHz via
+        // crispasr_session_set_pcm_sample_rate + crispasr_audio_load_at_rate.
+        const float* vv_pcm = pcm;
+        int vv_n = n_samples;
+        std::vector<float> pcm24_buf;
+        if (s->pcm_sample_rate != 24000) {
+            const int n_out = (int)((double)n_samples * 24000.0 / (double)s->pcm_sample_rate);
+            pcm24_buf.resize((size_t)n_out);
             for (int i = 0; i < n_out; ++i) {
-                const double pos = (double)i * 16000.0 / 24000.0;
+                const double pos = (double)i * (double)s->pcm_sample_rate / 24000.0;
                 int i0 = (int)pos;
                 int i1 = i0 + 1;
                 if (i0 < 0)
                     i0 = 0;
-                if (i1 >= n_in)
-                    i1 = n_in - 1;
+                if (i1 >= n_samples)
+                    i1 = n_samples - 1;
                 const float frac = (float)(pos - (double)i0);
-                out[(size_t)i] = in[i0] * (1.0f - frac) + in[i1] * frac;
+                pcm24_buf[(size_t)i] = pcm[i0] * (1.0f - frac) + pcm[i1] * frac;
             }
-            return out;
-        };
-
-        const std::vector<float> pcm24 = resample_16k_to_24k(pcm, n_samples);
-        vibevoice_result* vr = vibevoice_transcribe_with_probs(s->vibevoice_ctx, pcm24.data(), (int)pcm24.size());
+            vv_pcm = pcm24_buf.data();
+            vv_n = n_out;
+        }
+        // Session hotwords double as vibevoice's free-form context injection
+        // (CLI: --context; here the comma-separated hotword list is spliced
+        // into the prompt's "with extra info:" slot, PR #223 / issue #224).
+        const char* vv_context = s->hotwords.empty() ? nullptr : s->hotwords.c_str();
+        vibevoice_result* vr = vibevoice_transcribe_with_probs_and_context(s->vibevoice_ctx, vv_pcm, vv_n, vv_context);
         if (!vr || !vr->text) {
             if (vr)
                 vibevoice_result_free(vr);
@@ -4028,6 +6194,7 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         seg.text = vr->text;
         seg.t0 = 0;
         seg.t1 = (int64_t)((double)n_samples * 100.0 / 16000.0);
+        _fire_token_callbacks(s, toks);
         seg.words = emit_words_from_tokens(toks);
         vibevoice_result_free(vr);
         r->segments.push_back(std::move(seg));
@@ -4043,6 +6210,15 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             return nullptr;
         }
         canary_ctc_decode_result* dr = canary_ctc_greedy_decode_with_probs(s->ctc_ctx, logits, T_enc, V);
+        // Opt-in logits capture for forced alignment (see
+        // crispasr_session_set_return_logits). canary_ctc_compute_logits returns
+        // per-frame log-probabilities (already log-softmaxed), frame-major
+        // [n_frames × n_vocab]; copy before the buffer is freed below.
+        if (s->return_logits) {
+            r->logits.assign(logits, logits + (size_t)T_enc * V);
+            r->n_logit_vocab = V;
+            r->n_logit_frames = T_enc;
+        }
         std::free(logits);
         if (!dr || !dr->text) {
             if (dr)
@@ -4067,6 +6243,7 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             tk.p = dr->token_probs[i];
             toks.push_back(std::move(tk));
         }
+        _fire_token_callbacks(s, toks);
         seg.words = emit_words_from_tokens(toks);
         canary_ctc_decode_result_free(dr);
         r->segments.push_back(std::move(seg));
@@ -4101,6 +6278,7 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         seg.text = text;
         seg.t0 = 0;
         seg.t1 = (int64_t)((double)n_samples * 100.0 / 16000.0);
+        _fire_token_callbacks(s, toks);
         seg.words = emit_words_from_tokens(toks);
         r->segments.push_back(std::move(seg));
         return r;
@@ -4113,7 +6291,22 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         if (s->beam_size > 1) {
             glm_asr_set_beam_size((glm_asr_context*)s->glmasr_ctx, s->beam_size);
         }
-        glm_asr_set_ask((glm_asr_context*)s->glmasr_ctx, s->ask.empty() ? nullptr : s->ask.c_str());
+        // ask > language instruction > default (mirrors crispasr_backend_glm_asr.cpp).
+        // "en"/"auto" keep the blueprint default transcription prompt —
+        // English is its default behaviour; only explicit non-English hints
+        // inject an instruction.
+        if (!s->ask.empty()) {
+            glm_asr_set_ask((glm_asr_context*)s->glmasr_ctx, s->ask.c_str());
+        } else {
+            const std::string eff_lang = lang_set ? lang : s->source_language;
+            if (!eff_lang.empty() && eff_lang != "auto" && eff_lang != "en") {
+                const std::string instr = "Please transcribe in " + ca_iso_to_english_lang(eff_lang) + ".";
+                glm_asr_set_ask((glm_asr_context*)s->glmasr_ctx, instr.c_str());
+            } else {
+                glm_asr_set_ask((glm_asr_context*)s->glmasr_ctx, nullptr);
+            }
+        }
+        glm_asr_set_max_new_tokens((glm_asr_context*)s->glmasr_ctx, s->max_new_tokens); // #292
         glm_asr_result* gr = glm_asr_transcribe_with_probs((glm_asr_context*)s->glmasr_ctx, pcm, n_samples);
         if (!gr || !gr->text) {
             if (gr)
@@ -4125,40 +6318,38 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         toks.reserve((size_t)gr->n_tokens);
         for (int i = 0; i < gr->n_tokens; i++) {
             ca_token_record tk;
-            // GLM uses GPT-2 byte-level BPE: Ġ→space, Ċ→newline.
+            // GLM uses GPT-2 byte-level BPE — full table decode (CJK, etc.).
             const char* raw = glm_asr_token_text((glm_asr_context*)s->glmasr_ctx, gr->token_ids[i]);
-            if (raw) {
-                for (size_t ci = 0; raw[ci] != '\0';) {
-                    unsigned char c = (unsigned char)raw[ci];
-                    if (c == 0xC4 && raw[ci + 1] != '\0') {
-                        unsigned char c2 = (unsigned char)raw[ci + 1];
-                        if (c2 == 0xA0) {
-                            tk.text += ' ';
-                            ci += 2;
-                            continue;
-                        }
-                        if (c2 == 0x8A) {
-                            tk.text += '\n';
-                            ci += 2;
-                            continue;
-                        }
-                    }
-                    tk.text += (char)c;
-                    ci++;
-                }
-            }
+            if (raw)
+                tk.text = gpt2_byte_decode(raw);
             tk.t0 = -1;
             tk.t1 = -1;
             tk.p = gr->token_probs[i];
             toks.push_back(std::move(tk));
         }
-        char* text = strdup(gr->text);
+        std::string fixed_text = core_ngram::fix_loops(gr->text);
         glm_asr_result_free(gr);
-        return package_with_tokens(text, std::move(toks));
+
+        // issue #218 follow-up: don't route through package_with_tokens()
+        // here (shared with kyutai-stt/firered-asr, which aren't affected) —
+        // build the segment directly so seg.words can be filtered with the
+        // same collapse decision as seg.text, instead of just cleaning the
+        // flat text and leaving every repeated word in word-level output.
+        crispasr_session_seg seg;
+        seg.text = fixed_text;
+        seg.t0 = 0;
+        seg.t1 = (int64_t)((double)n_samples * 100.0 / 16000.0);
+        _fire_token_callbacks(s, toks);
+        seg.words = emit_words_from_tokens(toks);
+        filter_words_by_ngram_collapse(seg.words);
+        r->segments.push_back(std::move(seg));
+        return r;
     }
 #endif
 #ifdef CA_HAVE_KYUTAI
-    if ((s->backend == "kyutai-stt" || s->backend == "kyutai" || s->backend == "moshi-stt") && s->kyutai_ctx) {
+    if ((s->backend == "kyutai-stt" || s->backend == "kyutai" || s->backend == "moshi-stt" ||
+         s->backend == "kyutai-stt-2.6b") &&
+        s->kyutai_ctx) {
         // PLAN §90: forward sticky session beam_size into kyutai-stt's
         // per-context setter so session-API consumers (CrisperWeaver's
         // worker pool, Rust/Node bindings) get the same beam search
@@ -4166,6 +6357,9 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         if (s->beam_size > 1) {
             kyutai_stt_set_beam_size((kyutai_stt_context*)s->kyutai_ctx, s->beam_size);
         }
+        // Forward the caller's PCM rate so kyutai skips 16k→24k resample
+        // when the audio was already loaded at 24 kHz (issue #263).
+        kyutai_stt_set_input_sample_rate((kyutai_stt_context*)s->kyutai_ctx, s->pcm_sample_rate);
         kyutai_stt_result* kr = kyutai_stt_transcribe_with_probs((kyutai_stt_context*)s->kyutai_ctx, pcm, n_samples);
         if (!kr || !kr->text) {
             if (kr)
@@ -4247,6 +6441,8 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         if (s->beam_size > 1) {
             moonshine_set_beam_size((moonshine_context*)s->moonshine_ctx, s->beam_size);
         }
+        // #292: forward the session's max_new_tokens (0 keeps the 194 default).
+        moonshine_set_max_new_tokens((moonshine_context*)s->moonshine_ctx, s->max_new_tokens);
         moonshine_result* mr = moonshine_transcribe_with_probs((moonshine_context*)s->moonshine_ctx, pcm, n_samples);
         if (!mr || !mr->text) {
             if (mr)
@@ -4311,7 +6507,21 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         }
         if (oar)
             omniasr_result_free(oar);
-        // CTC variant: text only.
+        // CTC variant: text only (+ optional raw logits for forced alignment).
+        if (s->return_logits) {
+            float* lg = nullptr;
+            int lv = 0, lf = 0;
+            char* text =
+                omniasr_transcribe_with_logits((omniasr_context*)s->omniasr_ctx, pcm, n_samples, &lg, &lv, &lf);
+            crispasr_session_result* res = package_text_only(text, true);
+            if (res && lg) {
+                res->logits.assign(lg, lg + (size_t)lv * lf);
+                res->n_logit_vocab = lv;
+                res->n_logit_frames = lf;
+            }
+            free(lg);
+            return res;
+        }
         return package_text_only(omniasr_transcribe((omniasr_context*)s->omniasr_ctx, pcm, n_samples), true);
     }
 #endif
@@ -4336,6 +6546,9 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         if (!text && s->backend == "funasr" && s->funasr_ctx) {
             if (s->beam_size > 1)
                 funasr_set_beam_size(s->funasr_ctx, s->beam_size);
+            if (!s->source_language.empty())
+                funasr_set_language(s->funasr_ctx, s->source_language.c_str());
+            funasr_set_max_new_tokens(s->funasr_ctx, s->max_new_tokens); // #292
             text = funasr_transcribe(s->funasr_ctx, pcm, n_samples);
             need_free = true;
         }
@@ -4343,6 +6556,24 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
 #ifdef CA_HAVE_PARAFORMER
         if (!text && s->backend == "paraformer" && s->paraformer_ctx) {
             text = paraformer_transcribe(s->paraformer_ctx, pcm, n_samples);
+            need_free = true;
+        }
+#endif
+#ifdef CA_HAVE_ARK_ASR
+        if (!text && s->backend == "ark-asr" && s->ark_asr_ctx) {
+            // EXPERIMENTAL language steering: ask > -l instruction > promptless.
+            if (!s->ask.empty()) {
+                ark_asr_set_ask(s->ark_asr_ctx, s->ask.c_str());
+            } else {
+                const std::string eff_lang = lang_set ? lang : s->source_language;
+                if (!eff_lang.empty() && eff_lang != "auto") {
+                    const std::string instr = "Transcribe the audio in " + ca_iso_to_english_lang(eff_lang) + ".";
+                    ark_asr_set_ask(s->ark_asr_ctx, instr.c_str());
+                } else {
+                    ark_asr_set_ask(s->ark_asr_ctx, nullptr);
+                }
+            }
+            text = ark_asr_transcribe(s->ark_asr_ctx, pcm, n_samples);
             need_free = true;
         }
 #endif
@@ -4439,37 +6670,30 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             // mimo_asr returns null + logs to stderr if the tokenizer companion
             // wasn't set via crispasr_session_set_codec_path. We surface a clean
             // "no transcription" rather than hanging.
-            mimo_asr_set_ask(s->mimo_asr_ctx, s->ask.empty() ? nullptr : s->ask.c_str());
+            // ask > language instruction > default (mirrors crispasr_backend_mimo_asr.cpp).
+            if (!s->ask.empty()) {
+                mimo_asr_set_ask(s->mimo_asr_ctx, s->ask.c_str());
+            } else {
+                const std::string eff_lang = lang_set ? lang : s->source_language;
+                if (!eff_lang.empty() && eff_lang != "auto") {
+                    const std::string instr =
+                        "Please transcribe this audio in " + ca_iso_to_english_lang(eff_lang) + ".";
+                    mimo_asr_set_ask(s->mimo_asr_ctx, instr.c_str());
+                } else {
+                    mimo_asr_set_ask(s->mimo_asr_ctx, nullptr);
+                }
+            }
+            mimo_asr_set_max_new_tokens(s->mimo_asr_ctx, s->max_new_tokens); // #292
             mimo_asr_result* mr = mimo_asr_transcribe_with_probs(s->mimo_asr_ctx, pcm, n_samples);
             if (mr && mr->text) {
                 std::vector<ca_token_record> toks;
                 toks.reserve((size_t)mr->n_tokens);
                 for (int i = 0; i < mr->n_tokens; i++) {
                     ca_token_record tk;
+                    // Mimo uses Qwen2 tokenizer (GPT-2 byte-level BPE) — full table decode.
                     const char* piece = mimo_asr_token_text(s->mimo_asr_ctx, mr->token_ids[i]);
-                    if (piece) {
-                        std::string p = piece;
-                        // Mimo uses Qwen2 tokenizer (GPT-2 byte-level BPE):
-                        // Ġ (0xC4 0xA0) → space, Ċ (0xC4 0x8A) → newline.
-                        for (size_t ci = 0; ci < p.size();) {
-                            unsigned char c = (unsigned char)p[ci];
-                            if (c == 0xC4 && ci + 1 < p.size()) {
-                                unsigned char c2 = (unsigned char)p[ci + 1];
-                                if (c2 == 0xA0) {
-                                    tk.text += ' ';
-                                    ci += 2;
-                                    continue;
-                                }
-                                if (c2 == 0x8A) {
-                                    tk.text += '\n';
-                                    ci += 2;
-                                    continue;
-                                }
-                            }
-                            tk.text += (char)c;
-                            ci++;
-                        }
-                    }
+                    if (piece)
+                        tk.text = gpt2_byte_decode(piece);
                     tk.t0 = -1;
                     tk.t1 = -1;
                     tk.p = mr->token_probs[i];
@@ -4485,8 +6709,43 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
 #endif
 #ifdef CA_HAVE_MOSS_AUDIO
         if (!text && s->moss_audio_ctx) {
-            const char* prompt = s->ask.empty() ? "Transcribe this audio." : s->ask.c_str();
+            // ask > language instruction > default (mirrors crispasr_backend_moss_audio.cpp).
+            std::string prompt_buf;
+            const char* prompt = "Transcribe this audio.";
+            if (!s->ask.empty()) {
+                prompt = s->ask.c_str();
+            } else {
+                const std::string eff_lang = lang_set ? lang : s->source_language;
+                if (!eff_lang.empty() && eff_lang != "auto") {
+                    prompt_buf = "Transcribe this audio in " + ca_iso_to_english_lang(eff_lang) + ".";
+                    prompt = prompt_buf.c_str();
+                }
+            }
             text = moss_audio_process(s->moss_audio_ctx, pcm, n_samples, prompt);
+            need_free = true;
+        }
+#endif
+#ifdef CA_HAVE_MOSS_TRANSCRIBE
+        if (!text && s->moss_transcribe_ctx) {
+            // ASR-only (promptless legacy layout); language/ask hints are ignored.
+            moss_transcribe_set_max_new_tokens(s->moss_transcribe_ctx, s->max_new_tokens); // #292
+            text = moss_transcribe_transcribe(s->moss_transcribe_ctx, pcm, n_samples);
+            need_free = true;
+        }
+#endif
+#ifdef CA_HAVE_MOSS_DIARIZE
+        if (!text && s->moss_diarize_ctx) {
+            if (!s->ask.empty()) {
+                moss_diarize_set_ask(s->moss_diarize_ctx, s->ask.c_str());
+            } else {
+                moss_diarize_set_ask(s->moss_diarize_ctx, nullptr);
+            }
+            // #292: forward the session's max_new_tokens (crispasr_session_set_max_new_tokens).
+            // <= 0 keeps the backend's 1024 default, matching the CLI adapter.
+            moss_diarize_set_max_new_tokens(s->moss_diarize_ctx, s->max_new_tokens);
+            // Language hint not auto-injected — model auto-detects language.
+            // Only inject when explicitly set by the caller (not LID-resolved).
+            text = moss_diarize_transcribe(s->moss_diarize_ctx, pcm, n_samples);
             need_free = true;
         }
 #endif
@@ -4979,6 +7238,47 @@ CA_EXPORT int crispasr_registry_list_backends_abi(char* out_csv, int32_t out_cap
     return (int)acc.size();
 }
 
+CA_EXPORT int crispasr_registry_default_bundle_info_abi(const char* backend, char* out_backend, int32_t backend_cap,
+                                                        char* out_license, int32_t license_cap,
+                                                        int32_t* out_requires_acceptance) {
+    if (!backend || !out_backend || backend_cap <= 0 || !out_license || license_cap <= 0 || !out_requires_acceptance)
+        return -1;
+    CrispasrRegistryBundle bundle;
+    if (!crispasr_registry_default_bundle(backend, bundle))
+        return 0;
+    if ((int)bundle.backend.size() + 1 > backend_cap || (int)bundle.license.size() + 1 > license_cap)
+        return -2;
+    std::memcpy(out_backend, bundle.backend.c_str(), bundle.backend.size());
+    out_backend[bundle.backend.size()] = '\0';
+    std::memcpy(out_license, bundle.license.c_str(), bundle.license.size());
+    out_license[bundle.license.size()] = '\0';
+    *out_requires_acceptance = bundle.requires_license_acceptance ? 1 : 0;
+    return (int)bundle.artifacts.size();
+}
+
+CA_EXPORT int crispasr_registry_default_bundle_artifact_abi(const char* backend, int32_t index, int32_t* out_kind,
+                                                            char* out_filename, int32_t filename_cap, char* out_url,
+                                                            int32_t url_cap, char* out_size, int32_t size_cap) {
+    if (!backend || index < 0 || !out_kind || !out_filename || filename_cap <= 0 || !out_url || url_cap <= 0 ||
+        !out_size || size_cap <= 0)
+        return -1;
+    CrispasrRegistryBundle bundle;
+    if (!crispasr_registry_default_bundle(backend, bundle) || index >= (int32_t)bundle.artifacts.size())
+        return 1;
+    const CrispasrRegistryArtifact& artifact = bundle.artifacts[index];
+    if ((int)artifact.filename.size() + 1 > filename_cap || (int)artifact.url.size() + 1 > url_cap ||
+        (int)artifact.approx_size.size() + 1 > size_cap)
+        return 2;
+    *out_kind = (int32_t)artifact.kind;
+    std::memcpy(out_filename, artifact.filename.c_str(), artifact.filename.size());
+    out_filename[artifact.filename.size()] = '\0';
+    std::memcpy(out_url, artifact.url.c_str(), artifact.url.size());
+    out_url[artifact.url.size()] = '\0';
+    std::memcpy(out_size, artifact.approx_size.c_str(), artifact.approx_size.size());
+    out_size[artifact.approx_size.size()] = '\0';
+    return 0;
+}
+
 CA_EXPORT int crispasr_session_result_n_segments(crispasr_session_result* r) {
     return r ? (int)r->segments.size() : 0;
 }
@@ -5024,6 +7324,33 @@ CA_EXPORT float crispasr_session_result_word_p(crispasr_session_result* r, int i
         return -1.0f;
     auto& ws = r->segments[i_seg].words;
     return (i_word >= 0 && i_word < (int)ws.size()) ? ws[i_word].p : -1.0f;
+}
+
+// Whisper's per-segment no-speech probability (the <|nospeech|> token
+// posterior), in [0, 1]. Only the whisper backend populates it; other
+// backends and out-of-range indices return the -1.0 sentinel so callers can
+// tell "unavailable" apart from a genuine low probability.
+CA_EXPORT float crispasr_session_result_segment_no_speech_prob(crispasr_session_result* r, int i_seg) {
+    if (!r || i_seg < 0 || i_seg >= (int)r->segments.size())
+        return -1.0f;
+    return r->segments[i_seg].no_speech_prob;
+}
+
+// Per-frame CTC logits (opted in via crispasr_session_set_return_logits) for
+// backends that produce a dense CTC grid (Omni CTC, wav2vec2/hubert/data2vec,
+// canary-ctc). Shape is n_logit_vocab × n_logit_frames;
+// crispasr_session_result_logits returns a frame-major buffer
+// (logits[t * n_logit_vocab + v]) valid for that many floats, or NULL when none
+// were captured. Raw pre-softmax for Omni & wav2vec2; log-probabilities for
+// canary-ctc. Owned by `r`; freed with crispasr_session_result_free.
+CA_EXPORT int crispasr_session_result_n_logit_frames(crispasr_session_result* r) {
+    return r ? r->n_logit_frames : 0;
+}
+CA_EXPORT int crispasr_session_result_n_logit_vocab(crispasr_session_result* r) {
+    return r ? r->n_logit_vocab : 0;
+}
+CA_EXPORT const float* crispasr_session_result_logits(crispasr_session_result* r) {
+    return (r && !r->logits.empty()) ? r->logits.data() : nullptr;
 }
 
 // Top-N alternative candidates for the word's first content token.
@@ -5077,16 +7404,31 @@ CA_EXPORT void crispasr_session_result_free(crispasr_session_result* r) {
 // `*out_n_samples` is set on success. Caller frees with `crispasr_pcm_free`.
 // Returns nullptr if the active backend doesn't support TTS or synthesis fails.
 //
-// `crispasr_session_set_voice` accepts:
-//   - a *.gguf voice pack (vibevoice or qwen3-tts), or
-//   - a *.wav reference audio. For qwen3-tts the reference transcription is
-//     required and goes through `ref_text_or_null`. Pass nullptr for a
-//     voice pack.
+// `crispasr_session_set_voice` accepts the active backend's native voice
+// format: a baked voice pack/profile, a preset name, or a *.wav reference.
+// Backends that condition on a reference transcript consume it through
+// `ref_text_or_null`.
 //
-// `crispasr_session_set_codec_path` forwards the codec GGUF path to the
-// active backend (qwen3-tts, orpheus, zonos, dia, tada, outetts, indextts).
+// `crispasr_session_set_codec_path` forwards the companion GGUF path to the
+// active backend (including OmniVoice's tokenizer and Chatterbox's S3Gen).
 // For Zonos and Dia the codec is auto-discovered as a sibling on open;
 // call this only to override the discovered path.
+
+CA_EXPORT int crispasr_session_set_parakeet_att_context(crispasr_session* s, int left, int right) {
+    // Issue #257: parakeet/canary local-attention window (encoder frames) — NeMo
+    // change_attention_model("rel_pos_local_attn", [L,R]); bounds long-audio
+    // encoder VRAM. Pass INT_MIN,INT_MIN to clear (use the model default);
+    // negative values = full attention. Applied before each transcribe.
+    if (!s)
+        return -1;
+    s->parakeet_att_context_left = left;
+    s->parakeet_att_context_right = right;
+#ifdef CA_HAVE_PARAKEET
+    if (s->parakeet_ctx && left != INT_MIN && right != INT_MIN)
+        parakeet_set_att_context(s->parakeet_ctx, left, right);
+#endif
+    return 0;
+}
 
 CA_EXPORT int crispasr_session_set_codec_path(crispasr_session* s, const char* path) {
     if (!s || !path)
@@ -5094,6 +7436,18 @@ CA_EXPORT int crispasr_session_set_codec_path(crispasr_session* s, const char* p
 #ifdef CA_HAVE_QWEN3_TTS
     if (s->qwen3_tts_ctx)
         return qwen3_tts_set_codec_path(s->qwen3_tts_ctx, path);
+#endif
+#ifdef CA_HAVE_MOSS_TTS
+    if (s->moss_tts_ctx)
+        return moss_tts_set_codec_path(s->moss_tts_ctx, path) ? 0 : -1;
+#endif
+#ifdef CA_HAVE_MOSS_TTS_LOCAL
+    if (s->moss_tts_local_ctx)
+        return moss_tts_local_set_codec_path(s->moss_tts_local_ctx, path) ? 0 : -1;
+#endif
+#ifdef CA_HAVE_OMNIVOICE
+    if (s->omnivoice_ctx)
+        return omnivoice_set_tokenizer_path(s->omnivoice_ctx, path);
 #endif
 #ifdef CA_HAVE_ORPHEUS
     if (s->orpheus_ctx) {
@@ -5134,6 +7488,10 @@ CA_EXPORT int crispasr_session_set_codec_path(crispasr_session* s, const char* p
         return 0;
     }
 #endif
+#ifdef CA_HAVE_IRODORI_TTS
+    if (s->irodori_ctx)
+        return irodori_tts_set_codec_path(s->irodori_ctx, path);
+#endif
 #ifdef CA_HAVE_INDEXTTS
     // indextts routes its BigVGAN vocoder companion (indextts-bigvgan)
     // through the shared codec-path setter, same as qwen3-tts/orpheus.
@@ -5143,13 +7501,15 @@ CA_EXPORT int crispasr_session_set_codec_path(crispasr_session* s, const char* p
     return 0; // not applicable
 }
 
-#if defined(CA_HAVE_INDEXTTS) || defined(CA_HAVE_VOXCPM2)
+#if defined(CA_HAVE_INDEXTTS) || defined(CA_HAVE_VOXCPM2) || defined(CA_HAVE_POCKET) || defined(CA_HAVE_TADA)
 // crispasr_audio_load lives in crispasr_audio.cpp (same shared lib);
 // forward-declare it so set_voice can decode a reference WAV without
-// pulling in the audio header. Always returns 16 kHz mono f32 — which is
-// exactly what voxcpm2's cloning reference wants (indextts needs 24 kHz,
-// upsampled below).
+// pulling in the audio header.
+// crispasr_audio_load_at_rate resamples directly to the requested rate,
+// avoiding the quality-degrading 16k→Nk double-resample path.
 extern "C" int crispasr_audio_load(const char* path, float** out_pcm, int* out_samples, int* out_sample_rate);
+extern "C" int crispasr_audio_load_at_rate(const char* path, int target_rate, float** out_pcm, int* out_samples,
+                                           int* out_sample_rate);
 #endif
 
 #ifdef CA_HAVE_INDEXTTS
@@ -5185,6 +7545,13 @@ CA_EXPORT int crispasr_session_set_voice(crispasr_session* s, const char* path, 
         return (tail[0] == '.' && (tail[1] == 'w' || tail[1] == 'W') && (tail[2] == 'a' || tail[2] == 'A') &&
                 (tail[3] == 'v' || tail[3] == 'V'));
     };
+#ifdef CA_HAVE_VOXTRAL_TTS
+    if (s->voxtral_tts_ctx) {
+        // `path` is a preset voice name (e.g. "fr_female"); applied at synthesize.
+        s->voxtral_tts_voice = path;
+        return 0;
+    }
+#endif
 #ifdef CA_HAVE_COSYVOICE3
     if (s->cosyvoice3_ctx) {
         // `path` is either a baked-bank voice name (e.g. "fleurs-en") or a
@@ -5221,6 +7588,32 @@ CA_EXPORT int crispasr_session_set_voice(crispasr_session* s, const char* path, 
         return zonos_tts_set_voice(s->zonos_ctx, path);
     }
 #endif
+#ifdef CA_HAVE_DOTS_TTS
+    if (s->dots_tts_ctx) {
+        // Voice cloning from a reference WAV (the speaker encoder was loaded at
+        // open). Caller is responsible for consent (the CLI/server layer gates
+        // it). ref_text is unused — dots.tts conditions on the CAM++ x-vector.
+        if (!ends_with_wav(path))
+            return -2;
+        return dots_tts_set_voice_prompt(s->dots_tts_ctx, path);
+    }
+#endif
+#ifdef CA_HAVE_CHATTERBOX
+    if (s->chatterbox_ctx) {
+        // Accept either a baked conditioning GGUF or a reference WAV. The
+        // backend installs all available conditioning tensors atomically.
+        return chatterbox_set_voice_from_wav(s->chatterbox_ctx, path);
+    }
+#endif
+#ifdef CA_HAVE_OMNIVOICE
+    if (s->omnivoice_ctx) {
+        // OmniVoice cloning uses a WAV plus its transcript. An empty path
+        // clears an existing prompt, matching the native backend API.
+        if (path[0] && !ends_with_wav(path))
+            return -2;
+        return omnivoice_set_voice_prompt(s->omnivoice_ctx, path, ref_text_or_null);
+    }
+#endif
 #ifdef CA_HAVE_QWEN3_TTS
     if (s->qwen3_tts_ctx) {
         if (ends_with_wav(path)) {
@@ -5234,6 +7627,85 @@ CA_EXPORT int crispasr_session_set_voice(crispasr_session* s, const char* path, 
         int rc = qwen3_tts_load_voice_pack(s->qwen3_tts_ctx, path);
         if (rc == 0)
             s->qwen3_tts_voice_loaded = true;
+        return rc;
+    }
+#endif
+#ifdef CA_HAVE_MOSS_TTS
+    if (s->moss_tts_ctx) {
+        // moss-tts clones from a reference WAV (no ref-text needed).
+        return moss_tts_set_reference_wav_file(s->moss_tts_ctx, path) ? 0 : -1;
+    }
+#endif
+#ifdef CA_HAVE_TADA
+    if (s->tada_ctx) {
+        if (!ends_with_wav(path)) {
+            // Pre-baked voice reference GGUF.
+            return tada_load_prompt(s->tada_ctx, path);
+        }
+        // #201: on-the-fly clone from a reference WAV + its transcript — the
+        // in-memory equivalent of the CLI --make-ref pipeline (no temp GGUF).
+        // Opt-in, default OFF: without CRISPASR_TADA_WAV_CLONE=1 the historical
+        // -2 reject of a .wav is preserved, so default behaviour is unchanged
+        // until the decoded-output roundtrip has validated this path (#201).
+        if (const char* g = crispasr_env::get("CRISPASR_TADA_WAV_CLONE"); !g || atoi(g) == 0) {
+            fprintf(stderr, "crispasr: tada .wav voice cloning is opt-in — set CRISPASR_TADA_WAV_CLONE=1 "
+                            "to enable (experimental; validate the output before relying on it)\n");
+            return -2;
+        }
+        if (!ref_text_or_null || !ref_text_or_null[0]) {
+            fprintf(stderr, "crispasr: tada .wav voice cloning requires the reference transcript "
+                            "(pass it as ref_text)\n");
+            return -2;
+        }
+        auto file_exists = [](const std::string& p) -> bool {
+            if (p.empty())
+                return false;
+            FILE* f = fopen(p.c_str(), "rb");
+            if (f) {
+                fclose(f);
+                return true;
+            }
+            return false;
+        };
+        std::string model_dir;
+        {
+            auto sep = s->model_path.find_last_of("/\\");
+            model_dir = (sep == std::string::npos) ? std::string(".") : s->model_path.substr(0, sep);
+        }
+        const std::string cache = crispasr_cache::dir();
+        auto resolve = [&](const std::string& configured, const std::string& fname) -> std::string {
+            if (file_exists(configured))
+                return configured;
+            std::string local = model_dir + "/" + fname;
+            if (file_exists(local))
+                return local;
+            std::string cached = cache + "/" + fname;
+            if (file_exists(cached))
+                return cached;
+            return std::string();
+        };
+        const std::string enc = resolve(s->tada_makeref_encoder, "tada-encoder-f16.gguf");
+        const std::string lang = s->source_language.empty() ? std::string("en") : s->source_language;
+        std::string ali = resolve(s->tada_makeref_aligner, "tada-aligner-" + lang + ".gguf");
+        if (ali.empty() && lang != "en")
+            ali = resolve(s->tada_makeref_aligner, "tada-aligner-en.gguf");
+        if (enc.empty() || ali.empty()) {
+            fprintf(stderr, "crispasr: tada .wav cloning needs the encoder + aligner GGUFs — place "
+                            "tada-encoder-f16.gguf + tada-aligner-<lang>.gguf next to the model or in the cache "
+                            "dir, or set them via crispasr_session_tada_set_makeref_models()\n");
+            return -3;
+        }
+        // Decode the reference WAV straight to 24 kHz mono (the encoder's rate).
+        float* pcm = nullptr;
+        int n = 0, sr = 0;
+        if (crispasr_audio_load_at_rate(path, 24000, &pcm, &n, &sr) != 0 || !pcm || n <= 0) {
+            fprintf(stderr, "crispasr: tada .wav cloning: failed to decode '%s'\n", path);
+            if (pcm)
+                free(pcm);
+            return -1;
+        }
+        int rc = tada_make_ref_from_pcm(s->tada_ctx, enc.c_str(), ali.c_str(), pcm, n, ref_text_or_null);
+        free(pcm);
         return rc;
     }
 #endif
@@ -5266,60 +7738,49 @@ CA_EXPORT int crispasr_session_set_voice(crispasr_session* s, const char* path, 
 #endif
 #ifdef CA_HAVE_INDEXTTS
     if (s->indextts_ctx) {
-        // indextts clones from a reference clip. Decode the WAV (16 kHz
-        // mono via the shared loader), upsample to the 24 kHz the encoder
-        // expects, and stash it for the next synthesize. ref_text is
-        // unused — indextts conditions on audio, not a transcript.
+        // indextts clones from a reference clip. Decode directly to 24 kHz
+        // (the encoder's native rate) — avoids the lossy 16k→24k resample.
+        // ref_text is unused — indextts conditions on audio, not a transcript.
         if (!ends_with_wav(path))
             return -2;
         float* pcm = nullptr;
         int n = 0, sr = 0;
-        if (crispasr_audio_load(path, &pcm, &n, &sr) != 0 || !pcm || n <= 0) {
+        if (crispasr_audio_load_at_rate(path, 24000, &pcm, &n, &sr) != 0 || !pcm || n <= 0) {
             if (pcm)
                 free(pcm);
             return -1;
         }
-        s->indextts_ref_pcm = indextts_resample_16k_to_24k(pcm, n);
+        s->indextts_ref_pcm.assign(pcm, pcm + n);
         free(pcm);
         return s->indextts_ref_pcm.empty() ? -1 : 0;
     }
 #endif
 #ifdef CA_HAVE_F5TTS
     if (s->f5tts_ctx) {
-        // F5-TTS clones from a reference WAV + its transcript. Load the
-        // audio (16 kHz from shared loader), resample to 24 kHz, and pass
-        // to the library which computes the mel spectrogram internally.
+        // F5-TTS clones from a reference WAV + its transcript. Load
+        // directly at 24 kHz — avoids the lossy 16k→24k resample path.
         if (!ends_with_wav(path))
             return -2;
         float* pcm = nullptr;
         int n = 0, sr = 0;
-        if (crispasr_audio_load(path, &pcm, &n, &sr) != 0 || !pcm || n <= 0) {
+        if (crispasr_audio_load_at_rate(path, 24000, &pcm, &n, &sr) != 0 || !pcm || n <= 0) {
             if (pcm)
                 free(pcm);
             return -1;
         }
-        // Resample 16 kHz → 24 kHz (linear interp)
-        int n24 = (int)((float)n * 24000.0f / 16000.0f);
-        std::vector<float> pcm24(n24);
-        for (int i = 0; i < n24; i++) {
-            float pos = (float)i * 16000.0f / 24000.0f;
-            int idx = (int)pos;
-            float frac = pos - (float)idx;
-            pcm24[i] = (idx + 1 < n) ? pcm[idx] * (1 - frac) + pcm[idx + 1] * frac : pcm[std::min(idx, n - 1)];
-        }
-        free(pcm);
         // RMS normalize to 0.1
         float rms = 0;
-        for (float v : pcm24)
-            rms += v * v;
-        rms = sqrtf(rms / (float)pcm24.size());
+        for (int i = 0; i < n; i++)
+            rms += pcm[i] * pcm[i];
+        rms = sqrtf(rms / (float)n);
         if (rms < 0.1f && rms > 1e-10f) {
             float s2 = 0.1f / rms;
-            for (float& v : pcm24)
-                v *= s2;
+            for (int i = 0; i < n; i++)
+                pcm[i] *= s2;
         }
         const char* rt = ref_text_or_null ? ref_text_or_null : "";
-        int rc = f5_tts_set_reference(s->f5tts_ctx, pcm24.data(), n24, rt);
+        int rc = f5_tts_set_reference(s->f5tts_ctx, pcm, n, rt);
+        free(pcm);
         return (rc == 0) ? 0 : -1;
     }
 #endif
@@ -5344,17 +7805,17 @@ CA_EXPORT int crispasr_session_set_voice(crispasr_session* s, const char* path, 
 #endif
 #ifdef CA_HAVE_POCKET
     if (s->pocket_tts_ctx) {
+        // Pocket TTS (Mimi encoder) expects 24 kHz. Load directly at that
+        // rate — avoids the lossy 16k→24k double-resample.
         if (!ends_with_wav(path))
             return -2;
         float* pcm = nullptr;
         int n = 0, sr = 0;
-        if (crispasr_audio_load(path, &pcm, &n, &sr) != 0 || !pcm || n <= 0) {
+        if (crispasr_audio_load_at_rate(path, 24000, &pcm, &n, &sr) != 0 || !pcm || n <= 0) {
             if (pcm)
                 free(pcm);
             return -1;
         }
-        // Pocket-tts needs 24 kHz mono — crispasr_audio_load already
-        // resamples to 24 kHz, so we can pass directly.
         int rc = pocket_tts_set_voice(s->pocket_tts_ctx, pcm, n);
         free(pcm);
         return rc;
@@ -5367,6 +7828,28 @@ CA_EXPORT int crispasr_session_set_voice(crispasr_session* s, const char* path, 
     }
 #endif
     return -3;
+}
+
+// #201: configure the TADA encoder + aligner GGUF paths used for on-the-fly
+// voice cloning (crispasr_session_set_voice with a `.wav` + ref_text). Either
+// path may be NULL/empty to clear it and fall back to auto-resolution (next to
+// the model, then the cache dir). The aligner is language-specific
+// (tada-aligner-<lang>.gguf) — match it to the reference audio's language.
+// Returns 0 on success, -1 if the session is invalid or has no TADA backend.
+CA_EXPORT int crispasr_session_tada_set_makeref_models(crispasr_session* s, const char* encoder_gguf,
+                                                       const char* aligner_gguf) {
+    if (!s)
+        return -1;
+#ifdef CA_HAVE_TADA
+    if (s->tada_ctx) {
+        s->tada_makeref_encoder = encoder_gguf ? encoder_gguf : "";
+        s->tada_makeref_aligner = aligner_gguf ? aligner_gguf : "";
+        return 0;
+    }
+#endif
+    (void)encoder_gguf;
+    (void)aligner_gguf;
+    return -1;
 }
 
 // Select a fixed/preset speaker by NAME for backends that bake speakers
@@ -5538,11 +8021,32 @@ CA_EXPORT int crispasr_session_is_voice_design(crispasr_session* s) {
 
 // Raw synthesis — no watermark. Used internally; the public API wraps this
 // and applies the watermark automatically.
+#ifdef CA_HAVE_COSYVOICE3
+static bool crispasr_session_ensure_cosyvoice3_cloning_models(crispasr_session* s) {
+    std::lock_guard<std::mutex> lock(s->cosyvoice3_cloning_mutex);
+    if (s->cosyvoice3_cloning_models_loaded)
+        return true;
+    if (s->cosyvoice3_camp_path.empty() || s->cosyvoice3_s3tok_path.empty()) {
+        s->last_synth_error =
+            "cosyvoice3 WAV cloning requires cosyvoice3-campplus-f16.gguf and cosyvoice3-s3tok-f16.gguf";
+        return false;
+    }
+    if (cosyvoice3_tts_init_campplus_from_file(s->cosyvoice3_ctx, s->cosyvoice3_camp_path.c_str()) != 0 ||
+        cosyvoice3_tts_init_s3tok_from_file(s->cosyvoice3_ctx, s->cosyvoice3_s3tok_path.c_str()) != 0) {
+        s->last_synth_error = "failed to load CosyVoice3 WAV-cloning companions";
+        return false;
+    }
+    s->cosyvoice3_cloning_models_loaded = true;
+    return true;
+}
+#endif
+
 static float* crispasr_session_synthesize_raw_impl(crispasr_session* s, const char* text, int* out_n_samples) {
     if (out_n_samples)
         *out_n_samples = 0;
     if (!s || !text)
         return nullptr;
+    s->last_synth_error.clear();
 #ifdef CA_HAVE_COSYVOICE3
     if (s->cosyvoice3_ctx) {
         // Voice is a bank name (default zero_shot) unless set_voice supplied a
@@ -5551,6 +8055,8 @@ static float* crispasr_session_synthesize_raw_impl(crispasr_session* s, const ch
         const std::string& v = s->cosyvoice3_voice;
         const bool is_wav =
             v.size() >= 4 && (v.compare(v.size() - 4, 4, ".wav") == 0 || v.compare(v.size() - 4, 4, ".WAV") == 0);
+        if (is_wav && !crispasr_session_ensure_cosyvoice3_cloning_models(s))
+            return nullptr;
         int n = 0;
         float* pcm = is_wav ? cosyvoice3_tts_synth_from_wav(s->cosyvoice3_ctx, text, v.c_str(),
                                                             s->cosyvoice3_ref_text.c_str(), &n)
@@ -5577,27 +8083,133 @@ static float* crispasr_session_synthesize_raw_impl(crispasr_session* s, const ch
 #endif
 #ifdef CA_HAVE_ZONOS
     if (s->zonos_ctx) {
+        // Output language: target_language (intuitive for TTS) → source_language
+        // (mirror of the CLI -l flag). zonos takes an eSpeak code directly.
+        const std::string tts_lang = !s->target_language.empty() ? s->target_language : s->source_language;
+        if (!tts_lang.empty() && tts_lang != "auto")
+            zonos_tts_set_language(s->zonos_ctx, tts_lang.c_str());
         return zonos_tts_synthesize(s->zonos_ctx, text, out_n_samples);
     }
 #endif
 #ifdef CA_HAVE_QWEN3_TTS
     if (s->qwen3_tts_ctx) {
-        return qwen3_tts_synthesize(s->qwen3_tts_ctx, text, out_n_samples);
+        // Pre-flight: surface a clear error when the Base model is used
+        // without a voice reference — qwen3_tts_synthesize_codes prints
+        // to stderr (invisible on Android) and returns nullptr, which the
+        // Dart side can only report as a generic "no audio produced".
+        if (!s->qwen3_tts_voice_loaded) {
+            const bool is_cv = qwen3_tts_is_custom_voice(s->qwen3_tts_ctx);
+            const bool is_vd = qwen3_tts_is_voice_design(s->qwen3_tts_ctx);
+            if (!is_cv && !is_vd) {
+                s->last_synth_error = "qwen3-tts Base requires a voice — "
+                                      "select a voice pack or reference WAV in the voice picker";
+                return nullptr;
+            }
+        }
+        // Output language: target_language → source_language. qwen3-tts keys
+        // its codec_language_names table by English name ("German", ...).
+        {
+            const std::string tts_lang = !s->target_language.empty() ? s->target_language : s->source_language;
+            if (!tts_lang.empty() && tts_lang != "auto")
+                qwen3_tts_set_language_by_name(s->qwen3_tts_ctx, ca_iso_to_english_lang(tts_lang).c_str());
+        }
+        float* pcm = qwen3_tts_synthesize(s->qwen3_tts_ctx, text, out_n_samples);
+        if (!pcm && s->last_synth_error.empty()) {
+            s->last_synth_error = "qwen3-tts synthesis failed — "
+                                  "try q8_0 quantisation or a different model variant";
+        }
+        return pcm;
+    }
+#endif
+#ifdef CA_HAVE_MOSS_TTS
+    if (s->moss_tts_ctx) {
+        moss_tts_synth_params p = moss_tts_synth_default_params();
+        const std::string tts_lang = !s->target_language.empty() ? s->target_language : s->source_language;
+        std::string lang_en;
+        if (!tts_lang.empty() && tts_lang != "auto") {
+            lang_en = ca_iso_to_english_lang(tts_lang);
+            p.language = lang_en.c_str();
+        }
+        float* pcm = moss_tts_synthesize(s->moss_tts_ctx, text, &p, out_n_samples);
+        if (!pcm && s->last_synth_error.empty()) {
+            s->last_synth_error = "moss-tts synthesis failed — ensure the companion codec GGUF is loaded "
+                                  "(crispasr_session_set_codec_path)";
+        }
+        return pcm;
+    }
+#endif
+#ifdef CA_HAVE_MIOTTS
+    if (s->miotts_ctx) {
+        int n = 0;
+        float* pcm = miotts_synthesize(s->miotts_ctx, text, &n);
+        if (out_n_samples)
+            *out_n_samples = n;
+        return pcm;
+    }
+#endif
+#ifdef CA_HAVE_MOSS_TTS_LOCAL
+    if (s->moss_tts_local_ctx) {
+        moss_tts_local_synth_params p = moss_tts_local_synth_default_params();
+        const std::string tts_lang = !s->target_language.empty() ? s->target_language : s->source_language;
+        std::string lang_en;
+        if (!tts_lang.empty() && tts_lang != "auto") {
+            lang_en = ca_iso_to_english_lang(tts_lang);
+            p.language = lang_en.c_str();
+        }
+        float* pcm = moss_tts_local_synthesize(s->moss_tts_local_ctx, text, &p, out_n_samples);
+        if (!pcm && s->last_synth_error.empty()) {
+            s->last_synth_error = "moss-tts-local synthesis failed — ensure the companion codec GGUF is loaded "
+                                  "(crispasr_session_set_codec_path)";
+        }
+        return pcm;
+    }
+#endif
+#ifdef CA_HAVE_OMNIVOICE
+    if (s->omnivoice_ctx) {
+        float* pcm = omnivoice_synthesize(s->omnivoice_ctx, text, out_n_samples);
+        if (!pcm && s->last_synth_error.empty()) {
+            s->last_synth_error = "omnivoice synthesis failed — "
+                                  "audio tokenizer may not be loaded";
+        }
+        return pcm;
     }
 #endif
 #ifdef CA_HAVE_ORPHEUS
     if (s->orpheus_ctx) {
-        if (!s->orpheus_codec_loaded)
-            return nullptr; // SNAC must be loaded via set_codec_path first
+        if (!s->orpheus_codec_loaded) {
+            s->last_synth_error = "orpheus requires the SNAC codec — "
+                                  "download the codec companion model";
+            return nullptr;
+        }
         return orpheus_synthesize(s->orpheus_ctx, text, out_n_samples);
     }
 #endif
 #ifdef CA_HAVE_KOKORO
     if (s->kokoro_ctx) {
-        // Kokoro malloc's its PCM via the same allocator as
-        // crispasr_pcm_free. Output is 24 kHz mono float — same
-        // convention as vibevoice / qwen3-tts / orpheus.
-        return kokoro_synthesize(s->kokoro_ctx, text, out_n_samples);
+        // Output language: target_language → source_language. kokoro takes an
+        // eSpeak language code directly (e.g. "de", "en-us").
+        const std::string tts_lang = !s->target_language.empty() ? s->target_language : s->source_language;
+        if (!tts_lang.empty() && tts_lang != "auto")
+            kokoro_set_language(s->kokoro_ctx, tts_lang.c_str());
+        float* pcm = kokoro_synthesize(s->kokoro_ctx, text, out_n_samples);
+        if (!pcm && s->last_synth_error.empty()) {
+            s->last_synth_error = "kokoro synthesis failed — "
+                                  "this is usually because the built-in phonemizer could not "
+                                  "process the text (check that a voice pack is loaded)";
+        }
+        return pcm;
+    }
+#endif
+#ifdef CA_HAVE_VOXTRAL_TTS
+    if (s->voxtral_tts_ctx) {
+        const char* voice = s->voxtral_tts_voice.empty() ? nullptr : s->voxtral_tts_voice.c_str();
+        float* pcm = voxtral_tts_synthesize(s->voxtral_tts_ctx, text, voice, out_n_samples);
+        if (!pcm && s->last_synth_error.empty()) {
+            s->last_synth_error = "voxtral-tts synthesis failed — the GGUF may be missing "
+                                  "codec.semantic_cb.weight (re-download or set "
+                                  "CRISPASR_VOXTRAL_TTS_SEMANTIC_CB)";
+        }
+        return pcm;
     }
 #endif
 #ifdef CA_HAVE_CHATTERBOX
@@ -5605,9 +8217,31 @@ static float* crispasr_session_synthesize_raw_impl(crispasr_session* s, const ch
         return chatterbox_synthesize(s->chatterbox_ctx, text, out_n_samples);
     }
 #endif
+#ifdef CA_HAVE_BANANAMIND_TTS
+    if (s->bananamind_tts_ctx) {
+        float* pcm = nullptr;
+        int sr = 0;
+        int n = bananamind_tts_synthesize(s->bananamind_tts_ctx, text, &pcm, &sr);
+        if (n > 0 && pcm) {
+            *out_n_samples = n;
+            return pcm;
+        }
+        return nullptr;
+    }
+#endif
 #ifdef CA_HAVE_TADA
     if (s->tada_ctx) {
         return tada_synthesize(s->tada_ctx, text, out_n_samples);
+    }
+#endif
+#ifdef CA_HAVE_LFM2_AUDIO
+    if (s->lfm2_audio_ctx) {
+        return lfm2_audio_synthesize(s->lfm2_audio_ctx, text, nullptr, out_n_samples);
+    }
+#endif
+#ifdef CA_HAVE_MINI_OMNI2
+    if (s->mini_omni2_ctx) {
+        return mini_omni2_synthesize(s->mini_omni2_ctx, text, out_n_samples);
     }
 #endif
 #ifdef CA_HAVE_CSM
@@ -5622,6 +8256,11 @@ static float* crispasr_session_synthesize_raw_impl(crispasr_session* s, const ch
         // Dia emits 44.1 kHz mono float (DAC codec); PCM is malloc'd and freed
         // via crispasr_pcm_free, same as the other TTS backends.
         return dia_tts_synthesize(s->dia_tts_ctx, text, out_n_samples);
+    }
+#endif
+#ifdef CA_HAVE_DOTS_TTS
+    if (s->dots_tts_ctx) {
+        return dots_tts_synthesize(s->dots_tts_ctx, text, out_n_samples);
     }
 #endif
 #ifdef CA_HAVE_POCKET
@@ -5714,6 +8353,18 @@ static float* crispasr_session_synthesize_raw_impl(crispasr_session* s, const ch
         float* pcm = nullptr;
         int sr = 0;
         int n = f5_tts_synthesize(s->f5tts_ctx, text, &pcm, &sr);
+        if (n <= 0 || !pcm)
+            return nullptr;
+        *out_n_samples = n;
+        return pcm;
+    }
+#endif
+#ifdef CA_HAVE_IRODORI_TTS
+    if (s->irodori_ctx) {
+        // Irodori-TTS outputs 48 kHz mono. DAC-VAE decode pending (outputs silence placeholder).
+        float* pcm = nullptr;
+        int sr = 0;
+        int n = irodori_tts_synthesize(s->irodori_ctx, text, &pcm, &sr);
         if (n <= 0 || !pcm)
             return nullptr;
         *out_n_samples = n;
@@ -5837,19 +8488,226 @@ CA_EXPORT float* crispasr_session_synthesize_raw(crispasr_session* s, const char
     return crispasr_session_synthesize_raw_impl(s, text, out_n_samples);
 }
 
-// Synthesize + auto-watermark. The default API — all TTS output is
-// watermarked for EU AI Act provenance compliance. Use synthesize_raw()
-// only when you need to post-process PCM before watermarking.
+// Synthesize + auto-watermark. The default API — all TTS output is watermarked
+// for EU AI Act Art. 50 provenance compliance, on EVERY C-ABI consumer (wasm /
+// Python / Dart / Go / server), not just the CLI. Uses the robust, band-limited
+// watermark (alpha<=0 → the #260 default, ~0.05) so the mark is reliably
+// DETECTABLE yet inaudible — the faint 0.005 it used before was too weak to
+// detect on real speech. Use synthesize_raw() to post-process PCM before marking.
 CA_EXPORT float* crispasr_session_synthesize(crispasr_session* s, const char* text, int* out_n_samples) {
     float* pcm = crispasr_session_synthesize_raw_impl(s, text, out_n_samples);
     if (pcm && out_n_samples && *out_n_samples > 0) {
-        crispasr_watermark_embed(pcm, *out_n_samples, 0.005f);
+        crispasr_watermark_embed(pcm, *out_n_samples, -1.0f);
     }
     return pcm;
 }
 
 CA_EXPORT void crispasr_pcm_free(float* pcm) {
     free(pcm);
+}
+
+// Streaming synthesis: split `text` into sentence chunks and fire `cb` with the
+// watermarked PCM of each chunk as it is produced — progressive delivery for
+// embedders, without buffering the whole clip. Sample rate is the same as
+// crispasr_session_synthesize (backend-native; caller-known). The PCM passed to
+// `cb` is owned by this call (freed after `cb` returns); copy it if needed.
+// `is_final` is 1 on the last chunk. Returns 0 on success, -1 on bad args.
+CA_EXPORT int crispasr_session_synthesize_streaming(crispasr_session* s, const char* text, crispasr_pcm_stream_cb cb,
+                                                    void* user_data) {
+    if (!s || !text || !cb)
+        return -1;
+
+    // Sentence split on ASCII (. ! ? newline) and CJK (。！？) terminators; the
+    // terminator stays with its sentence; whitespace-only pieces are dropped.
+    const std::string t = text;
+    std::vector<std::string> chunks;
+    std::string cur;
+    auto flush = [&]() {
+        size_t a = cur.find_first_not_of(" \t\r\n");
+        size_t b = cur.find_last_not_of(" \t\r\n");
+        if (a != std::string::npos)
+            chunks.push_back(cur.substr(a, b - a + 1));
+        cur.clear();
+    };
+    for (size_t i = 0; i < t.size();) {
+        unsigned char c = (unsigned char)t[i];
+        size_t adv = 1;
+        bool term = (c == '.' || c == '!' || c == '?' || c == '\n');
+        if (!term && i + 2 < t.size()) {
+            unsigned char b1 = (unsigned char)t[i + 1], b2 = (unsigned char)t[i + 2];
+            if ((c == 0xE3 && b1 == 0x80 && b2 == 0x82) ||                 // 。
+                (c == 0xEF && b1 == 0xBC && (b2 == 0x81 || b2 == 0x9F))) { // ！ ？
+                term = true;
+                adv = 3;
+            }
+        }
+        cur.append(t, i, adv);
+        i += adv;
+        if (term)
+            flush();
+    }
+    flush();
+    if (chunks.empty())
+        return 0;
+
+    for (size_t i = 0; i < chunks.size(); i++) {
+        int n = 0;
+        float* pcm = crispasr_session_synthesize(s, chunks[i].c_str(), &n);
+        const int is_final = (i + 1 == chunks.size()) ? 1 : 0;
+        cb(pcm && n > 0 ? pcm : nullptr, pcm ? n : 0, is_final, user_data);
+        free(pcm);
+    }
+    return 0;
+}
+
+// =========================================================================
+// Speech-to-Speech — audio in → audio out via a single model pass.
+// =========================================================================
+
+CA_EXPORT float* crispasr_session_speech_to_speech(crispasr_session* s, const float* in_samples, int n_in_samples,
+                                                   char** out_text, int* out_n_samples) {
+    if (!s || !in_samples || n_in_samples <= 0)
+        return nullptr;
+    if (out_n_samples)
+        *out_n_samples = 0;
+    if (out_text)
+        *out_text = nullptr;
+
+#ifdef CA_HAVE_LFM2_AUDIO
+    if (s->lfm2_audio_ctx) {
+        char* text = nullptr;
+        int n = 0;
+        float* pcm =
+            lfm2_audio_speech_to_speech(s->lfm2_audio_ctx, in_samples, n_in_samples,
+                                        s->source_language.empty() ? nullptr : s->source_language.c_str(), &text, &n);
+        if (out_n_samples)
+            *out_n_samples = n;
+        if (out_text)
+            *out_text = text;
+        else
+            free(text);
+        return pcm;
+    }
+#endif
+#ifdef CA_HAVE_MINI_OMNI2
+    if (s->mini_omni2_ctx) {
+        char* text = nullptr;
+        int n = 0;
+        float* pcm = mini_omni2_speech_to_speech(s->mini_omni2_ctx, in_samples, n_in_samples, &text, &n);
+        if (out_n_samples)
+            *out_n_samples = n;
+        if (out_text)
+            *out_text = text;
+        else
+            free(text);
+        return pcm;
+    }
+#endif
+#ifdef CA_HAVE_VOXCPM2_VAE
+    if (s->voxcpm2_vae_ctx) {
+        const float* vae_input = in_samples;
+        int vae_input_count = n_in_samples;
+        std::vector<float> resampled;
+        if (s->pcm_sample_rate != 16000) {
+            resampled = core_audio::resample_polyphase(in_samples, n_in_samples, s->pcm_sample_rate, 16000);
+            vae_input = resampled.data();
+            vae_input_count = (int)resampled.size();
+        }
+
+        int n = 0;
+        float* pcm = voxcpm2_vae_upscale(s->voxcpm2_vae_ctx, vae_input, vae_input_count, &n);
+        if (!pcm || n <= 0) {
+            s->last_synth_error = "VoxCPM2 AudioVAE upscaler produced no audio";
+            voxcpm2_vae_pcm_free(pcm);
+            return nullptr;
+        }
+        if (out_n_samples)
+            *out_n_samples = n;
+        return pcm;
+    }
+#endif
+#ifdef CA_HAVE_SIDON
+    if (s->sidon_ctx) {
+        const float* sidon_input = in_samples;
+        int sidon_input_count = n_in_samples;
+        std::vector<float> resampled;
+        if (s->pcm_sample_rate != 16000) {
+            resampled = core_audio::resample_polyphase(in_samples, n_in_samples, s->pcm_sample_rate, 16000);
+            sidon_input = resampled.data();
+            sidon_input_count = (int)resampled.size();
+        }
+
+        std::vector<float> restored = sidon_restore(s->sidon_ctx, sidon_input, sidon_input_count);
+        if (restored.empty()) {
+            s->last_synth_error = "Sidon restoration produced no audio";
+            return nullptr;
+        }
+        float* pcm = (float*)malloc(restored.size() * sizeof(float));
+        if (!pcm) {
+            s->last_synth_error = "failed to allocate Sidon output";
+            return nullptr;
+        }
+        memcpy(pcm, restored.data(), restored.size() * sizeof(float));
+        if (out_n_samples)
+            *out_n_samples = (int)restored.size();
+        return pcm;
+    }
+#endif
+
+    s->last_synth_error = "backend '" + s->backend + "' does not support speech-to-speech";
+    return nullptr;
+}
+
+// =========================================================================
+// Hotwords / contextual biasing — session-level setter.
+// =========================================================================
+
+CA_EXPORT int crispasr_session_set_hotwords(crispasr_session* s, const char* hotwords, float boost) {
+    if (!s)
+        return -1;
+    s->hotwords = hotwords ? hotwords : "";
+    s->hotwords_boost = boost > 0.0f ? boost : 1.5f;
+
+    // For parakeet CTC/TDT, apply immediately to the trie.
+#ifdef CA_HAVE_PARAKEET
+    if (s->parakeet_ctx) {
+        if (s->hotwords.empty()) {
+            parakeet_set_hotwords(s->parakeet_ctx, nullptr, 0, 0.0f);
+        } else {
+            // Parse comma-separated hotwords into an array of C strings.
+            std::vector<std::string> hw_strings;
+            std::istringstream iss(s->hotwords);
+            std::string token;
+            while (std::getline(iss, token, ',')) {
+                // Trim whitespace.
+                size_t start = token.find_first_not_of(" \t");
+                size_t end = token.find_last_not_of(" \t");
+                if (start != std::string::npos)
+                    hw_strings.push_back(token.substr(start, end - start + 1));
+            }
+            std::vector<const char*> ptrs;
+            ptrs.reserve(hw_strings.size());
+            for (auto& w : hw_strings)
+                ptrs.push_back(w.c_str());
+            parakeet_set_hotwords(s->parakeet_ctx, ptrs.data(), (int)ptrs.size(), s->hotwords_boost);
+        }
+    }
+#endif
+
+    // For LLM backends, hotwords are injected into the ask prompt at
+    // transcribe time. The stored string is consumed in the transcribe
+    // dispatch path via s->hotwords. No immediate action needed.
+    return 0;
+}
+
+// Returns a human-readable error description when the last synthesize call
+// returned nullptr. Empty string when the last call succeeded or no error
+// detail is available. The returned pointer is owned by the session — valid
+// until the next synthesize call or session close.
+CA_EXPORT const char* crispasr_session_last_synth_error(crispasr_session* s) {
+    if (!s)
+        return "";
+    return s->last_synth_error.c_str();
 }
 
 // =========================================================================
@@ -5977,22 +8835,667 @@ CA_EXPORT crispasr_stream* crispasr_session_stream_open(crispasr_session* s, int
     return nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// Source separation session API
+// ---------------------------------------------------------------------------
+
+CA_EXPORT int crispasr_session_separate(crispasr_session* s, const float* pcm_stereo, int n_samples) {
+    if (!s || !pcm_stereo || n_samples <= 0)
+        return -1;
+#ifdef CA_HAVE_HTDEMUCS
+    if (s->htdemucs_ctx) {
+        if (s->htdemucs_last_result) {
+            htdemucs_result_free(s->htdemucs_last_result);
+            s->htdemucs_last_result = nullptr;
+        }
+        s->htdemucs_last_result = htdemucs_separate(s->htdemucs_ctx, pcm_stereo, n_samples);
+        return s->htdemucs_last_result ? s->htdemucs_last_result->n_sources : -1;
+    }
+#endif
+#ifdef CA_HAVE_MEL_BAND_ROFORMER
+    if (s->mbr_ctx) {
+        if (s->mbr_last_result) {
+            mel_band_roformer_result_free(s->mbr_last_result);
+            s->mbr_last_result = nullptr;
+        }
+        s->mbr_last_result = mel_band_roformer_separate(s->mbr_ctx, pcm_stereo, n_samples, /*in_channels=*/2);
+        return s->mbr_last_result ? s->mbr_last_result->n_sources : -1;
+    }
+#endif
+    return -1;
+}
+
+CA_EXPORT int crispasr_session_separate_n_stems(crispasr_session* s) {
+    if (!s)
+        return 0;
+#ifdef CA_HAVE_HTDEMUCS
+    if (s->htdemucs_last_result)
+        return s->htdemucs_last_result->n_sources;
+#endif
+#ifdef CA_HAVE_MEL_BAND_ROFORMER
+    if (s->mbr_last_result)
+        return s->mbr_last_result->n_sources;
+#endif
+    return 0;
+}
+
+CA_EXPORT const char* crispasr_session_separate_stem_name(crispasr_session* s, int stem_idx) {
+    if (!s)
+        return nullptr;
+#ifdef CA_HAVE_HTDEMUCS
+    if (s->htdemucs_last_result && stem_idx >= 0 && stem_idx < s->htdemucs_last_result->n_sources)
+        return s->htdemucs_last_result->source_names[stem_idx];
+#endif
+#ifdef CA_HAVE_MEL_BAND_ROFORMER
+    if (s->mbr_last_result && stem_idx >= 0 && stem_idx < s->mbr_last_result->n_sources)
+        return s->mbr_last_result->source_names[stem_idx];
+#endif
+    return nullptr;
+}
+
+CA_EXPORT const float* crispasr_session_separate_stem(crispasr_session* s, int stem_idx, int* out_n_samples) {
+    if (!s)
+        return nullptr;
+#ifdef CA_HAVE_HTDEMUCS
+    if (s->htdemucs_last_result && stem_idx >= 0 && stem_idx < s->htdemucs_last_result->n_sources) {
+        if (out_n_samples)
+            *out_n_samples = s->htdemucs_last_result->n_samples;
+        return s->htdemucs_last_result->sources[stem_idx];
+    }
+#endif
+#ifdef CA_HAVE_MEL_BAND_ROFORMER
+    if (s->mbr_last_result && stem_idx >= 0 && stem_idx < s->mbr_last_result->n_sources) {
+        if (out_n_samples)
+            *out_n_samples = s->mbr_last_result->n_samples;
+        return s->mbr_last_result->sources[stem_idx];
+    }
+#endif
+    if (out_n_samples)
+        *out_n_samples = 0;
+    return nullptr;
+}
+
+CA_EXPORT int crispasr_session_separate_sample_rate(crispasr_session* s) {
+    if (!s)
+        return 0;
+#ifdef CA_HAVE_HTDEMUCS
+    if (s->htdemucs_ctx)
+        return htdemucs_sample_rate(s->htdemucs_ctx);
+#endif
+#ifdef CA_HAVE_MEL_BAND_ROFORMER
+    if (s->mbr_ctx)
+        return mel_band_roformer_sample_rate(s->mbr_ctx);
+#endif
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Pitch (F0) session API
+//
+// Mirrors the separation block above: pitch frames are not crispasr_segments,
+// so they get their own entry points rather than riding on transcribe().
+// ---------------------------------------------------------------------------
+
+CA_EXPORT int crispasr_session_pitch(crispasr_session* s, const float* pcm_16k, int n_samples, float hop_ms) {
+    if (!s || !pcm_16k || n_samples <= 0)
+        return -1;
+#ifdef CA_HAVE_CREPE
+    if (s->crepe_ctx) {
+        const int n_max = crepe_n_frames(s->crepe_ctx, n_samples, hop_ms);
+        if (n_max <= 0)
+            return -1;
+        s->crepe_last_frames.assign((size_t)n_max, crepe_frame{});
+        const int n = crepe_compute_f0(s->crepe_ctx, pcm_16k, n_samples, hop_ms, s->crepe_last_frames.data(), n_max);
+        if (n <= 0) {
+            s->crepe_last_frames.clear();
+            return -1;
+        }
+        s->crepe_last_frames.resize((size_t)n);
+        return n;
+    }
+#endif
+    (void)hop_ms;
+    return -1;
+}
+
+CA_EXPORT int crispasr_session_pitch_n_frames(crispasr_session* s) {
+    if (!s)
+        return 0;
+#ifdef CA_HAVE_CREPE
+    return (int)s->crepe_last_frames.size();
+#else
+    return 0;
+#endif
+}
+
+CA_EXPORT int crispasr_session_pitch_frame(crispasr_session* s, int idx, float* out_time_ms, float* out_f0_hz,
+                                           float* out_voiced_prob) {
+    if (!s || idx < 0)
+        return -1;
+#ifdef CA_HAVE_CREPE
+    if (idx < (int)s->crepe_last_frames.size()) {
+        const crepe_frame& f = s->crepe_last_frames[(size_t)idx];
+        if (out_time_ms)
+            *out_time_ms = f.time_ms;
+        if (out_f0_hz)
+            *out_f0_hz = f.f0_hz;
+        if (out_voiced_prob)
+            *out_voiced_prob = f.voiced_prob;
+        return 0;
+    }
+#else
+    (void)out_time_ms;
+    (void)out_f0_hz;
+    (void)out_voiced_prob;
+#endif
+    return -1;
+}
+
+CA_EXPORT const float* crispasr_session_pitch_frames(crispasr_session* s, int* out_n_frames) {
+    if (out_n_frames)
+        *out_n_frames = 0;
+    if (!s)
+        return nullptr;
+#ifdef CA_HAVE_CREPE
+    if (!s->crepe_last_frames.empty()) {
+        if (out_n_frames)
+            *out_n_frames = (int)s->crepe_last_frames.size();
+        // crepe_frame is three floats; the flat view is {time_ms, f0_hz,
+        // voiced_prob} x n_frames, matching the Dart PitchFrame field order.
+        return reinterpret_cast<const float*>(s->crepe_last_frames.data());
+    }
+#endif
+    return nullptr;
+}
+
+CA_EXPORT int crispasr_session_pitch_sample_rate(crispasr_session* s) {
+    if (!s)
+        return 0;
+#ifdef CA_HAVE_CREPE
+    if (s->crepe_ctx)
+        return CREPE_SAMPLE_RATE;
+#endif
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Voice conversion (SVC) session API
+//
+// This is the PRIMARY surface for RVC — deliberately not a CLI verb. The input
+// is ContentVec features, which CrispASR does not produce (the consumer owns
+// the content encoder), so a standalone command line could not run it.
+//
+// STOCHASTIC BY DESIGN: two RNG sites mean output varies run to run. Pass NULL
+// for the noise buffers in production; pass explicit buffers to replay a draw,
+// which is the only way to compare against another implementation.
+// ---------------------------------------------------------------------------
+
+CA_EXPORT int crispasr_session_convert(crispasr_session* s, const float* content, int n_frames, const float* f0_hz,
+                                       int speaker_id, const float* noise_zp, const float* noise_sine) {
+    if (!s || !content || !f0_hz || n_frames <= 0)
+        return -1;
+#ifdef CA_HAVE_RVC_SVC
+    if (s->rvc_ctx) {
+        if (s->rvc_last) {
+            rvc_svc_result_free(s->rvc_last);
+            s->rvc_last = nullptr;
+        }
+        s->rvc_last = rvc_svc_convert(s->rvc_ctx, content, n_frames, f0_hz, speaker_id, noise_zp, noise_sine);
+        return s->rvc_last ? s->rvc_last->n_samples : -1;
+    }
+#endif
+    (void)speaker_id;
+    (void)noise_zp;
+    (void)noise_sine;
+    return -1;
+}
+
+CA_EXPORT const float* crispasr_session_convert_audio(crispasr_session* s, int* out_n_samples) {
+    if (out_n_samples)
+        *out_n_samples = 0;
+    if (!s)
+        return nullptr;
+#ifdef CA_HAVE_RVC_SVC
+    if (s->rvc_last) {
+        if (out_n_samples)
+            *out_n_samples = s->rvc_last->n_samples;
+        return s->rvc_last->pcm;
+    }
+#endif
+    return nullptr;
+}
+
+// The checkpoint's expected ContentVec dim (256 = v1/layer-9, 768 = v2/layer-12).
+// Requested so a v1/v2 mismatch refuses LOUDLY rather than sounding subtly
+// wrong — a consumer cannot make that check from its side.
+CA_EXPORT int crispasr_session_convert_content_dim(crispasr_session* s) {
+#ifdef CA_HAVE_RVC_SVC
+    if (s && s->rvc_ctx)
+        return rvc_svc_content_dim(s->rvc_ctx);
+#else
+    (void)s;
+#endif
+    return 0;
+}
+
+CA_EXPORT int crispasr_session_convert_n_speakers(crispasr_session* s) {
+#ifdef CA_HAVE_RVC_SVC
+    if (s && s->rvc_ctx)
+        return rvc_svc_n_speakers(s->rvc_ctx);
+#else
+    (void)s;
+#endif
+    return 0;
+}
+
+// Output rate is a property of the checkpoint (32k/40k/48k), not a constant.
+CA_EXPORT int crispasr_session_convert_sample_rate(crispasr_session* s) {
+#ifdef CA_HAVE_RVC_SVC
+    if (s && s->rvc_ctx)
+        return rvc_svc_sample_rate(s->rvc_ctx);
+#else
+    (void)s;
+#endif
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Chord recognition session API
+//
+// A chord timeline is not crispasr_segments either, so it follows pitch and
+// piano: its own entry points, a flat float view for the bulk read, and a
+// separate name lookup because the labels are strings.
+// ---------------------------------------------------------------------------
+
+// --- Guitar tablature (--tab) -------------------------------------------
+//
+// Task-shaped surface per docs/contributing.md §7: a run call returning a
+// count, an n_* accessor, and a FLAT all-float view for the bulk read. Flat and
+// all-float on purpose — a mixed int/float struct read through a float view
+// misreads the int lanes in every binding.
+//
+// ⚠️ What crosses this boundary is EMISSION SCORES, not a decided tablature.
+// The grid is [frame][string][class] log-probabilities; the constrained
+// Viterbi/DP that picks a playable fingering (one note per string, fret range,
+// capo, hand span) is the caller's. Do not argmax this and call it a tab.
+CA_EXPORT int crispasr_session_tab(crispasr_session* s, const float* pcm, int n_samples, int sample_rate) {
+    if (!s || !pcm || n_samples <= 0 || sample_rate <= 0)
+        return -1;
+#ifdef CA_HAVE_TABCNN
+    if (s->tabcnn_ctx) {
+        s->tabcnn_last_logp.clear();
+        s->tabcnn_last_frames = 0;
+        const int n = tabcnn_n_frames(s->tabcnn_ctx, n_samples, sample_rate);
+        if (n <= 0)
+            return -1;
+        s->tabcnn_last_logp.resize((size_t)n * TABCNN_NUM_STRINGS * TABCNN_NUM_CLASSES);
+        const int got = tabcnn_compute(s->tabcnn_ctx, pcm, n_samples, sample_rate, s->tabcnn_last_logp.data(), n);
+        if (got <= 0) {
+            s->tabcnn_last_logp.clear();
+            return -1;
+        }
+        s->tabcnn_last_logp.resize((size_t)got * TABCNN_NUM_STRINGS * TABCNN_NUM_CLASSES);
+        s->tabcnn_last_frames = got;
+        return got;
+    }
+#endif
+    (void)sample_rate;
+    return -1;
+}
+
+CA_EXPORT int crispasr_session_tab_n_frames(crispasr_session* s) {
+    if (!s)
+        return 0;
+#ifdef CA_HAVE_TABCNN
+    return s->tabcnn_last_frames;
+#else
+    return 0;
+#endif
+}
+
+// Flat view: [frame][string][class] log-probabilities, frame-major. Valid until
+// the next crispasr_session_tab call or session close.
+CA_EXPORT const float* crispasr_session_tab_emissions(crispasr_session* s, int* out_n_frames, int* out_n_strings,
+                                                      int* out_n_classes) {
+    if (out_n_frames)
+        *out_n_frames = 0;
+    if (out_n_strings)
+        *out_n_strings = 0;
+    if (out_n_classes)
+        *out_n_classes = 0;
+    if (!s)
+        return nullptr;
+#ifdef CA_HAVE_TABCNN
+    if (s->tabcnn_last_frames > 0 && !s->tabcnn_last_logp.empty()) {
+        if (out_n_frames)
+            *out_n_frames = s->tabcnn_last_frames;
+        if (out_n_strings)
+            *out_n_strings = TABCNN_NUM_STRINGS;
+        if (out_n_classes)
+            *out_n_classes = TABCNN_NUM_CLASSES;
+        return s->tabcnn_last_logp.data();
+    }
+#endif
+    return nullptr;
+}
+
+// The class index meaning "string not played". A decoder that guesses this
+// wrong emits confidently wrong tablature with no error anywhere.
+CA_EXPORT int crispasr_session_tab_silent_class(crispasr_session* s) {
+    if (!s)
+        return -1;
+#ifdef CA_HAVE_TABCNN
+    if (s->tabcnn_ctx)
+        return tabcnn_silent_class(s->tabcnn_ctx);
+#endif
+    return -1;
+}
+
+// Seconds per frame, so a caller can place emissions on its own timeline.
+CA_EXPORT float crispasr_session_tab_frame_period(crispasr_session* s) {
+    if (!s)
+        return 0.0f;
+#ifdef CA_HAVE_TABCNN
+    if (s->tabcnn_ctx)
+        return tabcnn_frame_period(s->tabcnn_ctx);
+#endif
+    return 0.0f;
+}
+
+// Open-string MIDI pitch per string (0 = lowest), or -1. A capo/transpose-aware
+// decoder needs these rather than hardcoding standard tuning.
+CA_EXPORT int crispasr_session_tab_string_open_midi(crispasr_session* s, int string) {
+    if (!s)
+        return -1;
+#ifdef CA_HAVE_TABCNN
+    if (s->tabcnn_ctx)
+        return tabcnn_string_open_midi(s->tabcnn_ctx, string);
+#else
+    (void)string;
+#endif
+    return -1;
+}
+
+CA_EXPORT int crispasr_session_chords(crispasr_session* s, const float* pcm, int n_samples, int sample_rate) {
+    if (!s || !pcm || n_samples <= 0 || sample_rate <= 0)
+        return -1;
+#ifdef CA_HAVE_BTC_CHORDS
+    if (s->btc_ctx) {
+        s->btc_last_spans.clear();
+        s->btc_last_names.clear();
+        btc_chords_result* r = btc_chords_recognize(s->btc_ctx, pcm, n_samples, sample_rate);
+        if (!r)
+            return -1;
+        s->btc_last_spans.reserve((size_t)r->n_spans * 4);
+        s->btc_last_names.reserve((size_t)r->n_spans);
+        for (int i = 0; i < r->n_spans; i++) {
+            const btc_chord_span& sp = r->spans[i];
+            s->btc_last_spans.push_back((float)sp.start_ms);
+            s->btc_last_spans.push_back((float)sp.end_ms);
+            s->btc_last_spans.push_back((float)sp.label);
+            s->btc_last_spans.push_back(sp.confidence);
+            const char* nm = btc_chords_label_name(s->btc_ctx, sp.label);
+            s->btc_last_names.emplace_back(nm ? nm : "N");
+        }
+        const int n = r->n_spans;
+        btc_chords_result_free(r);
+        return n;
+    }
+#endif
+    (void)sample_rate;
+    return -1;
+}
+
+CA_EXPORT int crispasr_session_chords_n_spans(crispasr_session* s) {
+    if (!s)
+        return 0;
+#ifdef CA_HAVE_BTC_CHORDS
+    return (int)s->btc_last_names.size();
+#else
+    return 0;
+#endif
+}
+
+CA_EXPORT const float* crispasr_session_chords_spans(crispasr_session* s, int* out_n_spans) {
+    if (out_n_spans)
+        *out_n_spans = 0;
+    if (!s)
+        return nullptr;
+#ifdef CA_HAVE_BTC_CHORDS
+    if (!s->btc_last_names.empty()) {
+        if (out_n_spans)
+            *out_n_spans = (int)s->btc_last_names.size();
+        return s->btc_last_spans.data();
+    }
+#endif
+    return nullptr;
+}
+
+CA_EXPORT const char* crispasr_session_chords_span_name(crispasr_session* s, int idx) {
+    if (!s || idx < 0)
+        return nullptr;
+#ifdef CA_HAVE_BTC_CHORDS
+    if (idx < (int)s->btc_last_names.size())
+        return s->btc_last_names[(size_t)idx].c_str();
+#endif
+    return nullptr;
+}
+
+CA_EXPORT int crispasr_session_chords_vocab_size(crispasr_session* s) {
+    if (!s)
+        return 0;
+#ifdef CA_HAVE_BTC_CHORDS
+    if (s->btc_ctx)
+        return btc_chords_vocab_size(s->btc_ctx);
+#endif
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// beats: audio in, a beat/downbeat grid out. Flat float view like chords, but
+// with no name table — a beat has no label, only a time and a downbeat flag.
+// ---------------------------------------------------------------------------
+
+CA_EXPORT int crispasr_session_beats(crispasr_session* s, const float* pcm, int n_samples, int sample_rate) {
+    if (!s || !pcm || n_samples <= 0 || sample_rate <= 0)
+        return -1;
+#ifdef CA_HAVE_BEAT_THIS
+    if (s->beat_ctx) {
+        if (sample_rate != beat_this_sample_rate(s->beat_ctx))
+            return -1; // caller resamples; the CLI path uses read_audio_data for this
+        s->beat_last_events.clear();
+        // One event per frame is the peak-picker's hard ceiling, so this can
+        // never truncate a real result.
+        const int max_events = beat_this_n_frames(n_samples);
+        std::vector<beat_this_event> ev((size_t)(max_events > 0 ? max_events : 1));
+        const int n = beat_this_track(s->beat_ctx, pcm, n_samples, ev.data(), (int)ev.size());
+        if (n < 0)
+            return -1;
+        s->beat_last_events.reserve((size_t)n * 2);
+        for (int i = 0; i < n; i++) {
+            s->beat_last_events.push_back(ev[(size_t)i].time_s);
+            s->beat_last_events.push_back(ev[(size_t)i].is_downbeat ? 1.0f : 0.0f);
+        }
+        return n;
+    }
+#endif
+    (void)sample_rate;
+    return -1;
+}
+
+CA_EXPORT int crispasr_session_beats_n_events(crispasr_session* s) {
+    if (!s)
+        return 0;
+#ifdef CA_HAVE_BEAT_THIS
+    return (int)(s->beat_last_events.size() / 2);
+#else
+    return 0;
+#endif
+}
+
+CA_EXPORT const float* crispasr_session_beats_events(crispasr_session* s, int* out_n_events) {
+    if (out_n_events)
+        *out_n_events = 0;
+    if (!s)
+        return nullptr;
+#ifdef CA_HAVE_BEAT_THIS
+    if (!s->beat_last_events.empty()) {
+        if (out_n_events)
+            *out_n_events = (int)(s->beat_last_events.size() / 2);
+        return s->beat_last_events.data();
+    }
+#endif
+    return nullptr;
+}
+
+CA_EXPORT int crispasr_session_beats_sample_rate(crispasr_session* s) {
+    if (!s)
+        return 0;
+#ifdef CA_HAVE_BEAT_THIS
+    if (s->beat_ctx)
+        return beat_this_sample_rate(s->beat_ctx);
+#endif
+    return 0;
+}
+
+CA_EXPORT float crispasr_session_beats_tempo_bpm(crispasr_session* s) {
+    if (!s)
+        return 0.0f;
+#ifdef CA_HAVE_BEAT_THIS
+    const int n = (int)(s->beat_last_events.size() / 2);
+    if (n < 2)
+        return 0.0f;
+    std::vector<beat_this_event> ev((size_t)n);
+    for (int i = 0; i < n; i++) {
+        ev[(size_t)i].time_s = s->beat_last_events[(size_t)i * 2];
+        ev[(size_t)i].is_downbeat = s->beat_last_events[(size_t)i * 2 + 1] != 0.0f;
+    }
+    return beat_this_tempo_bpm(ev.data(), n);
+#else
+    return 0.0f;
+#endif
+}
+
+CA_EXPORT int crispasr_session_piano(crispasr_session* s, const float* pcm_16k, int n_samples) {
+    if (!s || !pcm_16k || n_samples <= 0)
+        return -1;
+#ifdef CA_HAVE_PIANO_TRANSCRIPTION
+    if (s->piano_ctx) {
+        s->piano_last_notes.clear();
+        piano_transcription_result res{};
+        if (piano_transcription_transcribe(s->piano_ctx, pcm_16k, n_samples, &res) != 0)
+            return -1;
+        s->piano_last_notes.reserve((size_t)res.n_notes * 4);
+        for (int i = 0; i < res.n_notes; i++) {
+            const piano_note_event& e = res.note_events[i];
+            // Runtime reports seconds; the C ABI is milliseconds throughout
+            // (crispasr_session_pitch_frames is ms too) so convert once here
+            // rather than leaving every binding to guess the unit.
+            s->piano_last_notes.push_back(e.onset_time * 1000.0f);
+            s->piano_last_notes.push_back(e.offset_time * 1000.0f);
+            s->piano_last_notes.push_back((float)e.midi_note);
+            s->piano_last_notes.push_back((float)e.velocity);
+        }
+        const int n = res.n_notes;
+        piano_transcription_result_free(&res);
+        return n;
+    }
+#endif
+    return -1;
+}
+
+CA_EXPORT int crispasr_session_piano_n_notes(crispasr_session* s) {
+    if (!s)
+        return 0;
+#ifdef CA_HAVE_PIANO_TRANSCRIPTION
+    return (int)(s->piano_last_notes.size() / 4);
+#else
+    return 0;
+#endif
+}
+
+CA_EXPORT const float* crispasr_session_piano_notes(crispasr_session* s, int* out_n_notes) {
+    if (out_n_notes)
+        *out_n_notes = 0;
+    if (!s)
+        return nullptr;
+#ifdef CA_HAVE_PIANO_TRANSCRIPTION
+    if (s->piano_last_notes.empty())
+        return nullptr;
+    if (out_n_notes)
+        *out_n_notes = (int)(s->piano_last_notes.size() / 4);
+    return s->piano_last_notes.data();
+#else
+    return nullptr;
+#endif
+}
+
+CA_EXPORT int crispasr_session_piano_sample_rate(crispasr_session* s) {
+    if (!s)
+        return 0;
+#ifdef CA_HAVE_PIANO_TRANSCRIPTION
+    if (s->piano_ctx)
+        return (int)piano_transcription_sample_rate(s->piano_ctx);
+#endif
+    return 0;
+}
+
+
 CA_EXPORT void crispasr_session_close(crispasr_session* s) {
     if (!s)
         return;
+    {
+        // Unregister from the session-less polling API before teardown so a
+        // concurrent drain can't touch a dying session (see g_stream_session).
+        std::lock_guard<std::mutex> reg(g_stream_session_mtx);
+        if (g_stream_session == s)
+            g_stream_session = nullptr;
+    }
+#ifdef CA_HAVE_FIREREDPUNC
+    if (s->punc_ctx)
+        fireredpunc_free((fireredpunc_context*)s->punc_ctx);
+#endif
+#ifdef CA_HAVE_PCS
+    if (s->pcs_ctx)
+        pcs_free((pcs_context*)s->pcs_ctx);
+#endif
     if (s->whisper_ctx)
         whisper_free(s->whisper_ctx);
 #ifdef CA_HAVE_PARAKEET
     if (s->parakeet_ctx)
         parakeet_free(s->parakeet_ctx);
 #endif
+#ifdef CA_HAVE_NEMOTRON
+    if (s->nemotron_ctx)
+        nemotron_free(s->nemotron_ctx);
+#endif
 #ifdef CA_HAVE_CANARY
     if (s->canary_ctx)
         canary_free(s->canary_ctx);
 #endif
+#ifdef CA_HAVE_CANARY_QWEN
+    if (s->canary_qwen_ctx)
+        canary_qwen_free(s->canary_qwen_ctx);
+#endif
+#ifdef CA_HAVE_LFM2_AUDIO
+    if (s->lfm2_audio_ctx)
+        lfm2_audio_free(s->lfm2_audio_ctx);
+#endif
+#ifdef CA_HAVE_MINI_OMNI2
+    if (s->mini_omni2_ctx)
+        mini_omni2_free(s->mini_omni2_ctx);
+#endif
+#ifdef CA_HAVE_SIDON
+    if (s->sidon_ctx)
+        sidon_free(s->sidon_ctx);
+#endif
 #ifdef CA_HAVE_QWEN3
     if (s->qwen3_ctx)
         qwen3_asr_free(s->qwen3_ctx);
+#endif
+#ifdef CA_HAVE_HIGGS_STT
+    if (s->higgs_ctx)
+        higgs_stt_free(s->higgs_ctx);
 #endif
 #ifdef CA_HAVE_COHERE
     if (s->cohere_ctx)
@@ -6051,9 +9554,63 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
     if (s->qwen3_tts_ctx)
         qwen3_tts_free(s->qwen3_tts_ctx);
 #endif
+#ifdef CA_HAVE_MIOTTS
+    if (s->miotts_ctx)
+        miotts_free(s->miotts_ctx);
+#endif
+#ifdef CA_HAVE_PIANO_TRANSCRIPTION
+    if (s->piano_ctx)
+        piano_transcription_free(s->piano_ctx);
+#endif
+#ifdef CA_HAVE_MOSS_TTS
+    if (s->moss_tts_ctx)
+        moss_tts_free(s->moss_tts_ctx);
+#endif
+#ifdef CA_HAVE_MOSS_TTS_LOCAL
+    if (s->moss_tts_local_ctx)
+        moss_tts_local_free(s->moss_tts_local_ctx);
+#endif
+#ifdef CA_HAVE_OMNIVOICE
+    if (s->omnivoice_ctx)
+        omnivoice_free(s->omnivoice_ctx);
+#endif
 #ifdef CA_HAVE_GLMASR
     if (s->glmasr_ctx)
         glm_asr_free((glm_asr_context*)s->glmasr_ctx);
+#endif
+#ifdef CA_HAVE_HTDEMUCS
+    if (s->htdemucs_last_result)
+        htdemucs_result_free(s->htdemucs_last_result);
+    if (s->htdemucs_ctx)
+        htdemucs_free(s->htdemucs_ctx);
+#endif
+#ifdef CA_HAVE_MEL_BAND_ROFORMER
+    if (s->mbr_last_result)
+        mel_band_roformer_result_free(s->mbr_last_result);
+    if (s->mbr_ctx)
+        mel_band_roformer_free(s->mbr_ctx);
+#endif
+#ifdef CA_HAVE_RVC_SVC
+    if (s->rvc_last)
+        rvc_svc_result_free(s->rvc_last);
+    if (s->rvc_ctx)
+        rvc_svc_free(s->rvc_ctx);
+#endif
+#ifdef CA_HAVE_BTC_CHORDS
+    if (s->btc_ctx)
+        btc_chords_free(s->btc_ctx);
+#endif
+#ifdef CA_HAVE_TABCNN
+    if (s->tabcnn_ctx)
+        tabcnn_free(s->tabcnn_ctx);
+#endif
+#ifdef CA_HAVE_BEAT_THIS
+    if (s->beat_ctx)
+        beat_this_free(s->beat_ctx);
+#endif
+#ifdef CA_HAVE_CREPE
+    if (s->crepe_ctx)
+        crepe_free(s->crepe_ctx);
 #endif
 #ifdef CA_HAVE_KYUTAI
     if (s->kyutai_ctx)
@@ -6087,9 +9644,17 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
     if (s->kokoro_ctx)
         kokoro_free(s->kokoro_ctx);
 #endif
+#ifdef CA_HAVE_VOXTRAL_TTS
+    if (s->voxtral_tts_ctx)
+        voxtral_tts_free(s->voxtral_tts_ctx);
+#endif
 #ifdef CA_HAVE_CHATTERBOX
     if (s->chatterbox_ctx)
         chatterbox_free(s->chatterbox_ctx);
+#endif
+#ifdef CA_HAVE_BANANAMIND_TTS
+    if (s->bananamind_tts_ctx)
+        bananamind_tts_free(s->bananamind_tts_ctx);
 #endif
 #ifdef CA_HAVE_TADA
     if (s->tada_ctx)
@@ -6106,6 +9671,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
 #ifdef CA_HAVE_DIA
     if (s->dia_tts_ctx)
         dia_tts_free(s->dia_tts_ctx);
+#endif
+#ifdef CA_HAVE_DOTS_TTS
+    if (s->dots_tts_ctx)
+        dots_tts_free(s->dots_tts_ctx);
 #endif
 #ifdef CA_HAVE_POCKET
     if (s->pocket_tts_ctx)
@@ -6135,6 +9704,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
     if (s->voxcpm2_ctx)
         voxcpm2_free(s->voxcpm2_ctx);
 #endif
+#ifdef CA_HAVE_VOXCPM2_VAE
+    if (s->voxcpm2_vae_ctx)
+        voxcpm2_vae_free(s->voxcpm2_vae_ctx);
+#endif
 #ifdef CA_HAVE_COSYVOICE3
     if (s->cosyvoice3_ctx)
         cosyvoice3_tts_free(s->cosyvoice3_ctx);
@@ -6146,6 +9719,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
 #ifdef CA_HAVE_F5TTS
     if (s->f5tts_ctx)
         f5_tts_free(s->f5tts_ctx);
+#endif
+#ifdef CA_HAVE_IRODORI_TTS
+    if (s->irodori_ctx)
+        irodori_tts_free(s->irodori_ctx);
 #endif
 #ifdef CA_HAVE_PIPER
     if (s->piper_ctx)
@@ -6167,9 +9744,21 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
     if (s->mimo_asr_ctx)
         mimo_asr_free(s->mimo_asr_ctx);
 #endif
+#ifdef CA_HAVE_ARK_ASR
+    if (s->ark_asr_ctx)
+        ark_asr_free(s->ark_asr_ctx);
+#endif
 #ifdef CA_HAVE_MOSS_AUDIO
     if (s->moss_audio_ctx)
         moss_audio_free(s->moss_audio_ctx);
+#endif
+#ifdef CA_HAVE_MOSS_TRANSCRIBE
+    if (s->moss_transcribe_ctx)
+        moss_transcribe_free(s->moss_transcribe_ctx);
+#endif
+#ifdef CA_HAVE_MOSS_DIARIZE
+    if (s->moss_diarize_ctx)
+        moss_diarize_free(s->moss_diarize_ctx);
 #endif
     delete s;
 }
@@ -6190,7 +9779,7 @@ CA_EXPORT const char* crispasr_punc_process(void* ctx, const char* text) {
 }
 
 CA_EXPORT void crispasr_punc_free_text(const char* text) {
-    free((void*)text);
+    free(const_cast<char*>(text));
 }
 
 CA_EXPORT void crispasr_punc_free(void* ctx) {
@@ -6225,7 +9814,7 @@ CA_EXPORT const char* crispasr_truecase_process(void* ctx, const char* text) {
     return truecaser_lstm_process((truecaser_lstm_context*)ctx, text);
 }
 CA_EXPORT void crispasr_truecase_free_text(const char* text) {
-    free((void*)text);
+    free(const_cast<char*>(text));
 }
 CA_EXPORT void crispasr_truecase_free(void* ctx) {
     truecaser_lstm_free((truecaser_lstm_context*)ctx);
@@ -6238,7 +9827,7 @@ CA_EXPORT const char* crispasr_truecase_process(void* ctx, const char* text) {
     return truecaser_process((truecaser_context*)ctx, text);
 }
 CA_EXPORT void crispasr_truecase_free_text(const char* text) {
-    free((void*)text);
+    free(const_cast<char*>(text));
 }
 CA_EXPORT void crispasr_truecase_free(void* ctx) {
     truecaser_free((truecaser_context*)ctx);
@@ -6267,7 +9856,7 @@ CA_EXPORT const char* crispasr_pcs_process(void* ctx, const char* text) {
     return pcs_process((pcs_context*)ctx, text);
 }
 CA_EXPORT void crispasr_pcs_free_text(const char* text) {
-    free((void*)text);
+    free(const_cast<char*>(text));
 }
 CA_EXPORT void crispasr_pcs_free(void* ctx) {
     pcs_free((pcs_context*)ctx);
@@ -6305,6 +9894,9 @@ CA_EXPORT int crispasr_transcribe_parallel(struct whisper_context* ctx, struct w
 // =========================================================================
 
 CA_EXPORT const char* crispasr_c_api_version(void) {
+    // 0.7.0 — Adds exact canonical default-bundle enumeration for the
+    // model registry (primary, companion, extras, and licence gate).
+    // Pure addition; no symbol renames or signature changes.
     // 0.6.0 — Adds CrisperWeaver parity: crispasr_get_progress /
     // crispasr_reset_progress (atomic progress polling for Dart FFI),
     // crispasr_audio_load_stereo (stereo PCM decode),
@@ -6320,7 +9912,7 @@ CA_EXPORT const char* crispasr_c_api_version(void) {
     // `crispasr_detect_language_pcm` return-code contract.
     // 0.5.1 — Adds `crispasr_session_translate_text_free`.
     // Pure addition; no symbol renames or signature changes.
-    return "0.6.0";
+    return "0.7.0";
 }
 
 // Backwards-compatibility alias. The Dart smoke test and any 0.4.x-era
@@ -6421,6 +10013,82 @@ CA_EXPORT int crispasr_session_set_punctuation(crispasr_session* s, int enable) 
     return 0;
 }
 
+// Select + load a punctuation-restoration model on the session, the same way
+// the CLI `--punc-model` and the server do. `punc_model` is an alias
+// (auto|firered|fullstop|punctuate-all|pcs) or a direct .gguf path; the model
+// auto-downloads on first use. Pass "none"/""/NULL to unload. Restores
+// punctuation on non-PnC backends (parakeet RNNT/CTC, etc.) that emit none.
+// Returns 0 on success (incl. unload), -1 on bad handle, -2 if the requested
+// model failed to load, -3 if punctuation support wasn't compiled in.
+CA_EXPORT int crispasr_session_set_punc_model(crispasr_session* s, const char* punc_model) {
+    if (!s)
+        return -1;
+        // Unload any currently-resident context first.
+#ifdef CA_HAVE_FIREREDPUNC
+    if (s->punc_ctx) {
+        fireredpunc_free((fireredpunc_context*)s->punc_ctx);
+        s->punc_ctx = nullptr;
+    }
+#endif
+#ifdef CA_HAVE_PCS
+    if (s->pcs_ctx) {
+        pcs_free((pcs_context*)s->pcs_ctx);
+        s->pcs_ctx = nullptr;
+    }
+#endif
+
+    const crispasr_punc_spec spec = crispasr_resolve_punc_model(punc_model ? punc_model : "");
+    if (spec.kind == crispasr_punc_kind::none)
+        return 0; // unloaded / disabled
+
+    std::string path = spec.direct_path;
+    if (path.empty() && !spec.cache_filename.empty())
+        path = crispasr_cache::ensure_cached_file(spec.cache_filename, spec.url, /*quiet=*/true, "crispasr[punc]", "");
+    if (path.empty())
+        return -2;
+
+    if (spec.kind == crispasr_punc_kind::fireredpunc) {
+#ifdef CA_HAVE_FIREREDPUNC
+        s->punc_ctx = (void*)fireredpunc_init(path.c_str());
+        return s->punc_ctx ? 0 : -2;
+#else
+        return -3;
+#endif
+    }
+    if (spec.kind == crispasr_punc_kind::pcs) {
+#ifdef CA_HAVE_PCS
+        s->pcs_ctx = (void*)pcs_init(path.c_str());
+        return s->pcs_ctx ? 0 : -2;
+#else
+        return -3;
+#endif
+    }
+    return -2;
+}
+
+// Apply the session's resident punctuation model (if any) to every segment's
+// text, in place. PCS takes precedence over FireRedPunc. Gated on
+// `s->punctuation` so a caller that disabled punctuation still gets plain text.
+static void apply_session_punc_model(crispasr_session* s, crispasr_session_result* r) {
+    if (!s || !r || !s->punctuation)
+        return;
+    for (auto& seg : r->segments) {
+        char* out = nullptr;
+#ifdef CA_HAVE_PCS
+        if (s->pcs_ctx)
+            out = pcs_process((pcs_context*)s->pcs_ctx, seg.text.c_str());
+#endif
+#ifdef CA_HAVE_FIREREDPUNC
+        if (!out && s->punc_ctx)
+            out = fireredpunc_process((fireredpunc_context*)s->punc_ctx, seg.text.c_str());
+#endif
+        if (out) {
+            seg.text = out;
+            free(out);
+        }
+    }
+}
+
 // Sticky --translate toggle (whisper). For canary/cohere/voxtral the
 // equivalent is set_target_language() ≠ source. Default false.
 CA_EXPORT int crispasr_session_set_translate(crispasr_session* s, int enable) {
@@ -6453,6 +10121,12 @@ CA_EXPORT int crispasr_session_set_temperature(crispasr_session* s, float temper
 #ifdef CA_HAVE_CANARY
     if (s->canary_ctx) {
         canary_set_temperature(s->canary_ctx, temperature, seed);
+        touched++;
+    }
+#endif
+#ifdef CA_HAVE_CANARY_QWEN
+    if (s->canary_qwen_ctx) {
+        canary_qwen_set_temperature(s->canary_qwen_ctx, temperature, seed);
         touched++;
     }
 #endif
@@ -6560,13 +10234,18 @@ CA_EXPORT int crispasr_session_set_temperature(crispasr_session* s, float temper
     return touched > 0 ? 0 : -2;
 }
 
-// Set the seed for sampling-capable TTS backends. This currently
-// covers chatterbox, vibevoice, qwen3-tts, and orpheus. Other
-// backends silently no-op (rc=-2).
+// Set the seed for sampling-capable TTS backends. Unsupported backends
+// silently no-op (rc=-2).
 CA_EXPORT int crispasr_session_set_tts_seed(crispasr_session* s, uint64_t seed) {
     if (!s)
         return -1;
     int touched = 0;
+#ifdef CA_HAVE_VOXTRAL_TTS
+    if (s->voxtral_tts_ctx) {
+        voxtral_tts_set_seed(s->voxtral_tts_ctx, seed);
+        touched++;
+    }
+#endif
 #ifdef CA_HAVE_CHATTERBOX
     if (s->chatterbox_ctx) {
         chatterbox_set_seed((chatterbox_context*)s->chatterbox_ctx, (uint32_t)seed);
@@ -6633,6 +10312,24 @@ CA_EXPORT int crispasr_session_set_tts_seed(crispasr_session* s, uint64_t seed) 
         touched++;
     }
 #endif
+#ifdef CA_HAVE_MOSS_TTS
+    if (s->moss_tts_ctx) {
+        moss_tts_set_seed(s->moss_tts_ctx, (uint32_t)seed);
+        touched++;
+    }
+#endif
+#ifdef CA_HAVE_MOSS_TTS_LOCAL
+    if (s->moss_tts_local_ctx) {
+        moss_tts_local_set_seed(s->moss_tts_local_ctx, (uint32_t)seed);
+        touched++;
+    }
+#endif
+#ifdef CA_HAVE_OMNIVOICE
+    if (s->omnivoice_ctx) {
+        omnivoice_set_seed(s->omnivoice_ctx, seed);
+        touched++;
+    }
+#endif
 #ifdef CA_HAVE_ORPHEUS
     if (s->orpheus_ctx) {
         orpheus_set_seed((orpheus_context*)s->orpheus_ctx, seed);
@@ -6660,6 +10357,12 @@ CA_EXPORT int crispasr_session_set_tts_seed(crispasr_session* s, uint64_t seed) 
 #ifdef CA_HAVE_F5TTS
     if (s->f5tts_ctx) {
         f5_tts_set_seed(s->f5tts_ctx, seed);
+        touched++;
+    }
+#endif
+#ifdef CA_HAVE_IRODORI_TTS
+    if (s->irodori_ctx) {
+        irodori_tts_set_seed(s->irodori_ctx, seed);
         touched++;
     }
 #endif
@@ -6719,6 +10422,75 @@ CA_EXPORT int crispasr_session_set_tts_steps(crispasr_session* s, int steps) {
         touched++;
     }
 #endif
+#ifdef CA_HAVE_TADA
+    if (s->tada_ctx) {
+        // TADA flow-matching ODE steps (Python num_flow_matching_steps). The
+        // reporter's "quick and dirty" vs "slow and accurate" lever (#197) —
+        // more steps trade speed for acoustic fidelity. Read per synthesize().
+        tada_set_num_fm_steps(s->tada_ctx, steps);
+        touched++;
+    }
+#endif
+#ifdef CA_HAVE_IRODORI_TTS
+    if (s->irodori_ctx) {
+        // Irodori flow-matching Euler ODE step count (default 40). Read live per
+        // synthesize(), so mutation changes the next call's diffusion density (#241).
+        irodori_tts_set_ode_steps(s->irodori_ctx, steps);
+        touched++;
+    }
+#endif
+#ifdef CA_HAVE_OMNIVOICE
+    if (s->omnivoice_ctx) {
+        // OmniVoice masked-iterative (diffusion) step count (default 32). stage0
+        // cost = steps × 2 backbone forwards, so this is its dominant speed lever
+        // — ASR-clean down to ~16. Read live per synthesize() (#254).
+        omnivoice_set_num_steps(s->omnivoice_ctx, steps);
+        touched++;
+    }
+#endif
+    return touched > 0 ? 0 : -2;
+}
+
+// TTS CFG guidance scale. Honoured by vibevoice (0 = model default:
+// 1.3 base / 3.0 realtime; upstream's realtime demo uses 1.5).
+// Spontaneous BGM onsets are documented VibeVoice model behavior —
+// lowering cfg or changing the seed re-rolls them. Other TTS
+// backends no-op (rc=-2).
+CA_EXPORT int crispasr_session_set_tts_cfg_scale(crispasr_session* s, float scale) {
+    if (!s)
+        return -1;
+    int touched = 0;
+#ifdef CA_HAVE_VIBEVOICE
+    if (s->vibevoice_ctx) {
+        vibevoice_set_cfg_scale((vibevoice_context*)s->vibevoice_ctx, scale);
+        touched++;
+    }
+#endif
+#ifdef CA_HAVE_IRODORI_TTS
+    if (s->irodori_ctx) {
+        // Maps to Irodori's (primary) text CFG scale (default 3.0). The separate
+        // speaker CFG (default 5.0) is reachable only via the CLI env override
+        // CRISPASR_IRODORI_CFG_SPEAKER — the single generic knob can't carry it (#241).
+        irodori_tts_set_cfg_scale_text(s->irodori_ctx, scale);
+        touched++;
+    }
+#endif
+    return touched > 0 ? 0 : -2;
+}
+
+// Number of flow-matching timing candidates ranked per token (TADA). Higher
+// = more reliable multilingual timing, higher cost. Returns 0 on success,
+// -1 if session is null, -2 if no backend supports it.
+CA_EXPORT int crispasr_session_set_tts_num_candidates(crispasr_session* s, int n) {
+    if (!s)
+        return -1;
+    int touched = 0;
+#ifdef CA_HAVE_TADA
+    if (s->tada_ctx) {
+        tada_set_num_candidates(s->tada_ctx, n);
+        touched++;
+    }
+#endif
     return touched > 0 ? 0 : -2;
 }
 
@@ -6744,6 +10516,12 @@ CA_EXPORT int crispasr_session_set_top_p(crispasr_session* s, float top_p) {
 #ifdef CA_HAVE_CHATTERBOX
     if (s->chatterbox_ctx) {
         chatterbox_set_top_p((chatterbox_context*)s->chatterbox_ctx, top_p);
+        touched++;
+    }
+#endif
+#ifdef CA_HAVE_TADA
+    if (s->tada_ctx) {
+        tada_set_top_p(s->tada_ctx, top_p);
         touched++;
     }
 #endif
@@ -6776,6 +10554,40 @@ CA_EXPORT int crispasr_session_set_repetition_penalty(crispasr_session* s, float
         touched++;
     }
 #endif
+#ifdef CA_HAVE_TADA
+    if (s->tada_ctx) {
+        tada_set_repetition_penalty(s->tada_ctx, r);
+        touched++;
+    }
+#endif
+    return touched > 0 ? 0 : -2;
+}
+
+// Set the top-k sampling cutoff (0 = disabled). Honoured by tada.
+CA_EXPORT int crispasr_session_set_top_k(crispasr_session* s, int top_k) {
+    if (!s)
+        return -1;
+    int touched = 0;
+#ifdef CA_HAVE_TADA
+    if (s->tada_ctx) {
+        tada_set_top_k(s->tada_ctx, top_k);
+        touched++;
+    }
+#endif
+    return touched > 0 ? 0 : -2;
+}
+
+// Enable/disable sampling (0 = greedy). Honoured by tada.
+CA_EXPORT int crispasr_session_set_do_sample(crispasr_session* s, int enable) {
+    if (!s)
+        return -1;
+    int touched = 0;
+#ifdef CA_HAVE_TADA
+    if (s->tada_ctx) {
+        tada_set_do_sample(s->tada_ctx, enable != 0);
+        touched++;
+    }
+#endif
     return touched > 0 ? 0 : -2;
 }
 
@@ -6789,6 +10601,29 @@ CA_EXPORT int crispasr_session_set_cfg_weight(crispasr_session* s, float cfg_wei
 #ifdef CA_HAVE_CHATTERBOX
     if (s->chatterbox_ctx) {
         chatterbox_set_cfg_weight((chatterbox_context*)s->chatterbox_ctx, cfg_weight);
+        touched++;
+    }
+#endif
+#ifdef CA_HAVE_TADA
+    if (s->tada_ctx) {
+        // TADA acoustic classifier-free-guidance scale (Python acoustic_cfg, #197).
+        tada_set_acoustic_cfg(s->tada_ctx, cfg_weight);
+        touched++;
+    }
+#endif
+    return touched > 0 ? 0 : -2;
+}
+
+// Set the TADA flow-matching noise temperature (Python noise_temp, default 0.9).
+// Honoured by tada; other backends no-op. Returns 0 on success, -1 if session
+// is null, -2 if no backend supports it.
+CA_EXPORT int crispasr_session_set_tts_noise_temp(crispasr_session* s, float noise_temp) {
+    if (!s)
+        return -1;
+    int touched = 0;
+#ifdef CA_HAVE_TADA
+    if (s->tada_ctx) {
+        tada_set_noise_temp(s->tada_ctx, noise_temp);
         touched++;
     }
 #endif
@@ -6889,6 +10724,13 @@ CA_EXPORT int crispasr_session_set_beam_size(crispasr_session* s, int n) {
     if (!s)
         return -1;
     s->beam_size = n > 0 ? n : 1;
+    return 0;
+}
+
+CA_EXPORT int crispasr_session_set_return_logits(crispasr_session* s, int enable) {
+    if (!s)
+        return -1;
+    s->return_logits = enable != 0;
     return 0;
 }
 
@@ -7089,8 +10931,40 @@ CA_EXPORT float crispasr_titanet_cosine_sim(const float* a, const float* b, int3
     return titanet_cosine_sim(a, b, dim);
 }
 
+// Open a speaker profile db for CLOSED-ROSTER matching (issue #266).
+// `expected_names_csv` is the comma-separated list of enrolled participants
+// the caller asserts are present in the audio being processed — the loaded
+// db is narrowed to exactly those profiles. `consent_attested` affirms a
+// lawful basis + explicit consent from every enrolled person (GDPR Art. 9).
+// Returns NULL unless both are provided: there is deliberately no
+// open-ended "identify anyone in the db" mode (EU AI Act, Annex III 1(a)).
+CA_EXPORT void* crispasr_speaker_db_open(const char* dir_path, const char* expected_names_csv,
+                                         int32_t consent_attested) {
+    if (!consent_attested) {
+        fprintf(stderr, "crispasr: speaker_db_open refused: matching named voiceprints is biometric\n"
+                        "  identification (GDPR Art. 9); pass consent_attested=1 only with a lawful basis\n"
+                        "  and explicit consent from every enrolled person\n");
+        return nullptr;
+    }
+    if (!expected_names_csv || !*expected_names_csv) {
+        fprintf(stderr, "crispasr: speaker_db_open refused: a closed roster of claimed participants is\n"
+                        "  required (expected_names_csv, e.g. \"Alice,Bob\"); open 1:N identification is\n"
+                        "  deliberately unsupported\n");
+        return nullptr;
+    }
+    speaker_db* db = speaker_db_load(dir_path);
+    if (db)
+        speaker_db_retain(db, expected_names_csv);
+    return (void*)db;
+}
+
+// Legacy open-1:N entry point — removed (issue #266). Kept as a symbol so
+// old callers fail loudly at runtime instead of at link time.
 CA_EXPORT void* crispasr_speaker_db_load(const char* dir_path) {
-    return (void*)speaker_db_load(dir_path);
+    (void)dir_path;
+    fprintf(stderr, "crispasr: crispasr_speaker_db_load was removed (#266): open 1:N identification is\n"
+                    "  unsupported. Use crispasr_speaker_db_open(dir, expected_names_csv, consent_attested)\n");
+    return nullptr;
 }
 
 CA_EXPORT void crispasr_speaker_db_free(void* db) {
@@ -7118,9 +10992,26 @@ CA_EXPORT float crispasr_speaker_db_match(const void* db, const float* embedding
     return name ? score : -1.0f;
 }
 
+// Enroll with an explicit consent attestation (issue #266). Refuses (rc=2)
+// unless `consent_attested` is non-zero; the attestation + timestamp are
+// recorded in the v2 .spkr profile as an audit trail.
+CA_EXPORT int32_t crispasr_speaker_db_enroll2(const char* dir_path, const char* name, const float* embedding,
+                                              int32_t dim, int32_t consent_attested) {
+    if (!consent_attested)
+        return 2;
+    return speaker_db_enroll(dir_path, name, embedding, dim, /*consent_attested=*/true) ? 0 : 1;
+}
+
+// Legacy ungated enrollment — removed (issue #266); fails loudly at runtime.
 CA_EXPORT int32_t crispasr_speaker_db_enroll(const char* dir_path, const char* name, const float* embedding,
                                              int32_t dim) {
-    return speaker_db_enroll(dir_path, name, embedding, dim) ? 0 : 1;
+    (void)dir_path;
+    (void)name;
+    (void)embedding;
+    (void)dim;
+    fprintf(stderr, "crispasr: crispasr_speaker_db_enroll was removed (#266): enrollment requires a consent\n"
+                    "  attestation. Use crispasr_speaker_db_enroll2(dir, name, emb, dim, consent_attested)\n");
+    return 2;
 }
 
 #endif // CA_HAVE_TITANET

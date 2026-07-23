@@ -57,7 +57,81 @@ TEST_CASE("Watermark is imperceptible (low distortion)", "[unit][watermark]") {
     // case is pessimistic but we just verify it's not destructive.
     // Real speech perception threshold is ~20 dB.
     double snr_db = 10.0 * std::log10(signal_power / noise_power);
-    REQUIRE(snr_db > 5.0);  // not destructive even on worst-case sine
+    REQUIRE(snr_db > 5.0); // not destructive even on worst-case sine
+}
+
+// A broadband voiced-speech-like signal — a 130 Hz fundamental with harmonics
+// rolling off by ~4 kHz, syllable-rate amplitude modulation. This is far closer
+// to real TTS output than a pure sine and exercises the speech-band watermark
+// under realistic masking. Detection margins here are large (the pure-sine cases
+// above are pathological worst/edge cases), so CI robustness does not hinge on
+// a near-tie. Guards issue #260 (the watermark must stay inaudible AND
+// detectable on speech, not just on a tone).
+namespace {
+std::vector<float> make_speechlike(int n_samples, int sample_rate = 24000) {
+    std::vector<float> pcm(n_samples);
+    uint32_t rng = 0x12345678u; // deterministic — reproducible across platforms
+    for (int i = 0; i < n_samples; i++) {
+        double t = (double)i / (double)sample_rate;
+        double env = 0.4 * (1.0 + 0.9 * std::sin(2.0 * 3.14159265358979 * 4.0 * t));
+        double s = 0.0;
+        for (int h = 1; h <= 25; h++) {
+            double f = 130.0 * h;
+            if (f > 4000.0)
+                break;
+            s += (1.0 / h) * std::sin(2.0 * 3.14159265358979 * f * t);
+        }
+        // Aspiration/breath noise floor — real voiced speech is not a pure
+        // harmonic comb; the noise fills the inter-harmonic nulls so the
+        // watermark band has continuous energy (as in real TTS output).
+        rng = rng * 1664525u + 1013904223u;
+        double noise = ((double)rng / 4294967296.0 - 0.5);
+        pcm[i] = (float)(env * (s * 0.15 + noise * 0.02));
+    }
+    return pcm;
+}
+} // namespace
+
+TEST_CASE("Watermark on speech-like signal: detectable + inaudible comb (issue #260)", "[unit][watermark]") {
+    auto pcm = make_speechlike(72000); // 3 s
+    auto clean = pcm;
+
+    crispasr_watermark_embed_impl(pcm.data(), (int)pcm.size());
+
+    float score_wm = crispasr_watermark_detect_impl(pcm.data(), (int)pcm.size());
+    float score_clean = crispasr_watermark_detect_impl(clean.data(), (int)clean.size());
+
+    // Detection survives moving the comb into the speech band, with clean
+    // separation from unwatermarked audio.
+    REQUIRE(score_wm > 0.65f);
+    REQUIRE(score_clean < 0.60f);
+
+    // Issue #260: the comb must stay below ~5 kHz. Above 5 kHz — the region
+    // where the pre-#260 wideband comb painted an audible "tinny" tone over
+    // near-silence — the watermark must inject essentially nothing. Measure
+    // the residual watermark energy above bin 213 (~5 kHz) vs the signal.
+    const int n_fft = 1024;
+    const int k_5khz = 213; // ~5 kHz at 24 kHz / 1024
+    std::vector<float> re(n_fft), im(n_fft), re_d(n_fft), im_d(n_fft);
+    double sig_hi = 0.0, noise_hi = 0.0;
+    for (int start = 0; start + n_fft <= (int)pcm.size(); start += n_fft) {
+        for (int i = 0; i < n_fft; i++) {
+            re[i] = clean[start + i];
+            im[i] = 0.0f;
+            re_d[i] = pcm[start + i] - clean[start + i];
+            im_d[i] = 0.0f;
+        }
+        crispasr_wm::fft_radix2(re.data(), im.data(), n_fft, false);
+        crispasr_wm::fft_radix2(re_d.data(), im_d.data(), n_fft, false);
+        for (int k = k_5khz; k < n_fft / 2 - 4; k++) {
+            sig_hi += (double)re[k] * re[k] + (double)im[k] * im[k];
+            noise_hi += (double)re_d[k] * re_d[k] + (double)im_d[k] * im_d[k];
+        }
+    }
+    double above_5khz_snr = 10.0 * std::log10(sig_hi / (noise_hi + 1e-30));
+    // Legacy wideband put ~17 dB of comb up here (audible); the speech-band
+    // watermark leaves >40 dB SNR above 5 kHz (measured ~52 dB on real qwen3).
+    REQUIRE(above_5khz_snr > 40.0);
 }
 
 TEST_CASE("Watermark survives volume normalization", "[unit][watermark]") {
@@ -112,8 +186,10 @@ TEST_CASE("Watermark survives int16 round-trip (WAV writer path)", "[unit][water
     std::vector<int16_t> pcm_i16(pcm.size());
     for (size_t i = 0; i < pcm.size(); i++) {
         float s = pcm[i];
-        if (s > 1.0f) s = 1.0f;
-        if (s < -1.0f) s = -1.0f;
+        if (s > 1.0f)
+            s = 1.0f;
+        if (s < -1.0f)
+            s = -1.0f;
         pcm_i16[i] = (int16_t)(s * 32767.0f);
     }
 

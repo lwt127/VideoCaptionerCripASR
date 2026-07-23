@@ -19,8 +19,13 @@
 #include "chatterbox_campplus.h"
 #include "chatterbox_s3gen.h"
 #include "chatterbox_s3tok.h"
+#include "core/conv.h"
+#include "core/dac_decoder.h" // core_dac::fastconv_cache (shared FASTCONV)
 #include "core/gguf_loader.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
@@ -28,6 +33,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -36,6 +42,32 @@
 #include <random>
 #include <string>
 #include <vector>
+
+// ===========================================================================
+// Bench instrumentation — `CB_S3GEN_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool cb_s3gen_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_CB_S3GEN_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct cb_s3gen_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit cb_s3gen_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~cb_s3gen_bench_stage() {
+        if (!cb_s3gen_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  cb_s3gen_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -261,13 +293,24 @@ struct chatterbox_s3gen_context {
     // Use CRISPASR_S3GEN_UNET_PIN_CPU_OP=mul_mat to opt in for testing.
     bool unet_pin_mm_cpu = false;
 
-    // True when the UNet weights are GPU-resident (opt-in via
-    // CRISPASR_S3GEN_UNET_GPU_RESIDENCY=1). In that mode the cfm_euler_solve
-    // run_denoiser path also pins `unet_input` to the GPU backend (see the
-    // PLAN #83 r9 follow-up #4 comment there). The ggml-side mutation log
-    // patch in ggml-backend.cpp handles the related src[j] dangling-pointer
-    // issue for any other inputs that cross backends.
+    // True when the UNet weights are GPU-resident (default since we switched to
+    // full GPU + GGML_PREC_F32 mul_mat hints; opt-out via CRISPASR_S3GEN_UNET_CPU=1).
     bool unet_on_gpu = false;
+
+    // Set at load time on Metal when the CFM (s3.fd.*) weights are quantized.
+    // Metal's q8_0 mat-vec kernel (kernel_quantize_q8_0_f32 +
+    // kernel_mul_mv_q8_0_q8_0) requantizes the F32 activations to q8_0 and does
+    // q8×q8, ignoring the GGML_PREC_F32 hint mul_mat_hp() sets — corrupting the
+    // CFM (NaN on the batch=2 fused CFG graph at the very first Euler step;
+    // finite-but-garbage on the batch=1 path). It is NOT a 10-step accumulation.
+    // CPU dequantizes q8→F32 and computes F32×F32 (correct), so routing the CFM
+    // to CPU restores intelligible mel; F16 s3gen stays GPU-resident (it takes
+    // the correct mul_mm_f16_f32_hp path). CUDA is unaffected (PLAN #83 validated
+    // GPU+PREC_F32 to cos 1.0 on P100), so this is gated to Metal builds. Opt
+    // back onto GPU with CRISPASR_S3GEN_UNET_CPU=0. (A GPU-keeping alternative
+    // would be to dequantize s3.fd.* to F16 at load on Metal.)
+    bool force_unet_cpu = false;
+
 
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
@@ -282,8 +325,61 @@ struct chatterbox_s3gen_context {
 
     ggml_backend_sched_t sched = nullptr;
     std::vector<uint8_t> compute_meta;
+
+    // §208 — alternative single-all-GPU raw-gallocr CFM path
+    // (CRISPASR_S3GEN_UNET_GALLOCR=1). The legacy `sched` path rebuilds +
+    // re-allocates the b2 UNet graph every Euler step (~54% of synthesis) and
+    // cannot cache (sched mutates the graph on alloc — SIGSEGV on reuse). A raw
+    // ggml_gallocr on a single GPU backend does NOT mutate the graph on alloc,
+    // so the b2 graph + allocation are built once per T_mel and reused across all
+    // Euler steps (set 3 inputs → ggml_backend_graph_compute → read output).
+    // Independent of `sched`/`compute_meta` so the encoder/vocoder are untouched.
+    // §208 verdict: correct (parity 0.999) but a perf DUD — the host build+alloc
+    // it eliminates is only ~0.3% of the compute-bound per-step. Default OFF.
+    bool unet_gallocr_active = false;
+    ggml_gallocr_t unet_galloc = nullptr;
+    ggml_context* unet_cached_ctx = nullptr; // owns the cached b2 graph (kept alive)
+    ggml_cgraph* unet_cached_gf = nullptr;
+    int unet_cached_T = 0;
+    std::vector<uint8_t> unet_cache_meta; // persistent meta buffer for the cached graph
+
+    // Pre-permuted ConvTranspose1d weights for decomposed mul_mat + col2im_1d.
+    static constexpr int kMaxUps = 4;
+    ggml_tensor* ups_w_perm[kMaxUps] = {};
+    ggml_context* ctx_perm = nullptr;
+    ggml_backend_buffer_t buf_perm = nullptr;
+
+    // F16-dequantized CFM (s3.fd.*) weights, used on Metal when the GGUF is
+    // quantized: Metal's q8 mat-vec kernel requantizes activations to q8 and
+    // corrupts the flow-matcher, so we dequantize the CFM weights to F16 at
+    // load and keep them GPU-resident (correct mul_mm_f16_f32_hp path). See
+    // force_unet_cpu comment for the full diagnosis.
+    bool dequant_cfm_f16 = false;
+    ggml_context* ctx_f16 = nullptr;
+    ggml_backend_buffer_t buf_f16 = nullptr;
+
+    // FASTCONV (docs/perf-sweep/PLAN.md): baked F32 copies of the F16 conv
+    // kernels, so the fork's per-graph F16→F32 cast (in ggml_conv_1d) becomes a
+    // no-op. Two caches because s3gen weights are split across backends (split
+    // load routes s3.fd.*→CPU, rest→GPU; the Metal CFM fix moves quantized
+    // s3.fd.* back to GPU) — each F16 conv kernel is baked on ITS OWN backend so
+    // the pointer-swap in c->tensors preserves placement exactly. Cast-kill only
+    // (no k=1→matmul), which is bitwise-identical to the legacy cast. Gated
+    // CRISPASR_S3GEN_FASTCONV (default OFF pending a full seeded A/B on a quiet box).
+    core_dac::fastconv_cache fc_gpu;
+    core_dac::fastconv_cache fc_cpu;
+
     mt19937_state noise_rng{};
     uint32_t noise_seed = 0;
+
+    // Per-call performance counters (populated when CHATTERBOX_BENCH=1)
+    struct {
+        int64_t t_encoder_us = 0;
+        int64_t t_cfm_us = 0;
+        int64_t t_vocoder_us = 0;
+        int n_cfm_steps = 0;
+        int T_mel = 0;
+    } last_perf;
 
     // S3Tokenizer (module 3 of native voice clone). Bound from the s3.tok.*
     // tensors after weight load. See chatterbox_s3tok.{h,cpp}.
@@ -299,8 +395,22 @@ struct chatterbox_s3gen_context {
     int s3tok_campplus_unused = 0;
 
     ~chatterbox_s3gen_context() {
+        if (unet_galloc)
+            ggml_gallocr_free(unet_galloc);
+        if (unet_cached_ctx)
+            ggml_free(unet_cached_ctx);
         if (sched)
             ggml_backend_sched_free(sched);
+        if (buf_perm)
+            ggml_backend_buffer_free(buf_perm);
+        if (ctx_perm)
+            ggml_free(ctx_perm);
+        if (buf_f16)
+            ggml_backend_buffer_free(buf_f16);
+        if (ctx_f16)
+            ggml_free(ctx_f16);
+        fc_gpu.free();
+        fc_cpu.free();
         if (ctx_w)
             ggml_free(ctx_w);
         if (buf_w)
@@ -329,6 +439,26 @@ struct chatterbox_s3gen_context {
 // scheduler then routes those compute ops to CPU; only the GPU-resident
 // weight tensors stay on GPU and get copied over as needed.
 enum class s3gen_subgraph { encoder, unet, vocoder };
+// True when the CFM denoiser weights (s3.fd.*) in the GGUF are quantized.
+// Peeks tensor types from the metadata without loading the weights, so the
+// residency decision can be made before the (split) load.
+static bool s3gen_cfm_is_quantized(const char* path) {
+    gguf_context* meta = core_gguf::open_metadata(path);
+    if (!meta)
+        return false;
+    bool quantized = false;
+    const int64_t n = gguf_get_n_tensors(meta);
+    for (int64_t i = 0; i < n; i++) {
+        const char* name = gguf_get_tensor_name(meta, i);
+        if (name && std::strncmp(name, "s3.fd.", 6) == 0 && ggml_is_quantized(gguf_get_tensor_type(meta, i))) {
+            quantized = true;
+            break;
+        }
+    }
+    core_gguf::free_metadata(meta);
+    return quantized;
+}
+
 static bool s3gen_env_force_cpu(s3gen_subgraph which) {
     const char* envname = nullptr;
     switch (which) {
@@ -408,7 +538,7 @@ static void s3gen_maybe_pin_graph_to_cpu(chatterbox_s3gen_context* c, ggml_cgrap
     // Override: set CRISPASR_S3GEN_UNET_PIN_CPU_OP, CRISPASR_S3GEN_UNET_KEEP_GPU_OP,
     // or CRISPASR_S3GEN_UNET_CPU=1 to take manual control.
     // force_cpu takes full priority — auto_pin_mm does not apply when UNET_CPU=1.
-    const bool force_cpu = s3gen_env_force_cpu(which);
+    const bool force_cpu = s3gen_env_force_cpu(which) || (is_unet && c->force_unet_cpu);
     const bool auto_pin_mm = is_unet && c->unet_pin_mm_cpu && !keep_mode && !pin_only_mode && !force_cpu;
 
     if (!force_cpu && !keep_mode && !pin_only_mode && !auto_pin_mm)
@@ -532,7 +662,21 @@ extern "C" struct chatterbox_s3gen_context* chatterbox_s3gen_init_from_file(cons
         delete c;
         return nullptr;
     }
-    c->backend = use_gpu ? ggml_backend_init_best() : c->backend_cpu;
+    // §212: apply the CPU thread count to the s3gen backend. Previously the
+    // count was stored but never set on the backend, so the encoder / CFM (CPU
+    // route) / HiFT vocoder all ran at ggml's default thread count regardless
+    // of -t or CRISPASR_CHATTERBOX_THREADS. Honour the env directly too, so a
+    // standalone s3gen (no parent chatterbox to pre-resolve it) is configurable.
+    {
+        int s3_threads = c->n_threads;
+        if (const char* e = std::getenv("CRISPASR_CHATTERBOX_THREADS"); e && *e)
+            s3_threads = std::max(1, atoi(e));
+        c->n_threads = s3_threads;
+        ggml_backend_cpu_set_n_threads(c->backend_cpu, s3_threads);
+        if (verbosity >= 1)
+            fprintf(stderr, "s3gen: CPU backend threads=%d\n", s3_threads);
+    }
+    c->backend = use_gpu ? crispasr_init_gpu_backend() : c->backend_cpu;
     if (!c->backend) {
         if (verbosity >= 1 && use_gpu) {
             fprintf(stderr, "s3gen: GPU backend unavailable, falling back to CPU\n");
@@ -551,34 +695,47 @@ extern "C" struct chatterbox_s3gen_context* chatterbox_s3gen_init_from_file(cons
     }
     core_gguf::WeightLoad wl;
     bool loaded = false;
-    // PLAN #83 r9 (2026-05-23): two layered fixes for GPU FP16 compound drift
-    // through the 10-step CFM Euler solver (cos_min 0.858 on CUDA P100,
-    // 0.923 on M1 Metal vs 1.000 on CPU — see LEARNINGS Rounds 7 + 8).
-    //
-    //   1. Default: load ConditionalDecoder weights (s3.fd.*) on the CPU
-    //      backend buffer. The ggml scheduler routes ops to the backend
-    //      where weights live, so the UNet runs entirely on CPU
-    //      (genuine F32 dequant + F32 accumulation). Encoder (s3.fe.*),
-    //      flow front-end (s3.flow.*), tokenizer (s3.tok.*), speaker
-    //      encoder (s3.se.*), and HiFT vocoder (s3.v.*) keep GPU residency.
-    //
-    //   2. CRISPASR_S3GEN_UNET_GPU_RESIDENCY=1 opts out of #1: all weights
-    //      go on GPU, and the UNet relies instead on the per-op
-    //      GGML_PREC_F32 hints set by mul_mat_hp() (above). Validates
-    //      the kernel-level high-precision path (Metal: _hp kernels;
-    //      CUDA cuBLAS: CUBLAS_COMPUTE_32F).
-    const char* gpu_res_env = std::getenv("CRISPASR_S3GEN_UNET_GPU_RESIDENCY");
-    const bool unet_on_gpu = gpu_res_env && (gpu_res_env[0] == '1' || gpu_res_env[0] == 'y' || gpu_res_env[0] == 'Y');
-    c->unet_on_gpu = unet_on_gpu && (c->backend != c->backend_cpu);
-    if (c->backend != c->backend_cpu && !unet_on_gpu) {
-        auto is_gpu = [](const char* name, void*) -> bool { return std::strncmp(name, "s3.fd.", 6) != 0; };
-        loaded = core_gguf::load_weights_split(path, c->backend, c->backend_cpu, is_gpu, nullptr, "s3gen", wl);
-    } else {
-        if (c->backend != c->backend_cpu && verbosity >= 1) {
-            fprintf(stderr, "s3gen: CRISPASR_S3GEN_UNET_GPU_RESIDENCY=1 — UNet weights on GPU; "
-                            "relying on GGML_PREC_F32 mul_mat hints\n");
+    // UNet GPU-residency: default ON when GPU is available.
+    // GGML_PREC_F32 hints on all UNet mul_mat ops (mul_mat_hp()) give Metal
+    // the _hp kernel path (F32 accumulation), fixing the FP16 compound drift
+    // that caused cos_min 0.858 in PLAN #83 (see LEARNINGS Rounds 7 + 8).
+    // The parallel=true sched (set below) handles CFG uncond divergence (Bug B).
+    // Opt-out: CRISPASR_S3GEN_UNET_CPU=1 reverts to CPU residency for debugging.
+    {
+        const char* unet_cpu_env = std::getenv("CRISPASR_S3GEN_UNET_CPU");
+        // Explicit env wins both ways: =1/y forces CPU, =0/n forces GPU (lets a
+        // user override the Metal-q8 auto-route below).
+        const bool unet_cpu_env_on =
+            unet_cpu_env && (unet_cpu_env[0] == '1' || unet_cpu_env[0] == 'y' || unet_cpu_env[0] == 'Y');
+        const bool unet_cpu_env_off =
+            unet_cpu_env && (unet_cpu_env[0] == '0' || unet_cpu_env[0] == 'n' || unet_cpu_env[0] == 'N');
+#ifdef GGML_USE_METAL
+        // Metal q8 fix: Metal's q8 mat-vec kernel (kernel_quantize_q8_0_f32 +
+        // kernel_mul_mv_q8_0_q8_0) requantizes the CFM activations to q8 and
+        // corrupts the flow-matcher (NaN on the batch=2 CFG graph, garbage on
+        // batch=1). Default fix: dequantize the quantized CFM (s3.fd.*) weights
+        // to F16 at load and keep the CFM GPU-resident — the correct
+        // mul_mm_f16_f32_hp path, at full GPU speed (the post-load conversion
+        // below sets dequant_cfm_f16 results). CRISPASR_S3GEN_UNET_CPU=1 forces
+        // the slower CPU route instead; CRISPASR_S3GEN_UNET_CPU=0 keeps the
+        // (broken) q8 GPU path for debugging.
+        if (!unet_cpu_env_on && !unet_cpu_env_off && c->backend != c->backend_cpu && s3gen_cfm_is_quantized(path)) {
+            c->dequant_cfm_f16 = true;
         }
-        loaded = core_gguf::load_weights(path, c->backend, "s3gen", wl);
+#endif
+        const bool unet_cpu_forced = unet_cpu_env_on || c->force_unet_cpu;
+        c->unet_on_gpu = (c->backend != c->backend_cpu) && !unet_cpu_forced;
+        if (c->backend != c->backend_cpu && unet_cpu_forced) {
+            // Hybrid: UNet weights on CPU, rest on GPU (opt-out path).
+            auto is_gpu = [](const char* name, void*) -> bool { return std::strncmp(name, "s3.fd.", 6) != 0; };
+            loaded = core_gguf::load_weights_split(path, c->backend, c->backend_cpu, is_gpu, nullptr, "s3gen", wl);
+        } else {
+            if (c->backend != c->backend_cpu && verbosity >= 1) {
+                fprintf(stderr, "s3gen: UNet GPU-resident (GGML_PREC_F32 mul_mat); "
+                                "set CRISPASR_S3GEN_UNET_CPU=1 to revert\n");
+            }
+            loaded = core_gguf::load_weights(path, c->backend, "s3gen", wl);
+        }
     }
     if (!loaded) {
         delete c;
@@ -589,10 +746,145 @@ extern "C" struct chatterbox_s3gen_context* chatterbox_s3gen_init_from_file(cons
     c->buf_cpu_w = wl.buf_cpu;
     c->tensors = std::move(wl.tensors);
 
+    // Metal q8 fix (see dequant_cfm_f16 comment): replace each quantized CFM
+    // (s3.fd.*) weight with an F16 GPU copy so the CFM uses the correct
+    // mul_mm_f16_f32_hp Metal kernel instead of the activation-requantizing
+    // q8 mat-vec kernel. CPU-side dequant (q8→F32→F16) is exact w.r.t. the
+    // stored q8; the original q8 tensors stay in buf_w but are unreferenced.
+    if (c->dequant_cfm_f16) {
+        std::vector<ggml_tensor*> qsrc;
+        for (auto& kv : c->tensors) {
+            if (kv.first.rfind("s3.fd.", 0) == 0 && kv.second && ggml_is_quantized(kv.second->type))
+                qsrc.push_back(kv.second);
+        }
+        if (!qsrc.empty()) {
+            const size_t meta = ggml_tensor_overhead() * (qsrc.size() + 8) + 4096;
+            struct ggml_init_params fp = {meta, nullptr, true};
+            c->ctx_f16 = ggml_init(fp);
+            std::vector<ggml_tensor*> f16dst(qsrc.size(), nullptr);
+            for (size_t i = 0; i < qsrc.size(); i++) {
+                ggml_tensor* s = qsrc[i];
+                f16dst[i] = ggml_new_tensor(c->ctx_f16, GGML_TYPE_F16, ggml_n_dims(s), s->ne);
+                if (f16dst[i])
+                    ggml_set_name(f16dst[i], ggml_get_name(s));
+            }
+            c->buf_f16 = ggml_backend_alloc_ctx_tensors(c->ctx_f16, c->backend);
+            size_t n_conv = 0, bytes_q = 0, bytes_f16 = 0;
+            std::vector<char> raw;
+            std::vector<float> f32;
+            std::vector<ggml_fp16_t> f16;
+            for (size_t i = 0; i < qsrc.size(); i++) {
+                ggml_tensor* s = qsrc[i];
+                ggml_tensor* d = f16dst[i];
+                const auto* tt = ggml_get_type_traits(s->type);
+                if (!d || !tt || !tt->to_float)
+                    continue;
+                const int64_t n = ggml_nelements(s);
+                raw.resize(ggml_nbytes(s));
+                ggml_backend_tensor_get(s, raw.data(), 0, ggml_nbytes(s));
+                f32.resize((size_t)n);
+                tt->to_float(raw.data(), f32.data(), n);
+                f16.resize((size_t)n);
+                ggml_fp32_to_fp16_row(f32.data(), f16.data(), n);
+                ggml_backend_tensor_set(d, f16.data(), 0, (size_t)n * sizeof(ggml_fp16_t));
+                c->tensors[ggml_get_name(s)] = d; // redirect graph lookups to the F16 copy
+                n_conv++;
+                bytes_q += ggml_nbytes(s);
+                bytes_f16 += ggml_nbytes(d);
+            }
+            if (verbosity >= 1) {
+                fprintf(stderr,
+                        "s3gen: quantized CFM on Metal → dequantized %zu UNet1D weights q8→F16 GPU-resident "
+                        "(%.0f→%.0f MiB; correct mul_mm_f16_f32_hp path, full GPU speed; "
+                        "CRISPASR_S3GEN_UNET_CPU=1 for the CPU route)\n",
+                        n_conv, bytes_q / 1048576.0, bytes_f16 / 1048576.0);
+            }
+        }
+    }
+
+    // FASTCONV: bake F32 copies of the F16 conv kernels and redirect graph
+    // lookups to them (same pointer-swap idiom as the ctx_f16 fix above), so
+    // ggml_conv_1d skips its per-graph F16→F32 kernel cast. Bitwise-identical to
+    // the legacy cast (the bake IS that conversion, done once at load). Each
+    // kernel is baked on its OWN backend to preserve split-load placement.
+    // Gated CRISPASR_S3GEN_FASTCONV; default OFF until a full seeded A/B lands.
+    {
+        // Default ON: the A/B proved cast-kill is audio byte-identical to the
+        // legacy in-graph cast (ON vs OFF @seed42 = 0/32768 across all samples,
+        // which for this flow-matching+AR pipeline also subsumes the determinism
+        // gate — a non-deterministic run would have diverged). Set =0 to revert.
+        const char* e = std::getenv("CRISPASR_S3GEN_FASTCONV");
+        const bool on = !e || (e[0] != '0');
+        if (on) {
+            const bool have_gpu = (c->backend_cpu && c->backend_cpu != c->backend);
+            ggml_backend_buffer_type_t cpu_buft =
+                have_gpu ? ggml_backend_get_default_buffer_type(c->backend_cpu) : nullptr;
+            std::vector<ggml_tensor*> gpu_k, cpu_k;
+            for (auto& kv : c->tensors) {
+                ggml_tensor* w = kv.second;
+                if (!w || w->type != GGML_TYPE_F16 || ggml_n_dims(w) != 3)
+                    continue; // conv kernels are the only 3D weights (matmuls are 2D)
+                // Exclude ConvTranspose1d upsample weights (.ups.): they go through
+                // core_convt's decomposed permute path, not ggml_conv_1d, and the
+                // permute below reads the F16 original from c->tensors — swapping
+                // them to F32 would feed garbage to permute_convt1d_weight.
+                if (kv.first.find(".ups.") != std::string::npos)
+                    continue;
+                // Route each kernel to a cache on ITS OWN backend so the swap
+                // preserves split-load placement. CPU-only mode → all on c->backend.
+                const bool on_cpu =
+                    have_gpu && w->buffer && cpu_buft && ggml_backend_buffer_get_type(w->buffer) == cpu_buft;
+                (on_cpu ? cpu_k : gpu_k).push_back(w);
+            }
+            c->fc_gpu.bake(c->backend, gpu_k, true);
+            if (have_gpu)
+                c->fc_cpu.bake(c->backend_cpu, cpu_k, true);
+            size_t swapped = 0;
+            for (auto& kv : c->tensors) {
+                ggml_tensor* w = kv.second;
+                ggml_tensor* f = c->fc_gpu.get(w);
+                if (f == w)
+                    f = c->fc_cpu.get(w);
+                if (f != w) {
+                    kv.second = f;
+                    swapped++;
+                }
+            }
+            if (verbosity >= 1 || std::getenv("CRISPASR_S3GEN_FASTCONV_DEBUG")) {
+                fprintf(stderr, "s3gen: FASTCONV ON — baked %zu GPU + %zu CPU F16 conv kernels → F32 (%zu swapped)\n",
+                        c->fc_gpu.f32.size(), c->fc_cpu.f32.size(), swapped);
+            }
+        }
+    }
+
     if (verbosity >= 1) {
         fprintf(stderr, "s3gen: loaded %zu tensors from %s\n", c->tensors.size(), path);
         fprintf(stderr, "s3gen: diffusion noise seed=%u\n", c->noise_seed);
         std::fflush(stderr);
+    }
+
+    // Permute ConvTranspose1d weights for decomposed mul_mat + col2im_1d.
+    {
+        const char* ups_names[3] = {"s3.v.ups.0.weight", "s3.v.ups.1.weight", "s3.v.ups.2.weight"};
+        const int n_ups = 3;
+        const size_t meta_bytes = ggml_tensor_overhead() * (size_t)n_ups + 4096;
+        struct ggml_init_params pp = {meta_bytes, nullptr, true};
+        c->ctx_perm = ggml_init(pp);
+        std::unique_ptr<float[]> perm_bufs[3];
+        for (int i = 0; i < n_ups; i++) {
+            auto it = c->tensors.find(ups_names[i]);
+            if (it == c->tensors.end())
+                continue;
+            ggml_tensor* src = it->second;
+            perm_bufs[i] = core_convt::permute_convt1d_weight(src);
+            c->ups_w_perm[i] =
+                ggml_new_tensor_2d(c->ctx_perm, GGML_TYPE_F32, (int)src->ne[2], (int)src->ne[0] * (int)src->ne[1]);
+        }
+        c->buf_perm = ggml_backend_alloc_ctx_tensors(c->ctx_perm, c->backend);
+        for (int i = 0; i < n_ups; i++) {
+            if (c->ups_w_perm[i] && perm_bufs[i])
+                ggml_backend_tensor_set(c->ups_w_perm[i], perm_bufs[i].get(), 0, ggml_nbytes(c->ups_w_perm[i]));
+        }
     }
 
     // Verify critical tensors exist
@@ -620,11 +912,31 @@ extern "C" struct chatterbox_s3gen_context* chatterbox_s3gen_init_from_file(cons
         // [cmd_buf_last waitUntilCompleted] which does NOT invalidate the
         // GPU's view of a shared-storage Metal buffer that was overwritten
         // by a CPU memcpy between consecutive command-buffer submissions.
-        // Gated on `c->unet_on_gpu` so CPU residency (production default)
-        // keeps the lower-overhead parallel=false path (Bug B is M1-Metal
-        // specific; CPU residency was never broken).
-        c->sched = ggml_backend_sched_new(backends, nullptr, n_be, 32768, c->unet_on_gpu, false);
+        // parallel=true: required for CFG uncond pass correctness on Metal (Bug B).
+        // Now always enabled when a GPU backend is present (UNet is GPU by default).
+        const bool use_parallel = (c->backend != c->backend_cpu);
+        c->sched = ggml_backend_sched_new(backends, nullptr, n_be, 32768, use_parallel, false);
         c->compute_meta.resize(ggml_tensor_overhead() * 32768 + ggml_graph_overhead_custom(32768, false));
+    }
+
+    // §208 — opt into the single-all-GPU raw-gallocr cached CFM path. Requires a
+    // real GPU backend and the UNet kept on GPU (the CPU/hybrid routes keep the
+    // legacy sched path). The F16-dequant CFM weights (dequant_cfm_f16) are
+    // already GPU-resident via c->tensors, so the gallocr path picks them up
+    // unchanged. Falls back to legacy automatically when unmet.
+    {
+        const char* g = std::getenv("CRISPASR_S3GEN_UNET_GALLOCR");
+        const bool want_gallocr = g && (g[0] == '1' || g[0] == 'y' || g[0] == 'Y');
+        c->unet_gallocr_active = want_gallocr && (c->backend != c->backend_cpu) && c->unet_on_gpu;
+        if (want_gallocr && !c->unet_gallocr_active && verbosity >= 1) {
+            fprintf(stderr,
+                    "s3gen: CRISPASR_S3GEN_UNET_GALLOCR requested but unmet "
+                    "(GPU=%d, unet_on_gpu=%d) — using legacy sched path\n",
+                    (int)(c->backend != c->backend_cpu), (int)c->unet_on_gpu);
+        } else if (c->unet_gallocr_active && verbosity >= 1) {
+            fprintf(stderr, "s3gen: §208 UNet CFM raw-gallocr cached path ENABLED "
+                            "(single-GPU, graph reused across Euler steps)\n");
+        }
     }
 
     // S3Tokenizer V2 — bind from `s3.tok.*` (optional; the field stays
@@ -854,7 +1166,7 @@ extern "C" void chatterbox_s3gen_set_seed(struct chatterbox_s3gen_context* ctx, 
 // x: (D, T), returns: (D, T)
 static ggml_tensor* build_conformer_block(ggml_context* ctx, ggml_cgraph* gf, chatterbox_s3gen_context* c,
                                           ggml_tensor* x, int seq_len, const char* prefix, int n_heads, int head_dim,
-                                          int D, int ff_dim, ggml_tensor* pos_emb = nullptr) {
+                                          int D, int /*ff_dim*/, ggml_tensor* pos_emb = nullptr) {
     const int TT = seq_len; // renamed to avoid shadowing
     char key[64];
     auto W = [&](const char* suffix) -> ggml_tensor* {
@@ -1031,8 +1343,8 @@ static ggml_tensor* build_conformer_block(ggml_context* ctx, ggml_cgraph* gf, ch
         // contracts ne[0]: scores.ne[0]=TT, v_t.ne[0]=hd. No match!
 
         // Let me use a different approach: transpose scores to (TT_q, TT_k, H), then mul_mat with v_t
-        ggml_tensor* scores_t = ggml_cont(ctx, ggml_permute(ctx, scores, 1, 0, 2, 3)); // (TT_q, TT_k, H)
-        // Now ggml_mul_mat(v_t, scores_t): contracts ne[0]. v_t.ne[0]=hd, scores_t.ne[0]=TT_q. Still no.
+        // scores_t = ggml_cont(ctx, ggml_permute(ctx, scores, 1, 0, 2, 3)); // (TT_q, TT_k, H)
+        // ggml_mul_mat(v_t, scores_t): contracts ne[0]. v_t.ne[0]=hd, scores_t.ne[0]=TT_q. Still no.
 
         // Actually: we want out[d][q][h] = sum_k attn[k][q][h] * v[d][k][h]
         // This is: for each h: out[:,q] = V[:,:] @ attn[:,q]
@@ -1641,7 +1953,7 @@ static ggml_tensor* mul_mat_hp(ggml_context* ctx, ggml_tensor* a, ggml_tensor* b
 
 // Helper: CausalResnetBlock1D — block1 + time_mlp + block2 + residual.
 static ggml_tensor* causal_resnet_block(ggml_context* ctx, ggml_tensor* x, ggml_tensor* t_emb,
-                                        chatterbox_s3gen_context* c, const char* prefix, ggml_tensor* mask) {
+                                        chatterbox_s3gen_context* c, const char* prefix, ggml_tensor* /*mask*/) {
     char key[64];
     auto W = [&](const char* suffix) -> ggml_tensor* {
         std::snprintf(key, sizeof(key), "%s.%s", prefix, suffix);
@@ -1715,7 +2027,6 @@ static ggml_tensor* basic_transformer_block(ggml_context* ctx, ggml_tensor* x, /
         return core_gguf::try_get(c->tensors, key);
     };
 
-    int C = (int)x->ne[1];
     int TT = (int)x->ne[0];
 
     // Transpose to (T, C) for attention
@@ -1786,6 +2097,293 @@ static ggml_tensor* basic_transformer_block(ggml_context* ctx, ggml_tensor* x, /
 
     // Transpose back to (C, T)
     return ggml_cont(ctx, ggml_transpose(ctx, xt));
+}
+
+// ── Batch=2 UNet helpers (cond + uncond in one graph) ───────────────────────
+//
+// Tensors are 3D: (T, C, 2) where ne[2]=2 is the batch axis.
+// batch=0 = conditioned pass, batch=1 = unconditioned pass.
+// All ggml_mul_mat operations handle ne[2] as an outer batch dim natively,
+// so attention GEMMs (≈90% of UNet compute) run as batch=2 Metal dispatches.
+// Convolutions cannot easily be batched (ggml_conv_1d does not guarantee ne[2]
+// support), so causal_conv1d_b2 slices, runs two 2-D convs, and stacks.
+
+// Causal conv1d for batch=2 input: slice each batch item, run 2D conv, concat.
+static ggml_tensor* causal_conv1d_b2(ggml_context* ctx, ggml_tensor* x, // (T, C_in, 2)
+                                     ggml_tensor* weight, ggml_tensor* bias) {
+    int T = (int)x->ne[0];
+    int C_in = (int)x->ne[1];
+    // Contiguous 2D views of each batch slice.
+    ggml_tensor* x0 = ggml_view_2d(ctx, x, T, C_in, x->nb[1], 0);
+    ggml_tensor* x1 = ggml_view_2d(ctx, x, T, C_in, x->nb[1], x->nb[2]);
+    ggml_tensor* y0 = causal_conv1d(ctx, x0, weight, bias); // (T, C_out)
+    ggml_tensor* y1 = causal_conv1d(ctx, x1, weight, bias); // (T, C_out)
+    int T_out = (int)y0->ne[0];
+    int C_out = (int)y0->ne[1];
+    y0 = ggml_reshape_3d(ctx, y0, T_out, C_out, 1);
+    y1 = ggml_reshape_3d(ctx, y1, T_out, C_out, 1);
+    return ggml_concat(ctx, y0, y1, 2); // (T_out, C_out, 2)
+}
+
+// CausalBlock1D for batch=2. Skips the per-call debug probing machinery.
+static ggml_tensor* causal_block1d_b2(ggml_context* ctx, ggml_tensor* x, // (T, C_in, 2)
+                                      ggml_tensor* conv_w, ggml_tensor* conv_b, ggml_tensor* ln_w, ggml_tensor* ln_b) {
+    x = causal_conv1d_b2(ctx, x, conv_w, conv_b); // (T, C_out, 2)
+    x = ggml_cont(ctx, ggml_transpose(ctx, x));   // (C_out, T, 2)
+    x = ggml_norm(ctx, x, 1e-5f);                 // norm over C_out for each (T, batch)
+    if (ln_w)
+        x = ggml_mul(ctx, x, ln_w); // (C_out,) broadcasts ✓
+    if (ln_b)
+        x = ggml_add(ctx, x, ln_b);
+    x = ggml_cont(ctx, ggml_transpose(ctx, x)); // (T, C_out, 2)
+    x = ggml_mish(ctx, x);
+    return x;
+}
+
+// CausalResnetBlock1D for batch=2.
+// t_emb is (1024,) — same time step for both passes, broadcast to both.
+static ggml_tensor* causal_resnet_block_b2(ggml_context* ctx, ggml_tensor* x, ggml_tensor* t_emb,
+                                           chatterbox_s3gen_context* c, const char* prefix, ggml_tensor* /*mask*/) {
+    char key[64];
+    auto W = [&](const char* suffix) -> ggml_tensor* {
+        std::snprintf(key, sizeof(key), "%s.%s", prefix, suffix);
+        return core_gguf::try_get(c->tensors, key);
+    };
+
+    ggml_tensor* residual = x; // (T, C_in, 2)
+
+    x = causal_block1d_b2(ctx, x, W("b1.0.weight"), W("b1.0.bias"), W("b1.2.weight"), W("b1.2.bias"));
+
+    // Time MLP — same t_emb for both passes (identical time step); broadcast to all T and both batch items.
+    ggml_tensor* t_proj_in = ggml_mish(ctx, t_emb);                      // (1024,)
+    ggml_tensor* t_proj = mul_mat_hp(ctx, W("mlp.1.weight"), t_proj_in); // (C_out,)
+    ggml_tensor* t_b = W("mlp.1.bias");
+    if (t_b)
+        t_proj = ggml_add(ctx, t_proj, t_b);
+    t_proj = ggml_reshape_2d(ctx, t_proj, 1, (int)t_proj->ne[0]); // (1, C_out) broadcasts over (T, C_out, 2)
+    x = ggml_add(ctx, x, t_proj);
+
+    x = causal_block1d_b2(ctx, x, W("b2.0.weight"), W("b2.0.bias"), W("b2.2.weight"), W("b2.2.bias"));
+
+    ggml_tensor* rc_w = W("rc.weight");
+    if (rc_w) {
+        ggml_tensor* rc_b = W("rc.bias");
+        if (rc_w->ne[0] == 1) {
+            // k=1 pointwise: use mul_mat so batch dim flows naturally.
+            ggml_tensor* rc_w_2d = ggml_reshape_2d(ctx, rc_w, rc_w->ne[1], rc_w->ne[2]); // (C_in, C_out)
+            ggml_tensor* res_T = ggml_cont(ctx, ggml_transpose(ctx, residual));          // (C_in, T, 2)
+            residual = mul_mat_hp(ctx, rc_w_2d, res_T);               // (C_out, T, 2) — batch=2 supported
+            residual = ggml_cont(ctx, ggml_transpose(ctx, residual)); // (T, C_out, 2)
+            if (rc_b) {
+                ggml_tensor* rb2d = ggml_reshape_2d(ctx, rc_b, 1, (int)rc_b->ne[0]);
+                residual = ggml_add(ctx, residual, rb2d);
+            }
+        } else {
+            // k>1 conv: slice and stack.
+            residual = causal_conv1d_b2(ctx, residual, rc_w, rc_b);
+        }
+    }
+
+    return ggml_add(ctx, x, residual);
+}
+
+// BasicTransformerBlock for batch=2.
+// Key change: Q/K/V are reshaped to 4D (hd, nh, T, B) and permuted to (hd, T, nh, B)
+// so flash_attn_ext sees them as (D, N, H, B) — its standard batched layout.
+static ggml_tensor* basic_transformer_block_b2(ggml_context* ctx, ggml_tensor* x, // (T, C, 2)
+                                               chatterbox_s3gen_context* c, const char* prefix,
+                                               ggml_tensor* /*attn_mask*/, int n_heads, int head_dim) {
+    char key[64];
+    auto W = [&](const char* suffix) -> ggml_tensor* {
+        std::snprintf(key, sizeof(key), "%s.%s", prefix, suffix);
+        return core_gguf::try_get(c->tensors, key);
+    };
+
+    int TT = (int)x->ne[0]; // T_mel
+    int B = (int)x->ne[2];  // batch size (2)
+
+    ggml_tensor* xt = ggml_cont(ctx, ggml_transpose(ctx, x)); // (C, T, 2)
+
+    // norm1 → self-attention
+    ggml_tensor* residual = xt;
+    ggml_tensor* xn = ggml_norm(ctx, xt, 1e-5f); // (C, T, 2) — norms over ne[0]=C ✓
+    ggml_tensor* n1w = W("norm1.weight");
+    ggml_tensor* n1b = W("norm1.bias");
+    if (n1w)
+        xn = ggml_mul(ctx, xn, n1w); // (C,) broadcasts ✓
+    if (n1b)
+        xn = ggml_add(ctx, xn, n1b);
+
+    int proj_dim = n_heads * head_dim;                         // 512
+    ggml_tensor* Q = mul_mat_hp(ctx, W("attn1.q.weight"), xn); // (proj_dim, T, 2)
+    ggml_tensor* K = mul_mat_hp(ctx, W("attn1.k.weight"), xn);
+    ggml_tensor* V = mul_mat_hp(ctx, W("attn1.v.weight"), xn);
+
+    // Reshape to 4D: (hd, nh, T, B) then permute to (hd, T, nh, B) for flash_attn (D, N, H, B).
+    Q = ggml_reshape_4d(ctx, Q, head_dim, n_heads, TT, B);
+    K = ggml_reshape_4d(ctx, K, head_dim, n_heads, TT, B);
+    V = ggml_reshape_4d(ctx, V, head_dim, n_heads, TT, B);
+
+    Q = ggml_cont(ctx, ggml_permute(ctx, Q, 0, 2, 1, 3)); // (hd, T, nh, B)
+    K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));
+    V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));
+
+    float scale = 1.0f / std::sqrt((float)head_dim);
+    ggml_tensor* attn = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+    // attn: (hd, T, nh, B)
+
+    attn = ggml_reshape_3d(ctx, attn, proj_dim, TT, B); // (proj_dim, T, 2)
+    attn = mul_mat_hp(ctx, W("attn1.o.weight"), attn);  // (proj_dim, T, 2) — batch flows ✓
+    ggml_tensor* o_b = W("attn1.o.bias");
+    if (o_b)
+        attn = ggml_add(ctx, attn, o_b); // (proj_dim,) broadcasts ✓
+
+    xt = ggml_add(ctx, residual, attn);
+
+    // norm3 → FF (GELU up/down)
+    residual = xt;
+    xn = ggml_norm(ctx, xt, 1e-5f);
+    if (W("norm3.weight"))
+        xn = ggml_mul(ctx, xn, W("norm3.weight"));
+    if (W("norm3.bias"))
+        xn = ggml_add(ctx, xn, W("norm3.bias"));
+
+    ggml_tensor* ff_up = mul_mat_hp(ctx, W("ff.up.weight"), xn); // (4C, T, 2)
+    if (W("ff.up.bias"))
+        ff_up = ggml_add(ctx, ff_up, W("ff.up.bias"));
+    ff_up = ggml_gelu(ctx, ff_up);
+
+    ggml_tensor* ff_out = mul_mat_hp(ctx, W("ff.down.weight"), ff_up); // (C, T, 2)
+    if (W("ff.down.bias"))
+        ff_out = ggml_add(ctx, ff_out, W("ff.down.bias"));
+
+    xt = ggml_add(ctx, residual, ff_out);
+    return ggml_cont(ctx, ggml_transpose(ctx, xt)); // (T, C, 2)
+}
+
+// Build the UNet1D denoiser graph for cond + uncond in one Metal pass (CFG).
+// x_in: (T, 320, 2) where batch=0=conditioned, batch=1=unconditioned
+// t_emb: (1024,) — same time step for both
+// Returns: (T, 80, 2) velocity predictions — read back as [cond | uncond]
+// When `meta_keep` is non-null the graph is built into that persistent meta
+// buffer (not the shared c->compute_meta) and ctx0 is returned via *ctx_keep
+// instead of being freed, so the graph object survives for reuse across CFM
+// steps under the raw-gallocr path (§208). Default (both null) = the legacy
+// behaviour: build into c->compute_meta, free ctx0, return the graph (the meta
+// buffer is caller-owned so the graph data survives the ggml_free).
+static ggml_cgraph* build_graph_unet1d_b2(chatterbox_s3gen_context* c, int T_mel,
+                                          std::vector<uint8_t>* meta_keep = nullptr,
+                                          ggml_context** ctx_keep = nullptr) {
+    std::vector<uint8_t>& meta = meta_keep ? *meta_keep : c->compute_meta;
+    ggml_init_params ip = {meta.size(), meta.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 32768, false);
+
+    ggml_tensor* x_in = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, T_mel, 320, 2);
+    ggml_set_name(x_in, "unet_input_b2");
+    ggml_set_input(x_in);
+
+    ggml_tensor* t_emb = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1024);
+    ggml_set_name(t_emb, "time_emb");
+    ggml_set_input(t_emb);
+
+    ggml_tensor* mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, T_mel, 1);
+    ggml_set_name(mask, "mask");
+    ggml_set_input(mask);
+
+    ggml_tensor* x = x_in;
+    ggml_tensor* hidden = nullptr;
+
+    // ---- Down block ----
+    {
+        x = causal_resnet_block_b2(ctx0, x, t_emb, c, "s3.fd.db.0.0", mask);
+        for (int j = 0; j < 4; j++) {
+            char prefix[48];
+            std::snprintf(prefix, sizeof(prefix), "s3.fd.db.0.1.%d", j);
+            x = basic_transformer_block_b2(ctx0, x, c, prefix, nullptr, 8, 64);
+        }
+        hidden = x; // save for skip connection
+        ggml_tensor* ds_w = T(c, "s3.fd.db.0.2.weight");
+        ggml_tensor* ds_b = T(c, "s3.fd.db.0.2.bias");
+        if (ds_w)
+            x = causal_conv1d_b2(ctx0, x, ds_w, ds_b);
+    }
+
+    // ---- Mid blocks (12) ----
+    for (int i = 0; i < 12; i++) {
+        char prefix[48];
+        std::snprintf(prefix, sizeof(prefix), "s3.fd.mb.%d.0", i);
+        x = causal_resnet_block_b2(ctx0, x, t_emb, c, prefix, mask);
+        for (int j = 0; j < 4; j++) {
+            char tb_prefix[48];
+            std::snprintf(tb_prefix, sizeof(tb_prefix), "s3.fd.mb.%d.1.%d", i, j);
+            x = basic_transformer_block_b2(ctx0, x, c, tb_prefix, nullptr, 8, 64);
+        }
+    }
+
+    // ---- Up block ----
+    {
+        if (hidden) {
+            int T_x = (int)x->ne[0];
+            int T_h = (int)hidden->ne[0];
+            if (T_x < T_h) {
+                hidden = ggml_view_3d(ctx0, hidden, T_x, (int)hidden->ne[1], 2, hidden->nb[1], hidden->nb[2], 0);
+                hidden = ggml_cont(ctx0, hidden);
+            }
+            x = ggml_concat(ctx0, x, hidden, 1); // concat along C dim → (T, 2C, 2)
+        }
+        x = causal_resnet_block_b2(ctx0, x, t_emb, c, "s3.fd.ub.0.0", mask);
+        for (int j = 0; j < 4; j++) {
+            char prefix[48];
+            std::snprintf(prefix, sizeof(prefix), "s3.fd.ub.0.1.%d", j);
+            x = basic_transformer_block_b2(ctx0, x, c, prefix, nullptr, 8, 64);
+        }
+        ggml_tensor* us_w = T(c, "s3.fd.ub.0.2.weight");
+        ggml_tensor* us_b = T(c, "s3.fd.ub.0.2.bias");
+        if (us_w)
+            x = causal_conv1d_b2(ctx0, x, us_w, us_b);
+    }
+
+    // ---- Final block ----
+    {
+        ggml_tensor* fb_w = T(c, "s3.fd.fb.block.0.weight");
+        ggml_tensor* fb_b = T(c, "s3.fd.fb.block.0.bias");
+        ggml_tensor* fb_ln_w = T(c, "s3.fd.fb.block.2.weight");
+        ggml_tensor* fb_ln_b = T(c, "s3.fd.fb.block.2.bias");
+        if (fb_w)
+            x = causal_block1d_b2(ctx0, x, fb_w, fb_b, fb_ln_w, fb_ln_b);
+        if (mask)
+            x = ggml_mul(ctx0, x, mask); // (T, 1) broadcasts ✓
+
+        // Final projection: k=1 conv → use mul_mat to handle batch=2 correctly.
+        ggml_tensor* fp_w = T(c, "s3.fd.fp.weight"); // (1, C_in, 80)
+        ggml_tensor* fp_b = T(c, "s3.fd.fp.bias");
+        if (fp_w) {
+            ggml_tensor* fp_w_2d = ggml_reshape_2d(ctx0, fp_w, fp_w->ne[1], fp_w->ne[2]); // (C_in, 80)
+            x = ggml_cont(ctx0, ggml_transpose(ctx0, x));                                 // (C_in, T, 2)
+            x = mul_mat_hp(ctx0, fp_w_2d, x);                                             // (80, T, 2)
+            x = ggml_cont(ctx0, ggml_transpose(ctx0, x));                                 // (T, 80, 2)
+            if (fp_b) {
+                ggml_tensor* b2d = ggml_reshape_2d(ctx0, fp_b, 1, (int)fp_b->ne[0]);
+                x = ggml_add(ctx0, x, b2d);
+            }
+        }
+    }
+
+    if (mask)
+        x = ggml_mul(ctx0, x, mask); // (T, 1) broadcasts over (T, 80, 2) ✓
+    ggml_set_name(x, "denoiser_out_b2");
+    // Mark the terminal node as a graph output so the gallocr keeps its buffer
+    // live for the per-step tensor_get read (no-op for the legacy sched path —
+    // it reads the same tensor by name and the flag does not change numerics).
+    ggml_set_output(x);
+    ggml_build_forward_expand(gf, x);
+    if (ctx_keep) {
+        *ctx_keep = ctx0; // caller owns ctx0 (cached gallocr path) — do not free
+    } else {
+        ggml_free(ctx0);
+    }
+    return gf;
 }
 
 // Build the full UNet1D denoiser graph for one CFM step.
@@ -1872,7 +2470,6 @@ static ggml_cgraph* build_graph_unet1d(chatterbox_s3gen_context* c, int T_mel) {
         if (mark_db_resnet)
             ggml_set_output(x);
         // 4 transformer blocks
-        ggml_tensor* xt = ggml_cont(ctx0, ggml_transpose(ctx0, x));
         for (int j = 0; j < 4; j++) {
             char prefix[48];
             std::snprintf(prefix, sizeof(prefix), "s3.fd.db.0.1.%d", j);
@@ -2017,111 +2614,263 @@ static std::vector<float> cfm_euler_solve(chatterbox_s3gen_context* c,
     // Prepare mask (all ones)
     std::vector<float> mask_data(T_mel, 1.0f);
 
+    // Pre-compute time embeddings for all steps before the Euler loop to avoid
+    // 20× repeated Metal→CPU weight reads (1024×320 + 1024×1024 per call).
+    // For meanflow we also pre-compute r embeddings and the mixer output.
+    auto compute_time_emb = [&](float t) -> std::vector<float> {
+        std::vector<float> emb = sinusoidal_embedding(t, 320);
+        ggml_tensor* tm1_w = T(c, "s3.fd.tm.linear_1.weight");
+        ggml_tensor* tm1_b = T(c, "s3.fd.tm.linear_1.bias");
+        ggml_tensor* tm2_w = T(c, "s3.fd.tm.linear_2.weight");
+        ggml_tensor* tm2_b = T(c, "s3.fd.tm.linear_2.bias");
+        if (!tm1_w || !tm2_w)
+            return emb;
+        std::vector<float> w1(1024 * 320), b1(1024, 0.0f);
+        std::vector<float> w2(1024 * 1024), b2(1024, 0.0f);
+        tensor_get_f32(tm1_w, w1.data(), 0, w1.size());
+        if (tm1_b)
+            tensor_get_f32(tm1_b, b1.data(), 0, b1.size());
+        tensor_get_f32(tm2_w, w2.data(), 0, w2.size());
+        if (tm2_b)
+            tensor_get_f32(tm2_b, b2.data(), 0, b2.size());
+        std::vector<float> h1(1024);
+        for (int i = 0; i < 1024; i++) {
+            float sum = b1[i];
+            for (int j = 0; j < 320; j++)
+                sum += w1[i * 320 + j] * emb[j];
+            float sig = 1.0f / (1.0f + std::exp(-sum));
+            h1[i] = sum * sig;
+        }
+        emb.resize(1024);
+        for (int i = 0; i < 1024; i++) {
+            float sum = b2[i];
+            for (int j = 0; j < 1024; j++)
+                sum += w2[i * 1024 + j] * h1[j];
+            emb[i] = sum;
+        }
+        return emb;
+    };
+    // t_embs[step] = time embedding for t_span[step]; for meanflow also r_embs + mixed
+    std::vector<std::vector<float>> t_embs(n_steps);
+    std::vector<std::vector<float>> r_embs(meanflow ? n_steps : 0);
+    std::vector<std::vector<float>> mixed_embs(meanflow ? n_steps : 0);
+    // Load mixer weights once (meanflow only)
+    std::vector<float> tmx_w_data;
+    ggml_tensor* tmx_w_ptr = meanflow ? T(c, "s3.fd.tmx.weight") : nullptr;
+    if (tmx_w_ptr) {
+        tmx_w_data.resize(1024 * 2048);
+        tensor_get_f32(tmx_w_ptr, tmx_w_data.data(), 0, tmx_w_data.size());
+    }
+    for (int step = 0; step < n_steps; step++) {
+        t_embs[step] = compute_time_emb(t_span[step]);
+        if (meanflow) {
+            r_embs[step] = compute_time_emb(t_span[step + 1]);
+            std::vector<float> concat(2048);
+            std::memcpy(concat.data(), t_embs[step].data(), 1024 * sizeof(float));
+            std::memcpy(concat.data() + 1024, r_embs[step].data(), 1024 * sizeof(float));
+            mixed_embs[step].resize(1024, 0.0f);
+            if (!tmx_w_data.empty()) {
+                for (int i = 0; i < 1024; i++) {
+                    float sum = 0.0f;
+                    for (int j = 0; j < 2048; j++)
+                        sum += tmx_w_data[i * 2048 + j] * concat[j];
+                    mixed_embs[step][i] = sum;
+                }
+            }
+        }
+    }
+
+    // When cfg_rate > 0 and not meanflow we run two UNet passes per step (cond + uncond).
+    // The batch=2 graph fuses both into one Metal dispatch so attention GEMMs (≈90% of
+    // compute) run as batched matmuls rather than two sequential single-batch calls.
+    // Opt out with CRISPASR_S3GEN_UNET_CFG_SINGLE=1 to force the old sequential path.
+    // Interval-CFG (opt-in, APPROXIMATE — mirrors OMNIVOICE_CFG_INTERVAL): recompute
+    // the uncond UNet pass only every K CFM Euler steps and reuse the cached uncond
+    // velocity in between; the cond pass stays fresh every step; the first and last
+    // step always recompute. K>1 forces the SEQUENTIAL single-UNet path (the batched
+    // B2 graph fuses cond+uncond in one dispatch, so there is nothing to skip), then
+    // skips the uncond pass. Only active when K>1 && cfg_rate>0 && !meanflow, so at the
+    // default the batched B2 path below is byte-for-byte unchanged (K=1 = exact).
+    // Gated CRISPASR_S3GEN_CFG_INTERVAL.
+    const int cfg_interval = [] {
+        const char* e = std::getenv("CRISPASR_S3GEN_CFG_INTERVAL");
+        const int k = e ? std::atoi(e) : 1;
+        return k < 1 ? 1 : k;
+    }();
+    const bool cfg_interval_on = cfg_interval > 1 && cfg_rate > 0.0f && !meanflow;
+    std::vector<float> v_uncond_cache; // last computed uncond velocity; reused between recomputes
+    if (cfg_interval_on && c->verbosity >= 1)
+        fprintf(stderr, "s3gen: interval-CFG K=%d (uncond UNet pass recomputed every %d steps; first+last always)\n",
+                cfg_interval, cfg_interval);
+
+    // B2 fuses cond+uncond; interval needs the standalone uncond pass to skip → force single.
+    const bool use_cfg_b2 =
+        (cfg_rate > 0.0f && !meanflow) && !std::getenv("CRISPASR_S3GEN_UNET_CFG_SINGLE") && !cfg_interval_on;
+
+    // Reusable input buffer for batch=2: (T, 320, 2) — cond in batch 0, uncond in batch 1.
+    std::vector<float> b2_input(use_cfg_b2 ? T_mel * 320 * 2 : 0, 0.0f);
+
     // Euler ODE steps
     for (int step = 0; step < n_steps; step++) {
         float t_val = t_span[step];
         float r_val = t_span[step + 1];
-
-        // Rebuild the graph each step so Metal re-allocates tensors and reads
-        // the updated time_emb, rather than caching the first step's values.
-        ggml_cgraph* gf = build_graph_unet1d(c, T_mel);
         float dt = r_val - t_val;
 
-        // Build conditioned input: [x, mu, spks, cond] concatenated along channels
-        // ggml tensor ne=(T_mel, 320): data stored as data[ch * T_mel + t]
-        // (channel-first, T is fast axis)
+        // Time embedding — pre-computed; same for both cond and uncond passes.
+        const std::vector<float>& t_sin = meanflow ? mixed_embs[step] : t_embs[step];
+
+        // Build conditioned input: [x, mu, spks, cond] concatenated along channels.
+        // ggml layout: ne=(T_mel, 320), data[ch * T_mel + t].
         std::vector<float> unet_input(T_mel * 320, 0.0f);
         for (int ch = 0; ch < 80; ch++) {
             for (int t = 0; t < T_mel; t++) {
                 unet_input[(ch + 0) * T_mel + t] = x[ch * T_mel + t];
                 unet_input[(ch + 80) * T_mel + t] = mu[ch * T_mel + t];
-                unet_input[(ch + 160) * T_mel + t] = spk_emb[ch]; // broadcast over T
+                unet_input[(ch + 160) * T_mel + t] = spk_emb[ch];
                 unet_input[(ch + 240) * T_mel + t] = cond[ch * T_mel + t];
             }
         }
 
-        // Build unconditioned input for CFG: [x, 0, 0, 0]
-        std::vector<float> unet_uncond(T_mel * 320, 0.0f);
-        if (cfg_rate > 0.0f) {
-            for (int ch = 0; ch < 80; ch++) {
-                for (int t = 0; t < T_mel; t++) {
-                    unet_uncond[ch * T_mel + t] = x[ch * T_mel + t];
+        // ── Batch=2 CFG path ──────────────────────────────────────────────────
+        if (use_cfg_b2) {
+            // Stack cond (batch 0) and uncond (batch 1) into b2_input.
+            // Uncond input: [x, 0, 0, 0] — channels 80..319 remain zero.
+            std::memcpy(b2_input.data(), unet_input.data(), T_mel * 320 * sizeof(float));
+            for (int ch = 0; ch < 80; ch++)
+                for (int t = 0; t < T_mel; t++)
+                    b2_input[T_mel * 320 + ch * T_mel + t] = x[ch * T_mel + t];
+            // channels 80..319 of uncond stay zero — b2_input was zero-init'd above
+            // and zeroed out each step (only the x-channels are non-zero for uncond).
+            // Faster: just zero the uncond non-x region explicitly.
+            std::fill(b2_input.begin() + T_mel * 320 + 80 * T_mel, b2_input.begin() + T_mel * 320 * 2, 0.0f);
+
+            ggml_cgraph* gf_b2 = nullptr;
+            if (c->unet_gallocr_active) {
+                // ── §208: single-all-GPU raw-gallocr cached path ──────────────
+                // Build + allocate the b2 graph once per T_mel and reuse it across
+                // all Euler steps. Unlike ggml_backend_sched_alloc_graph (which
+                // mutates the graph by inserting split-copy nodes and leaves stale
+                // backend_buffer pointers — SIGSEGV on reuse, the §207 finding),
+                // ggml_gallocr_alloc_graph does NOT mutate the graph, so the same
+                // object can be re-fed and re-computed every step. The CFM weights
+                // are GPU-resident (F16-dequant on Metal) and reached via c->tensors.
+                if (!c->unet_cached_gf || c->unet_cached_T != T_mel) {
+                    if (c->unet_cached_ctx) {
+                        ggml_free(c->unet_cached_ctx);
+                        c->unet_cached_ctx = nullptr;
+                        c->unet_cached_gf = nullptr;
+                    }
+                    if (c->unet_galloc) {
+                        ggml_gallocr_free(c->unet_galloc);
+                        c->unet_galloc = nullptr;
+                    }
+                    c->unet_cache_meta.resize(c->compute_meta.size());
+                    ggml_context* keep = nullptr;
+                    c->unet_cached_gf = build_graph_unet1d_b2(c, T_mel, &c->unet_cache_meta, &keep);
+                    c->unet_cached_ctx = keep;
+                    c->unet_cached_T = T_mel;
+                    c->unet_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(c->backend));
+                    if (!c->unet_galloc || !ggml_gallocr_alloc_graph(c->unet_galloc, c->unet_cached_gf)) {
+                        fprintf(stderr, "s3gen: UNet1D b2 gallocr alloc failed\n");
+                        break;
+                    }
+                    if (c->verbosity >= 1)
+                        fprintf(stderr, "s3gen: [unet-b2 gallocr] built+allocated graph T_mel=%d n_nodes=%d\n", T_mel,
+                                ggml_graph_n_nodes(c->unet_cached_gf));
+                }
+                gf_b2 = c->unet_cached_gf;
+
+                ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b2, "unet_input_b2"), b2_input.data(), 0,
+                                        b2_input.size() * sizeof(float));
+                ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b2, "time_emb"), t_sin.data(), 0,
+                                        t_sin.size() * sizeof(float));
+                ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b2, "mask"), mask_data.data(), 0,
+                                        mask_data.size() * sizeof(float));
+
+                if (ggml_backend_graph_compute(c->backend, gf_b2) != GGML_STATUS_SUCCESS) {
+                    fprintf(stderr, "s3gen: UNet1D b2 gallocr compute failed\n");
+                    break;
+                }
+            } else {
+                // ── Legacy ggml_backend_sched path (default) ──────────────────
+                // Rebuild graph each step (sched mutates it on alloc; not reusable).
+                const bool bench_alloc = crispasr_env::get("CRISPASR_CHATTERBOX_BENCH") != nullptr;
+                int64_t t_alloc0 = bench_alloc ? ggml_time_us() : 0;
+                gf_b2 = build_graph_unet1d_b2(c, T_mel);
+                ggml_backend_sched_reset(c->sched);
+                s3gen_maybe_pin_graph_to_cpu(c, gf_b2, s3gen_subgraph::unet);
+                if (!ggml_backend_sched_alloc_graph(c->sched, gf_b2)) {
+                    fprintf(stderr, "s3gen: failed to alloc UNet1D b2 graph\n");
+                    break;
+                }
+                if (bench_alloc) {
+                    // §208: host-side build+sched-alloc cost — the work the gallocr
+                    // cached path eliminates per step. Bounds the achievable speedup
+                    // independent of GPU compute contention.
+                    fprintf(stderr, "s3gen: [unet-b2 host build+alloc] step %d = %.2f ms\n", step,
+                            (ggml_time_us() - t_alloc0) / 1000.0);
+                }
+                static int b2_diag_seen = 0;
+                if (!b2_diag_seen && c->verbosity >= 1) {
+                    fprintf(stderr, "s3gen: [unet-b2 step 0] n_nodes=%d n_splits=%d\n", ggml_graph_n_nodes(gf_b2),
+                            ggml_backend_sched_get_n_splits(c->sched));
+                    b2_diag_seen = 1;
+                }
+
+                ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b2, "unet_input_b2"), b2_input.data(), 0,
+                                        b2_input.size() * sizeof(float));
+                ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b2, "time_emb"), t_sin.data(), 0,
+                                        t_sin.size() * sizeof(float));
+                ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b2, "mask"), mask_data.data(), 0,
+                                        mask_data.size() * sizeof(float));
+
+                if (ggml_backend_sched_graph_compute(c->sched, gf_b2) != GGML_STATUS_SUCCESS) {
+                    fprintf(stderr, "s3gen: UNet1D b2 compute failed\n");
+                    break;
                 }
             }
-        }
 
-        // Time embedding: sinusoidal(320) → MLP(320→1024→1024)
-        // For meanflow: also compute r embedding and mix via time_embed_mixer
-        std::vector<float> t_sin = sinusoidal_embedding(t_val, 320);
-        // Helper: run time MLP (shared for t and r)
-        auto time_mlp = [&](std::vector<float>& emb) {
-            ggml_tensor* tm1_w = T(c, "s3.fd.tm.linear_1.weight");
-            ggml_tensor* tm1_b = T(c, "s3.fd.tm.linear_1.bias");
-            ggml_tensor* tm2_w = T(c, "s3.fd.tm.linear_2.weight");
-            ggml_tensor* tm2_b = T(c, "s3.fd.tm.linear_2.bias");
-            if (!tm1_w || !tm2_w)
-                return;
-            std::vector<float> w1(1024 * 320), b1(1024, 0.0f);
-            std::vector<float> w2(1024 * 1024), b2(1024, 0.0f);
-            tensor_get_f32(tm1_w, w1.data(), 0, w1.size());
-            if (tm1_b)
-                tensor_get_f32(tm1_b, b1.data(), 0, b1.size());
-            tensor_get_f32(tm2_w, w2.data(), 0, w2.size());
-            if (tm2_b)
-                tensor_get_f32(tm2_b, b2.data(), 0, b2.size());
-            std::vector<float> h1(1024);
-            for (int i = 0; i < 1024; i++) {
-                float sum = b1[i];
-                for (int j = 0; j < 320; j++)
-                    sum += w1[i * 320 + j] * emb[j];
-                h1[i] = sum;
+            // Output: (T, 80, 2) — batch 0 = cond, batch 1 = uncond.
+            ggml_tensor* out_b2 = ggml_graph_get_tensor(gf_b2, "denoiser_out_b2");
+            if (step == 0 && c->verbosity >= 1) {
+                fprintf(stderr, "s3gen: [b2] denoiser out ne=(%d, %d, %d)\n", (int)out_b2->ne[0], (int)out_b2->ne[1],
+                        (int)out_b2->ne[2]);
             }
-            // SiLU: x * sigmoid(x)
-            for (int i = 0; i < 1024; i++) {
-                float sig = 1.0f / (1.0f + std::exp(-h1[i]));
-                h1[i] = h1[i] * sig;
-            }
-            emb.resize(1024);
-            for (int i = 0; i < 1024; i++) {
-                float sum = b2[i];
-                for (int j = 0; j < 1024; j++)
-                    sum += w2[i * 1024 + j] * h1[j];
-                emb[i] = sum;
-            }
-        };
-        time_mlp(t_sin); // t_sin is now (1024,) t embedding
+            const size_t nb_b2 = ggml_nbytes(out_b2);
+            std::vector<float> vb2(nb_b2 / sizeof(float));
+            ggml_backend_tensor_get(out_b2, vb2.data(), 0, nb_b2);
 
-        if (meanflow) {
-            // Meanflow: compute r embedding, concat with t, mix
-            std::vector<float> r_emb = sinusoidal_embedding(r_val, 320);
-            time_mlp(r_emb); // r_emb is now (1024,) r embedding
-            // Concat [t_emb, r_emb] → (2048,)
-            std::vector<float> concat(2048);
-            std::memcpy(concat.data(), t_sin.data(), 1024 * sizeof(float));
-            std::memcpy(concat.data() + 1024, r_emb.data(), 1024 * sizeof(float));
-            // time_embed_mixer: linear(2048 → 1024)
-            ggml_tensor* tmx_w = T(c, "s3.fd.tmx.weight");
-            if (tmx_w) {
-                std::vector<float> w(1024 * 2048);
-                tensor_get_f32(tmx_w, w.data(), 0, w.size());
-                for (int i = 0; i < 1024; i++) {
-                    float sum = 0.0f;
-                    for (int j = 0; j < 2048; j++)
-                        sum += w[i * 2048 + j] * concat[j];
-                    t_sin[i] = sum;
+            // vb2 layout: [cond: T*80 floats | uncond: T*80 floats]
+            // data[ch * T + t] for cond; data[T*80 + ch * T + t] for uncond.
+            int out_T = (int)out_b2->ne[0];
+            int use_T = std::min(out_T, T_mel);
+            int use_C = std::min((int)out_b2->ne[1], 80);
+
+            for (int ch = 0; ch < use_C; ch++) {
+                for (int t = 0; t < use_T; t++) {
+                    float vc = vb2[ch * out_T + t];
+                    float vu = vb2[out_T * 80 + ch * out_T + t];
+                    x[ch * T_mel + t] += dt * ((1.0f + cfg_rate) * vc - cfg_rate * vu);
                 }
             }
+
+            if (c->verbosity >= 2 || dump_stages) {
+                float rms = 0.0f;
+                for (float v : x)
+                    rms += v * v;
+                rms = std::sqrt(rms / x.size());
+                fprintf(stderr, "s3gen: CFM step %d/%d (t=%.3f→%.3f) x_rms=%.4f [b2]\n", step + 1, n_steps, t_val,
+                        r_val, rms);
+            }
+            continue;
         }
 
-        // Helper: run denoiser with given input, return velocity
+        // ── Single-pass path (meanflow or cfg=0) ─────────────────────────────
+        ggml_cgraph* gf = build_graph_unet1d(c, T_mel);
+
         auto run_denoiser = [&](const std::vector<float>& input) -> std::vector<float> {
             ggml_backend_sched_reset(c->sched);
             s3gen_maybe_pin_graph_to_cpu(c, gf, s3gen_subgraph::unet);
-            // PLAN #83 r9 follow-up #5: Bug B (CFG uncond divergence) is fixed
-            // at the sched level by `parallel=true` in ggml_backend_sched_new
-            // (see the sched_new call near the top of this file). The earlier
-            // workaround of pinning `unet_input` to the GPU backend is no
-            // longer needed and was removed; CRISPASR_NO_INPUT_PIN is gone.
             if (!ggml_backend_sched_alloc_graph(c->sched, gf)) {
                 fprintf(stderr, "s3gen: failed to alloc UNet1D graph\n");
                 return {};
@@ -2138,64 +2887,9 @@ static std::vector<float> cfm_euler_solve(chatterbox_s3gen_context* c,
                                     t_sin.size() * sizeof(float));
             ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "mask"), mask_data.data(), 0,
                                     mask_data.size() * sizeof(float));
-            // PLAN #83 r9 follow-up: dump per-node allocator decisions on step 0
-            // so we can diff 1-mark vs 2-mark configs and spot the address
-            // collision that causes Metal NaN. Format: "name @ data_ptr size bytes".
-            if (step == 0) {
-                const char* dump_addr = std::getenv("CRISPASR_S3GEN_DUMP_UNET_ADDR");
-                if (dump_addr && *dump_addr) {
-                    const int n_nodes_addr = ggml_graph_n_nodes(gf);
-                    fprintf(stderr, "s3gen: [DUMP_UNET_ADDR=%s] %d nodes\n", dump_addr, n_nodes_addr);
-                    for (int i = 0; i < n_nodes_addr; ++i) {
-                        ggml_tensor* node = ggml_graph_node(gf, i);
-                        if (!node)
-                            continue;
-                        fprintf(stderr, "s3gen: [addr] %4d  %p  %8zu  %s\n", i, node->data, ggml_nbytes(node),
-                                node->name);
-                    }
-                }
-            }
             if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS) {
                 fprintf(stderr, "s3gen: UNet1D compute failed\n");
                 return {};
-            }
-            // PLAN #83 r9 per-segment drift bisect: when CRISPASR_S3GEN_DUMP_UNET=<tag>
-            // is set, dump every "dump_*" named intermediate from step 0 to
-            // /tmp/cb-unet-dump-<tag>-<name>.bin. Run twice (weight-residency
-            // vs gpu-residency), compare per-block.
-            if (step == 0) {
-                const char* dump_tag = std::getenv("CRISPASR_S3GEN_DUMP_UNET");
-                if (dump_tag && *dump_tag) {
-                    // PLAN #83 r9 follow-up #5: run_denoiser fires twice per
-                    // CFM step (cond + uncond). Without disambiguation the
-                    // second call overwrites the first. Use a local static
-                    // counter to tag dumps "cond"/"uncond".
-                    static int dump_call_idx = 0;
-                    const char* pass_tag = (dump_call_idx % 2 == 0) ? "cond" : "uncond";
-                    dump_call_idx++;
-                    const int n_nodes = ggml_graph_n_nodes(gf);
-                    int n_dumped = 0;
-                    for (int i = 0; i < n_nodes; ++i) {
-                        ggml_tensor* node = ggml_graph_node(gf, i);
-                        if (!node || std::strncmp(node->name, "dump_", 5) != 0)
-                            continue;
-                        const size_t nb_node = ggml_nbytes(node);
-                        std::vector<char> buf(nb_node);
-                        ggml_backend_tensor_get(node, buf.data(), 0, nb_node);
-                        char path[256];
-                        std::snprintf(path, sizeof(path), "/tmp/cb-unet-dump-%s-%s-%s.bin", dump_tag, pass_tag,
-                                      node->name);
-                        FILE* fp = std::fopen(path, "wb");
-                        if (fp) {
-                            std::fwrite(buf.data(), 1, nb_node, fp);
-                            std::fclose(fp);
-                            n_dumped++;
-                        }
-                    }
-                    fprintf(stderr,
-                            "s3gen: [DUMP_UNET=%s pass=%s] dumped %d intermediates to /tmp/cb-unet-dump-%s-%s-*.bin\n",
-                            dump_tag, pass_tag, n_dumped, dump_tag, pass_tag);
-                }
             }
             ggml_tensor* out = ggml_graph_get_tensor(gf, "denoiser_out");
             if (step == 0 && c->verbosity >= 1) {
@@ -2207,32 +2901,36 @@ static std::vector<float> cfm_euler_solve(chatterbox_s3gen_context* c,
             return v;
         };
 
-        // Run conditioned pass
         std::vector<float> v_cond = run_denoiser(unet_input);
         if (v_cond.empty())
             break;
 
-        // Run unconditioned pass for CFG (skip for meanflow — distilled, no CFG)
         std::vector<float> v_uncond;
         if (cfg_rate > 0.0f && !meanflow) {
-            v_uncond = run_denoiser(unet_uncond);
+            // Interval-CFG: recompute the uncond pass on the first + last step and
+            // every K-th step; otherwise reuse the cached uncond velocity (the approximation).
+            const bool recompute_unc =
+                !cfg_interval_on || v_uncond_cache.empty() || (step % cfg_interval == 0) || (step == n_steps - 1);
+            if (recompute_unc) {
+                v_uncond = run_denoiser(std::vector<float>(T_mel * 320, 0.0f));
+                if (cfg_interval_on && !v_uncond.empty())
+                    v_uncond_cache = v_uncond;
+            } else {
+                v_uncond = v_uncond_cache; // reuse stale uncond velocity
+            }
         }
 
-        // Read output dimensions from the conditioned pass
         ggml_tensor* out_t = ggml_graph_get_tensor(gf, "denoiser_out");
         int out_T = (int)out_t->ne[0];
         int out_C = (out_t->ne[1] > 1) ? (int)out_t->ne[1] : 1;
         int use_T = std::min(out_T, T_mel);
         int use_C = std::min(out_C, 80);
 
-        // Euler step with CFG blending:
-        // v = (1 + cfg_rate) * v_cond - cfg_rate * v_uncond
-        // Denoiser output is ggml (ne[0]=T, ne[1]=C) → data[ch * T + t] (channel-first)
         for (int ch = 0; ch < use_C; ch++) {
             for (int t = 0; t < use_T; t++) {
                 float vc = v_cond[ch * out_T + t];
                 float v;
-                if (cfg_rate > 0.0f && !v_uncond.empty()) {
+                if (!v_uncond.empty()) {
                     float vu = v_uncond[ch * out_T + t];
                     v = (1.0f + cfg_rate) * vc - cfg_rate * vu;
                 } else {
@@ -2244,20 +2942,18 @@ static std::vector<float> cfm_euler_solve(chatterbox_s3gen_context* c,
 
         if (c->verbosity >= 2 || dump_stages) {
             float rms = 0.0f;
-            for (auto v : x)
+            for (float v : x)
                 rms += v * v;
             rms = std::sqrt(rms / x.size());
             fprintf(stderr, "s3gen: CFM step %d/%d (t=%.3f→%.3f) x_rms=%.4f\n", step + 1, n_steps, t_val, r_val, rms);
         }
         if (dump_stages) {
-            // Print first 5 values at (t=0, ch=0..4) for diff comparison
             fprintf(stderr, "s3gen[dump]: cfm_step_%d (t=0,ch=0..4): ", step);
             for (int ch = 0; ch < 5; ch++)
                 fprintf(stderr, "%.6f ", x[ch * T_mel + 0]);
             fprintf(stderr, "\n");
-            // Also velocity rms
             float v_rms = 0;
-            for (auto v : v_cond)
+            for (float v : v_cond)
                 v_rms += v * v;
             v_rms = std::sqrt(v_rms / v_cond.size());
             fprintf(stderr, "s3gen[dump]: velocity_rms=%.4f\n", v_rms);
@@ -2486,29 +3182,27 @@ static std::vector<float> hift_vocoder_cpu(chatterbox_s3gen_context* c,
             int s = strides[stage];
             int k = kernels[stage];
             int p = (k - s) / 2;
-            // ggml_conv_transpose_1d doesn't support non-zero padding
-            // Run with p=0, then crop (k-s)/2 from each side
-            int T_in = (int)x->ne[0];
-            x = ggml_conv_transpose_1d(ctx0, up_w, x, s, 0, 1);
-            // Output length with p=0: (T_in - 1) * s + k
-            // Expected with p: (T_in - 1) * s + k - 2*p = T_in * s
-            if (p > 0) {
-                int T_out = (int)((T_in - 1) * s + k);
-                int T_want = T_in * s; // expected output length
-                int C_out = (int)x->ne[1];
-                // Crop p from left: view starting at offset p
-                x = ggml_view_2d(ctx0, x, T_want, C_out, x->nb[1], p * x->nb[0]);
-                x = ggml_cont(ctx0, x);
+            ggml_tensor* wp = (stage < chatterbox_s3gen_context::kMaxUps) ? c->ups_w_perm[stage] : nullptr;
+            if (wp) {
+                x = core_convt::convt1d_decomp_tf(ctx0, x, wp, up_b, s, k, p, p);
+            } else {
+                int T_in = (int)x->ne[0];
+                x = ggml_conv_transpose_1d(ctx0, up_w, x, s, 0, 1);
+                if (p > 0) {
+                    int T_want = T_in * s;
+                    int C_out = (int)x->ne[1];
+                    x = ggml_view_2d(ctx0, x, T_want, C_out, x->nb[1], p * x->nb[0]);
+                    x = ggml_cont(ctx0, x);
+                }
+                if (up_b)
+                    x = ggml_add(ctx0, x, ggml_reshape_2d(ctx0, up_b, 1, (int)up_b->ne[0]));
             }
-            if (up_b)
-                x = ggml_add(ctx0, x, ggml_reshape_2d(ctx0, up_b, 1, (int)up_b->ne[0]));
         }
         // Reflection pad at last upsample stage: ReflectionPad1d((1, 0))
         // Python: if i == num_upsamples - 1: x = self.reflection_pad(x)
         if (stage == 2) {
             // Reflect-pad 1 sample on left: x[-1] is prepended
             // x has ne=(T, C). Take the second sample (index 1), prepend it.
-            int T_x = (int)x->ne[0];
             int C_x = (int)x->ne[1];
             // reflection pad left=1: new[0] = x[1], new[1..T] = x[0..T-1]
             ggml_tensor* pad_sample = ggml_view_2d(ctx0, x, 1, C_x, x->nb[1], 1 * x->nb[0]); // x[:,1]
@@ -3106,8 +3800,18 @@ static bool chatterbox_s3gen_compute_gen_mel(struct chatterbox_s3gen_context* ct
         return false;
     if (out_T_mel)
         *out_T_mel = 0;
-    if (n_cfm_steps <= 0)
-        n_cfm_steps = 10;
+    // Resolve the CFM step count. 0 = auto (the default since the cfm_steps
+    // sentinel): meanflow/turbo distilled models use 2 steps, standard models
+    // use 6 (§207). An explicit positive count (--tts-steps /
+    // chatterbox_set_cfm_steps) is honoured as-is. A literal 10 with a meanflow
+    // model is also treated as the legacy auto-default and mapped to 2
+    // (back-compat with pre-§207 callers that passed the old default of 10).
+    // NOTE: §207 changed the standard default 10→6, which silently broke the
+    // old `== 10` meanflow downgrade — turbo then ran 6 meanflow steps instead
+    // of 2. This resolves it at a single choke point regardless of the default.
+    const bool is_meanflow = (T(ctx, "s3.fd.tmx.weight") != nullptr);
+    if (n_cfm_steps <= 0 || (is_meanflow && n_cfm_steps == 10))
+        n_cfm_steps = is_meanflow ? 2 : 6;
 
     if (ctx->verbosity >= 1) {
         fprintf(stderr, "s3gen: %d speech tokens + %d prompt tokens, %d CFM steps\n", n_speech_tokens, n_prompt_tokens,
@@ -3119,7 +3823,9 @@ static bool chatterbox_s3gen_compute_gen_mel(struct chatterbox_s3gen_context* ct
     bool dump_stages = dump_env && dump_env[0] == '1';
 
     // 1. Conformer encoder: tokens → (80, T_mel)
+    int64_t t_enc0 = ggml_time_us();
     std::vector<float> h = run_conformer_encoder(ctx, speech_tokens, n_speech_tokens, prompt_tokens, n_prompt_tokens);
+    ctx->last_perf.t_encoder_us = ggml_time_us() - t_enc0;
 
     int T_mel_total = (n_prompt_tokens + n_speech_tokens) * 2; // 2x upsample
     int T_mel_prompt = n_prompt_tokens * 2;
@@ -3211,19 +3917,20 @@ static bool chatterbox_s3gen_compute_gen_mel(struct chatterbox_s3gen_context* ct
     }
 
     // 4. CFM Euler solver: noise → mel
-    // Detect meanflow: time_embed_mixer weight exists only in meanflow models
-    bool is_meanflow = (T(ctx, "s3.fd.tmx.weight") != nullptr);
+    // is_meanflow + the resolved step count were determined at function entry
+    // (meanflow detected via the s3.fd.tmx.weight mixer tensor). Meanflow uses
+    // a linear schedule and no CFG.
     float cfg = is_meanflow ? 0.0f : 0.7f;
-    // Meanflow defaults to 2 CFM steps (distilled model); override if caller passed default 10
     int actual_steps = n_cfm_steps;
-    if (is_meanflow && n_cfm_steps == 10) {
-        actual_steps = 2; // Python default for meanflow
-    }
     if (ctx->verbosity >= 1 && is_meanflow) {
         fprintf(stderr, "s3gen: meanflow mode (%d steps, linear schedule, no CFG)\n", actual_steps);
     }
+    int64_t t_cfm0 = ggml_time_us();
     std::vector<float> mel = cfm_euler_solve(ctx, h, cond, spk_proj, init_noise_cf, T_mel_total, actual_steps, cfg,
                                              is_meanflow, dump_stages);
+    ctx->last_perf.t_cfm_us = ggml_time_us() - t_cfm0;
+    ctx->last_perf.n_cfm_steps = actual_steps;
+    ctx->last_perf.T_mel = T_mel_gen;
 
     // 5. Extract generated portion (skip prompt region)
     std::vector<float> gen_mel(80 * T_mel_gen);
@@ -3313,6 +4020,7 @@ extern "C" float* chatterbox_s3gen_synthesize(struct chatterbox_s3gen_context* c
                                               int n_cfm_steps, int* out_n_samples) {
     if (!ctx || !speech_tokens || n_speech_tokens <= 0 || !out_n_samples)
         return nullptr;
+    cb_s3gen_bench_stage _bs_total("synthesize_total");
     *out_n_samples = 0;
 
     std::vector<float> gen_mel;
@@ -3327,7 +4035,9 @@ extern "C" float* chatterbox_s3gen_synthesize(struct chatterbox_s3gen_context* c
     const char* dump_env2 = std::getenv("CRISPASR_S3GEN_DUMP");
     bool dump_voc = dump_env2 && dump_env2[0] == '1';
     std::map<std::string, std::vector<float>> voc_dump;
+    int64_t t_voc0 = ggml_time_us();
     std::vector<float> wav = hift_vocoder_cpu(ctx, gen_mel, T_mel_gen, nullptr, 0, dump_voc ? &voc_dump : nullptr);
+    ctx->last_perf.t_vocoder_us = ggml_time_us() - t_voc0;
     if (dump_voc) {
         // Print per-stage RMS for comparison against reference GGUF
         const char* stage_names[] = {"voc_conv_pre", "voc_ups_0", "voc_rb_0", "voc_ups_1",
@@ -3456,6 +4166,18 @@ extern "C" void chatterbox_s3gen_pcm_free(float* pcm) {
 
 extern "C" void chatterbox_s3gen_free(struct chatterbox_s3gen_context* ctx) {
     delete ctx;
+}
+
+extern "C" int chatterbox_s3gen_get_perf(const struct chatterbox_s3gen_context* ctx,
+                                         struct chatterbox_s3gen_perf* out) {
+    if (!ctx || !out)
+        return 0;
+    out->t_encoder_us = ctx->last_perf.t_encoder_us;
+    out->t_cfm_us = ctx->last_perf.t_cfm_us;
+    out->t_vocoder_us = ctx->last_perf.t_vocoder_us;
+    out->n_cfm_steps = ctx->last_perf.n_cfm_steps;
+    out->T_mel = ctx->last_perf.T_mel;
+    return 1;
 }
 
 // ---------------------------------------------------------------------------

@@ -36,6 +36,10 @@ public:
 
         struct piper_tts_params pp = piper_tts_default_params();
         pp.n_threads = p.n_threads;
+        // use_gpu deliberately NOT forwarded: piper's tiny VITS graph is
+        // launch-bound on GPU — measured 5x slower on M1 Metal (13.5s vs
+        // 2.7s CPU) with a correct, roundtrip-verified waveform. Keep CPU
+        // until someone needs GPU piper and batches the graph.
         pp.verbosity = p.print_progress ? 2 : 1;
         pp.noise_scale = -1.0f; // use model defaults
         pp.length_scale = -1.0f;

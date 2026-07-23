@@ -487,6 +487,96 @@ else
     FAILED_NAMES="$FAILED_NAMES\n    - audit log spoken_disclaimer"
 fi
 
+# ─────────────────────── streaming synthesis (PR #177) ───────────────────
+echo
+echo "=== POST /v1/audio/speech?stream — per-chunk PCM (CAP_STREAMING) ==="
+
+# stream=true with a PCM format → 200, raw int16 (no RIFF), non-trivial,
+# int16-aligned. qwen3-tts has CAP_STREAMING so this exercises the true
+# per-chunk path (worker thread + chunked provider); other backends fall
+# back to whole-clip but still stream the bytes.
+TMPSTREAM=$(mktemp -t crispasr-stream.XXXXXX.pcm)
+code=$(curl -s -N -X POST \
+    -H 'Content-Type: application/json' \
+    -d '{"input":"Streaming first audio test. This is the second sentence.","response_format":"pcm","stream":true}' \
+    -o "$TMPSTREAM" -w "%{http_code}" \
+    "http://127.0.0.1:$PORT/v1/audio/speech")
+assert "stream=true pcm → 200" "200" "$code"
+if [ -s "$TMPSTREAM" ]; then
+    SIZE=$(wc -c < "$TMPSTREAM" | tr -d ' ')
+    head4=$(dd if="$TMPSTREAM" bs=4 count=1 2>/dev/null)
+    if [ "$head4" != "RIFF" ]; then
+        echo "  ✓ streamed pcm has no RIFF header (raw int16, $SIZE bytes)"
+        PASS=$((PASS + 1))
+    else
+        echo "  ✗ streamed pcm unexpectedly starts with RIFF"
+        FAIL=$((FAIL + 1))
+    fi
+    if [ "$SIZE" -gt 1000 ] && [ $((SIZE % 2)) -eq 0 ]; then
+        echo "  ✓ streamed pcm is non-trivial and int16-aligned ($SIZE bytes)"
+        PASS=$((PASS + 1))
+    else
+        echo "  ✗ streamed pcm too small or misaligned ($SIZE bytes)"
+        FAIL=$((FAIL + 1))
+        FAILED_NAMES="$FAILED_NAMES\n    - streamed pcm size/alignment"
+    fi
+else
+    echo "  ✗ streamed pcm response body empty"
+    FAIL=$((FAIL + 1))
+    FAILED_NAMES="$FAILED_NAMES\n    - streamed pcm body present"
+fi
+rm -f "$TMPSTREAM"
+
+# stream=true with wav format → 200 (wav is a PCM format; streaming wraps it).
+code=$(curl -s -N -o /dev/null -w "%{http_code}" -X POST \
+    -H 'Content-Type: application/json' \
+    -d '{"input":"stream wav","response_format":"wav","stream":true}' \
+    "http://127.0.0.1:$PORT/v1/audio/speech")
+assert "stream=true wav → 200" "200" "$code"
+
+# stream=true with mp3 → 400 (compressed formats need whole-file encoding).
+out=$(curl -s -N -X POST \
+    -H 'Content-Type: application/json' \
+    -d '{"input":"stream mp3","response_format":"mp3","stream":true}' \
+    "http://127.0.0.1:$PORT/v1/audio/speech")
+assert_contains "stream=true mp3 → rejected (use pcm/wav/f32)" "stream=false" "$out"
+
+# The server log should show the streaming-synthesis-finished marker for at
+# least one of the streamed requests above.
+if grep -q 'streaming synthesis finished' "$SERVER_LOG"; then
+    echo "  ✓ server log records streaming-synthesis-finished"
+    PASS=$((PASS + 1))
+else
+    echo "  ✗ server log missing streaming-synthesis marker"
+    FAIL=$((FAIL + 1))
+    FAILED_NAMES="$FAILED_NAMES\n    - streaming-synthesis log marker"
+fi
+
+# Stream vs whole-clip equivalence: with a fixed seed the talker generates the
+# same codes either way, so the streaming windowed decode must cover exactly the
+# same frames as the whole-clip decode → identical total sample count. (The
+# per-window seam differs by <2% in amplitude but never in length.) This is the
+# regression guard that streaming stays a windowing of the same synthesis, not a
+# diverging path.
+SEQ_INPUT='{"input":"Stream equals whole clip equivalence check sentence.","response_format":"pcm","seed":4242'
+TMPNS=$(mktemp -t crispasr-ns.XXXXXX.pcm)
+TMPST=$(mktemp -t crispasr-st.XXXXXX.pcm)
+curl -s -X POST -H 'Content-Type: application/json' \
+    -d "$SEQ_INPUT}" -o "$TMPNS" "http://127.0.0.1:$PORT/v1/audio/speech" >/dev/null
+curl -s -N -X POST -H 'Content-Type: application/json' \
+    -d "$SEQ_INPUT, \"stream\":true}" -o "$TMPST" "http://127.0.0.1:$PORT/v1/audio/speech" >/dev/null
+NS_SZ=$(wc -c < "$TMPNS" | tr -d ' ')
+ST_SZ=$(wc -c < "$TMPST" | tr -d ' ')
+rm -f "$TMPNS" "$TMPST"
+if [ "$NS_SZ" -gt 1000 ] && [ "$NS_SZ" = "$ST_SZ" ]; then
+    echo "  ✓ same-seed stream == whole-clip total samples ($NS_SZ bytes)"
+    PASS=$((PASS + 1))
+else
+    echo "  ✗ stream/whole-clip sample count differs: non-stream=$NS_SZ stream=$ST_SZ"
+    FAIL=$((FAIL + 1))
+    FAILED_NAMES="$FAILED_NAMES\n    - stream==whole-clip sample count"
+fi
+
 # ─────────────────────────── 401 path ────────────────────────────────────
 # Re-running the server with --api-key is heavy; skip unless explicitly
 # enabled via TEST_AUTH=1. Even so, leave a hook here for completeness.

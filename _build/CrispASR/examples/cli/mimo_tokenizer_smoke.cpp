@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include "core/crispasr_env.h"
 
 namespace {
 
@@ -67,7 +68,7 @@ int main(int argc, char** argv) {
     // CPU-pin until the Metal conv-stem watchdog hang is verified absent on
     // forward conv (cf. qwen3-tts kernel_conv_transpose_1d). Set
     // MIMO_SMOKE_GPU=1 to exercise the GPU path.
-    cp.use_gpu = std::getenv("MIMO_SMOKE_GPU") != nullptr;
+    cp.use_gpu = crispasr_env::get("CRISPASR_MIMO_SMOKE_GPU") != nullptr;
     mimo_tokenizer_context* ctx = mimo_tokenizer_init_from_file(model_path, cp);
     if (!ctx) {
         fprintf(stderr, "smoke: failed to load tokenizer '%s'\n", model_path);
@@ -93,7 +94,7 @@ int main(int argc, char** argv) {
         else
             n_pass++;
         printf("%s %-22s n=%-8d min=%-12.4f max=%-12.4f mean=%-12.4f\n", tag, stage, n, s.min_v, s.max_v, s.mean);
-        if (std::getenv("MIMO_SMOKE_DUMP")) {
+        if (crispasr_env::get("CRISPASR_MIMO_SMOKE_DUMP")) {
             char path[256];
             std::snprintf(path, sizeof(path), "/tmp/mimo_cpp_%s.bin", stage);
             FILE* f = std::fopen(path, "wb");

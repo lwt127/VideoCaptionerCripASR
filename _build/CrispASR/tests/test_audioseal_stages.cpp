@@ -7,6 +7,7 @@
 // extract and compare them.
 
 #include "audioseal.h"
+#include "core/crispasr_env.h"
 #include "core/gguf_loader.h"
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -20,12 +21,18 @@
 
 static std::vector<float> load_npy(const char* path) {
     FILE* f = fopen(path, "rb");
-    if (!f) return {};
-    char magic[6]; fread(magic, 1, 6, f);
-    uint8_t v[2]; fread(v, 1, 2, f);
-    uint16_t hlen; fread(&hlen, 2, 1, f);
+    if (!f)
+        return {};
+    char magic[6];
+    fread(magic, 1, 6, f);
+    uint8_t v[2];
+    fread(v, 1, 2, f);
+    uint16_t hlen;
+    fread(&hlen, 2, 1, f);
     fseek(f, 6 + 2 + 2 + hlen, SEEK_SET);
-    long pos = ftell(f); fseek(f, 0, SEEK_END); long end = ftell(f);
+    long pos = ftell(f);
+    fseek(f, 0, SEEK_END);
+    long end = ftell(f);
     fseek(f, pos, SEEK_SET);
     int n = (int)((end - pos) / sizeof(float));
     std::vector<float> d(n);
@@ -45,8 +52,11 @@ static double cosine(const float* a, const float* b, int n) {
 }
 
 int main() {
-    const char* gguf = getenv("AUDIOSEAL_GGUF");
-    if (!gguf) { fprintf(stderr, "Set AUDIOSEAL_GGUF\n"); return 1; }
+    const char* gguf = crispasr_env::get("CRISPASR_AUDIOSEAL_GGUF");
+    if (!gguf) {
+        fprintf(stderr, "Set AUDIOSEAL_GGUF\n");
+        return 1;
+    }
 
     // Load reference input
     auto ref_input = load_npy("/tmp/as_enc_input.npy");
@@ -61,10 +71,14 @@ int main() {
     auto params = audioseal_default_params();
     params.verbosity = 0;
     auto* ctx = audioseal_init_from_file(gguf, params);
-    if (!ctx) { fprintf(stderr, "Failed to load GGUF\n"); return 2; }
+    if (!ctx) {
+        fprintf(stderr, "Failed to load GGUF\n");
+        return 2;
+    }
 
     // Run embed to get the full output
-    uint8_t msg[16]; memset(msg, 1, 16);
+    uint8_t msg[16];
+    memset(msg, 1, 16);
     float* out = audioseal_embed(ctx, ref_input.data(), N, msg);
     if (!out) {
         fprintf(stderr, "embed failed\n");
@@ -92,14 +106,19 @@ int main() {
         // Print first 20 samples of watermark for visual comparison
         printf("\nFirst 20 watermark samples:\n");
         printf("  ours: ");
-        for (int i = 0; i < 20 && i < N; i++) printf("%.4f ", our_wm[i]);
+        for (int i = 0; i < 20 && i < N; i++)
+            printf("%.4f ", our_wm[i]);
         printf("\n  ref:  ");
-        for (int i = 0; i < 20 && i < N; i++) printf("%.4f ", ref_w[i]);
+        for (int i = 0; i < 20 && i < N; i++)
+            printf("%.4f ", ref_w[i]);
         printf("\n");
     }
 
     // Per-stage comparison (encoder stages)
-    struct { const char* npy; const char* name; } stages[] = {
+    struct {
+        const char* npy;
+        const char* name;
+    } stages[] = {
         {"/tmp/as_enc_0.npy", "enc.0 (input conv)"},
         {"/tmp/as_enc_1.npy", "enc.1 (resblock 0)"},
         {"/tmp/as_enc_3.npy", "enc.3 (downsample 0)"},

@@ -92,7 +92,7 @@
 
             <div id="input_file">
                 Audio file:
-                <input type="file" id="file" name="file" onchange="loadAudio(event)" />
+                <input type="file" id="file" name="file" accept="audio/*,.wav,.mp3,.flac,.ogg,.m4a,.aac,.opus,.webm,.wma" onchange="loadAudio(event)" />
             </div>
 
             <div id="input_mic" style="display: none;">
@@ -469,6 +469,7 @@
                     var buf = new Uint8Array(reader.result);
 
                     context.decodeAudioData(buf.buffer, function(audioBuffer) {
+                        // Browser decoded the audio (supports wav, mp3, flac, ogg, m4a/aac, opus, webm)
                         var offlineContext = new OfflineAudioContext(audioBuffer.numberOfChannels, audioBuffer.length, audioBuffer.sampleRate);
                         var source = offlineContext.createBufferSource();
                         source.buffer = audioBuffer;

@@ -5,11 +5,14 @@
 
 #include "firered_vad.h"
 #include "core/gguf_loader.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "gguf.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -17,9 +20,47 @@
 #include <string>
 #include <vector>
 
+// §193 Accelerate cblas_sgemm for all cpu_linear calls.
+// Set FIRERED_VAD_FORCE_SCALAR=1 to validate scalar fallback.
+#if defined(HAVE_ACCELERATE)
+#include <Accelerate/Accelerate.h>
+static bool firered_vad_use_scalar() {
+    static int v = -1;
+    if (v < 0)
+        v = (crispasr_env::get("CRISPASR_FIRERED_VAD_FORCE_SCALAR") != nullptr) ? 1 : 0;
+    return v != 0;
+}
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+// ===========================================================================
+// Bench instrumentation — `FIRERED_VAD_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool firered_vad_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_FIRERED_VAD_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct firered_vad_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit firered_vad_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~firered_vad_bench_stage() {
+        if (!firered_vad_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  firered_vad_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ===========================================================================
 // Model
@@ -73,7 +114,20 @@ static void read_f32(ggml_tensor* t, std::vector<float>& out) {
 }
 
 // Linear: out[i] = sum_j w[i*K+j] * x[j] + b[i], for each time step
+// out[T,N] = x[T,K] @ w[N,K]^T + b[N]  (w is row-major [N,K])
 static void cpu_linear(const float* x, const float* w, const float* b, float* out, int T, int K, int N) {
+#if defined(HAVE_ACCELERATE)
+    if (!firered_vad_use_scalar()) {
+        // w stored as [N,K] → CblasTrans to get x[T,K] @ w^T[K,N] → out[T,N]
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, N, K, 1.0f, x, K, w, K, 0.0f, out, N);
+        if (b) {
+            for (int t = 0; t < T; t++)
+                for (int n = 0; n < N; n++)
+                    out[t * N + n] += b[n];
+        }
+        return;
+    }
+#endif
     for (int t = 0; t < T; t++) {
         for (int n = 0; n < N; n++) {
             double s = 0;
@@ -287,7 +341,7 @@ extern "C" struct firered_vad_context* firered_vad_init(const char* model_path) 
     gguf_free(gctx);
 
     // Load weights
-    ggml_backend_t backend = ggml_backend_init_best();
+    ggml_backend_t backend = crispasr_init_gpu_backend();
     if (!backend) {
         delete ctx;
         return nullptr;
@@ -366,10 +420,15 @@ extern "C" int firered_vad_detect(struct firered_vad_context* ctx, const float* 
     auto& m = ctx->model;
     auto& hp = m.hp;
 
+    firered_vad_bench_stage _bs_total("detect_total");
+
     // Compute fbank
     std::vector<float> features;
     int n_frames = 0;
-    compute_fbank_vad(samples, n_samples, features, n_frames);
+    {
+        firered_vad_bench_stage _bs("feature_extraction");
+        compute_fbank_vad(samples, n_samples, features, n_frames);
+    }
     if (n_frames <= 0)
         return -1;
 

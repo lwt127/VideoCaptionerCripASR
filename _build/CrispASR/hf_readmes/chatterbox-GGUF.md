@@ -1,7 +1,29 @@
 ---
 license: mit
 language:
+- ar
+- da
+- de
+- el
 - en
+- es
+- fi
+- fr
+- he
+- hi
+- it
+- ja
+- ko
+- ms
+- nl
+- no
+- pl
+- pt
+- ru
+- sv
+- sw
+- tr
+- zh
 base_model:
 - ResembleAI/chatterbox
 pipeline_tag: text-to-speech
@@ -21,6 +43,8 @@ library_name: ggml
 GGUF / ggml conversion of [`ResembleAI/chatterbox`](https://huggingface.co/ResembleAI/chatterbox) for use with **[CrispStrobe/CrispASR](https://github.com/CrispStrobe/CrispASR)**.
 
 Chatterbox is a full TTS pipeline: character tokenizer → T3 (30-layer Llama AR, 520M) → speech tokens → S3Gen (Conformer encoder + UNet1D CFM denoiser, 10 Euler steps) → HiFTGenerator vocoder (conv chains + Snake activations + iSTFT) → 24 kHz WAV. Distributed under **MIT license**.
+
+This is the **multilingual** Chatterbox (23 languages: Arabic, Danish, German, Greek, English, Spanish, Finnish, French, Hebrew, Hindi, Italian, Japanese, Korean, Malay, Dutch, Norwegian, Polish, Portuguese, Russian, Swedish, Swahili, Turkish, Chinese) — the T3 GGUF carries the 2454-token multilingual text tokenizer. Select the language with `-l <code>` (e.g. `-l de`, `-l ja`); English is the default.
 
 Two GGUF files are needed: the **T3 model** (text → speech tokens) and the **S3Gen model** (speech tokens → audio).
 
@@ -115,7 +139,7 @@ Requires `pip install gguf safetensors torch huggingface_hub`.
 ## Related models
 
 - [`cstr/lahgtna-chatterbox-v1-GGUF`](https://huggingface.co/cstr/lahgtna-chatterbox-v1-GGUF) — Arabic T3 variant (MIT, shares S3Gen)
-- [`cstr/orpheus-3b-base-GGUF`](https://huggingface.co/cstr/orpheus-3b-base-GGUF) — Llama-3.2 + SNAC TTS
+- [`cstr/orpheus-3b-0.1-ft-GGUF`](https://huggingface.co/cstr/orpheus-3b-0.1-ft-GGUF) — Llama-3.2 + SNAC TTS
 - [`cstr/qwen3-tts-0.6b-customvoice-GGUF`](https://huggingface.co/cstr/qwen3-tts-0.6b-customvoice-GGUF) — Qwen3-TTS with fixed speakers
 
 ## License

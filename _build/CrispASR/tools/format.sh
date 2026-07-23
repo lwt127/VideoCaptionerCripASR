@@ -45,6 +45,7 @@ Install:
   macOS:  brew install llvm@18
           (binary lands at /opt/homebrew/opt/llvm@18/bin/clang-format)
   Ubuntu: sudo apt install clang-format-18
+  Conda:  conda install -c conda-forge clang-format=18
 EOF
     exit 2
 fi
@@ -75,6 +76,26 @@ if [[ ${#files[@]} -eq 0 ]]; then
              ! -name 'stb_vorbis.c' \
              ! -path '*/coreml/*'
     )
+fi
+
+fmt_files=()
+skipped=()
+for f in "${files[@]}"; do
+    case "$f" in
+        *.c|*.cc|*.cpp|*.cxx|*.h|*.hh|*.hpp|*.hxx) fmt_files+=("$f") ;;
+        *) skipped+=("$f") ;;
+    esac
+done
+files=()
+if [[ ${#fmt_files[@]} -gt 0 ]]; then
+    files=("${fmt_files[@]}")
+fi
+
+if [[ ${#files[@]} -eq 0 ]]; then
+    if [[ ${#skipped[@]} -gt 0 ]]; then
+        echo "format.sh: skipped ${#skipped[@]} non-C/C++ file(s)"
+    fi
+    exit 0
 fi
 
 if [[ "$mode" == "fix" ]]; then

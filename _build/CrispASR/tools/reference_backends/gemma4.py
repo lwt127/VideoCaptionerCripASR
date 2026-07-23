@@ -225,6 +225,11 @@ def _dump_full(model_dir: Path, audio: np.ndarray, stages: Set[str], max_new_tok
     model = AutoModelForImageTextToText.from_pretrained(
         pretrained, torch_dtype=dtype, trust_remote_code=True,
     ).eval()
+    try:
+        from . import _reload_guard
+    except ImportError:
+        import _reload_guard
+    _reload_guard.reload_if_random_init(model, model_dir)
     dev = next(model.parameters()).device
 
     chat = [{"role": "user", "content": [

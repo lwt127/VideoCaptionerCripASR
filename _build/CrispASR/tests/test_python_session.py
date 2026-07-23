@@ -30,6 +30,11 @@ PARAKEET_MODEL = os.environ.get(
     "PARAKEET_MODEL",
     os.path.join(os.path.dirname(__file__), "..", "..", "test_cohere", "parakeet-tdt-0.6b-v3.gguf"),
 )
+# Omni CTC model for the raw-logits accessor test. Skips when unset/missing.
+OMNI_CTC_MODEL = os.environ.get(
+    "OMNI_CTC_MODEL",
+    os.path.join(os.path.dirname(__file__), "..", "models", "omniasr-ctc.gguf"),
+)
 
 # Find the built shared library
 LIB_PATH = os.environ.get("CRISPASR_LIB")
@@ -158,6 +163,89 @@ class TestParakeetSession(unittest.TestCase):
 
 
 @unittest.skipUnless(LIB_PATH, "libwhisper not built")
+@unittest.skipUnless(os.path.exists(OMNI_CTC_MODEL), f"Omni CTC model not found at {OMNI_CTC_MODEL}")
+class TestOmniCtcLogits(unittest.TestCase):
+    """Raw per-frame CTC logits accessor (Omni CTC backend).
+
+    Mirrors the Rust ``session_omni_ctc_logits`` integration test.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from crispasr import Session
+        # Auto-detect doesn't recognise every Omni GGUF on this pinned release;
+        # the generic "omniasr" backend routes all CTC/LLM variants.
+        cls.session = Session(OMNI_CTC_MODEL, lib_path=LIB_PATH, n_threads=4, backend="omniasr")
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "session"):
+            cls.session.close()
+
+    def _clip(self):
+        # The 300M CTC model has a ~5 s positional-encoding limit (per its HF
+        # card), so decode only the first ~4 s of the ~11 s clip.
+        return load_jfk_pcm()[: 16000 * 4]
+
+    def test_transcribe_with_logits(self):
+        pcm = self._clip()
+        segs, logits = self.session.transcribe_with_logits(pcm)
+        text = " ".join(s.text for s in segs).strip()
+        self.assertTrue(text, "expected a transcript")
+
+        # Accessor contract: a dense (n_frames, n_vocab) grid, shaped + finite.
+        self.assertIsNotNone(logits, "CTC backend should return a logits grid")
+        self.assertEqual(logits.ndim, 2)
+        n_frames, n_vocab = logits.shape
+        self.assertGreater(n_frames, 0)
+        self.assertGreater(n_vocab, 0)
+        self.assertEqual(logits.size, n_frames * n_vocab)
+        self.assertTrue(np.isfinite(logits).all(), "logits must be finite")
+
+        # Greedy CTC over the exposed logits (argmax per frame, collapse
+        # repeats, drop blank id 0) must yield a non-degenerate token stream —
+        # evidence the grid is the real decode input, not zeros/garbage.
+        best = logits.argmax(axis=1)
+        keep = best != 0
+        keep[1:] &= best[1:] != best[:-1]
+        n_tokens = int(keep.sum())
+        self.assertGreater(n_tokens, 0)
+        self.assertLess(n_tokens, n_frames)
+
+    def test_logits_capture_preserves_transcript(self):
+        pcm = self._clip()
+        segs, _ = self.session.transcribe_with_logits(pcm)
+        with_logits = " ".join(s.text for s in segs).strip()
+        # Turn capture back off; the plain transcript must be unchanged.
+        self.session.set_return_logits(False)
+        plain = " ".join(s.text for s in self.session.transcribe(pcm)).strip()
+        self.assertEqual(plain, with_logits, "logits capture changed the transcript")
+
+    def test_ctc_vocab(self):
+        vocab = self.session.ctc_vocab()
+        self.assertIsNotNone(vocab, "CTC backend should expose a vocab")
+        self.assertGreater(len(vocab), 1000)
+        # A word-boundary token exists — literal space (v2) or U+2581 (v1).
+        self.assertTrue(any(p == " " or "▁" in p for p in vocab),
+                        "no word-boundary token in vocab")
+
+        # End-to-end: a greedy CTC decode over the exposed logits, detokenized
+        # via the exposed vocab, must reproduce the built-in transcript. Proves
+        # the vocab shares the logits' id space.
+        pcm = self._clip()
+        segs, logits = self.session.transcribe_with_logits(pcm)
+        text = " ".join(s.text for s in segs).strip()
+        self.assertTrue(text)
+        self.assertEqual(logits.shape[1], len(vocab))
+        best = logits.argmax(axis=1)
+        keep = best != 0
+        keep[1:] &= best[1:] != best[:-1]
+        decoded = "".join(vocab[i].replace("▁", " ") for i in best[keep]).strip()
+        self.assertEqual(decoded, text,
+                         "vocab-detokenized greedy decode != built-in transcript")
+
+
+@unittest.skipUnless(LIB_PATH, "libwhisper not built")
 class TestAvailableBackends(unittest.TestCase):
     """Test backend discovery."""
 
@@ -194,6 +282,27 @@ class TestRegistryAndCache(unittest.TestCase):
         if entry is not None:
             self.assertIsInstance(entry.filename, str)
             self.assertGreater(len(entry.filename), 0)
+
+    def test_registry_default_bundle(self):
+        from crispasr import registry_default_bundle
+        bundle = registry_default_bundle("omnivoice", lib_path=LIB_PATH)
+        self.assertIsNotNone(bundle)
+        self.assertEqual(bundle.backend, "omnivoice")
+        self.assertEqual(
+            [artifact.kind for artifact in bundle.artifacts],
+            ["primary", "companion"],
+        )
+        self.assertEqual(bundle.artifacts[0].filename, "omnivoice-f16.gguf")
+        self.assertEqual(
+            bundle.artifacts[1].filename,
+            "omnivoice-tokenizer-f16.gguf",
+        )
+
+    def test_registry_default_bundle_unknown(self):
+        from crispasr import registry_default_bundle
+        self.assertIsNone(
+            registry_default_bundle("nonexistent-backend-xyz", lib_path=LIB_PATH)
+        )
 
 
 @unittest.skipUnless(LIB_PATH, "libwhisper not built")

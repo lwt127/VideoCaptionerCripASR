@@ -10,13 +10,16 @@
 #include "fireredpunc.h"
 
 #include "core/gguf_loader.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
 
+#include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -24,6 +27,32 @@
 #include <map>
 #include <string>
 #include <vector>
+
+// ===========================================================================
+// Bench instrumentation — `FIREREDPUNC_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool fireredpunc_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = std::getenv("FIREREDPUNC_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct fireredpunc_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit fireredpunc_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~fireredpunc_bench_stage() {
+        if (!fireredpunc_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  fireredpunc_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ---------------------------------------------------------------------------
 // WordPiece tokenizer (minimal, matching BERT chinese-bert-wwm-ext)
@@ -33,7 +62,9 @@ namespace {
 
 struct WordPieceTokenizer {
     std::vector<std::string> id_to_token;
+    std::vector<float> scores; // SP Unigram log-probs (empty => greedy fallback)
     std::map<std::string, int> token_to_id;
+    size_t max_piece_len = 0;
     int unk_id = 100;              // [UNK]
     int cls_id = 101;              // [CLS]
     int sep_id = 102;              // [SEP]
@@ -42,9 +73,80 @@ struct WordPieceTokenizer {
 
     void build_map() {
         token_to_id.clear();
+        max_piece_len = 0;
         for (int i = 0; i < (int)id_to_token.size(); i++) {
             token_to_id[id_to_token[i]] = i;
+            max_piece_len = std::max(max_piece_len, id_to_token[i].size());
         }
+    }
+
+    // SentencePiece Unigram is NOT greedy — the correct segmentation maximises the
+    // sum of piece log-probs (Viterbi). Greedy longest-match mis-splits multi-subword
+    // words (e.g. "delayed"), corrupting the XLM-R embeddings. Needs tokenizer.ggml.scores.
+    std::vector<int> tokenize_sp_viterbi(const std::string& text) const {
+        std::string s; // SP-normalised: whitespace-split words each ▁-prefixed
+        {
+            std::string cur;
+            auto flush = [&]() {
+                if (!cur.empty()) {
+                    s += "\xE2\x96\x81";
+                    s += cur;
+                    cur.clear();
+                }
+            };
+            for (char c : text) {
+                if (c == ' ' || c == '\t' || c == '\n' || c == '\r')
+                    flush();
+                else
+                    cur += c;
+            }
+            flush();
+        }
+        const int n = (int)s.size();
+        if (n == 0)
+            return {};
+        auto is_boundary = [&](int i) { return i == 0 || i == n || ((unsigned char)s[i] & 0xC0) != 0x80; };
+        const double NEG = -1e30;
+        std::vector<double> dp(n + 1, NEG);
+        std::vector<int> bp(n + 1, -1), bid(n + 1, -1);
+        dp[0] = 0.0;
+        for (int i = 1; i <= n; i++) {
+            if (!is_boundary(i))
+                continue;
+            int jmin = (max_piece_len && i > (int)max_piece_len) ? i - (int)max_piece_len : 0;
+            for (int j = i - 1; j >= jmin; j--) {
+                if (!is_boundary(j) || dp[j] <= NEG / 2)
+                    continue;
+                auto it = token_to_id.find(s.substr(j, i - j));
+                if (it == token_to_id.end())
+                    continue;
+                double sc = dp[j] + scores[it->second];
+                if (sc > dp[i]) {
+                    dp[i] = sc;
+                    bp[i] = j;
+                    bid[i] = it->second;
+                }
+            }
+            if (dp[i] <= NEG / 2) { // one-char <unk> fallback keeps the lattice connected
+                int j = i - 1;
+                while (j > 0 && !is_boundary(j))
+                    j--;
+                if (dp[j] > NEG / 2) {
+                    dp[i] = dp[j] - 1e4;
+                    bp[i] = j;
+                    bid[i] = unk_id;
+                }
+            }
+        }
+        std::vector<int> ids;
+        for (int i = n; i > 0;) {
+            if (bp[i] < 0)
+                return {};
+            ids.push_back(bid[i]);
+            i = bp[i];
+        }
+        std::reverse(ids.begin(), ids.end());
+        return ids;
     }
 
     int lookup(const std::string& tok) const {
@@ -52,8 +154,11 @@ struct WordPieceTokenizer {
         return it != token_to_id.end() ? it->second : unk_id;
     }
 
-    // SentencePiece tokenization: split on whitespace, prefix ▁, greedy longest match
+    // SentencePiece tokenization. Uses Unigram Viterbi when scores are present
+    // (correct for XLM-R); falls back to greedy longest-match otherwise.
     std::vector<int> tokenize_sp(const std::string& text) const {
+        if (!scores.empty())
+            return tokenize_sp_viterbi(text);
         std::vector<int> ids;
         // Split on whitespace
         std::vector<std::string> words;
@@ -262,6 +367,7 @@ static bool fireredpunc_load(fireredpunc_context& ctx, const char* path) {
 
     // Vocab
     ctx.tokenizer.id_to_token = core_gguf::kv_str_array(meta, "tokenizer.ggml.tokens");
+    ctx.tokenizer.scores = core_gguf::kv_f32_array(meta, "tokenizer.ggml.scores");
     ctx.tokenizer.cls_id = ctx.cls_id;
     ctx.tokenizer.pad_id = ctx.pad_id;
     std::string tok_type = core_gguf::kv_str(meta, "fireredpunc.tokenizer_type", "wordpiece");
@@ -289,7 +395,7 @@ static bool fireredpunc_load(fireredpunc_context& ctx, const char* path) {
     const char* punc_backend = getenv("FIREREDPUNC_BACKEND");
     const bool force_cpu = punc_backend && strcmp(punc_backend, "cpu") == 0;
     const bool force_gpu = punc_backend && strcmp(punc_backend, "gpu") == 0;
-    ctx.backend = (force_cpu && !force_gpu) ? ggml_backend_cpu_init() : ggml_backend_init_best();
+    ctx.backend = (force_cpu && !force_gpu) ? ggml_backend_cpu_init() : crispasr_init_gpu_backend();
     if (!ctx.backend)
         ctx.backend = ggml_backend_cpu_init();
     // Always have a separate CPU backend on hand for ggml_backend_sched
@@ -364,6 +470,9 @@ static std::vector<int> fireredpunc_run(fireredpunc_context& ctx, const std::vec
     struct ggml_init_params gp = {mem, nullptr, true};
     ggml_context* ctx0 = ggml_init(gp);
 
+    // LayerNorm epsilon: BERT (chinese-bert-wwm) = 1e-12; XLM-RoBERTa = 1e-5.
+    const float ln_eps = ctx.tokenizer.is_sentencepiece ? 1e-5f : 1e-12f;
+
     // Input: token IDs [seq_len]
     ggml_tensor* inp_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, seq_len);
     ggml_set_name(inp_ids, "inp_ids");
@@ -385,7 +494,7 @@ static std::vector<int> fireredpunc_run(fireredpunc_context& ctx, const std::vec
     ggml_tensor* type_emb = ggml_get_rows(ctx0, ctx.type_emb_w, type_ids); // [seq_len, d]
 
     ggml_tensor* emb = ggml_add(ctx0, ggml_add(ctx0, tok_emb, pos_emb), type_emb);
-    emb = ggml_norm(ctx0, emb, 1e-12f);
+    emb = ggml_norm(ctx0, emb, ln_eps);
     emb = ggml_add(ctx0, ggml_mul(ctx0, emb, ctx.emb_ln_w), ctx.emb_ln_b);
     // emb: [d_model, seq_len] (ggml column-major)
 
@@ -430,18 +539,18 @@ static std::vector<int> fireredpunc_run(fireredpunc_context& ctx, const std::vec
 
         // Post-norm (residual + LN)
         cur = ggml_add(ctx0, cur, residual);
-        cur = ggml_norm(ctx0, cur, 1e-12f);
+        cur = ggml_norm(ctx0, cur, ln_eps);
         cur = ggml_add(ctx0, ggml_mul(ctx0, cur, L.attn_ln_w), L.attn_ln_b);
 
         // FFN
         residual = cur;
         ggml_tensor* ffn = ggml_add(ctx0, ggml_mul_mat(ctx0, L.ffn_up_w, cur), L.ffn_up_b);
-        ffn = ggml_gelu(ctx0, ffn);
+        ffn = ggml_gelu_erf(ctx0, ffn);
         ffn = ggml_add(ctx0, ggml_mul_mat(ctx0, L.ffn_down_w, ffn), L.ffn_down_b);
 
         // Post-norm
         cur = ggml_add(ctx0, ffn, residual);
-        cur = ggml_norm(ctx0, cur, 1e-12f);
+        cur = ggml_norm(ctx0, cur, ln_eps);
         cur = ggml_add(ctx0, ggml_mul(ctx0, cur, L.ffn_ln_w), L.ffn_ln_b);
     }
 
@@ -557,6 +666,7 @@ fireredpunc_context* fireredpunc_init(const char* model_path) {
 char* fireredpunc_process(fireredpunc_context* ctx, const char* text) {
     if (!ctx || !text)
         return nullptr;
+    fireredpunc_bench_stage _bs_total("process_total");
 
     // Tokenize
     std::string input(text);
@@ -621,30 +731,9 @@ char* fireredpunc_process(fireredpunc_context* ctx, const char* text) {
         // Must match the tokenizer's splitting exactly.
         int n_subtokens;
         if (ctx->tokenizer.is_sentencepiece) {
-            // SentencePiece: prefix with ▁, then greedy longest match
-            std::string sp_word = "\xE2\x96\x81" + lword;
-            n_subtokens = 0;
-            size_t start = 0;
-            while (start < sp_word.size()) {
-                size_t end = sp_word.size();
-                bool found = false;
-                while (end > start) {
-                    std::string sub = sp_word.substr(start, end - start);
-                    if (ctx->tokenizer.token_to_id.count(sub)) {
-                        found = true;
-                        start = end;
-                        n_subtokens++;
-                        break;
-                    }
-                    end--;
-                    while (end > start && (sp_word[end] & 0xC0) == 0x80)
-                        end--;
-                }
-                if (!found) {
-                    n_subtokens++;
-                    break;
-                }
-            }
+            // Use the SAME segmentation the model saw (Viterbi when scores present) —
+            // re-counting greedily here drifts on multi-subword words.
+            n_subtokens = (int)ctx->tokenizer.tokenize_sp(lword).size();
         } else {
             // WordPiece: try whole word, then greedy ## splitting
             n_subtokens = 0;

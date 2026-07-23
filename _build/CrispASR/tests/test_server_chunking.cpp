@@ -138,8 +138,61 @@ TEST_CASE("server TTS policy keeps VibeVoice voice cloning single-shot", "[unit]
     REQUIRE(out[0] == "First sentence. Second sentence. Third sentence.");
 }
 
-TEST_CASE("server TTS policy chunks non-VibeVoice backends", "[unit][chunking]") {
-    auto out = crispasr_tts_plan_chunks_for_backend("First sentence. Second sentence.", "qwen3-tts");
+// GH #171 regression: the production TTS backends register as
+// "vibevoice-tts" / "vibevoice-1.5b" / "vibevoice-tts-base", NOT the bare
+// "vibevoice" (that's the ASR backend). The guard must match every variant
+// by prefix or the server sentence-splits each request (the CLI never does),
+// degrading voice-clone continuity. These cases FAIL on a bare-string guard.
+TEST_CASE("server TTS policy keeps ALL vibevoice* TTS variants single-shot", "[unit][chunking]") {
+    const char* text = "First sentence. Second sentence. Third sentence.";
+    for (const char* name : {"vibevoice-tts", "vibevoice-1.5b", "vibevoice-tts-1.5b", "vibevoice-tts-base"}) {
+        CAPTURE(name);
+        auto out = crispasr_tts_plan_chunks_for_backend(text, name);
+        REQUIRE(out.size() == 1);
+        REQUIRE(out[0] == text);
+    }
+}
+
+TEST_CASE("server TTS policy keeps qwen3-tts variants single-shot", "[unit][chunking]") {
+    const char* text = "First sentence. Second sentence. Third sentence.";
+    for (const char* name : {"qwen3-tts", "qwen3-tts-1.7b-base", "qwen3-tts-customvoice", "qwen3-tts-voicedesign"}) {
+        CAPTURE(name);
+        auto out = crispasr_tts_plan_chunks_for_backend(text, name);
+        REQUIRE(out.size() == 1);
+        REQUIRE(out[0] == text);
+    }
+}
+
+// GH #197 regression: TADA's AR talker generates multi-sentence utterances in a
+// single pass like HumeAI's reference tada.py. Splitting at punctuation made each
+// isolated sentence's duration head over-predict the trailing pause (e.g. "Hi."
+// alone → ~9 s of silence+hum) and inserted extra inter-chunk silence — both
+// diverge from the reference. The backend registers as bare "tada".
+TEST_CASE("server TTS policy keeps tada single-shot", "[unit][chunking]") {
+    const char* text = "Hi. My name is Bob. It's really nice to meet you!";
+    for (const char* name : {"tada", "tada-1b", "tada-tts-1b", "tada-3b-ml"}) {
+        CAPTURE(name);
+        auto out = crispasr_tts_plan_chunks_for_backend(text, name);
+        REQUIRE(out.size() == 1);
+        REQUIRE(out[0] == text);
+    }
+}
+
+// PLAN #200: dots.tts is a continuous-latent AR model that generates
+// multi-sentence utterances in one pass with its own EOS, like the reference
+// dots.tts generate(text). Splitting re-runs the per-sentence trailing-pause
+// over-prediction AND re-emits the spoken AI-disclaimer that
+// dots_tts_synthesize prepends on each call (one per chunk) when cloning. The
+// backend registers as "dots-tts".
+TEST_CASE("server TTS policy keeps dots-tts single-shot", "[unit][chunking]") {
+    const char* text = "First sentence. Second sentence. Third sentence.";
+    auto out = crispasr_tts_plan_chunks_for_backend(text, "dots-tts");
+    REQUIRE(out.size() == 1);
+    REQUIRE(out[0] == text);
+}
+
+TEST_CASE("server TTS policy chunks sentence-safe backends", "[unit][chunking]") {
+    auto out = crispasr_tts_plan_chunks_for_backend("First sentence. Second sentence.", "kokoro");
     REQUIRE(out.size() == 2);
     REQUIRE(out[0] == "First sentence.");
     REQUIRE(out[1] == "Second sentence.");

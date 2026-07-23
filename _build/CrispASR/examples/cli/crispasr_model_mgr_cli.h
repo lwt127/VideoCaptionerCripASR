@@ -30,9 +30,12 @@ struct CrispasrResolvePreview {
 /// automatically (when `auto_download`) or prompt on a TTY. When stdin
 /// is not a TTY and `auto_download` is false, we pass `model_arg`
 /// through unchanged so the caller gets a clear load-time error.
+/// `accepted_license` attests acceptance of a RESTRICTED licence (the exact
+/// SPDX-ish tag, or "all"); `auto_download` alone is NOT sufficient for those.
 std::string crispasr_resolve_model_cli(const std::string& model_arg, const std::string& backend_name, bool quiet,
                                        const std::string& cache_dir_override = "", bool auto_download = false,
-                                       const std::string& preferred_quant = "");
+                                       const std::string& preferred_quant = "",
+                                       const std::string& accepted_license = "");
 
 /// Preview the non-interactive resolution result without downloading.
 /// When `ignore_cache` is true, local cache hits are reported as

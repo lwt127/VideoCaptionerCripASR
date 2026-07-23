@@ -8,6 +8,7 @@
 //   4. Synthesized audio has sane properties (non-silent, correct sample rate)
 
 #include <catch2/catch_test_macros.hpp>
+#include "core/crispasr_env.h"
 
 #include "piper_tts.h"
 
@@ -19,8 +20,9 @@
 // Model path passed via -DPIPER_TEST_MODEL="..." at compile time,
 // or via PIPER_TEST_MODEL env var at runtime.
 static std::string get_model_path() {
-    const char* env = std::getenv("PIPER_TEST_MODEL");
-    if (env && *env) return env;
+    const char* env = crispasr_env::get("CRISPASR_PIPER_TEST_MODEL");
+    if (env && *env)
+        return env;
 #ifdef PIPER_TEST_MODEL
     return PIPER_TEST_MODEL;
 #else
@@ -30,7 +32,8 @@ static std::string get_model_path() {
 
 static float compute_rms(const float* pcm, int n) {
     double sum = 0.0;
-    for (int i = 0; i < n; i++) sum += (double)pcm[i] * (double)pcm[i];
+    for (int i = 0; i < n; i++)
+        sum += (double)pcm[i] * (double)pcm[i];
     return (float)std::sqrt(sum / n);
 }
 
@@ -60,7 +63,8 @@ TEST_CASE("piper phoneme synthesis (IPA)", "[piper][espeak]") {
         float* pcm = nullptr;
         int sr = 0;
         // "hello world" in IPA
-        int n = piper_tts_synthesize_phonemes(ctx, "h\xc9\x99l\xcb\x88o\xca\x8a w\xcb\x88\xc9\x9c\xcb\x90ld", &pcm, &sr);
+        int n =
+            piper_tts_synthesize_phonemes(ctx, "h\xc9\x99l\xcb\x88o\xca\x8a w\xcb\x88\xc9\x9c\xcb\x90ld", &pcm, &sr);
         REQUIRE(n > 0);
         REQUIRE(pcm != nullptr);
         REQUIRE(sr == 22050);

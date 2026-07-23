@@ -34,10 +34,13 @@
 #include "core/bpe.h"
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
+#include "core/dac_decoder.h" // core_dac::fastconv_cache (FASTCONV kernel bake)
 #include "core/audio_resample.h"
 #include "core/fft.h"
 #include "core/mel.h"
 #include "core/wav_reader.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 #include "chatterbox_campplus.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -68,6 +71,32 @@
 #endif
 
 namespace {
+
+// ===========================================================================
+// Bench instrumentation — `COSYVOICE3_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool cosyvoice3_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_COSYVOICE3_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct cosyvoice3_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit cosyvoice3_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~cosyvoice3_bench_stage() {
+        if (!cosyvoice3_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  cosyvoice3_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 struct cv3_hp {
     uint32_t n_layers = 24;
@@ -344,6 +373,10 @@ struct cv3_hift {
     ggml_context* ctx_w = nullptr;
     ggml_backend_buffer_t buf_w = nullptr;
     std::map<std::string, ggml_tensor*> tensors;
+
+    // FASTCONV: baked F32 copies of the F16 hift conv kernels (cast-kill).
+    // Owns its own ctx+buffer; freed in cosyvoice3_tts_free before the backend.
+    core_dac::fastconv_cache hift_fc;
 };
 
 } // namespace
@@ -376,6 +409,10 @@ struct cosyvoice3_tts_context {
     // the same plan via skip_plan.
     ggml_cgraph* step_t1_gf = nullptr;
     int step_t1_fixed_kv_len = 0;
+
+    // §192 CPU embed cache: all speech_embd rows dequantized to F32 at
+    // init. Avoids a GPU round-trip + graph-cache invalidation per AR step.
+    std::vector<float> speech_embd_cache; // [speech_vocab * d_model]
 
     // RAS sampler RNG. Seeded once at init from params.seed (or 42);
     // re-seedable via cosyvoice3_tts_set_seed. Advances through every
@@ -932,13 +969,26 @@ extern "C" struct cosyvoice3_tts_context* cosyvoice3_tts_init_from_file(const ch
         return nullptr;
     }
     ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
-    // Phase 2 default: CPU-only. The cosyvoice3 LM is small (~0.5B,
-    // 24 layers) so CPU is acceptable for the diff-validation phase.
-    // GPU path lands in a later phase once the prefill + step shapes
-    // are validated.
-    ctx->backend = ctx->backend_cpu;
-    if (params.use_gpu && params.verbosity >= 1) {
-        fprintf(stderr, "cosyvoice3_tts: --gpu requested but pinned to CPU for Phase 2 (LLM validation)\n");
+    // The original diff-validation implementation pinned every CosyVoice3
+    // stage to CPU even when the caller requested GPU execution.  Besides the
+    // AR LLM, the flow estimator runs 22 transformer blocks twice for every
+    // Euler step, so that stale pin makes normal synthesis appear hung on
+    // CUDA machines.  All stages use the shared backend scheduler below and
+    // can therefore follow their GPU-resident weights, with CPU retained as
+    // the fallback for unsupported operations.
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
+    if (!ctx->backend) {
+        if (params.use_gpu && params.verbosity >= 1) {
+            fprintf(stderr, "cosyvoice3_tts: GPU backend unavailable, falling back to CPU\n");
+        }
+        ctx->backend = ctx->backend_cpu;
+    }
+    if (ggml_backend_is_cpu(ctx->backend)) {
+        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    }
+    if (params.verbosity >= 1) {
+        fprintf(stderr, "cosyvoice3_tts: using %s backend: %s\n", ggml_backend_is_cpu(ctx->backend) ? "CPU" : "GPU",
+                ggml_backend_name(ctx->backend));
     }
 
     // ---- Weight pass ----
@@ -1017,6 +1067,25 @@ extern "C" struct cosyvoice3_tts_context* cosyvoice3_tts_init_from_file(const ch
                 ctx->tensors.size(), hp.n_layers, hp.d_model, hp.n_heads, hp.n_kv_heads, hp.head_dim, hp.ff_dim,
                 hp.text_vocab, hp.speech_vocab, hp.speech_codebook);
     }
+
+    // §192 Pre-dequantize speech embedding table to CPU F32. The table is
+    // [d_model, speech_vocab] = 896×6761 ≈ 24 MB in F32; negligible RAM
+    // cost but saves a GPU round-trip + graph-cache invalidation per AR step.
+    {
+        ggml_tensor* w = ctx->lm.speech_embd_w;
+        const int d = (int)hp.d_model;
+        const int v = (int)hp.speech_vocab;
+        ctx->speech_embd_cache.resize((size_t)v * d);
+        if (w->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_get(w, ctx->speech_embd_cache.data(), 0, (size_t)v * d * sizeof(float));
+        } else {
+            const size_t nbytes = ggml_nbytes(w);
+            std::vector<uint8_t> raw(nbytes);
+            ggml_backend_tensor_get(w, raw.data(), 0, nbytes);
+            ggml_get_type_traits(w->type)->to_float(raw.data(), ctx->speech_embd_cache.data(), (size_t)v * d);
+        }
+    }
+
     return ctx;
 }
 
@@ -1039,6 +1108,7 @@ extern "C" void cosyvoice3_tts_free(struct cosyvoice3_tts_context* ctx) {
         ggml_backend_buffer_free(ctx->flow.buf_w);
     if (ctx->flow.ctx_w)
         ggml_free(ctx->flow.ctx_w);
+    ctx->hift.hift_fc.free(); // FASTCONV baked kernels (before the backend is freed)
     if (ctx->hift.buf_w)
         ggml_backend_buffer_free(ctx->hift.buf_w);
     if (ctx->hift.ctx_w)
@@ -1130,7 +1200,12 @@ extern "C" float* cosyvoice3_tts_prefill_with_embeds(struct cosyvoice3_tts_conte
         return nullptr;
     const auto& hp = ctx->hp;
     const int d = (int)hp.d_model;
-    if (!cv3_kv_init(ctx, std::max(n_past + n_tokens + 1024, 4096)))
+    // Standalone prefill callers need some decode headroom, but allocating a
+    // fixed 4096-token cache makes the cached T=1 Metal graph attend over all
+    // 4096 slots on every generated token.  The generation entry points size
+    // the cache to their known token budget before reaching this fallback.
+    const int prefill_capacity = ctx->kv_max_ctx > 0 ? ctx->kv_max_ctx : std::max(n_past + n_tokens + 256, 512);
+    if (!cv3_kv_init(ctx, std::max(n_past + n_tokens, prefill_capacity)))
         return nullptr;
 
     // Invalidate any cached step graph — prefill builds in the same
@@ -1197,21 +1272,45 @@ extern "C" float* cosyvoice3_tts_step_speech(struct cosyvoice3_tts_context* ctx,
         fprintf(stderr, "cosyvoice3_tts: speech_id %d out of range [0, %u)\n", speech_id, hp.speech_vocab);
         return nullptr;
     }
-    if (!cv3_kv_init(ctx, std::max(n_past + 1 + 1024, 4096)))
+    // Generation pre-sizes the cache to its full token budget.  Keep a
+    // modest fallback for direct step callers without inflating an existing
+    // request-sized cache to 4096 slots.
+    const int step_capacity = ctx->kv_max_ctx > 0 ? ctx->kv_max_ctx : 512;
+    if (!cv3_kv_init(ctx, std::max(n_past + 1, step_capacity)))
         return nullptr;
     if (n_past + 1 > ctx->kv_max_ctx) {
         fprintf(stderr, "cosyvoice3_tts: kv overflow (%d+1 > %d)\n", n_past, ctx->kv_max_ctx);
         return nullptr;
     }
 
-    // Step 1: look up speech_embd[speech_id] as a [d_model, 1] F32 buffer.
-    float* embed = cv3_run_embed(ctx, ctx->lm.speech_embd_w, &speech_id, 1);
-    if (!embed)
-        return nullptr;
+    // Step 1: look up speech_embd[speech_id]. §192: use the CPU F32 cache
+    // when available — avoids a GPU round-trip and preserves step_t1_gf.
+    float* embed_alloc = nullptr;
+    const float* embed;
+    if (!ctx->speech_embd_cache.empty()) {
+        embed = ctx->speech_embd_cache.data() + (size_t)speech_id * d;
+    } else {
+        embed_alloc = cv3_run_embed(ctx, ctx->lm.speech_embd_w, &speech_id, 1);
+        if (!embed_alloc)
+            return nullptr;
+        embed = embed_alloc;
+    }
 
-    // Step 2: run the LM forward with that embedding. Use the cached
-    // T=1 graph when possible to amortise the build cost across steps.
-    const int fixed_kv = ctx->kv_max_ctx;
+    // Step 2: run the LM forward with that embedding. Cache the T=1 graph
+    // topology, but always reset + allocate the scheduler before execution.
+    // Skipping scheduler allocation for a cached graph leaves stale compute
+    // buffer bindings on GPU backends; the second AR step then crashes while
+    // encoding the first normalization op (issue #194). This mirrors the
+    // VibeVoice bucket-cache fix: graph construction stays amortized while
+    // the inexpensive scheduler split/allocation pass is refreshed.
+    // Keep storage sized to the full generation budget, but expose only a
+    // 256-token bucket to the T=1 attention graph. The graph is rebuilt when
+    // generation crosses a bucket boundary; short requests avoid attending
+    // over the entire (normally 512-token) CLI budget on every step.
+    const char* kv_bucket_env = crispasr_env::get("CRISPASR_COSYVOICE3_KV_BUCKET");
+    const bool use_kv_bucket = !kv_bucket_env || strcmp(kv_bucket_env, "0") != 0;
+    const int kv_bucket = ((n_past + 1 + 255) / 256) * 256;
+    const int fixed_kv = use_kv_bucket ? std::min(ctx->kv_max_ctx, kv_bucket) : ctx->kv_max_ctx;
     const bool can_skip = (ctx->step_t1_gf != nullptr && ctx->step_t1_fixed_kv_len == fixed_kv);
 
     ggml_cgraph* gf;
@@ -1220,17 +1319,18 @@ extern "C" float* cosyvoice3_tts_step_speech(struct cosyvoice3_tts_context* ctx,
     } else {
         gf = cv3_build_lm_graph(ctx, /*n_tokens*/ 1, /*n_past*/ 0, /*fixed_kv_len*/ fixed_kv);
         if (!gf) {
-            free(embed);
-            return nullptr;
-        }
-        ggml_backend_sched_reset(ctx->sched);
-        if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
-            fprintf(stderr, "cosyvoice3_tts: step alloc_graph failed\n");
-            free(embed);
+            free(embed_alloc);
             return nullptr;
         }
         ctx->step_t1_gf = gf;
         ctx->step_t1_fixed_kv_len = fixed_kv;
+    }
+
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        fprintf(stderr, "cosyvoice3_tts: step alloc_graph failed\n");
+        free(embed_alloc);
+        return nullptr;
     }
 
     auto set_t = [&](const char* nm, const void* data, size_t bytes) {
@@ -1242,10 +1342,10 @@ extern "C" float* cosyvoice3_tts_step_speech(struct cosyvoice3_tts_context* ctx,
     };
 
     if (!set_t("inputs_embeds", embed, (size_t)d * sizeof(float))) {
-        free(embed);
+        free(embed_alloc);
         return nullptr;
     }
-    free(embed);
+    free(embed_alloc);
 
     int32_t pos = n_past;
     if (!set_t("lm_positions", &pos, sizeof(pos)))
@@ -1420,6 +1520,8 @@ extern "C" int32_t* cosyvoice3_tts_generate_tokens_from_embeds(struct cosyvoice3
     const int speech_vocab = (int)hp.speech_vocab;
     const int max_steps = max_tokens > 0 ? max_tokens : (ctx->params.max_tokens > 0 ? ctx->params.max_tokens : 1500);
 
+    if (!cv3_kv_init(ctx, n_tokens + max_steps))
+        return nullptr;
     cosyvoice3_tts_reset_kv(ctx);
     float* logits = cosyvoice3_tts_prefill_with_embeds(ctx, embeds, n_tokens, /*n_past*/ 0);
     if (!logits)
@@ -2075,7 +2177,7 @@ extern "C" int cosyvoice3_tts_init_flow_from_file(struct cosyvoice3_tts_context*
 //
 //   AdaLayerNormZero.forward(x, emb):
 //     emb = self.linear(self.silu(emb))                              # (B, 6d)
-//     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp \
+//     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
 //         = torch.chunk(emb, 6, dim=1)
 //     x = self.norm(x) * (1 + scale_msa[:, None]) + shift_msa[:, None]
 //     return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
@@ -2825,6 +2927,60 @@ ggml_tensor* cv3_dit_block_apply(ggml_context* ctx0, ggml_tensor* x, ggml_tensor
     return ggml_add(ctx0, x_after_attn, ggml_mul(ctx0, ff, gate_mlp));
 }
 
+// Batch-aware variant used by the CFM classifier-free-guidance path. x is
+// [d,T,B]; modulation is shared across the batch because both CFG branches
+// use the same Euler timestep.
+ggml_tensor* cv3_dit_block_apply_batched(ggml_context* ctx0, ggml_tensor* x, ggml_tensor* t_silu,
+                                         ggml_tensor* positions, const cv3_dit_block& b, int d, int n_h, int hd,
+                                         float rope_theta) {
+    const float ln_eps = 1e-6f;
+    const float attn_scale = 1.0f / std::sqrt((float)hd);
+    const int T = (int)x->ne[1];
+    const int B = (int)x->ne[2];
+
+    ggml_tensor* mod = ggml_add(ctx0, ggml_mul_mat(ctx0, b.adaln_w, t_silu), b.adaln_b);
+    const size_t fs = sizeof(float);
+    auto chunk = [&](int idx) { return ggml_view_1d(ctx0, mod, d, (size_t)(idx * d) * fs); };
+    ggml_tensor* shift_msa = chunk(0);
+    ggml_tensor* scale_msa = chunk(1);
+    ggml_tensor* gate_msa = chunk(2);
+    ggml_tensor* shift_mlp = chunk(3);
+    ggml_tensor* scale_mlp = chunk(4);
+    ggml_tensor* gate_mlp = chunk(5);
+
+    ggml_tensor* lnx_a = ggml_norm(ctx0, x, ln_eps);
+    ggml_tensor* h_a = ggml_add(ctx0, lnx_a, ggml_mul(ctx0, lnx_a, scale_msa));
+    h_a = ggml_add(ctx0, h_a, shift_msa);
+
+    ggml_tensor* Q = ggml_add(ctx0, ggml_mul_mat(ctx0, b.attn_q_w, h_a), b.attn_q_b);
+    ggml_tensor* K = ggml_add(ctx0, ggml_mul_mat(ctx0, b.attn_k_w, h_a), b.attn_k_b);
+    ggml_tensor* V = ggml_add(ctx0, ggml_mul_mat(ctx0, b.attn_v_w, h_a), b.attn_v_b);
+    Q = ggml_reshape_4d(ctx0, Q, d, 1, T, B);
+    K = ggml_reshape_4d(ctx0, K, d, 1, T, B);
+    Q = ggml_rope_ext(ctx0, Q, positions, nullptr, hd, GGML_ROPE_TYPE_NORMAL, 0, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f,
+                      0.0f);
+    K = ggml_rope_ext(ctx0, K, positions, nullptr, hd, GGML_ROPE_TYPE_NORMAL, 0, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f,
+                      0.0f);
+    Q = ggml_reshape_4d(ctx0, Q, hd, n_h, T, B);
+    K = ggml_reshape_4d(ctx0, K, hd, n_h, T, B);
+    V = ggml_reshape_4d(ctx0, V, hd, n_h, T, B);
+    Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
+    K = ggml_cont(ctx0, ggml_permute(ctx0, K, 0, 2, 1, 3));
+    V = ggml_cont(ctx0, ggml_permute(ctx0, V, 0, 2, 1, 3));
+    ggml_tensor* attn = ggml_flash_attn_ext(ctx0, Q, K, V, nullptr, attn_scale, 0.0f, 0.0f);
+    attn = ggml_reshape_3d(ctx0, attn, d, T, B);
+    attn = ggml_add(ctx0, ggml_mul_mat(ctx0, b.attn_o_w, attn), b.attn_o_b);
+    ggml_tensor* x_after_attn = ggml_add(ctx0, x, ggml_mul(ctx0, attn, gate_msa));
+
+    ggml_tensor* lnx_f = ggml_norm(ctx0, x_after_attn, ln_eps);
+    ggml_tensor* h_f = ggml_add(ctx0, lnx_f, ggml_mul(ctx0, lnx_f, scale_mlp));
+    h_f = ggml_add(ctx0, h_f, shift_mlp);
+    ggml_tensor* ff = ggml_add(ctx0, ggml_mul_mat(ctx0, b.ffn_l1_w, h_f), b.ffn_l1_b);
+    ff = ggml_gelu(ctx0, ff);
+    ff = ggml_add(ctx0, ggml_mul_mat(ctx0, b.ffn_l2_w, ff), b.ffn_l2_b);
+    return ggml_add(ctx0, x_after_attn, ggml_mul(ctx0, ff, gate_mlp));
+}
+
 ggml_cgraph* cv3_build_dit_full_graph(cosyvoice3_tts_context* ctx, int T_mel) {
     const auto& fh = ctx->flow.hp;
     const auto& f = ctx->flow;
@@ -3103,6 +3259,130 @@ ggml_cgraph* cv3_build_estimator_full_graph(cosyvoice3_tts_context* ctx, int T_m
     return gf;
 }
 
+// Build the upstream-style B=2 CFG estimator. The expensive DiT stack runs
+// once for [conditional, unconditional]; the causal position-convolution
+// inputs are built independently before the two branches are stacked.
+ggml_cgraph* cv3_build_estimator_cfg_graph(cosyvoice3_tts_context* ctx, int T_mel) {
+    const auto& fh = ctx->flow.hp;
+    const auto& f = ctx->flow;
+    const int mel = (int)fh.mel_dim;
+    const int spk_out = (int)fh.spk_dim_out;
+    const int dit_dim = (int)fh.dit_dim;
+    const int n_h = (int)fh.dit_heads;
+    const int hd = (int)fh.dit_head_dim;
+    const int L = (int)fh.n_dit_layers;
+    const float ln_eps = 1e-6f;
+
+    ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 12288, false);
+
+    auto input_2d = [&](const char* name) {
+        ggml_tensor* t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, mel, T_mel);
+        ggml_set_input(t);
+        ggml_set_name(t, name);
+        return t;
+    };
+    auto input_spk = [&](const char* name) {
+        ggml_tensor* t = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, spk_out);
+        ggml_set_input(t);
+        ggml_set_name(t, name);
+        return t;
+    };
+    ggml_tensor* x = input_2d("cfg_x_in");
+    ggml_tensor* mu_c = input_2d("cfg_mu_cond");
+    ggml_tensor* cond_c = input_2d("cfg_cond_cond");
+    ggml_tensor* spk_c = input_spk("cfg_spk_cond");
+    ggml_tensor* mu_u = input_2d("cfg_mu_uncond");
+    ggml_tensor* cond_u = input_2d("cfg_cond_uncond");
+    ggml_tensor* spk_u = input_spk("cfg_spk_uncond");
+    ggml_tensor* sin_emb = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 256);
+    ggml_set_input(sin_emb);
+    ggml_set_name(sin_emb, "cfg_sin_emb");
+    ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T_mel);
+    ggml_set_input(positions);
+    ggml_set_name(positions, "cfg_positions");
+
+    ggml_tensor* t_emb = ggml_add(ctx0, ggml_mul_mat(ctx0, f.dit_time_mlp_0_w, sin_emb), f.dit_time_mlp_0_b);
+    t_emb = ggml_silu(ctx0, t_emb);
+    t_emb = ggml_add(ctx0, ggml_mul_mat(ctx0, f.dit_time_mlp_2_w, t_emb), f.dit_time_mlp_2_b);
+    ggml_tensor* t_silu = ggml_silu(ctx0, t_emb);
+
+    auto input_branch = [&](ggml_tensor* mu, ggml_tensor* spk, ggml_tensor* cond) {
+        ggml_tensor* spk_template = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, spk_out, T_mel);
+        ggml_tensor* spk_bc = ggml_repeat(ctx0, spk, spk_template);
+        ggml_tensor* catted = ggml_concat(ctx0, ggml_concat(ctx0, ggml_concat(ctx0, x, cond, 0), mu, 0), spk_bc, 0);
+        ggml_tensor* h = ggml_add(ctx0, ggml_mul_mat(ctx0, f.dit_in_proj_w, catted), f.dit_in_proj_b);
+        ggml_tensor* pos = cv3_causal_grouped_conv1d(ctx0, h, f.dit_conv_pos_c1_w, f.dit_conv_pos_c1_b);
+        pos = cv3_mish(ctx0, pos);
+        pos = cv3_causal_grouped_conv1d(ctx0, pos, f.dit_conv_pos_c2_w, f.dit_conv_pos_c2_b);
+        pos = cv3_mish(ctx0, pos);
+        return ggml_add(ctx0, pos, h);
+    };
+
+    ggml_tensor* h_c = ggml_reshape_3d(ctx0, input_branch(mu_c, spk_c, cond_c), dit_dim, T_mel, 1);
+    ggml_tensor* h_u = ggml_reshape_3d(ctx0, input_branch(mu_u, spk_u, cond_u), dit_dim, T_mel, 1);
+    ggml_tensor* h = ggml_concat(ctx0, h_c, h_u, 2);
+    for (int il = 0; il < L; il++)
+        h = cv3_dit_block_apply_batched(ctx0, h, t_silu, positions, f.blocks[il], dit_dim, n_h, hd, fh.rope_theta);
+
+    ggml_tensor* nmod = ggml_add(ctx0, ggml_mul_mat(ctx0, f.dit_norm_out_w, t_silu), f.dit_norm_out_b);
+    const size_t fs = sizeof(float);
+    ggml_tensor* nscale = ggml_view_1d(ctx0, nmod, dit_dim, 0);
+    ggml_tensor* nshift = ggml_view_1d(ctx0, nmod, dit_dim, (size_t)dit_dim * fs);
+    ggml_tensor* lnx = ggml_norm(ctx0, h, ln_eps);
+    ggml_tensor* normed = ggml_add(ctx0, lnx, ggml_mul(ctx0, lnx, nscale));
+    normed = ggml_add(ctx0, normed, nshift);
+    ggml_tensor* dphi = ggml_add(ctx0, ggml_mul_mat(ctx0, f.dit_proj_out_w, normed), f.dit_proj_out_b);
+    ggml_set_name(dphi, "cfg_dphi");
+    ggml_set_output(dphi);
+    ggml_build_forward_expand(gf, dphi);
+    ggml_free(ctx0);
+    return gf;
+}
+
+float* cv3_run_estimator_cfg(cosyvoice3_tts_context* ctx, const float* x, int T_mel, const float* mu, const float* spks,
+                             const float* cond, const float* mu_zero, const float* spks_zero, const float* cond_zero,
+                             const float* sin_emb_t) {
+    const int mel = (int)ctx->flow.hp.mel_dim;
+    const int spk_out = (int)ctx->flow.hp.spk_dim_out;
+    ggml_cgraph* gf = cv3_build_estimator_cfg_graph(ctx, T_mel);
+    if (!gf)
+        return nullptr;
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
+        return nullptr;
+    auto set_t = [&](const char* name, const void* data, size_t bytes) {
+        ggml_tensor* t = ggml_graph_get_tensor(gf, name);
+        if (!t)
+            return false;
+        ggml_backend_tensor_set(t, data, 0, bytes);
+        return true;
+    };
+    const size_t mel_bytes = (size_t)mel * T_mel * sizeof(float);
+    if (!set_t("cfg_x_in", x, mel_bytes) || !set_t("cfg_mu_cond", mu, mel_bytes) ||
+        !set_t("cfg_cond_cond", cond, mel_bytes) || !set_t("cfg_spk_cond", spks, (size_t)spk_out * sizeof(float)) ||
+        !set_t("cfg_mu_uncond", mu_zero, mel_bytes) || !set_t("cfg_cond_uncond", cond_zero, mel_bytes) ||
+        !set_t("cfg_spk_uncond", spks_zero, (size_t)spk_out * sizeof(float)) ||
+        !set_t("cfg_sin_emb", sin_emb_t, 256 * sizeof(float)))
+        return nullptr;
+    std::vector<int32_t> pos((size_t)T_mel);
+    for (int i = 0; i < T_mel; i++)
+        pos[(size_t)i] = i;
+    if (!set_t("cfg_positions", pos.data(), pos.size() * sizeof(int32_t)))
+        return nullptr;
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "cosyvoice3_tts: batched CFG estimator compute failed\n");
+        return nullptr;
+    }
+    ggml_tensor* out_t = ggml_graph_get_tensor(gf, "cfg_dphi");
+    const size_t n = out_t ? (size_t)ggml_nelements(out_t) : 0;
+    float* out = n ? (float*)malloc(n * sizeof(float)) : nullptr;
+    if (out)
+        ggml_backend_tensor_get(out_t, out, 0, n * sizeof(float));
+    return out;
+}
+
 // Run the full-estimator graph once. Returns a malloc'd float[T_mel*mel_dim]
 // buffer (caller frees).
 float* cv3_run_estimator_full(cosyvoice3_tts_context* ctx, const float* x, int T_mel, const float* mu,
@@ -3195,29 +3475,93 @@ float* cv3_run_solve_euler(cosyvoice3_tts_context* ctx, const float* mu, int T_m
     std::vector<float> mu_zero(mel_n, 0.0f);
     std::vector<float> cond_zero(mel_n, 0.0f);
     std::vector<float> spks_zero((size_t)spk_out, 0.0f);
+    const char* cfg_batch_env = crispasr_env::get("CRISPASR_COSYVOICE3_CFG_BATCH");
+    bool use_cfg_batch = !cfg_batch_env || strcmp(cfg_batch_env, "0") != 0;
+
+    // Interval-CFG (opt-in, APPROXIMATE — mirrors OMNIVOICE_CFG_INTERVAL): recompute
+    // the uncond CFG forward only every K steps and reuse the cached uncond dphi in
+    // between; the cond forward stays fresh every step; the first AND last step
+    // always recompute uncond. This uses a slightly stale uncond, so it CHANGES the
+    // output and stays gated OFF by default (K=1 = exact). It requires the SEPARATE
+    // 2-forward path — the batched path (COSYVOICE3_CFG_BATCH) fuses cond+uncond into
+    // one graph, so there is no uncond forward to skip; K>1 therefore forces separate
+    // forwards. Only active when K>1 && cfg_rate!=0, so at the default the legacy path
+    // below is byte-for-byte unchanged. Gated CRISPASR_COSYVOICE3_CFG_INTERVAL.
+    const int cfg_interval = [] {
+        const char* e = std::getenv("CRISPASR_COSYVOICE3_CFG_INTERVAL");
+        const int k = e ? atoi(e) : 1;
+        return k < 1 ? 1 : k;
+    }();
+    const bool interval_on = cfg_interval > 1 && cfg_rate != 0.0f;
+    if (interval_on)
+        use_cfg_batch = false;       // interval needs the standalone uncond forward to skip
+    std::vector<float> uncond_cache; // last computed uncond dphi [mel_n]; reused between recomputes
+    if (interval_on && std::getenv("CRISPASR_COSYVOICE3_CFG_INTERVAL_DEBUG"))
+        fprintf(stderr, "cosyvoice3_tts: interval-CFG K=%d (uncond recomputed every %d steps; first+last always)\n",
+                cfg_interval, cfg_interval);
 
     double t = t_span[0];
     double dt = t_span[1] - t_span[0];
     for (int step = 1; step <= n_steps; step++) {
         std::vector<float> sin_emb = cv3_compute_sin_emb((float)t, 256);
 
-        float* dphi_cond = cv3_run_estimator_full(ctx, x.data(), T_mel, mu, spks_proj, cond, sin_emb.data());
-        if (!dphi_cond)
-            return nullptr;
-        float* dphi_unc = cv3_run_estimator_full(ctx, x.data(), T_mel, mu_zero.data(), spks_zero.data(),
-                                                 cond_zero.data(), sin_emb.data());
-        if (!dphi_unc) {
-            free(dphi_cond);
-            return nullptr;
-        }
-
-        // CFG combine: dphi = (1 + cfg) * dphi_cond - cfg * dphi_unc.
         const float w_cond = 1.0f + cfg_rate;
         const float w_unc = cfg_rate;
-        for (size_t i = 0; i < mel_n; i++) {
-            dphi_cond[i] = w_cond * dphi_cond[i] - w_unc * dphi_unc[i];
+        float* dphi_cond = nullptr;
+        if (interval_on) {
+            // Cond fresh every step; uncond recomputed on the first + last step and
+            // every K-th step, otherwise reused from uncond_cache (the approximation).
+            dphi_cond = cv3_run_estimator_full(ctx, x.data(), T_mel, mu, spks_proj, cond, sin_emb.data());
+            if (!dphi_cond)
+                return nullptr;
+            const bool recompute_unc = (step == 1) || (step == n_steps) || (((step - 1) % cfg_interval) == 0);
+            if (recompute_unc || uncond_cache.empty()) {
+                float* dphi_unc = cv3_run_estimator_full(ctx, x.data(), T_mel, mu_zero.data(), spks_zero.data(),
+                                                         cond_zero.data(), sin_emb.data());
+                if (!dphi_unc) {
+                    free(dphi_cond);
+                    return nullptr;
+                }
+                uncond_cache.assign(dphi_unc, dphi_unc + mel_n);
+                free(dphi_unc);
+            }
+            for (size_t i = 0; i < mel_n; i++)
+                dphi_cond[i] = w_cond * dphi_cond[i] - w_unc * uncond_cache[i];
+        } else if (cfg_rate == 0.0f) {
+            dphi_cond = cv3_run_estimator_full(ctx, x.data(), T_mel, mu, spks_proj, cond, sin_emb.data());
+            if (!dphi_cond)
+                return nullptr;
+        } else if (use_cfg_batch) {
+            float* cfg_pair = cv3_run_estimator_cfg(ctx, x.data(), T_mel, mu, spks_proj, cond, mu_zero.data(),
+                                                    spks_zero.data(), cond_zero.data(), sin_emb.data());
+            if (cfg_pair) {
+                dphi_cond = (float*)malloc(mel_n * sizeof(float));
+                if (!dphi_cond) {
+                    free(cfg_pair);
+                    return nullptr;
+                }
+                for (size_t i = 0; i < mel_n; i++)
+                    dphi_cond[i] = w_cond * cfg_pair[i] - w_unc * cfg_pair[mel_n + i];
+                free(cfg_pair);
+            } else {
+                fprintf(stderr, "cosyvoice3_tts: batched CFG unavailable; falling back to separate forwards\n");
+                use_cfg_batch = false;
+            }
         }
-        free(dphi_unc);
+        if (!dphi_cond) {
+            dphi_cond = cv3_run_estimator_full(ctx, x.data(), T_mel, mu, spks_proj, cond, sin_emb.data());
+            if (!dphi_cond)
+                return nullptr;
+            float* dphi_unc = cv3_run_estimator_full(ctx, x.data(), T_mel, mu_zero.data(), spks_zero.data(),
+                                                     cond_zero.data(), sin_emb.data());
+            if (!dphi_unc) {
+                free(dphi_cond);
+                return nullptr;
+            }
+            for (size_t i = 0; i < mel_n; i++)
+                dphi_cond[i] = w_cond * dphi_cond[i] - w_unc * dphi_unc[i];
+            free(dphi_unc);
+        }
 
         if (step == 1 && dphi_step0_out) {
             std::memcpy(dphi_step0_out, dphi_cond, mel_n * sizeof(float));
@@ -3837,7 +4181,7 @@ ggml_cgraph* cv3_build_hift_decode_graph(cosyvoice3_tts_context* ctx, int T_mel)
 
     for (int i = 0; i < 3; i++) {
         const int u = up_rates[i];
-        const int ch_out = base >> (i + 1); // 256, 128, 64
+        // ch_out = base >> (i + 1) = 256, 128, 64
 
         // LeakyReLU(slope=0.1) → CausalConv1dUpsample = Upsample(nearest, u) + CausalConv1d(K, left-pad K-1).
         x = ggml_leaky_relu(ctx0, x, slope, /*inplace*/ false);
@@ -4269,6 +4613,65 @@ extern "C" int cosyvoice3_tts_init_hift_from_file(struct cosyvoice3_tts_context*
     }
     hf.f0_classifier_w = require_t("cosyvoice3.hift.f0.classifier.w");
     hf.f0_classifier_b = require_t("cosyvoice3.hift.f0.classifier.b");
+
+    // ---- FASTCONV: bake one F32 copy of each F16 hift conv kernel at load,
+    // then re-point the named fields to the baked copies. The fork's
+    // ggml_conv_1d casts an F16 kernel → F32 inside EVERY graph when the
+    // activations are F32; baking that cast once and swapping the pointer makes
+    // it a no-op, bitwise-equivalent (the one-time F16→F32 conversion is the
+    // exact same conversion the per-graph cast performs). Zero graph change —
+    // every hift graph reads these fields via `const auto& h = ctx->hift`.
+    // ⚠ cosyvoice3 upsamples with a REGULAR conv1d (cv3_causal_conv1d), NOT a
+    // conv_transpose, so ups_w[] ARE baked (unlike the HiFi-GAN / chatterbox
+    // `.ups` exclusion). The 2D linears (m_source.l_linear, f0.classifier) and
+    // the 1D biases/alphas are not conv kernels and are left untouched (the CPU
+    // source path reads l_linear as raw F32 — must not be swapped).
+    // Gated CRISPASR_COSYVOICE3_FASTCONV (default on — numerically equivalent).
+    {
+        const char* env = getenv("CRISPASR_COSYVOICE3_FASTCONV");
+        const bool fc_on = !env || env[0] != '0';
+        std::vector<ggml_tensor**> fields;
+        fields.push_back(&hf.conv_pre_w);
+        fields.push_back(&hf.conv_post_w);
+        for (int i = 0; i < 3; i++)
+            fields.push_back(&hf.ups_w[i]);
+        for (auto& rb : hf.resblocks)
+            for (int j = 0; j < 3; j++) {
+                fields.push_back(&rb.c1_w[j]);
+                fields.push_back(&rb.c2_w[j]);
+            }
+        for (int i = 0; i < 3; i++)
+            fields.push_back(&hf.src_down_w[i]);
+        for (auto& rb : hf.src_resblocks)
+            for (int j = 0; j < 3; j++) {
+                fields.push_back(&rb.c1_w[j]);
+                fields.push_back(&rb.c2_w[j]);
+            }
+        for (int i = 0; i < 5; i++)
+            fields.push_back(&hf.f0_condnet_w[i]);
+
+        std::vector<ggml_tensor*> kernels;
+        kernels.reserve(fields.size());
+        for (ggml_tensor** f : fields)
+            kernels.push_back(*f);
+        hf.hift_fc.bake(ctx->backend, kernels, fc_on);
+        int swapped = 0;
+        for (ggml_tensor** f : fields) {
+            ggml_tensor* baked = hf.hift_fc.get(*f);
+            if (baked != *f) {
+                *f = baked;
+                swapped++;
+            }
+        }
+        if (getenv("CRISPASR_COSYVOICE3_FASTCONV_DEBUG")) {
+            int f16 = 0;
+            for (ggml_tensor* k : kernels)
+                if (k && k->type == GGML_TYPE_F16)
+                    f16++;
+            fprintf(stderr, "cosyvoice3_tts:hift FASTCONV %s: %d/%zu conv kernels F16, %d baked+swapped\n",
+                    fc_on ? "ON" : "OFF", f16, kernels.size(), swapped);
+        }
+    }
 
     hf.loaded = true;
     if (ctx->params.verbosity >= 1) {
@@ -4971,6 +5374,10 @@ std::vector<int32_t> cv3_generate_tokens_with_stop_floor(cosyvoice3_tts_context*
     const int speech_vocab = (int)ctx->hp.speech_vocab;
     const int max_steps = max_tokens > 0 ? max_tokens : (ctx->params.max_tokens > 0 ? ctx->params.max_tokens : 1500);
 
+    // Right-size the fixed-shape T=1 graph to this request.  This preserves
+    // graph reuse while avoiding attention over thousands of unused KV slots.
+    if (!cv3_kv_init(ctx, n_tokens + max_steps))
+        return out;
     cosyvoice3_tts_reset_kv(ctx);
     float* logits = cosyvoice3_tts_prefill_with_embeds(ctx, embeds, n_tokens, /*n_past*/ 0);
     if (!logits)
@@ -5119,12 +5526,15 @@ float* cv3_synth_with_voice(cosyvoice3_tts_context* ctx, const char* text, const
     const int aligned_t_ref_mel = prompt_token_len * mel_ratio;
 
     // ---- 1. Tokenise prompt_text + user_text ----
-    std::vector<int32_t> prompt_ids = cv3_tokenise_prompt(ctx->vocab, voice->prompt_text);
-    std::vector<int32_t> user_ids = cv3_tokenise_prompt(ctx->vocab, std::string(text));
     std::vector<int32_t> text_ids;
-    text_ids.reserve(prompt_ids.size() + user_ids.size());
-    text_ids.insert(text_ids.end(), prompt_ids.begin(), prompt_ids.end());
-    text_ids.insert(text_ids.end(), user_ids.begin(), user_ids.end());
+    {
+        cosyvoice3_bench_stage _b("tokenize");
+        std::vector<int32_t> prompt_ids = cv3_tokenise_prompt(ctx->vocab, voice->prompt_text);
+        std::vector<int32_t> user_ids = cv3_tokenise_prompt(ctx->vocab, std::string(text));
+        text_ids.reserve(prompt_ids.size() + user_ids.size());
+        text_ids.insert(text_ids.end(), prompt_ids.begin(), prompt_ids.end());
+        text_ids.insert(text_ids.end(), user_ids.begin(), user_ids.end());
+    }
     if (text_ids.empty()) {
         fprintf(stderr, "cosyvoice3_tts: synth: empty text after tokenisation\n");
         return nullptr;
@@ -5144,8 +5554,11 @@ float* cv3_synth_with_voice(cosyvoice3_tts_context* ctx, const char* text, const
     int max_steps = ctx->params.max_tokens > 0 ? ctx->params.max_tokens : (int)text_ids.size() * 20;
     if (max_steps < 16)
         max_steps = 16;
-    std::vector<int32_t> gen_tokens =
-        cv3_generate_tokens_with_stop_floor(ctx, lm_embeds.data(), n_lm, max_steps, stop_floor);
+    std::vector<int32_t> gen_tokens;
+    {
+        cosyvoice3_bench_stage _b("lm_ar_decode");
+        gen_tokens = cv3_generate_tokens_with_stop_floor(ctx, lm_embeds.data(), n_lm, max_steps, stop_floor);
+    }
     if (gen_tokens.empty()) {
         fprintf(stderr, "cosyvoice3_tts: synth: AR decode produced 0 tokens\n");
         return nullptr;
@@ -5154,7 +5567,7 @@ float* cv3_synth_with_voice(cosyvoice3_tts_context* ctx, const char* text, const
         fprintf(stderr, "cosyvoice3_tts: synth: generated %zu speech tokens\n", gen_tokens.size());
     }
 
-    if (const char* dump = std::getenv("COSYVOICE3_DUMP_TOKENS")) {
+    if (const char* dump = crispasr_env::get("CRISPASR_COSYVOICE3_DUMP_TOKENS")) {
         FILE* f = std::fopen(dump, "w");
         if (f) {
             std::fprintf(f, "text_ids(%zu):", text_ids.size());
@@ -5173,15 +5586,20 @@ float* cv3_synth_with_voice(cosyvoice3_tts_context* ctx, const char* text, const
     }
 
     // ---- 3. Compose full speech-token sequence + run pre_la + repeat_interleave ----
-    std::vector<int32_t> full_tokens;
-    full_tokens.reserve(prompt_tokens.size() + gen_tokens.size());
-    full_tokens.insert(full_tokens.end(), prompt_tokens.begin(), prompt_tokens.end());
-    full_tokens.insert(full_tokens.end(), gen_tokens.begin(), gen_tokens.end());
-    std::vector<float> mu = cv3_run_pre_la_and_interleave(ctx, full_tokens);
+    const size_t n_full_tokens = prompt_tokens.size() + gen_tokens.size();
+    std::vector<float> mu;
+    {
+        cosyvoice3_bench_stage _b("pre_la+interleave");
+        std::vector<int32_t> full_tokens;
+        full_tokens.reserve(n_full_tokens);
+        full_tokens.insert(full_tokens.end(), prompt_tokens.begin(), prompt_tokens.end());
+        full_tokens.insert(full_tokens.end(), gen_tokens.begin(), gen_tokens.end());
+        mu = cv3_run_pre_la_and_interleave(ctx, full_tokens);
+    }
     if (mu.empty())
         return nullptr;
     const int mel = (int)ctx->flow.hp.mel_dim;
-    const int T_mel_total = (int)(full_tokens.size() * (size_t)ctx->flow.hp.token_mel_ratio);
+    const int T_mel_total = (int)(n_full_tokens * (size_t)ctx->flow.hp.token_mel_ratio);
     const int T_ref_mel = aligned_t_ref_mel;
     if (T_ref_mel > T_mel_total) {
         fprintf(stderr, "cosyvoice3_tts: synth: voice ref_mel (%d) longer than full T_mel (%d) — corrupt voice\n",
@@ -5204,9 +5622,30 @@ float* cv3_synth_with_voice(cosyvoice3_tts_context* ctx, const char* text, const
     std::vector<float> x_init = cv3_seeded_gaussian((size_t)T_mel_total * (size_t)mel, /*seed*/ 0);
 
     // ---- 7. Run flow Euler → mel ----
-    float* mel_full =
-        cosyvoice3_tts_solve_flow_euler(ctx, mu.data(), T_mel_total, spks_proj.data(), cond.data(), x_init.data(),
-                                        /*n_steps*/ 10, ctx->flow.hp.cfm_inference_cfg_rate);
+    // §235: audible synthesis defaults to 6 CFM Euler steps — perceptual parity
+    // with the upstream 10 (log-mel corr vs 10-step: 6→0.9925, confirmed across
+    // short/numbers/long + a human listen, 2026-07-11), for ~−40% flow work
+    // (~−19% of the synthesis wall). hp.cfm_n_steps (10) is preserved for the
+    // diff harness / cv3_extract_* stages (which pin 10 to match PyTorch); the
+    // min() also respects a model GGUF that ships fewer steps. Override with
+    // COSYVOICE3_FLOW_STEPS.
+    int flow_steps = std::min((int)ctx->flow.hp.cfm_n_steps, 6);
+    if (const char* env_steps = crispasr_env::get("CRISPASR_COSYVOICE3_FLOW_STEPS")) {
+        char* end = nullptr;
+        const long parsed = std::strtol(env_steps, &end, 10);
+        if (end != env_steps && *end == '\0' && parsed >= 1 && parsed <= 100) {
+            flow_steps = (int)parsed;
+        } else if (ctx->params.verbosity >= 1) {
+            fprintf(stderr, "cosyvoice3_tts: ignoring invalid COSYVOICE3_FLOW_STEPS='%s' (expected 1..100)\n",
+                    env_steps);
+        }
+    }
+    float* mel_full;
+    {
+        cosyvoice3_bench_stage _b("flow_euler");
+        mel_full = cosyvoice3_tts_solve_flow_euler(ctx, mu.data(), T_mel_total, spks_proj.data(), cond.data(),
+                                                   x_init.data(), flow_steps, ctx->flow.hp.cfm_inference_cfg_rate);
+    }
     if (!mel_full)
         return nullptr;
 
@@ -5218,8 +5657,12 @@ float* cv3_synth_with_voice(cosyvoice3_tts_context* ctx, const char* text, const
     free(mel_full);
 
     // ---- 9. HiFT inference → 24 kHz audio ----
-    std::vector<float> noise_buf = cv3_seeded_uniform_noise((size_t)T_mel_out * 480 * 9, /*seed*/ 0);
-    float* audio = cosyvoice3_tts_run_hift_inference(ctx, mel_out.data(), T_mel_out, noise_buf.data());
+    float* audio;
+    {
+        cosyvoice3_bench_stage _b("hift_vocoder");
+        std::vector<float> noise_buf = cv3_seeded_uniform_noise((size_t)T_mel_out * 480 * 9, /*seed*/ 0);
+        audio = cosyvoice3_tts_run_hift_inference(ctx, mel_out.data(), T_mel_out, noise_buf.data());
+    }
     if (!audio)
         return nullptr;
 

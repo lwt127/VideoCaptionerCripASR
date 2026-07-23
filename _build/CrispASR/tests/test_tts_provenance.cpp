@@ -3,8 +3,8 @@
 // Tests for: consent gate logic, C2PA no-op, ID3v2 tag structure,
 // WAV LIST/INFO metadata, disclaimer helpers.
 
-#include "crispasr_wav_writer.h"
-#include "crispasr_c2pa.h"
+#include "core/crispasr_wav_writer.h"
+#include "core/crispasr_c2pa.h"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -112,6 +112,157 @@ TEST_CASE("ID3v2 TXXX contains GENERATOR=CrispASR", "[unit][provenance][mp3]") {
     std::string tag = crispasr_make_id3v2_ai_tag();
     REQUIRE(tag.find("GENERATOR") != std::string::npos);
     REQUIRE(tag.find("CrispASR") != std::string::npos);
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// MP3 encoding (in-tree glint encoder, crispasr_mp3_writer.h)
+// ──────────────────────────────────────────────────────────────────────────
+
+#include "crispasr_mp3_writer.h"
+
+TEST_CASE("MP3 target rate maps to native MP3 rates", "[unit][provenance][mp3]") {
+    // Native rates pass through
+    REQUIRE(crispasr_mp3_target_rate(16000) == 16000);
+    REQUIRE(crispasr_mp3_target_rate(22050) == 22050);
+    REQUIRE(crispasr_mp3_target_rate(24000) == 24000);
+    REQUIRE(crispasr_mp3_target_rate(44100) == 44100);
+    REQUIRE(crispasr_mp3_target_rate(48000) == 48000);
+    // Non-native rates go to the nearest rate at or above
+    REQUIRE(crispasr_mp3_target_rate(20000) == 22050);
+    REQUIRE(crispasr_mp3_target_rate(23000) == 24000);
+    // Above 48 kHz caps at 48 kHz
+    REQUIRE(crispasr_mp3_target_rate(96000) == 48000);
+}
+
+TEST_CASE("MP3 encode: ID3 prefix, frame sync, CBR size", "[unit][provenance][mp3]") {
+    // 0.5 s of 440 Hz sine at 24 kHz
+    const int sr = 24000;
+    const int n = sr / 2;
+    std::vector<float> pcm(n);
+    for (int i = 0; i < n; i++)
+        pcm[i] = 0.5f * std::sin(2.0f * 3.14159265f * 440.0f * (float)i / (float)sr);
+
+    std::string mp3 = crispasr_make_mp3(pcm.data(), n, sr);
+    REQUIRE(!mp3.empty());
+    REQUIRE(mp3.substr(0, 3) == "ID3");
+
+    // First byte after the ID3v2 tag must be an MPEG frame sync
+    // (11 set bits: 0xFF then top 3 bits of the next byte).
+    uint32_t ss = ((uint32_t)(uint8_t)mp3[6] << 21) | ((uint32_t)(uint8_t)mp3[7] << 14) |
+                  ((uint32_t)(uint8_t)mp3[8] << 7) | ((uint32_t)(uint8_t)mp3[9]);
+    size_t off = 10 + ss;
+    REQUIRE(mp3.size() > off + 4);
+    REQUIRE((uint8_t)mp3[off] == 0xFF);
+    REQUIRE(((uint8_t)mp3[off + 1] & 0xE0) == 0xE0);
+
+    // CBR 128 kbps → 0.5 s ≈ 8000 bytes of audio data (± a couple of
+    // frames for padding/flush)
+    size_t audio_bytes = mp3.size() - off;
+    REQUIRE(audio_bytes > 6000);
+    REQUIRE(audio_bytes < 10000);
+}
+
+TEST_CASE("MP3 encode: non-native rate is resampled, still valid", "[unit][provenance][mp3]") {
+    const int sr = 19000; // not an MP3 rate → resampled to 22050
+    const int n = sr / 4;
+    std::vector<float> pcm(n, 0.1f);
+    std::string mp3 = crispasr_make_mp3(pcm.data(), n, sr);
+    REQUIRE(!mp3.empty());
+    REQUIRE(mp3.substr(0, 3) == "ID3");
+}
+
+TEST_CASE("MP3 encode: invalid input returns empty", "[unit][provenance][mp3]") {
+    std::vector<float> pcm(100, 0.0f);
+    REQUIRE(crispasr_make_mp3(nullptr, 100, 24000).empty());
+    REQUIRE(crispasr_make_mp3(pcm.data(), 0, 24000).empty());
+    REQUIRE(crispasr_make_mp3(pcm.data(), 100, 0).empty());
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// AAC-LC encoding (in-tree glint encoder, crispasr_aac_writer.h)
+// ──────────────────────────────────────────────────────────────────────────
+
+#include "crispasr_aac_writer.h"
+
+TEST_CASE("AAC target rate maps to native AAC rates", "[unit][provenance][aac]") {
+    REQUIRE(crispasr_aac_target_rate(16000) == 16000);
+    REQUIRE(crispasr_aac_target_rate(24000) == 24000);
+    REQUIRE(crispasr_aac_target_rate(48000) == 48000);
+    REQUIRE(crispasr_aac_target_rate(96000) == 96000);
+    // Non-native rates go to the nearest rate at or above
+    REQUIRE(crispasr_aac_target_rate(20000) == 22050);
+    REQUIRE(crispasr_aac_target_rate(50000) == 64000);
+    // Above 96 kHz caps at 96 kHz
+    REQUIRE(crispasr_aac_target_rate(192000) == 96000);
+}
+
+TEST_CASE("AAC encode: ID3 prefix + ADTS syncword", "[unit][provenance][aac]") {
+    // 0.5 s of 440 Hz sine at 24 kHz
+    const int sr = 24000;
+    const int n = sr / 2;
+    std::vector<float> pcm(n);
+    for (int i = 0; i < n; i++)
+        pcm[i] = 0.5f * std::sin(2.0f * 3.14159265f * 440.0f * (float)i / (float)sr);
+
+    std::string aac = crispasr_make_aac(pcm.data(), n, sr);
+    REQUIRE(!aac.empty());
+    REQUIRE(aac.substr(0, 3) == "ID3");
+
+    // First bytes after the ID3v2 tag must be an ADTS syncword
+    // (12 set bits: 0xFF then top 4 bits of the next byte).
+    uint32_t ss = ((uint32_t)(uint8_t)aac[6] << 21) | ((uint32_t)(uint8_t)aac[7] << 14) |
+                  ((uint32_t)(uint8_t)aac[8] << 7) | ((uint32_t)(uint8_t)aac[9]);
+    size_t off = 10 + ss;
+    REQUIRE(aac.size() > off + 7);
+    REQUIRE((uint8_t)aac[off] == 0xFF);
+    REQUIRE(((uint8_t)aac[off + 1] & 0xF0) == 0xF0);
+}
+
+TEST_CASE("AAC encode: invalid input returns empty", "[unit][provenance][aac]") {
+    std::vector<float> pcm(100, 0.0f);
+    REQUIRE(crispasr_make_aac(nullptr, 100, 24000).empty());
+    REQUIRE(crispasr_make_aac(pcm.data(), 0, 24000).empty());
+    REQUIRE(crispasr_make_aac(pcm.data(), 100, 0).empty());
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Ogg Opus encoding + OpusTags AI-provenance (crispasr_opus_writer.h)
+// ──────────────────────────────────────────────────────────────────────────
+
+#include "crispasr_opus_writer.h"
+
+TEST_CASE("Opus encode: valid Ogg with AI-provenance in OpusTags", "[unit][provenance][opus]") {
+    const int sr = 48000;
+    const int n = sr / 2; // 0.5 s
+    std::vector<float> pcm(n);
+    for (int i = 0; i < n; i++)
+        pcm[i] = 0.3f * std::sin(2.0f * 3.14159265f * 300.0f * (float)i / (float)sr);
+
+    std::string opus = crispasr_make_opus(pcm.data(), n, sr);
+    REQUIRE(opus.size() > 100);
+    REQUIRE(opus.compare(0, 4, "OggS") == 0); // Ogg capture pattern
+
+    // The rewritten OpusTags packet carries the AI-provenance comments verbatim.
+    REQUIRE(opus.find("OpusTags") != std::string::npos);
+    REQUIRE(opus.find("AI_GENERATED=true") != std::string::npos);
+    REQUIRE(opus.find("GENERATOR=CrispASR") != std::string::npos);
+    REQUIRE(opus.find("AI_CONTENT_NOTICE=This audio was synthesized") != std::string::npos);
+
+    // The rewritten page must remain a valid Ogg Opus (CRC + lacing correct):
+    // glint's decoder round-trips it.
+    int dsr = 0, dch = 0, dfr = 0;
+    float* dec = glint_decode_audio(reinterpret_cast<const uint8_t*>(opus.data()), (int)opus.size(), &dsr, &dch, &dfr);
+    REQUIRE(dec != nullptr);
+    REQUIRE(dfr > 0);
+    REQUIRE(dsr == 48000);
+    glint_free(dec);
+}
+
+TEST_CASE("Opus encode: invalid input returns empty", "[unit][provenance][opus]") {
+    std::vector<float> pcm(100, 0.0f);
+    REQUIRE(crispasr_make_opus(nullptr, 100, 48000).empty());
+    REQUIRE(crispasr_make_opus(pcm.data(), 0, 48000).empty());
+    REQUIRE(crispasr_make_opus(pcm.data(), 100, 0).empty());
 }
 
 // ──────────────────────────────────────────────────────────────────────────

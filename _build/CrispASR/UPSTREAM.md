@@ -79,7 +79,8 @@ ffmpeg -y -i samples/jfk.wav -c:a libopus -b:a 32k /tmp/jfk.opus
 
 ## ggml — VNNI Q8_0 dot product on x86 AVX-VNNI / AVX512-VNNI
 
-**Status:** ⏳ design plan only, see [`ggml_plans.md`](ggml_plans.md)
+**Status:** ⏳ design plan only (the old `ggml_plans.md` writeup is gone;
+re-derive from this entry if picked up)
 
 **Issue.** ggml's `vec_dot_q8_0_q8_0` uses AVX2 `pmaddubsw` / `pmaddwd`,
 which is ~2× slower than the AVX-VNNI `vpdpbusd` instruction available
@@ -129,8 +130,9 @@ came from.
 ## ggml — fork-local patches we already carry
 
 These are not wishlist items — they are real CrispASR-local
-modifications inside the vendored `ggml/` subtree, marked with
-`// CrispASR patch` so a `git subtree pull` won't lose them silently.
+modifications carried in the `ggml` submodule (the `CrispStrobe/ggml`
+fork), marked with `// CrispASR patch` so an upstream merge into the
+fork won't lose them silently.
 Full root-cause / fix-shape per patch is in LEARNINGS.md
 "ggml fork patches we carry". Reproducing the four-patch inventory
 here so the upstream-PR question stays visible.

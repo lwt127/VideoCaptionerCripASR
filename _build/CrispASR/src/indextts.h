@@ -53,6 +53,33 @@ int indextts_set_vocoder_path(struct indextts_context* ctx, const char* path);
 float* indextts_synthesize(struct indextts_context* ctx, const char* text, const float* ref_pcm, int ref_n_samples,
                            int* out_n_samples);
 
+// ── Reference cache (voice cloning) ─────────────────────────────────
+// The reference conditioning (Conformer/Perceiver → cond latents) and ECAPA
+// speaker embedding are recomputed from ref audio each run. These let a caller
+// persist them and restore them to skip the reference encode on later runs.
+
+// Flat length of the conditioning latents (perceiver_n_latents * d_model).
+int indextts_conditioning_dim(const struct indextts_context* ctx);
+
+// Pre-set the cached conditioning (cond_count floats) + ECAPA embedding
+// (spk_count must be 512, or pass nullptr/0 to omit). Subsequent synthesize
+// calls skip the reference encode and use these. Pass ref_pcm=nullptr then.
+void indextts_set_reference_cache(struct indextts_context* ctx, const float* cond, int cond_count, const float* spk,
+                                  int spk_count);
+
+// Borrow the conditioning + speaker embedding computed by the last synthesize
+// (to cache them). Pointers valid until the next synthesize. Returns 0 on
+// success, -1 if nothing has been computed. Do not free.
+int indextts_get_reference_cache(const struct indextts_context* ctx, const float** cond, int* cond_count,
+                                 const float** spk, int* spk_count);
+
+// Drop the cached reference so the next synthesize re-encodes from ref audio.
+void indextts_clear_reference_cache(struct indextts_context* ctx);
+
+// Freeze the conditioning + speaker embedding computed by the last synthesize
+// so later calls reuse them (avoids re-encoding the reference per text chunk).
+void indextts_mark_reference_cached(struct indextts_context* ctx);
+
 // Run only the GPT stage: text → mel codes. Caller frees with
 // indextts_codes_free. *out_n is set to the number of mel code tokens.
 // ref_pcm/ref_n_samples are optional (nullptr/0 → dummy conditioning).

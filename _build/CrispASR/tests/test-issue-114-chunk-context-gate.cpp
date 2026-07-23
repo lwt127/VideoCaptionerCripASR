@@ -21,6 +21,7 @@
 #include "crispasr_chunk_context_gate.h"
 
 using crispasr_chunk_context::backend_allows_chunk_context;
+using crispasr_chunk_context::backend_self_chunks_on_explicit;
 using crispasr_chunk_context::should_use_chunk_context;
 
 TEST_CASE("issue #114: VAD-derived multi-slice run does NOT extend with context", "[unit][chunk-context][issue-114]") {
@@ -51,13 +52,41 @@ TEST_CASE("backend can opt out of external overlap-save context", "[unit][chunk-
     REQUIRE_FALSE(should_use_chunk_context(30, 6, 3.0f, false, false));
 }
 
+// Issue #257: routing of an explicit --chunk-seconds for internally-chunking
+// backends (parakeet / canary FastConformer) — bypass dispatcher slicing.
+TEST_CASE("issue #257: CAP_INTERNAL_CHUNKING backend + explicit --chunk-seconds self-chunks",
+          "[unit][chunk-context][issue-257]") {
+    // parakeet (has internal chunking), user passed --chunk-seconds 7 → dispatcher
+    // must NOT slice; hand the whole clip to the backend.
+    REQUIRE(backend_self_chunks_on_explicit(/*has_internal_chunking=*/true, /*explicit=*/true, /*chunk_seconds=*/7));
+}
+
+TEST_CASE("issue #257: non-internal-chunking backend keeps dispatcher chunking", "[unit][chunk-context][issue-257]") {
+    // cohere / granite lack CAP_INTERNAL_CHUNKING → dispatcher chunking is correct
+    // for them (the reporter saw no issue there).
+    REQUIRE_FALSE(backend_self_chunks_on_explicit(/*has_internal_chunking=*/false, /*explicit=*/true, 7));
+}
+
+TEST_CASE("issue #257: internal-chunking backend without explicit --chunk-seconds uses full-audio path",
+          "[unit][chunk-context][issue-257]") {
+    // No explicit --chunk-seconds → the CAP_UNBOUNDED_INPUT full-audio / library
+    // streaming default already applies; not a forced self-chunk decision.
+    REQUIRE_FALSE(backend_self_chunks_on_explicit(/*has_internal_chunking=*/true, /*explicit=*/false, 0));
+    // Explicit but chunk_seconds == 0 (== "library-internal streaming") is also not
+    // a fixed-size self-chunk request.
+    REQUIRE_FALSE(backend_self_chunks_on_explicit(/*has_internal_chunking=*/true, /*explicit=*/true, 0));
+}
+
 TEST_CASE("backend_allows_chunk_context: known offenders opt out, others do not",
           "[unit][chunk-context][backend-list]") {
     // Surfaced by tools/check-overlap-save-bug.sh A/B sweep.
+    REQUIRE_FALSE(backend_allows_chunk_context("canary-qwen"));    // #218: no word timestamps → seam dup; CAP_INTERNAL_CHUNKING makes external context redundant
     REQUIRE_FALSE(backend_allows_chunk_context("cohere"));
     REQUIRE_FALSE(backend_allows_chunk_context("gemma4-e2b"));
     REQUIRE_FALSE(backend_allows_chunk_context("glm-asr"));
+    REQUIRE_FALSE(backend_allows_chunk_context("granite"));         // #205: [T:N] word-trim drops slices
     REQUIRE_FALSE(backend_allows_chunk_context("kyutai-stt"));
+    REQUIRE_FALSE(backend_allows_chunk_context("moss-transcribe")); // #218: no timestamps → seam dup + worse loops
     REQUIRE_FALSE(backend_allows_chunk_context("qwen3"));
     REQUIRE_FALSE(backend_allows_chunk_context("voxtral"));
     // voxtral4b is a different model architecture and is NOT affected.
@@ -79,6 +108,7 @@ TEST_CASE("backend_allows_chunk_context: known offenders opt out, others do not"
     REQUIRE(backend_allows_chunk_context(nullptr));
 
     // Match is exact, not prefix/substring.
+    REQUIRE(backend_allows_chunk_context("canary-qwen-v2"));   // future variant, not blocked
     REQUIRE(backend_allows_chunk_context("cohere-v2"));
     REQUIRE(backend_allows_chunk_context("glm-asr-streaming"));
     REQUIRE(backend_allows_chunk_context("xglm-asr"));

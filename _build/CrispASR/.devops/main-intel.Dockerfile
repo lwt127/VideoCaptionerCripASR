@@ -10,11 +10,18 @@ RUN apt-get update && \
 COPY . .
 # Enable SYCL
 ARG GGML_SYCL_F16=OFF
+# NOTE (#261): GGML_NATIVE=OFF does NOT restrict the ISA to the flags listed —
+# ggml sets INS_ENB=ON in that case, so BMI2/SSE42/AVX default ON anyway. The
+# real baseline is Haswell-class (AVX2+FMA+F16C+BMI2); spelled out explicitly
+# so it's visible. See .devops/main-cuda.Dockerfile for the full explanation.
 RUN if [ "${GGML_SYCL_F16}" = "ON" ]; then \
         echo "GGML_SYCL_F16 is set" \
         && export OPT_SYCL_F16="-DGGML_SYCL_F16=ON"; \
     fi && \
-    cmake -B build -DCRISPASR_BUILD_TESTS=OFF -DGGML_SYCL=1 -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx ${OPT_SYCL_F16} && \
+    cmake -B build -DCRISPASR_BUILD_TESTS=OFF -DGGML_SYCL=1 \
+      -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
+    -DGGML_BMI2=ON -DGGML_SSE42=ON -DGGML_AVX=ON -DGGML_AVX512=OFF \
+      -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx ${OPT_SYCL_F16} && \
     cmake --build build -j"$(nproc)" --target crispasr-cli
 
 FROM intel/oneapi-basekit:$ONEAPI_VERSION AS runtime

@@ -96,7 +96,7 @@ For **auto-download** simply pass `-m auto`:
 
 ## Architecture
 
-Identical to Orpheus 3B — see [`cstr/orpheus-3b-base-GGUF`](https://huggingface.co/cstr/orpheus-3b-base-GGUF) for the full architecture writeup. The CrispASR `orpheus` runtime is checkpoint-agnostic; this GGUF is loaded by the same `orpheus_init_from_file` path with no source-code changes. The `--voice` flag here is just the speaker name string in the prompt; emotion and outburst control happens via the prompt text itself.
+Identical to Orpheus 3B — see [`cstr/orpheus-3b-0.1-ft-GGUF`](https://huggingface.co/cstr/orpheus-3b-0.1-ft-GGUF) for the full architecture writeup. The CrispASR `orpheus` runtime is checkpoint-agnostic; this GGUF is loaded by the same `orpheus_init_from_file` path with no source-code changes. The `--voice` flag here is just the speaker name string in the prompt; emotion and outburst control happens via the prompt text itself.
 
 ## Conversion
 

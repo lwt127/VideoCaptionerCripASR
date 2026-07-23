@@ -3,6 +3,7 @@
 
 #include "crispasr_cache.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -337,11 +338,12 @@ static bool fetch_libcurl(const std::string& url, const std::string& dest, bool 
 
 // ─── public API ──────────────────────────────────────────────────────────────
 
-std::string dir(const std::string& cache_dir_override) {
-    if (!cache_dir_override.empty()) {
-        mkdir(cache_dir_override.c_str(), 0755); // create leaf dir if absent
-        return cache_dir_override;
-    }
+namespace {
+
+std::string platform_default_dir() {
+#ifdef __EMSCRIPTEN__
+    return "/models";
+#endif
 
     const char* home = std::getenv("HOME");
 #ifdef _WIN32
@@ -361,6 +363,97 @@ std::string dir(const std::string& cache_dir_override) {
     return d;
 }
 
+void append_unique(std::vector<std::string>& dirs, const std::string& candidate) {
+    if (candidate.empty())
+        return;
+    if (std::find(dirs.begin(), dirs.end(), candidate) == dirs.end())
+        dirs.push_back(candidate);
+}
+
+// ─── source-identity helpers (issue #250) ────────────────────────────────────
+
+static unsigned long current_pid() {
+#ifdef _WIN32
+    return (unsigned long)GetCurrentProcessId();
+#else
+    return (unsigned long)getpid();
+#endif
+}
+
+// Unique temp path beside `dest` (same directory → same filesystem, so the
+// subsequent rename is atomic). Per-process + per-call so concurrent downloads
+// of the same target never write the same partial file.
+static std::string unique_temp_path(const std::string& dest) {
+    static int counter = 0;
+    return dest + ".part." + std::to_string(current_pid()) + "." + std::to_string(counter++);
+}
+
+// Atomically replace `dest` with `tmp`. POSIX rename() already replaces; on
+// Windows plain rename() fails if the target exists, so use MoveFileEx.
+static bool atomic_rename(const std::string& tmp, const std::string& dest) {
+#ifdef _WIN32
+    return MoveFileExA(tmp.c_str(), dest.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+#else
+    return ::rename(tmp.c_str(), dest.c_str()) == 0;
+#endif
+}
+
+// The source-record sidecar path for a cached file (records the URL it came
+// from, so a later request for a DIFFERENT url with the same basename is not
+// silently served the wrong bytes).
+static std::string sidecar_path(const std::string& file_path) {
+    return file_path + ".src";
+}
+
+static std::string read_text_file(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f)
+        return "";
+    std::string out;
+    char buf[512];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+        out.append(buf, n);
+    fclose(f);
+    // trim trailing whitespace/newline
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' '))
+        out.pop_back();
+    return out;
+}
+
+static void write_text_file(const std::string& path, const std::string& text) {
+    const std::string tmp = unique_temp_path(path);
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f)
+        return;
+    fwrite(text.data(), 1, text.size(), f);
+    fclose(f);
+    if (!atomic_rename(tmp, path))
+        ::remove(tmp.c_str());
+}
+
+} // namespace
+
+std::string dir(const std::string& cache_dir_override) {
+#ifdef __EMSCRIPTEN__
+    // WASM: use Emscripten MEMFS. Models are written by JS via FS.writeFile.
+    return cache_dir_override.empty() ? platform_default_dir() : cache_dir_override;
+#endif
+    std::string selected = cache_dir_override;
+    if (selected.empty()) {
+        if (const char* env = std::getenv("CRISPASR_CACHE_DIR"); env && *env)
+            selected = env;
+    }
+    if (selected.empty()) {
+        if (const char* env = std::getenv("CRISPASR_MODELS_DIR"); env && *env)
+            selected = env;
+    }
+    if (selected.empty())
+        selected = platform_default_dir();
+    mkdir(selected.c_str(), 0755); // create leaf dir if absent
+    return selected;
+}
+
 bool file_present(const std::string& path) {
     struct stat st;
     if (stat(path.c_str(), &st) != 0)
@@ -368,7 +461,17 @@ bool file_present(const std::string& path) {
     return st.st_size > 0;
 }
 
-bool fetch(const std::string& url, const std::string& dest, bool quiet) {
+// Worker: download `url` straight into `dest` (which the public fetch() sets to
+// a unique temp path). Split out so the public wrapper can add atomic rename.
+static bool fetch_download(const std::string& url, const std::string& dest, bool quiet) {
+#ifdef __EMSCRIPTEN__
+    // WASM: no network from C++ side. Models are pre-loaded by JS into MEMFS.
+    (void)url;
+    (void)dest;
+    (void)quiet;
+    fprintf(stderr, "crispasr: download not available in WASM — load model via JS FS.writeFile\n");
+    return false;
+#endif
 #ifdef _WIN32
     // ── WinHTTP: built-in Windows HTTPS stack, no shell-quoting issues ──────
     if (!quiet)
@@ -441,6 +544,19 @@ bool fetch(const std::string& url, const std::string& dest, bool quiet) {
     return false;
 }
 
+// Public fetch: download atomically (issue #250 Q10) — the backends write to a
+// unique temp path beside `dest`, and only a complete download is renamed into
+// place. An interrupted transfer therefore never leaves a partial non-zero file
+// at `dest` (which file_present() would later mistake for a valid cache hit),
+// and concurrent downloads to the same `dest` use distinct temps.
+bool fetch(const std::string& url, const std::string& dest, bool quiet) {
+    const std::string tmp = unique_temp_path(dest);
+    if (fetch_download(url, tmp, quiet) && file_present(tmp) && atomic_rename(tmp, dest) && file_present(dest))
+        return true;
+    ::remove(tmp.c_str()); // clean up any partial/temp bytes
+    return false;
+}
+
 // Build the well-known search list for already-on-disk model files.
 // Caller's cache_dir_override (or the canonical ~/.cache/crispasr) is
 // always tried first. Then we probe a small set of common locations
@@ -457,12 +573,14 @@ bool fetch(const std::string& url, const std::string& dest, bool quiet) {
 // The list is platform-agnostic; non-existent dirs are skipped silently.
 static std::vector<std::string> well_known_search_dirs(const std::string& cache_dir_override) {
     std::vector<std::string> dirs;
-    dirs.push_back(dir(cache_dir_override));
+    append_unique(dirs, dir(cache_dir_override));
 
     if (const char* env = std::getenv("CRISPASR_MODELS_DIR"); env && *env) {
-        dirs.emplace_back(env);
+        append_unique(dirs, env);
     }
-    dirs.emplace_back("/Volumes/backups/ai/crispasr-models");
+    append_unique(dirs, "/mnt/storage/gguf-models");
+    append_unique(dirs, "/Volumes/backups/ai/crispasr-models");
+    append_unique(dirs, platform_default_dir());
 
     const char* home = std::getenv("HOME");
 #ifdef _WIN32
@@ -470,8 +588,8 @@ static std::vector<std::string> well_known_search_dirs(const std::string& cache_
         home = std::getenv("USERPROFILE");
 #endif
     if (home && *home) {
-        dirs.emplace_back(std::string(home) + "/.cache/crispasr-models");
-        dirs.emplace_back(std::string(home) + "/.cache/huggingface/hub");
+        append_unique(dirs, std::string(home) + "/.cache/crispasr-models");
+        append_unique(dirs, std::string(home) + "/.cache/huggingface/hub");
     }
     return dirs;
 }
@@ -487,25 +605,35 @@ std::string probe_cached_file(const std::string& filename, const std::string& ca
 
 std::string ensure_cached_file(const std::string& filename, const std::string& url, bool quiet,
                                const char* pretty_label, const std::string& cache_dir_override) {
-    // Probe all well-known locations first. The first hit wins; we
-    // return its path directly (no copy into the canonical cache —
-    // that would waste disk for users with a dedicated model SSD).
+    // Probe all well-known locations. A hit is reused unless its `.src` sidecar
+    // records a DIFFERENT origin url — that is a same-basename file from another
+    // repository (issue #250) and must not be handed to the loader. No sidecar =
+    // a pre-#250 cache or a hand-managed model dir → trusted as-is (backward
+    // compat; keeps dedicated model SSDs working without re-download).
+    const std::string canonical = dir(cache_dir_override);
     for (const auto& d : well_known_search_dirs(cache_dir_override)) {
         const std::string p = d + "/" + filename;
-        if (file_present(p)) {
-            if (!quiet) {
-                fprintf(stderr, "%s: using cached %s\n", pretty_label, p.c_str());
-            }
-            return p;
+        if (!file_present(p))
+            continue;
+        const std::string sc = sidecar_path(p);
+        if (file_present(sc) && read_text_file(sc) != url) {
+            if (!quiet)
+                fprintf(stderr, "%s: cached %s is from a different source; not reusing\n", pretty_label, p.c_str());
+            continue; // wrong source — keep probing, then re-download below
         }
+        if (!quiet)
+            fprintf(stderr, "%s: using cached %s\n", pretty_label, p.c_str());
+        return p;
     }
 
-    const std::string dst = dir(cache_dir_override) + "/" + filename;
-    if (!quiet) {
+    // No source-consistent hit. Download into the canonical cache dir (atomically,
+    // overwriting any wrong-source file that lives there) and record the origin.
+    const std::string dst = canonical + "/" + filename;
+    if (!quiet)
         fprintf(stderr, "%s: downloading %s\n", pretty_label, url.c_str());
-    }
     if (!fetch(url, dst, quiet))
         return "";
+    write_text_file(sidecar_path(dst), url); // record source so a later same-basename request validates
     return dst;
 }
 

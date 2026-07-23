@@ -75,6 +75,14 @@ struct Config {
     // Score used when a found piece's token id is out of range of the
     // scores[] array. t5_translate uses 0.0f; indextts uses -20.0f.
     float oov_score_default = 0.0f;
+
+    // Optional SentencePiece byte_fallback table: 256 entries mapping a raw
+    // byte value → the token id of its "<0xHH>" piece (-1 if absent). When
+    // set, an out-of-vocab byte falls back to its byte token (one per byte,
+    // scored by scores[]) instead of a single <unk> — matching HF tokenizers
+    // trained with byte_fallback (e.g. llm-jp-3 for Irodori-TTS's emoji
+    // control tokens). nullptr → the plain <unk> fallback below.
+    const std::vector<int32_t>* byte_fallback = nullptr;
 };
 
 // Tokenize a string using unigram Viterbi best-segmentation.
@@ -109,6 +117,12 @@ static inline std::vector<int32_t> tokenize(const std::string& text,
         }
     }
 
+    // A ≥2 GiB input would overflow the int32 length below (n + 1 → INT_MIN,
+    // OOB reads in the DP tables / piece_at). No real ASR/TTS text approaches
+    // this. Reject at INT_MAX so `n + 1` (and `(size_t)n + 1`) never overflows.
+    if (s.size() >= 0x7fffffffu) {
+        return {};
+    }
     const int n = (int)s.size();
     if (n == 0) {
         return {};
@@ -119,9 +133,9 @@ static inline std::vector<int32_t> tokenize(const std::string& text,
     // dp[i] = best total log-prob to reach byte position i.
     // piece_at[i] = token ID of the last piece ending at position i.
     // prev_pos[i] = byte position before the last piece.
-    std::vector<float> dp(n + 1, NEG_INF);
-    std::vector<int32_t> piece_at(n + 1, -1);
-    std::vector<int> prev_pos(n + 1, -1);
+    std::vector<float> dp((size_t)n + 1, NEG_INF);
+    std::vector<int32_t> piece_at((size_t)n + 1, -1);
+    std::vector<int> prev_pos((size_t)n + 1, -1);
     dp[0] = 0.0f;
 
     for (int i = 0; i < n; i++) {
@@ -145,15 +159,55 @@ static inline std::vector<int32_t> tokenize(const std::string& text,
                     piece_at[j] = tid;
                     prev_pos[j] = i;
                 }
-            } else if (j == i + 1) {
-                // Single-byte fallback: heavy penalty so Viterbi only
-                // picks it when nothing else covers the byte.
-                float cand = dp[i] + cfg.unk_penalty;
-                if (cand > dp[j]) {
-                    dp[j] = cand;
-                    piece_at[j] = cfg.unk_id;
-                    prev_pos[j] = i;
-                }
+            }
+        }
+
+        // Unknown fallback. Two modes:
+        //
+        // (a) byte_fallback (SentencePiece byte_fallback): the OOV byte s[i]
+        //     becomes its "<0xHH>" token (one per byte, i → i+1, scored by
+        //     scores[]). This is what HF Unigram-with-byte_fallback does, and
+        //     what the Irodori-TTS model was trained on — its emoji emotion
+        //     controls (👂, 😮‍💨, …) are OOV and MUST become byte tokens, not
+        //     <unk> noise. Bypasses the utf8-alignment guard on purpose so a
+        //     multi-byte lead can still advance one byte at a time.
+        //
+        // (b) plain <unk>: advance one whole codepoint as a single <unk>
+        //     (heavy penalty). Guarantees the DP stays connected across an OOV
+        //     multi-byte codepoint — without it, the single-byte edge (i→i+1)
+        //     is illegal at a multi-byte lead (i+1 is a continuation byte the
+        //     alignment guard skips), no edge leaves i, and the whole string
+        //     collapses to just the BOS. In byte mode (utf8_aligned=false)
+        //     cp_len is 1, reproducing the original single-byte unk fallback.
+        if (cfg.byte_fallback && !cfg.byte_fallback->empty()) {
+            unsigned char b = (unsigned char)s[i];
+            int32_t bt = (b < cfg.byte_fallback->size()) ? (*cfg.byte_fallback)[b] : -1;
+            const int fj = i + 1;
+            float score = (bt >= 0 && bt < (int32_t)scores.size()) ? scores[bt] : cfg.unk_penalty;
+            float cand = dp[i] + score;
+            if (cand > dp[fj]) {
+                dp[fj] = cand;
+                piece_at[fj] = (bt >= 0) ? bt : cfg.unk_id;
+                prev_pos[fj] = i;
+            }
+        } else {
+            int cp_len = 1;
+            if (cfg.utf8_aligned) {
+                unsigned char lead = (unsigned char)s[i];
+                if ((lead & 0xE0) == 0xC0)
+                    cp_len = 2;
+                else if ((lead & 0xF0) == 0xE0)
+                    cp_len = 3;
+                else if ((lead & 0xF8) == 0xF0)
+                    cp_len = 4;
+                cp_len = std::min(cp_len, n - i);
+            }
+            const int fj = i + cp_len;
+            const float unk_cand = dp[i] + cfg.unk_penalty;
+            if (unk_cand > dp[fj]) {
+                dp[fj] = unk_cand;
+                piece_at[fj] = cfg.unk_id;
+                prev_pos[fj] = i;
             }
         }
     }
@@ -243,6 +297,11 @@ static inline std::vector<int32_t> tokenize_bpe(const std::string& text,
                                                 const std::unordered_map<std::string, int32_t>& token_to_id,
                                                 const std::vector<float>& scores, const Config& cfg = {},
                                                 bool prepend_space = true) {
+    // A >2 GiB input would overflow the int32 arithmetic below (max_iter =
+    // (int)symbols.size() * 2). No real ASR/TTS text approaches this.
+    if (text.size() > 0x7fffffffu) {
+        return {};
+    }
     std::string s;
     s.reserve(text.size() + 4);
     if (prepend_space) {

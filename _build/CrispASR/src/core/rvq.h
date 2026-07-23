@@ -43,4 +43,13 @@ struct Codebook {
 // Returns true on success, false if any codebook is malformed.
 bool encode_euclidean(const float* features, int T, int dim, const Codebook* stages, int n_stages, int32_t* codes_out);
 
+// Convenience wrapper for callers that hold per-stage codebooks as flat F32
+// (size[s], dim) row-major arrays (e.g. kyutai_stt / mimo, extracted from GGUF)
+// and want codes in the per-stage `out_codes[s][t]` layout. Computes each
+// ‖E[k]‖² internally, calls encode_euclidean, and transposes the (T, n_stages)
+// result into out_codes. All stages must share `dim`. Returns false on
+// malformed input. Unit-tested in test-core-rvq.
+bool encode_euclidean_per_stage(const float* features, int T, int dim, const float* const* embeds, const int* sizes,
+                                int n_stages, std::vector<std::vector<int32_t>>& out_codes);
+
 } // namespace core_rvq

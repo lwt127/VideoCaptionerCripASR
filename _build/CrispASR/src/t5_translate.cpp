@@ -14,6 +14,11 @@
 #include "t5_translate.h"
 #include "core/beam_decode.h"
 #include "core/gguf_loader.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (§232 t5 GPU path)
+#include "core/crispasr_env.h"
+#if defined(GGML_USE_METAL)
+#include "ggml-metal.h" // ggml_backend_is_metal (§232 CUDA/Vulkan-default gate)
+#endif
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -22,6 +27,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -29,6 +35,32 @@
 #include <map>
 #include <string>
 #include <vector>
+
+// ===========================================================================
+// Bench instrumentation — `T5_TRANSLATE_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool t5_translate_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_T5_TRANSLATE_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct t5_translate_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit t5_translate_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~t5_translate_bench_stage() {
+        if (!t5_translate_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  t5_translate_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ── Hyperparameters ──────────────────────────────────────────────
 
@@ -569,8 +601,8 @@ static bool alloc_cross_kv(t5_translate_context* c, int T_enc) {
     c->cross_kv_k.resize(nl);
     c->cross_kv_v.resize(nl);
     for (int i = 0; i < nl; i++) {
-        c->cross_kv_k[i] = ggml_new_tensor_3d(c->cross_kv_ctx, GGML_TYPE_F32, hd, T_enc, nh);
-        c->cross_kv_v[i] = ggml_new_tensor_3d(c->cross_kv_ctx, GGML_TYPE_F32, hd, T_enc, nh);
+        c->cross_kv_k[i] = ggml_new_tensor_3d(c->cross_kv_ctx, GGML_TYPE_F16, hd, T_enc, nh);
+        c->cross_kv_v[i] = ggml_new_tensor_3d(c->cross_kv_ctx, GGML_TYPE_F16, hd, T_enc, nh);
     }
     c->cross_kv_buf = ggml_backend_alloc_ctx_tensors(c->cross_kv_ctx, c->backend);
     if (!c->cross_kv_buf)
@@ -714,12 +746,15 @@ static bool compute_cross_kv(t5_translate_context* c, const float* enc_out, int 
             return false;
         }
 
-        size_t sz = (size_t)hd * T_enc * nh * sizeof(float);
-        std::vector<float> buf(hd * T_enc * nh);
-        ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "cross_k"), buf.data(), 0, sz);
-        ggml_backend_tensor_set(c->cross_kv_k[il], buf.data(), 0, sz);
-        ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "cross_v"), buf.data(), 0, sz);
-        ggml_backend_tensor_set(c->cross_kv_v[il], buf.data(), 0, sz);
+        const size_t n_elem = (size_t)hd * T_enc * nh;
+        std::vector<float> buf(n_elem);
+        std::vector<ggml_fp16_t> buf16(n_elem);
+        ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "cross_k"), buf.data(), 0, n_elem * sizeof(float));
+        ggml_fp32_to_fp16_row(buf.data(), buf16.data(), (int)n_elem);
+        ggml_backend_tensor_set(c->cross_kv_k[il], buf16.data(), 0, n_elem * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "cross_v"), buf.data(), 0, n_elem * sizeof(float));
+        ggml_fp32_to_fp16_row(buf.data(), buf16.data(), (int)n_elem);
+        ggml_backend_tensor_set(c->cross_kv_v[il], buf16.data(), 0, n_elem * sizeof(ggml_fp16_t));
         ggml_free(ctx0);
     }
     return true;
@@ -937,7 +972,7 @@ extern "C" struct t5_translate_context_params t5_translate_context_default_param
     t5_translate_context_params p{};
     p.n_threads = 4;
     p.verbosity = 1;
-    p.use_gpu = false;
+    p.use_gpu = true; // §232: GPU allowed by default; the is_metal gate + env decide actual use
     return p;
 }
 
@@ -962,8 +997,38 @@ extern "C" struct t5_translate_context* t5_translate_init_from_file(const char* 
                 hp.enc_n_layers, hp.dec_n_layers, hp.n_heads, hp.d_ff, hp.vocab_size, hp.ff_proj.c_str());
     }
 
+    // Backend selection (§232). t5 loads weights + KV onto c->backend via
+    // core_gguf::load_weights + ggml_backend_alloc_ctx_tensors, so picking a GPU
+    // backend is the whole change.
+    //   * CRISPASR_T5_GPU=1 forces GPU on ANY backend; =0 forces CPU.
+    //   * default: GPU on CUDA/Vulkan, CPU on Metal. Kaggle P100 A/B (madlad-3b):
+    //     identical en->de output, 2.13x wall (slow OpenBLAS baseline). On M1
+    //     (Accelerate) neutral — launch-bound (LEARNING 34) — so Metal stays CPU
+    //     unless forced. Mirrors LEARNING 34's is_metal gate.
     c->backend_cpu = ggml_backend_cpu_init();
+    const char* gpu_env = std::getenv("CRISPASR_T5_GPU");
+    const bool force_gpu = gpu_env && std::atoi(gpu_env) != 0;
+    const bool force_cpu = gpu_env && std::atoi(gpu_env) == 0;
     c->backend = c->backend_cpu;
+    if (!force_cpu && (force_gpu || params.use_gpu)) {
+        ggml_backend_t gpu = crispasr_init_gpu_backend();
+        if (gpu) {
+            bool is_metal = false;
+#if defined(GGML_USE_METAL)
+            is_metal = ggml_backend_is_metal(gpu);
+#endif
+            if (!is_metal || force_gpu) {
+                c->backend = gpu;
+                if (params.verbosity >= 1)
+                    fprintf(stderr, "t5: GPU backend enabled (%s)\n", ggml_backend_name(c->backend));
+            } else {
+                ggml_backend_free(gpu);
+                if (params.verbosity >= 1)
+                    fprintf(stderr, "t5: GPU default limited to CUDA/Vulkan (Metal neutral); set "
+                                    "CRISPASR_T5_GPU=1 to force\n");
+            }
+        }
+    }
 
     {
         core_gguf::WeightLoad wl;
@@ -982,8 +1047,9 @@ extern "C" struct t5_translate_context* t5_translate_init_from_file(const char* 
     }
 
     {
-        ggml_backend_t backends[] = {c->backend};
-        c->sched = ggml_backend_sched_new(backends, nullptr, 1, 16384, false, false);
+        ggml_backend_t backends[] = {c->backend, c->backend_cpu};
+        int n_be = (c->backend != c->backend_cpu) ? 2 : 1;
+        c->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
         c->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
     }
 
@@ -1007,8 +1073,10 @@ extern "C" void t5_translate_free(struct t5_translate_context* ctx) {
         ggml_backend_buffer_free(ctx->buf_w);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
-    if (ctx->backend)
+    if (ctx->backend && ctx->backend != ctx->backend_cpu)
         ggml_backend_free(ctx->backend);
+    if (ctx->backend_cpu)
+        ggml_backend_free(ctx->backend_cpu);
     delete ctx;
 }
 
@@ -1029,6 +1097,7 @@ extern "C" char* t5_translate(struct t5_translate_context* ctx, const char* text
         return nullptr;
     if (max_new_tokens <= 0)
         max_new_tokens = 200;
+    t5_translate_bench_stage _bs_total("translate_total");
 
     const auto& hp = ctx->model.hp;
 

@@ -24,3 +24,13 @@
 
 std::vector<int> crispasr_agglomerative_cluster(const std::vector<float>& embeddings, // N * dim floats, row-major
                                                 int n, int dim, float merge_threshold = 0.5f, int max_speakers = 32);
+
+// Per-cluster centroids: mean of each cluster's member embeddings,
+// L2-normalized (so cosine against another normalized vector is a dot
+// product). `labels` is the output of crispasr_agglomerative_cluster
+// (one ID in [0, K) per embedding; negatives are skipped). Returns a
+// K * dim row-major buffer, K = max(label) + 1. A cluster with no
+// members (impossible from the clusterer, but tolerated) yields a
+// zero vector.
+std::vector<float> crispasr_cluster_centroids(const std::vector<float>& embeddings, const std::vector<int>& labels,
+                                              int n, int dim);

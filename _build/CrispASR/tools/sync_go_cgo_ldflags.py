@@ -28,10 +28,10 @@ SYSTEM_LIBS_DARWIN = ["-lm", "-lstdc++"]
 # Darwin-only extra libs (Metal/BLAS backends, not in the base dot on Linux)
 DARWIN_EXTRA_LIBS = ["-lggml-metal", "-lggml-blas"]
 
-# Targets that appear in the CMake dependency graph but are not built
-# by the Go CI (which only builds src/, not examples/). Exclude them
-# from the LDFLAGS so the linker doesn't fail with -lcommon not found.
-EXCLUDE_LIBS = {"common"}
+# Targets that appear in the CMake dependency graph but should not be part of
+# the generated cross-platform base list. The Go binding adds platform backend
+# libraries separately so this check is stable across Linux and Darwin graphs.
+EXCLUDE_LIBS = {"common", "ggml-metal", "ggml-blas"}
 
 # CMake target names that differ from their OUTPUT_NAME. The linker
 # sees the output filename (libcrispasr.a), not the cmake target name
@@ -52,6 +52,7 @@ def generate_dot(dot_path):
         "-DCRISPASR_BUILD_EXAMPLES=OFF",
         "-DCRISPASR_BUILD_SERVER=OFF",
         "-DGGML_CUDA=OFF",
+        "-DCRISPASR_OPUS_FETCH=ON",
     ]
     subprocess.run(cmd, check=True, capture_output=True)
 

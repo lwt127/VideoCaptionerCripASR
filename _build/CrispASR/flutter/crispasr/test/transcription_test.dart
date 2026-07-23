@@ -15,7 +15,9 @@ import 'package:test/test.dart';
 DynamicLibrary _openLib() {
   final path = Platform.environment['CRISPASR_LIB'];
   if (path != null && path.isNotEmpty) return DynamicLibrary.open(path);
-  if (Platform.isMacOS) return DynamicLibrary.open('../../build/src/libwhisper.dylib');
+  if (Platform.isMacOS) {
+    return DynamicLibrary.open('../../build/src/libwhisper.dylib');
+  }
   return DynamicLibrary.open('../../build/src/libwhisper.so');
 }
 
@@ -47,33 +49,31 @@ void main() {
     }
 
     // Open session
-    final openFn = lib.lookupFunction<
-        Pointer Function(Pointer<Utf8>, Int32),
+    final openFn = lib.lookupFunction<Pointer Function(Pointer<Utf8>, Int32),
         Pointer Function(Pointer<Utf8>, int)>('crispasr_session_open');
-    final closeFn = lib.lookupFunction<
-        Void Function(Pointer),
-        void Function(Pointer)>('crispasr_session_close');
-    final backendFn = lib.lookupFunction<
-        Pointer<Utf8> Function(Pointer),
+    final closeFn =
+        lib.lookupFunction<Void Function(Pointer), void Function(Pointer)>(
+            'crispasr_session_close');
+    final backendFn = lib.lookupFunction<Pointer<Utf8> Function(Pointer),
         Pointer<Utf8> Function(Pointer)>('crispasr_session_backend');
     final transcribeFn = lib.lookupFunction<
         Pointer Function(Pointer, Pointer<Float>, Int32),
-        Pointer Function(Pointer, Pointer<Float>, int)>('crispasr_session_transcribe');
-    final nSegFn = lib.lookupFunction<
-        Int32 Function(Pointer),
-        int Function(Pointer)>('crispasr_session_result_n_segments');
+        Pointer Function(
+            Pointer, Pointer<Float>, int)>('crispasr_session_transcribe');
+    final nSegFn =
+        lib.lookupFunction<Int32 Function(Pointer), int Function(Pointer)>(
+            'crispasr_session_result_n_segments');
     final segTextFn = lib.lookupFunction<
         Pointer<Utf8> Function(Pointer, Int32),
-        Pointer<Utf8> Function(Pointer, int)>('crispasr_session_result_segment_text');
-    final segT0Fn = lib.lookupFunction<
-        Int64 Function(Pointer, Int32),
+        Pointer<Utf8> Function(
+            Pointer, int)>('crispasr_session_result_segment_text');
+    final segT0Fn = lib.lookupFunction<Int64 Function(Pointer, Int32),
         int Function(Pointer, int)>('crispasr_session_result_segment_t0');
-    final segT1Fn = lib.lookupFunction<
-        Int64 Function(Pointer, Int32),
+    final segT1Fn = lib.lookupFunction<Int64 Function(Pointer, Int32),
         int Function(Pointer, int)>('crispasr_session_result_segment_t1');
-    final resultFreeFn = lib.lookupFunction<
-        Void Function(Pointer),
-        void Function(Pointer)>('crispasr_session_result_free');
+    final resultFreeFn =
+        lib.lookupFunction<Void Function(Pointer), void Function(Pointer)>(
+            'crispasr_session_result_free');
 
     final pathPtr = modelPath.toNativeUtf8();
     final session = openFn(pathPtr, 2);
@@ -119,7 +119,8 @@ void main() {
   test('available backends includes whisper and parakeet', () {
     final fn = lib.lookupFunction<
         Int32 Function(Pointer<Utf8>, Int32),
-        int Function(Pointer<Utf8>, int)>('crispasr_session_available_backends');
+        int Function(
+            Pointer<Utf8>, int)>('crispasr_session_available_backends');
     final buf = malloc<Uint8>(256);
     final n = fn(buf.cast<Utf8>(), 256);
     expect(n, greaterThan(0));

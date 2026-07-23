@@ -18,6 +18,50 @@ permissions:
   contents: write
 
 jobs:
+  validate-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Verify VERSION matches tag
+        run: |
+          tag_version="${{ inputs.tag || github.ref_name }}"
+          tag_version="${tag_version#v}"
+          file_version="$(tr -d '[:space:]' < VERSION)"
+          echo "Tag: $tag_version  VERSION file: $file_version"
+          if [ "$tag_version" != "$file_version" ]; then
+            echo "::error::VERSION file ($file_version) does not match tag ($tag_version)"
+            exit 1
+          fi
+
+  # Releases must ship the current glint encoder: fail if the in-tree
+  # glint/ sync marker is behind github.com/CrispStrobe/glint main.
+  # Fix: run the "Sync glint" workflow (or tools/sync-glint.sh) and
+  # re-tag.
+  validate-glint-fresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Verify in-tree glint matches upstream main
+        run: |
+          synced="$(sed -n 's/.*Synced at upstream commit: `\([0-9a-f]*\)`.*/\1/p' glint/README.md)"
+          upstream="$(git ls-remote https://github.com/CrispStrobe/glint refs/heads/main | cut -f1)"
+          echo "in-tree: $synced  upstream main: $upstream"
+          if [ -z "$synced" ] || [ -z "$upstream" ]; then
+            echo "::error::could not read glint sync marker or upstream HEAD"
+            exit 1
+          fi
+          case "$upstream" in
+            "$synced"*) echo "glint is current" ;;
+            *) echo "::error::in-tree glint ($synced) is behind upstream main ($upstream); run the 'Sync glint' workflow and re-tag"
+               exit 1 ;;
+          esac
+
   build-linux:
     runs-on: ubuntu-22.04
     steps:
@@ -31,7 +75,10 @@ jobs:
 
       - name: Build
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_OPENBLAS=ON
+          cmake -S . -B build -DCRISPASR_C2PA_FETCH=ON -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_OPENBLAS=ON \
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
+            -DCRISPASR_OPUS_FETCH=ON
           cmake --build build --target crispasr-cli crispasr-quantize -j $(nproc)
 
       - name: Package
@@ -39,6 +86,7 @@ jobs:
           mkdir -p release/crispasr-linux-x86_64
           cp build/bin/crispasr release/crispasr-linux-x86_64/
           cp build/bin/crispasr-quantize release/crispasr-linux-x86_64/
+          bash scripts/bundle-c2pa.sh release/crispasr-linux-x86_64 || true
           cd release && tar czf crispasr-linux-x86_64.tar.gz crispasr-linux-x86_64/
 
       - uses: actions/upload-artifact@v4
@@ -51,6 +99,43 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/crispasr-linux-x86_64.tar.gz
+          fail_on_unmatched_files: false
+
+  # ── WebAssembly build (browser: ASR + TTS, all backends) ─────────────────────
+  build-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Setup emsdk
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 6.0.2  # 6.0.3 regressed WASM ISel (voxtral_tts crash); pin last-good
+
+      - name: Build WASM (all backends)
+        run: ./build-wasm.sh --clean
+
+      - name: Package
+        run: |
+          mkdir -p release/crispasr-wasm
+          cp build-wasm/bin/libwhisper.js build-wasm/bin/libwhisper.wasm release/crispasr-wasm/
+          [ -f build-wasm/bin/libwhisper.worker.js ] && cp build-wasm/bin/libwhisper.worker.js release/crispasr-wasm/ || true
+          printf 'CrispASR WebAssembly: libwhisper.js (global whisper_factory) + libwhisper.wasm.\nMultithreaded -> host page must be cross-origin isolated (COOP/COEP).\nTTS: Module.ttsOpenExplicit(model,backend,threads) -> ttsSetVoice(voice,"") -> ttsSynthesize(text) => Float32Array @24kHz.\nLoad files via Module.FS_createDataFile("/models",name,bytes,true,true).\n' > release/crispasr-wasm/README.txt
+          cd release && tar czf crispasr-wasm.tar.gz crispasr-wasm/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crispasr-wasm
+          path: release/crispasr-wasm.tar.gz
+
+      - name: Attach crispasr-wasm.tar.gz to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: release/crispasr-wasm.tar.gz
           fail_on_unmatched_files: false
 
   # ── Linux x86_64 CLI — AVX-512 + VNNI variant ────────────────────────────────
@@ -76,10 +161,11 @@ jobs:
 
       - name: Build
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+          cmake -S . -B build -DCRISPASR_C2PA_FETCH=ON -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
               -DGGML_OPENBLAS=ON \
               -DGGML_AVX512=ON -DGGML_AVX512_VNNI=ON \
-              -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON
+              -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
+              -DCRISPASR_OPUS_FETCH=ON
           cmake --build build --target crispasr-cli crispasr-quantize -j $(nproc)
 
       - name: Package
@@ -87,6 +173,7 @@ jobs:
           mkdir -p release/crispasr-linux-x86_64-avx512
           cp build/bin/crispasr release/crispasr-linux-x86_64-avx512/
           cp build/bin/crispasr-quantize release/crispasr-linux-x86_64-avx512/
+          bash scripts/bundle-c2pa.sh release/crispasr-linux-x86_64-avx512 || true
           cd release && tar czf crispasr-linux-x86_64-avx512.tar.gz \
               crispasr-linux-x86_64-avx512/
 
@@ -131,15 +218,17 @@ jobs:
 
       - name: Build
         run: |
-          cmake -S . -B build \
+          cmake -S . -B build -DCRISPASR_C2PA_FETCH=ON \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
             -DGGML_CUDA=ON \
             -DGGML_OPENBLAS=ON \
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
             -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120-real;120-virtual" \
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=ON \
-            -DCRISPASR_BUILD_SERVER=OFF
+            -DCRISPASR_BUILD_SERVER=OFF \
+            -DCRISPASR_OPUS_FETCH=ON
           cmake --build build --target crispasr-cli crispasr-quantize -j $(nproc)
 
       - name: Package
@@ -147,6 +236,7 @@ jobs:
           mkdir -p release/crispasr-linux-x86_64-cuda
           cp build/bin/crispasr release/crispasr-linux-x86_64-cuda/
           cp build/bin/crispasr-quantize release/crispasr-linux-x86_64-cuda/
+          bash scripts/bundle-c2pa.sh release/crispasr-linux-x86_64-cuda || true
           cd release && tar czf crispasr-linux-x86_64-cuda.tar.gz crispasr-linux-x86_64-cuda/
           ls -lh crispasr-linux-x86_64-cuda.tar.gz
 
@@ -191,15 +281,17 @@ jobs:
 
       - name: Build
         run: |
-          cmake -S . -B build \
+          cmake -S . -B build -DCRISPASR_C2PA_FETCH=ON \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
             -DGGML_CUDA=ON \
             -DGGML_OPENBLAS=ON \
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
             -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120a-real;120-virtual" \
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=ON \
-            -DCRISPASR_BUILD_SERVER=OFF
+            -DCRISPASR_BUILD_SERVER=OFF \
+            -DCRISPASR_OPUS_FETCH=ON
           cmake --build build --target crispasr-cli crispasr-quantize -j $(nproc)
 
       - name: Package
@@ -207,6 +299,7 @@ jobs:
           mkdir -p release/crispasr-linux-x86_64-cuda13
           cp build/bin/crispasr release/crispasr-linux-x86_64-cuda13/
           cp build/bin/crispasr-quantize release/crispasr-linux-x86_64-cuda13/
+          bash scripts/bundle-c2pa.sh release/crispasr-linux-x86_64-cuda13 || true
           cd release && tar czf crispasr-linux-x86_64-cuda13.tar.gz crispasr-linux-x86_64-cuda13/
           ls -lh crispasr-linux-x86_64-cuda13.tar.gz
 
@@ -220,6 +313,153 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/crispasr-linux-x86_64-cuda13.tar.gz
+          fail_on_unmatched_files: false
+
+  # ── Linux x86_64 CLI — HIP/ROCm variant ─────────────────────────────────────
+  # Native AMD GPU path via HIP (ROCm). Covers RDNA2 (gfx1030/1035),
+  # RDNA3 (gfx1100/1101/1102), RDNA4 (gfx1201 — RX 9070 / R9700),
+  # and datacenter MI-series (gfx906/908/90a). Requires ROCm 6.3+ on the host
+  # (gfx1201 support was added in ROCm 6.3). Prefer this over Vulkan on Linux
+  # AMD: HIP has full flash-attention, tinyBLAS INT8 VNNI, and MFMA paths.
+  build-linux-x86_64-hip:
+    runs-on: ubuntu-22.04
+    container:
+      image: rocm/dev-ubuntu-22.04:6.3
+    steps:
+      - name: Install git
+        run: apt-get update -y && apt-get install -y git
+
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install deps
+        # The slim rocm/dev image ships the HIP compiler + runtime but NOT the
+        # math libraries; GGML_HIP needs hipBLAS/rocBLAS (and their cmake config
+        # files) or `find_package(hipblas)` fails at configure time (#196).
+        run: apt-get install -y cmake g++ hipblas-dev rocblas-dev
+
+      - name: Build
+        run: |
+          cmake -S . -B build -DCRISPASR_C2PA_FETCH=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_HIP=ON \
+            -DCMAKE_PREFIX_PATH=/opt/rocm \
+            -DCMAKE_C_COMPILER=hipcc \
+            -DCMAKE_CXX_COMPILER=hipcc \
+            -DAMDGPU_TARGETS="gfx906;gfx908;gfx90a;gfx1030;gfx1035;gfx1100;gfx1101;gfx1102;gfx1201" \
+            -DGGML_NATIVE=OFF \
+            -DCRISPASR_BUILD_TESTS=OFF \
+            -DCRISPASR_BUILD_EXAMPLES=ON \
+            -DCRISPASR_BUILD_SERVER=OFF \
+            -DCRISPASR_OPUS_FETCH=ON
+          cmake --build build --target crispasr-cli crispasr-quantize -j $(nproc)
+
+      - name: Package
+        run: |
+          mkdir -p release/crispasr-linux-x86_64-hip
+          cp build/bin/crispasr release/crispasr-linux-x86_64-hip/
+          cp build/bin/crispasr-quantize release/crispasr-linux-x86_64-hip/
+          bash scripts/bundle-c2pa.sh release/crispasr-linux-x86_64-hip || true
+          cd release && tar czf crispasr-linux-x86_64-hip.tar.gz crispasr-linux-x86_64-hip/
+          ls -lh crispasr-linux-x86_64-hip.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crispasr-linux-x86_64-hip
+          path: release/crispasr-linux-x86_64-hip.tar.gz
+
+      - name: Attach crispasr-linux-x86_64-hip.tar.gz to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: release/crispasr-linux-x86_64-hip.tar.gz
+          fail_on_unmatched_files: false
+
+  # ── Linux x86_64 shared libs — HIP/ROCm variant ──────────────────────────────
+  # Mirrors build-linux-x86_64-hip as a shared-lib tarball for downstream
+  # FFI consumers (Rust crispasr-sys, Dart, Python ctypes) that need AMD GPU
+  # acceleration without rebuilding from source.
+  build-libs-linux-x86_64-hip:
+    runs-on: ubuntu-22.04
+    container:
+      image: rocm/dev-ubuntu-22.04:6.3
+    steps:
+      - name: Install git
+        run: apt-get update -y && apt-get install -y git
+
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install deps
+        # See build-linux-x86_64-hip: the slim rocm/dev image lacks hipBLAS/
+        # rocBLAS, which GGML_HIP requires at configure time (#196).
+        run: apt-get install -y cmake g++ patchelf hipblas-dev rocblas-dev
+
+      - name: Build (shared libs, HIP)
+        run: |
+          cmake -S . -B build-libs \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_HIP=ON \
+            -DCMAKE_PREFIX_PATH=/opt/rocm \
+            -DCMAKE_C_COMPILER=hipcc \
+            -DCMAKE_CXX_COMPILER=hipcc \
+            -DAMDGPU_TARGETS="gfx906;gfx908;gfx90a;gfx1030;gfx1035;gfx1100;gfx1101;gfx1102;gfx1201" \
+            -DGGML_NATIVE=OFF \
+            -DCRISPASR_BUILD_TESTS=OFF \
+            -DCRISPASR_BUILD_EXAMPLES=OFF \
+            -DCRISPASR_BUILD_SERVER=OFF \
+            -DCRISPASR_OPUS_FETCH=ON
+          cmake --build build-libs --config Release -j $(nproc) --target crispasr-lib
+
+      - name: Package
+        # This job runs inside the rocm/dev-ubuntu-22.04 container, where GitHub
+        # Actions defaults `run:` to `sh` (dash). `set -o pipefail` is a bashism
+        # that dash rejects on line 1 ("Illegal option -o pipefail" → exit 2),
+        # which is what kept this HIP libs asset persistently failing to package
+        # even though the build succeeds. Pin bash (present in the image).
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT=release/libcrispasr-linux-x86_64-hip
+          mkdir -p "$OUT/src" "$OUT/ggml/src" "$OUT/include" "$OUT/ggml/include"
+          cp -P build-libs/src/libcrispasr*.so* "$OUT/src/"
+          [ -e build-libs/src/libwhisper.so ] && cp -P build-libs/src/libwhisper.so* "$OUT/src/"
+          find build-libs/src -maxdepth 1 -name 'lib*.so*' \( -type f -o -type l \) \
+            ! -name 'libcrispasr*' ! -name 'libwhisper*' \
+            -exec cp -P {} "$OUT/src/" \;
+          find build-libs/ggml/src -name 'libggml*.so*' \( -type f -o -type l \) \
+            -exec cp -P {} "$OUT/ggml/src/" \;
+          # Flatten into lib/ (src/ and ggml/src/ stay as symlinks so existing
+          # CRISPASR_SYS_LIB_DIR consumers keep working), rewrite RUNPATH to be
+          # $ORIGIN-relative, then PROVE the bundle dlopens from a relocated
+          # copy. The old inline patchelf used $ORIGIN/../../ggml/src — one
+          # level too high, pointing outside the bundle — and shipped anyway,
+          # because the gate only checked dependencies were PRESENT, never that
+          # RUNPATH could find them. Fails the release rather than the consumer.
+          bash tools/package-lib-bundle.sh "$OUT"
+          cp include/crispasr.h "$OUT/include/"
+          cp ggml/include/*.h   "$OUT/ggml/include/" 2>/dev/null || true
+          cp LICENSE "$OUT/"
+          cp THIRD_PARTY_NOTICES.txt "$OUT/"
+          cd release && tar czf libcrispasr-linux-x86_64-hip.tar.gz libcrispasr-linux-x86_64-hip/
+          ls -lh libcrispasr-linux-x86_64-hip.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libcrispasr-linux-x86_64-hip
+          path: release/libcrispasr-linux-x86_64-hip.tar.gz
+
+      - name: Attach libcrispasr-linux-x86_64-hip.tar.gz to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: release/libcrispasr-linux-x86_64-hip.tar.gz
           fail_on_unmatched_files: false
 
   # ── Linux x86_64 CLI — Vulkan variant ──────────────────────────────────────
@@ -250,14 +490,16 @@ jobs:
 
       - name: Build
         run: |
-          cmake -S . -B build \
+          cmake -S . -B build -DCRISPASR_C2PA_FETCH=ON \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
             -DGGML_VULKAN=ON \
             -DGGML_OPENBLAS=ON \
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=ON \
-            -DCRISPASR_BUILD_SERVER=OFF
+            -DCRISPASR_BUILD_SERVER=OFF \
+            -DCRISPASR_OPUS_FETCH=ON
           cmake --build build --target crispasr-cli crispasr-quantize -j $(nproc)
 
       - name: Package
@@ -265,6 +507,7 @@ jobs:
           mkdir -p release/crispasr-linux-x86_64-vulkan
           cp build/bin/crispasr release/crispasr-linux-x86_64-vulkan/
           cp build/bin/crispasr-quantize release/crispasr-linux-x86_64-vulkan/
+          bash scripts/bundle-c2pa.sh release/crispasr-linux-x86_64-vulkan || true
           cd release && tar czf crispasr-linux-x86_64-vulkan.tar.gz crispasr-linux-x86_64-vulkan/
           ls -lh crispasr-linux-x86_64-vulkan.tar.gz
 
@@ -298,7 +541,8 @@ jobs:
 
       - name: Build
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_OPENBLAS=ON
+          cmake -S . -B build -DCRISPASR_C2PA_FETCH=ON -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_OPENBLAS=ON \
+            -DCRISPASR_OPUS_FETCH=ON
           cmake --build build --target crispasr-cli crispasr-quantize -j $(nproc)
 
       - name: Package
@@ -306,6 +550,7 @@ jobs:
           mkdir -p release/crispasr-linux-arm64
           cp build/bin/crispasr release/crispasr-linux-arm64/
           cp build/bin/crispasr-quantize release/crispasr-linux-arm64/
+          bash scripts/bundle-c2pa.sh release/crispasr-linux-arm64 || true
           cd release && tar czf crispasr-linux-arm64.tar.gz crispasr-linux-arm64/
 
       - uses: actions/upload-artifact@v4
@@ -336,8 +581,10 @@ jobs:
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_PLATFORM_NO_VERSIONED_SONAME=ON \
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
             -DCRISPASR_BUILD_TESTS=OFF \
-            -DCRISPASR_BUILD_EXAMPLES=OFF
+            -DCRISPASR_BUILD_EXAMPLES=OFF \
+            -DCRISPASR_OPUS_FETCH=ON
           cmake --build build -j$(nproc)
 
       - name: Build Python ctypes helpers library
@@ -413,7 +660,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_PLATFORM_NO_VERSIONED_SONAME=ON \
             -DCRISPASR_BUILD_TESTS=OFF \
-            -DCRISPASR_BUILD_EXAMPLES=OFF
+            -DCRISPASR_BUILD_EXAMPLES=OFF \
+            -DCRISPASR_OPUS_FETCH=ON
           cmake --build build -j$(nproc)
 
       - name: Build Python ctypes helpers library
@@ -472,7 +720,8 @@ jobs:
 
       - name: Build
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_METAL=ON
+          cmake -S . -B build -DCRISPASR_C2PA_FETCH=ON -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_METAL=ON \
+            -DCRISPASR_OPUS_FETCH=ON
           cmake --build build --target crispasr-cli crispasr-quantize -j $(sysctl -n hw.logicalcpu)
 
       - name: Package
@@ -480,6 +729,7 @@ jobs:
           mkdir -p release/crispasr-macos
           cp build/bin/crispasr release/crispasr-macos/
           cp build/bin/crispasr-quantize release/crispasr-macos/
+          bash scripts/bundle-c2pa.sh release/crispasr-macos || true
           cd release && tar czf crispasr-macos.tar.gz crispasr-macos/
 
       - uses: actions/upload-artifact@v4
@@ -493,6 +743,63 @@ jobs:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/crispasr-macos.tar.gz
           fail_on_unmatched_files: false
+
+  # ── Apple xcframework (iOS + simulator + macOS + tvOS/visionOS) ───────────────
+  #
+  # iOS shipped NOWHERE before this. build.yml has an ios-xcode-build job, but
+  # build.yml is deliberately NOT triggered on our v* tags (see its header: it is
+  # the upstream ggml matrix and its own release: job would race this workflow and
+  # attach ggml artifacts). Its "attach xcframework if ref_type == tag" step was
+  # therefore dead code — the workflow never ran on a tag, so no iOS asset ever
+  # reached a release. This puts the build where tags actually live.
+  #
+  # build-xcframework.sh builds STATIC (BUILD_SHARED_LIBS=OFF), so the xcframework
+  # has no dylib and none of the @rpath problems the desktop lib bundles had — the
+  # archive drops straight into an Xcode/Flutter project.
+  build-xcframework:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Build xcframework
+        run: |
+          chmod +x build-xcframework.sh
+          ./build-xcframework.sh
+
+      - name: Package
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          test -d build-apple/crispasr.xcframework  # fail loudly if the build produced nothing
+          mkdir -p release-ios
+          # --symlinks: the .framework Versions/Current symlinks must survive the
+          # zip or the consumer's framework is malformed. Zip from inside
+          # build-apple so the archive root is crispasr.xcframework, not a path.
+          ( cd build-apple && zip --symlinks -r "$GITHUB_WORKSPACE/release-ios/crispasr-${TAG}-xcframework.zip" crispasr.xcframework )
+          ls -lh release-ios/
+          # Guard: the zip name is crispasr-<TAG>-xcframework.zip (a DASH before
+          # xcframework). The attach glob below must match that; an earlier
+          # `*.xcframework.zip` (dot) matched nothing and, with
+          # fail_on_unmatched_files:false, the job went green having attached NO
+          # iOS asset. Assert the file exists here so a naming slip fails loudly.
+          test -n "$(ls release-ios/*xcframework.zip 2>/dev/null)" || { echo "no xcframework zip produced"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crispasr-xcframework
+          path: release-ios/*xcframework.zip
+
+      - name: Attach xcframework to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: release-ios/*xcframework.zip
+          # true, not false: this is the headline iOS asset — a glob that matches
+          # nothing must FAIL the release, not ship it silently (that is exactly
+          # how the first v0.8.20 run "succeeded" with no xcframework attached).
+          fail_on_unmatched_files: true
 
   # ── Shared-library bundle for macOS arm64 (Metal) ────────────────────────────
   #
@@ -528,7 +835,8 @@ jobs:
             -DGGML_BLAS_VENDOR=Apple \
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=OFF \
-            -DCRISPASR_BUILD_SERVER=OFF
+            -DCRISPASR_BUILD_SERVER=OFF \
+            -DCRISPASR_OPUS_FETCH=ON
           cmake --build build-libs --config Release \
             -j $(sysctl -n hw.logicalcpu) --target crispasr-lib
 
@@ -550,11 +858,32 @@ jobs:
             -exec cp -P {} "$OUT/ggml/src/" \;
           # Headers so binding authors can extend the FFI without
           # vendoring the whole CrispASR repo.
+          # NOTE: there are deliberately no libogg/libopus copies here. They
+          # are STATIC archives linked into libcrispasr (src/CMakeLists.txt
+          # forces BUILD_SHARED_LIBS=OFF around the FetchContent block), so
+          # they must not appear as separate dylibs. If they ever do, the
+          # @rpath gate below fails the release rather than shipping a bundle
+          # that cannot dlopen — which is what happened in v0.8.17.
+          # Headers so binding authors can extend the FFI without
+          # vendoring the whole CrispASR repo.
           cp include/crispasr.h "$OUT/include/"
           cp ggml/include/*.h   "$OUT/ggml/include/" 2>/dev/null || true
           cp LICENSE "$OUT/"
+          cp THIRD_PARTY_NOTICES.txt "$OUT/"
+
+          # Flatten into lib/ (src/ and ggml/src/ stay as symlinks so existing
+          # CRISPASR_SYS_LIB_DIR consumers keep working), rewrite LC_RPATH to be
+          # @loader_path-relative, then PROVE the bundle dlopens from a relocated
+          # copy. v0.8.18 baked the CI runner's build tree into LC_RPATH
+          # (/Users/runner/work/CrispASR/...), so @rpath/libggml.0.dylib resolved
+          # to a directory that exists on no other machine — and it shipped,
+          # because the gate only checked dependencies were PRESENT, never that
+          # LC_RPATH could find them. Same script the Linux lib jobs run.
+          bash tools/package-lib-bundle.sh "$OUT"
+
           cd release && tar czf libcrispasr-macos-arm64.tar.gz libcrispasr-macos-arm64/
           ls -lh libcrispasr-macos-arm64.tar.gz
+          echo "bundle contents:"; tar tzf libcrispasr-macos-arm64.tar.gz | sed 's/^/  /'
 
       - uses: actions/upload-artifact@v4
         with:
@@ -591,9 +920,11 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
             -DGGML_OPENBLAS=ON \
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=OFF \
-            -DCRISPASR_BUILD_SERVER=OFF
+            -DCRISPASR_BUILD_SERVER=OFF \
+            -DCRISPASR_OPUS_FETCH=ON
           cmake --build build-libs --config Release -j $(nproc) --target crispasr-lib
 
       - name: Package
@@ -613,15 +944,20 @@ jobs:
             -exec cp -P {} "$OUT/ggml/src/" \;
           # Patch RPATH to $ORIGIN so libs resolve siblings without
           # LD_LIBRARY_PATH (matches build-python-linux convention).
-          for f in "$OUT"/src/*.so* "$OUT"/ggml/src/*.so*; do
-            [ -L "$f" ] && continue
-            patchelf --set-rpath '$ORIGIN:$ORIGIN/../../ggml/src' "$f" 2>/dev/null || true
-          done
+          # Flatten into lib/ (src/ and ggml/src/ stay as symlinks so existing
+          # CRISPASR_SYS_LIB_DIR consumers keep working), rewrite RUNPATH to be
+          # $ORIGIN-relative, then PROVE the bundle dlopens from a relocated
+          # copy. The old inline patchelf used $ORIGIN/../../ggml/src — one
+          # level too high, pointing outside the bundle — and shipped anyway,
+          # because the gate only checked dependencies were PRESENT, never that
+          # RUNPATH could find them. Fails the release rather than the consumer.
+          bash tools/package-lib-bundle.sh "$OUT"
           # Headers so binding authors can extend the FFI without
           # vendoring the whole CrispASR repo.
           cp include/crispasr.h "$OUT/include/"
           cp ggml/include/*.h   "$OUT/ggml/include/" 2>/dev/null || true
           cp LICENSE "$OUT/"
+          cp THIRD_PARTY_NOTICES.txt "$OUT/"
           cd release && tar czf libcrispasr-linux-x86_64.tar.gz libcrispasr-linux-x86_64/
           ls -lh libcrispasr-linux-x86_64.tar.gz
 
@@ -662,7 +998,8 @@ jobs:
             -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=OFF \
-            -DCRISPASR_BUILD_SERVER=OFF
+            -DCRISPASR_BUILD_SERVER=OFF \
+            -DCRISPASR_OPUS_FETCH=ON
           cmake --build build-libs --config Release -j $(nproc) --target crispasr-lib
 
       - name: Package
@@ -677,13 +1014,18 @@ jobs:
             -exec cp -P {} "$OUT/src/" \;
           find build-libs/ggml/src -name 'libggml*.so*' \( -type f -o -type l \) \
             -exec cp -P {} "$OUT/ggml/src/" \;
-          for f in "$OUT"/src/*.so* "$OUT"/ggml/src/*.so*; do
-            [ -L "$f" ] && continue
-            patchelf --set-rpath '$ORIGIN:$ORIGIN/../../ggml/src' "$f" 2>/dev/null || true
-          done
+          # Flatten into lib/ (src/ and ggml/src/ stay as symlinks so existing
+          # CRISPASR_SYS_LIB_DIR consumers keep working), rewrite RUNPATH to be
+          # $ORIGIN-relative, then PROVE the bundle dlopens from a relocated
+          # copy. The old inline patchelf used $ORIGIN/../../ggml/src — one
+          # level too high, pointing outside the bundle — and shipped anyway,
+          # because the gate only checked dependencies were PRESENT, never that
+          # RUNPATH could find them. Fails the release rather than the consumer.
+          bash tools/package-lib-bundle.sh "$OUT"
           cp include/crispasr.h "$OUT/include/"
           cp ggml/include/*.h   "$OUT/ggml/include/" 2>/dev/null || true
           cp LICENSE "$OUT/"
+          cp THIRD_PARTY_NOTICES.txt "$OUT/"
           cd release && tar czf libcrispasr-linux-x86_64-avx512.tar.gz \
               libcrispasr-linux-x86_64-avx512/
           ls -lh libcrispasr-linux-x86_64-avx512.tar.gz
@@ -723,7 +1065,8 @@ jobs:
             -DGGML_OPENBLAS=ON \
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=OFF \
-            -DCRISPASR_BUILD_SERVER=OFF
+            -DCRISPASR_BUILD_SERVER=OFF \
+            -DCRISPASR_OPUS_FETCH=ON
           cmake --build build-libs --config Release -j $(nproc) --target crispasr-lib
 
       - name: Package
@@ -743,15 +1086,20 @@ jobs:
             -exec cp -P {} "$OUT/ggml/src/" \;
           # Patch RPATH to $ORIGIN so libs resolve siblings without
           # LD_LIBRARY_PATH (matches build-libs-linux-x86_64 convention).
-          for f in "$OUT"/src/*.so* "$OUT"/ggml/src/*.so*; do
-            [ -L "$f" ] && continue
-            patchelf --set-rpath '$ORIGIN:$ORIGIN/../../ggml/src' "$f" 2>/dev/null || true
-          done
+          # Flatten into lib/ (src/ and ggml/src/ stay as symlinks so existing
+          # CRISPASR_SYS_LIB_DIR consumers keep working), rewrite RUNPATH to be
+          # $ORIGIN-relative, then PROVE the bundle dlopens from a relocated
+          # copy. The old inline patchelf used $ORIGIN/../../ggml/src — one
+          # level too high, pointing outside the bundle — and shipped anyway,
+          # because the gate only checked dependencies were PRESENT, never that
+          # RUNPATH could find them. Fails the release rather than the consumer.
+          bash tools/package-lib-bundle.sh "$OUT"
           # Headers so binding authors can extend the FFI without
           # vendoring the whole CrispASR repo.
           cp include/crispasr.h "$OUT/include/"
           cp ggml/include/*.h   "$OUT/ggml/include/" 2>/dev/null || true
           cp LICENSE "$OUT/"
+          cp THIRD_PARTY_NOTICES.txt "$OUT/"
           cd release && tar czf libcrispasr-linux-arm64.tar.gz libcrispasr-linux-arm64/
           ls -lh libcrispasr-linux-arm64.tar.gz
 
@@ -790,7 +1138,8 @@ jobs:
             -DCRISPASR_BUILD_EXAMPLES=OFF `
             -DCRISPASR_BUILD_SERVER=OFF `
             -DGGML_NATIVE=OFF `
-            -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON
+            -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON `
+            -DCRISPASR_OPUS_FETCH=ON
           cmake --build build-libs --config Release -j $env:NUMBER_OF_PROCESSORS --target crispasr-lib
 
       - name: Package
@@ -814,6 +1163,7 @@ jobs:
           Get-ChildItem ggml\include\*.h -ErrorAction SilentlyContinue |
             Copy-Item -Destination "$OUT\ggml\include\"
           Copy-Item LICENSE "$OUT\"
+          Copy-Item THIRD_PARTY_NOTICES.txt "$OUT\"
           # Tar.gz (Windows 10+ ships tar; downstream tooling already
           # expects .tar.gz to mirror the macos-arm64 / linux artifacts).
           cd release
@@ -859,7 +1209,8 @@ jobs:
       - name: Build (shared libs, Vulkan)
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          for /f "tokens=*" %%i in ('"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath') do set VSINSTALL=%%i
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
           cmake -S . -B build-libs ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DBUILD_SHARED_LIBS=ON ^
@@ -869,7 +1220,8 @@ jobs:
             -DGGML_VULKAN=ON ^
             -DGGML_CUDA=OFF ^
             -DGGML_NATIVE=OFF ^
-            -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON
+            -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
+            -DCRISPASR_OPUS_FETCH=ON
           cmake --build build-libs --config Release -j %NUMBER_OF_PROCESSORS% --target crispasr-lib
 
       - name: Package
@@ -908,6 +1260,7 @@ jobs:
           Get-ChildItem ggml\include\*.h -ErrorAction SilentlyContinue |
             Copy-Item -Destination "$OUT\ggml\include\"
           Copy-Item LICENSE "$OUT\"
+          Copy-Item THIRD_PARTY_NOTICES.txt "$OUT\"
           cd release
           tar -czf libcrispasr-windows-x86_64-vulkan.tar.gz libcrispasr-windows-x86_64-vulkan
           Get-Item libcrispasr-windows-x86_64-vulkan.tar.gz | Format-List Name,Length
@@ -965,10 +1318,12 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
             -DGGML_CUDA=ON \
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
             -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120-real;120-virtual" \
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=OFF \
-            -DCRISPASR_BUILD_SERVER=OFF
+            -DCRISPASR_BUILD_SERVER=OFF \
+            -DCRISPASR_OPUS_FETCH=ON
           cmake --build build-libs --config Release -j $(nproc) --target crispasr-lib
 
       - name: Package
@@ -984,13 +1339,18 @@ jobs:
           # ggml-cuda.so + ggml-base.so + ggml-cpu.so all live under ggml/src
           find build-libs/ggml/src -name 'libggml*.so*' \( -type f -o -type l \) \
             -exec cp -P {} "$OUT/ggml/src/" \;
-          for f in "$OUT"/src/*.so* "$OUT"/ggml/src/*.so*; do
-            [ -L "$f" ] && continue
-            patchelf --set-rpath '$ORIGIN:$ORIGIN/../../ggml/src' "$f" 2>/dev/null || true
-          done
+          # Flatten into lib/ (src/ and ggml/src/ stay as symlinks so existing
+          # CRISPASR_SYS_LIB_DIR consumers keep working), rewrite RUNPATH to be
+          # $ORIGIN-relative, then PROVE the bundle dlopens from a relocated
+          # copy. The old inline patchelf used $ORIGIN/../../ggml/src — one
+          # level too high, pointing outside the bundle — and shipped anyway,
+          # because the gate only checked dependencies were PRESENT, never that
+          # RUNPATH could find them. Fails the release rather than the consumer.
+          bash tools/package-lib-bundle.sh "$OUT"
           cp include/crispasr.h "$OUT/include/"
           cp ggml/include/*.h   "$OUT/ggml/include/" 2>/dev/null || true
           cp LICENSE "$OUT/"
+          cp THIRD_PARTY_NOTICES.txt "$OUT/"
           cd release && tar czf libcrispasr-linux-x86_64-cuda.tar.gz libcrispasr-linux-x86_64-cuda/
           ls -lh libcrispasr-linux-x86_64-cuda.tar.gz
 
@@ -1012,7 +1372,8 @@ jobs:
   # tarball is self-contained for downstream Windows consumers — matches
   # the existing build-windows-cuda EXE bundle's pattern.
   build-libs-windows-x86_64-cuda:
-    runs-on: windows-latest
+    # Pin to windows-2022 — CUDA 12.8 doesn't support VS 2026 (MSVC 14.51).
+    runs-on: windows-2022
     env:
       CUDA_VERSION: "12.8.0"
     steps:
@@ -1031,7 +1392,8 @@ jobs:
       - name: Build (shared libs, CUDA)
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          for /f "tokens=*" %%i in ('"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath') do set VSINSTALL=%%i
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
           cmake -S . -B build-libs -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DBUILD_SHARED_LIBS=ON ^
@@ -1041,7 +1403,8 @@ jobs:
             -DGGML_CUDA=ON ^
             -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120-real;120-virtual" ^
             -DGGML_NATIVE=OFF ^
-            -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON
+            -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
+            -DCRISPASR_OPUS_FETCH=ON
           cmake --build build-libs --config Release -j %NUMBER_OF_PROCESSORS% --target crispasr-lib
 
       - name: Package
@@ -1082,6 +1445,7 @@ jobs:
           Get-ChildItem ggml\include\*.h -ErrorAction SilentlyContinue |
             Copy-Item -Destination "$OUT\ggml\include\"
           Copy-Item LICENSE "$OUT\"
+          Copy-Item THIRD_PARTY_NOTICES.txt "$OUT\"
           cd release
           tar -czf libcrispasr-windows-x86_64-cuda.tar.gz libcrispasr-windows-x86_64-cuda
           Get-Item libcrispasr-windows-x86_64-cuda.tar.gz | Format-List Name,Length
@@ -1122,7 +1486,8 @@ jobs:
             -DCRISPASR_BUILD_SERVER=OFF `
             -DGGML_NATIVE=OFF `
             -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF `
-            -DGGML_AVX=ON
+            -DGGML_AVX=ON `
+            -DCRISPASR_OPUS_FETCH=ON
           cmake --build build-libs --config Release -j $env:NUMBER_OF_PROCESSORS --target crispasr-lib
 
       - name: Package
@@ -1142,6 +1507,7 @@ jobs:
           Get-ChildItem ggml\include\*.h -ErrorAction SilentlyContinue |
             Copy-Item -Destination "$OUT\ggml\include\"
           Copy-Item LICENSE "$OUT\"
+          Copy-Item THIRD_PARTY_NOTICES.txt "$OUT\"
           cd release
           tar -czf libcrispasr-windows-x86_64-cpu-legacy.tar.gz libcrispasr-windows-x86_64-cpu-legacy
           Get-Item libcrispasr-windows-x86_64-cpu-legacy.tar.gz | Format-List Name,Length
@@ -1173,7 +1539,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release `
             -DBUILD_SHARED_LIBS=OFF `
             -DGGML_NATIVE=OFF `
-            -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON
+            -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON `
+            -DCRISPASR_OPUS_FETCH=ON
           cmake --build build --config Release --target crispasr-cli crispasr-quantize -j $env:NUMBER_OF_PROCESSORS
 
       - name: Package
@@ -1181,6 +1548,8 @@ jobs:
           New-Item -ItemType Directory -Force release\crispasr-windows-x86_64-cpu
           Copy-Item build\bin\Release\crispasr.exe release\crispasr-windows-x86_64-cpu\
           Copy-Item build\bin\Release\crispasr-quantize.exe release\crispasr-windows-x86_64-cpu\
+          Copy-Item LICENSE release\crispasr-windows-x86_64-cpu\
+          Copy-Item THIRD_PARTY_NOTICES.txt release\crispasr-windows-x86_64-cpu\
           Compress-Archive -Path release\crispasr-windows-x86_64-cpu -DestinationPath release\crispasr-windows-x86_64-cpu.zip -CompressionLevel Optimal
 
       - uses: actions/upload-artifact@v4
@@ -1214,7 +1583,8 @@ jobs:
             -DBUILD_SHARED_LIBS=OFF `
             -DGGML_NATIVE=OFF `
             -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF `
-            -DGGML_AVX=ON
+            -DGGML_AVX=ON `
+            -DCRISPASR_OPUS_FETCH=ON
           cmake --build build --config Release --target crispasr-cli crispasr-quantize -j $env:NUMBER_OF_PROCESSORS
 
       - name: Package
@@ -1222,6 +1592,8 @@ jobs:
           New-Item -ItemType Directory -Force release\crispasr-windows-x86_64-cpu-legacy
           Copy-Item build\bin\Release\crispasr.exe release\crispasr-windows-x86_64-cpu-legacy\
           Copy-Item build\bin\Release\crispasr-quantize.exe release\crispasr-windows-x86_64-cpu-legacy\
+          Copy-Item LICENSE release\crispasr-windows-x86_64-cpu-legacy\
+          Copy-Item THIRD_PARTY_NOTICES.txt release\crispasr-windows-x86_64-cpu-legacy\
           Compress-Archive -Path release\crispasr-windows-x86_64-cpu-legacy -DestinationPath release\crispasr-windows-x86_64-cpu-legacy.zip -CompressionLevel Optimal
 
       - uses: actions/upload-artifact@v4
@@ -1238,7 +1610,8 @@ jobs:
 
   # ── Windows CUDA (dynamic, requires NVIDIA driver on target machine) ─────────
   build-windows-cuda:
-    runs-on: windows-latest
+    # Pin to windows-2022 — CUDA 12.8 doesn't support VS 2026 (MSVC 14.51).
+    runs-on: windows-2022
     env:
       CUDA_VERSION: "12.8.0"
     steps:
@@ -1263,13 +1636,15 @@ jobs:
       - name: Build
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          for /f "tokens=*" %%i in ('"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath') do set VSINSTALL=%%i
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
           cmake -S . -B build -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DGGML_CUDA=ON ^
             -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120-real;120-virtual" ^
             -DGGML_NATIVE=OFF ^
-            -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON
+            -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
+            -DCRISPASR_OPUS_FETCH=ON
           cmake --build build --target crispasr-cli crispasr-quantize -j %NUMBER_OF_PROCESSORS%
 
       - name: Package (binary + DLLs + CUDA runtime)
@@ -1283,6 +1658,8 @@ jobs:
           Copy-Item "$env:CUDA_PATH\bin\cudart64_*.dll"   release\crispasr-windows-x86_64-cuda\ -ErrorAction SilentlyContinue
           Copy-Item "$env:CUDA_PATH\bin\cublas64_*.dll"   release\crispasr-windows-x86_64-cuda\ -ErrorAction SilentlyContinue
           Copy-Item "$env:CUDA_PATH\bin\cublasLt64_*.dll" release\crispasr-windows-x86_64-cuda\ -ErrorAction SilentlyContinue
+          Copy-Item LICENSE release\crispasr-windows-x86_64-cuda\
+          Copy-Item THIRD_PARTY_NOTICES.txt release\crispasr-windows-x86_64-cuda\
           Compress-Archive -Path release\crispasr-windows-x86_64-cuda -DestinationPath release\crispasr-windows-x86_64-cuda.zip -CompressionLevel Optimal
 
       - uses: actions/upload-artifact@v4
@@ -1320,13 +1697,15 @@ jobs:
       - name: Build
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          for /f "tokens=*" %%i in ('"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath') do set VSINSTALL=%%i
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
           cmake -S . -B build -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DGGML_VULKAN=ON ^
             -DGGML_CUDA=OFF ^
             -DGGML_NATIVE=OFF ^
-            -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON
+            -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
+            -DCRISPASR_OPUS_FETCH=ON
           cmake --build build --target crispasr-cli crispasr-quantize -j %NUMBER_OF_PROCESSORS%
 
       - name: Package (binary + DLLs)
@@ -1337,6 +1716,8 @@ jobs:
           Copy-Item build\bin\crispasr-quantize.exe release\crispasr-windows-x86_64-vulkan\
           Get-ChildItem build\bin\*.dll | Where-Object { $_.Name -notlike 'Catch2*' } |
             Copy-Item -Destination release\crispasr-windows-x86_64-vulkan\
+          Copy-Item LICENSE release\crispasr-windows-x86_64-vulkan\
+          Copy-Item THIRD_PARTY_NOTICES.txt release\crispasr-windows-x86_64-vulkan\
           Compress-Archive -Path release\crispasr-windows-x86_64-vulkan -DestinationPath release\crispasr-windows-x86_64-vulkan.zip -CompressionLevel Optimal
 
       - uses: actions/upload-artifact@v4
@@ -1420,6 +1801,7 @@ jobs:
           cp include/crispasr.h "$OUT/include/"
           cp ggml/include/*.h   "$OUT/include/" 2>/dev/null || true
           cp LICENSE "$OUT/"
+          cp THIRD_PARTY_NOTICES.txt "$OUT/"
           cd release && tar czf crispasr-android-arm64-v8a.tar.gz crispasr-android-arm64-v8a/
           ls -lh crispasr-android-arm64-v8a.tar.gz
 
@@ -1445,10 +1827,15 @@ jobs:
   # to transient permission issues). softprops won't clobber files that
   # already exist on the release.
   publish:
-    needs: [build-linux, build-linux-x86_64-avx512, build-linux-x86_64-cuda, build-linux-x86_64-cuda13, build-linux-arm64, build-python-linux, build-python-linux-arm64, build-macos, build-libs-macos-arm64, build-libs-linux-x86_64, build-libs-linux-x86_64-avx512, build-libs-linux-arm64, build-libs-linux-x86_64-cuda, build-libs-windows-x86_64, build-libs-windows-x86_64-vulkan, build-libs-windows-x86_64-cuda, build-libs-windows-x86_64-cpu-legacy, build-windows-cpu, build-windows-cpu-legacy, build-windows-cuda, build-windows-vulkan, build-android-arm64]
+    needs: [validate-version, build-linux, build-linux-x86_64-avx512, build-linux-x86_64-cuda, build-linux-x86_64-cuda13, build-linux-x86_64-hip, build-linux-arm64, build-python-linux, build-python-linux-arm64, build-macos, build-libs-macos-arm64, build-libs-linux-x86_64, build-libs-linux-x86_64-avx512, build-libs-linux-x86_64-hip, build-libs-linux-arm64, build-libs-linux-x86_64-cuda, build-libs-windows-x86_64, build-libs-windows-x86_64-vulkan, build-libs-windows-x86_64-cuda, build-libs-windows-x86_64-cpu-legacy, build-windows-cpu, build-windows-cpu-legacy, build-windows-cuda, build-windows-vulkan, build-android-arm64]
     if: always() && !cancelled()
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -1469,6 +1856,14 @@ jobs:
             artifacts/**/*.tar.gz
             artifacts/**/*.zip
           fail_on_unmatched_files: false
-          # Preserve existing release body (manually-curated notes)
-          # rather than letting auto-generation overwrite it.
           generate_release_notes: false
+
+      - name: Set release notes body
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          NOTES="RELEASE_NOTES_${TAG}.md"
+          if [ -f "$NOTES" ]; then
+            gh release edit "$TAG" --notes-file "$NOTES"
+          fi

@@ -303,7 +303,7 @@ if HAS_GPU:
               "for the default fat-binary arch list (slow)")
 
 CMAKE_FLAGS = [
-    "-DCMAKE_BUILD_TYPE=Release",
+    "-DCMAKE_BUILD_TYPE=Release", "-DCRISPASR_NO_C2PA_NATIVE=ON",
     # Skip everything we don't need for libcrispasr.so. The CI windows
     # release job uses the same trio (release.yml:281-283).
     "-DCRISPASR_BUILD_TESTS=OFF",

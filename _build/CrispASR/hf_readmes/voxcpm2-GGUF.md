@@ -1,35 +1,36 @@
 ---
 license: apache-2.0
 language:
-- en
-- zh
-- ja
-- ko
-- de
-- fr
-- es
-- pt
-- it
-- nl
-- ru
 - ar
+- da
+- de
+- el
+- en
+- es
+- fi
+- fr
+- he
 - hi
-- vi
-- th
 - id
+- it
+- ja
+- km
+- ko
+- lo
 - ms
+- my
+- nl
+- no
+- pl
+- pt
+- ru
+- sv
+- sw
+- th
 - tl
 - tr
-- pl
-- cs
-- sv
-- da
-- no
-- fi
-- el
-- he
-- uk
-- ro
+- vi
+- zh
 tags:
 - tts
 - text-to-speech
@@ -49,7 +50,7 @@ GGUF conversion of [openbmb/VoxCPM2](https://huggingface.co/openbmb/VoxCPM2) for
 - **Architecture:** TSLM (28L MiniCPM-4) + RALM (8L) + LocEnc (12L) + LocDiT (12L) + AudioVAE
 - **Parameters:** ~2B
 - **Output:** 48 kHz mono PCM
-- **Languages:** 30+ languages including English, Chinese, Japanese, Korean, German, French, Spanish, and more
+- **Languages:** 30 languages (Arabic, Burmese, Chinese, Danish, Dutch, English, Finnish, French, German, Greek, Hebrew, Hindi, Indonesian, Italian, Japanese, Khmer, Korean, Lao, Malay, Norwegian, Polish, Portuguese, Russian, Spanish, Swahili, Swedish, Tagalog, Thai, Turkish, Vietnamese) plus 9 Chinese dialects
 - **License:** Apache 2.0
 - **Voice Cloning:** Supported via reference audio
 
@@ -57,7 +58,7 @@ GGUF conversion of [openbmb/VoxCPM2](https://huggingface.co/openbmb/VoxCPM2) for
 
 - **Tokenizer-free:** Directly generates audio patches via diffusion (no discrete audio tokens)
 - **High quality:** CFM-based generation with classifier-free guidance
-- **Multilingual:** 30+ language support via CJK-split BPE tokenizer (73k vocab)
+- **Multilingual:** 30-language support via CJK-split BPE tokenizer (73k vocab)
 - **Voice cloning:** Zero-shot voice cloning from reference audio
 
 ## Usage with CrispASR
@@ -79,6 +80,7 @@ crispasr -m voxcpm2-q4_k.gguf \
 |------|------|-------------|
 | `voxcpm2-f16.gguf` | 4.63 GB | F16 weights (full precision) |
 | `voxcpm2-q4_k.gguf` | ~1.5 GB | Q4_K quantized (faster, slightly lower quality) |
+| `voxcpm2-q8_0.gguf` | 2.83 GB | Q8_0 quantized (near-F16 quality) |
 | `voxcpm2-ref.gguf` | 371 KB | Reference activation dump for numerical validation |
 
 ## Numerical Validation

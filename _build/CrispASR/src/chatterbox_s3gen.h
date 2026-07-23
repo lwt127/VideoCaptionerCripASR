@@ -16,6 +16,17 @@ extern "C" {
 
 struct chatterbox_s3gen_context;
 
+struct chatterbox_s3gen_perf {
+    int64_t t_encoder_us;
+    int64_t t_cfm_us;
+    int64_t t_vocoder_us;
+    int n_cfm_steps;
+    int T_mel;
+};
+
+// Retrieve timing from the most recent synthesize call. Returns 0 if ctx is null.
+int chatterbox_s3gen_get_perf(const struct chatterbox_s3gen_context* ctx, struct chatterbox_s3gen_perf* out);
+
 struct chatterbox_s3gen_context* chatterbox_s3gen_init_from_file(const char* path, int n_threads, int verbosity,
                                                                  bool use_gpu);
 void chatterbox_s3gen_set_seed(struct chatterbox_s3gen_context* ctx, uint32_t seed);

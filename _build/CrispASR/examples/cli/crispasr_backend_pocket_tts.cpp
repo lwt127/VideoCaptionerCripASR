@@ -20,6 +20,7 @@
 #include "core/audio_resample.h"
 #include "core/wav_reader.h"
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -27,6 +28,53 @@
 #include <vector>
 
 namespace {
+
+static bool ends_with_ci(const std::string& s, const std::string& suffix) {
+    if (s.size() < suffix.size())
+        return false;
+    for (size_t i = 0; i < suffix.size(); ++i) {
+        if (std::tolower((unsigned char)s[s.size() - suffix.size() + i]) != std::tolower((unsigned char)suffix[i]))
+            return false;
+    }
+    return true;
+}
+
+static bool file_exists(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f)
+        return false;
+    fclose(f);
+    return true;
+}
+
+// Resolve `--voice` for pocket-tts. Pocket only supports WAV voice references
+// (voice cloning via encoder weights), so a bare name from a server request
+// (`{"voice": "alice"}`) resolves to `<voice-dir>/alice.wav`. Mirrors the
+// bare-name resolution in the vibevoice / qwen3-tts adapters. Absolute paths and
+// names already carrying a `.wav` extension are passed through untouched.
+static std::string resolve_pocket_voice_path(const whisper_params& params) {
+    std::string voice_path = params.tts_voice;
+    if (voice_path.empty() || params.tts_voice_dir.empty())
+        return voice_path;
+    // Only rewrite a bare token: no path separators, no explicit .wav extension.
+    if (voice_path.find('/') != std::string::npos || voice_path.find('\\') != std::string::npos ||
+        ends_with_ci(voice_path, ".wav")) {
+        return voice_path;
+    }
+    // Path-traversal sanitisation (the server already guards network requests,
+    // but a direct CLI caller does not).
+    if (voice_path.find("..") != std::string::npos || voice_path.find('\0') != std::string::npos) {
+        fprintf(stderr, "crispasr[pocket-tts]: voice name '%s' contains illegal characters (.. or NUL)\n",
+                voice_path.c_str());
+        return voice_path;
+    }
+    const std::string wav_path = params.tts_voice_dir + "/" + voice_path + ".wav";
+    if (file_exists(wav_path))
+        return wav_path;
+    fprintf(stderr, "crispasr[pocket-tts]: warning: voice '%s' not found at '%s'\n", voice_path.c_str(),
+            wav_path.c_str());
+    return voice_path; // leave as-is; the WAV reader below emits a clear error.
+}
 
 class PocketTTSBackend : public CrispasrBackend {
 public:
@@ -113,13 +161,16 @@ public:
         pocket_tts_set_seed(ctx_, params.seed);
 
         // Load voice conditioning if --voice points to a WAV file
-        // (voice cloning requires encoder weights in the GGUF)
-        if (!params.tts_voice.empty() && params.tts_voice != last_voice_key_) {
+        // (voice cloning requires encoder weights in the GGUF). A bare name is
+        // resolved against --voice-dir so `--server`/`{"voice": "<name>"}` and
+        // multi-voice CLI runs work (issue #255). Cache on the resolved path so
+        // repeated requests with the same voice don't re-load the reference.
+        std::string voice_path = resolve_pocket_voice_path(params);
+        if (!voice_path.empty() && voice_path != last_voice_key_) {
             std::vector<float> ref_pcm;
             int ref_sr = 0;
-            if (!crispasr::core::read_wav_mono_pcm16(params.tts_voice, ref_pcm, ref_sr)) {
-                fprintf(stderr, "crispasr[pocket-tts]: failed to read voice reference '%s'\n",
-                        params.tts_voice.c_str());
+            if (!crispasr::core::read_wav_mono_pcm16(voice_path, ref_pcm, ref_sr)) {
+                fprintf(stderr, "crispasr[pocket-tts]: failed to read voice reference '%s'\n", voice_path.c_str());
             } else {
                 // Resample to 24 kHz if needed
                 if (ref_sr != 24000) {
@@ -130,7 +181,7 @@ public:
                     fprintf(stderr, "crispasr[pocket-tts]: voice cloning failed (rc=%d)\n", rc);
                 }
             }
-            last_voice_key_ = params.tts_voice;
+            last_voice_key_ = voice_path;
         }
 
         int n = 0;

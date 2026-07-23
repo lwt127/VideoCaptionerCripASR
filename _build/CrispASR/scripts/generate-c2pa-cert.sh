@@ -31,6 +31,28 @@ if [ -f "$CERT" ] && [ -f "$KEY" ]; then
 fi
 
 echo "Generating self-signed C2PA certificate..."
+# C2PA (and c2pa-rs) validate the signing cert against the spec's requirements:
+# a leaf cert (CA:FALSE) with critical keyUsage=digitalSignature, a non-empty
+# extendedKeyUsage (emailProtection), and Subject/Authority Key Identifiers.
+# A bare `openssl req -x509` without these is rejected at sign time with
+# "the certificate is invalid" — so pass them explicitly.
+EXT_CNF="$(mktemp -t crispasr-c2pa-ext.XXXXXX)"
+trap 'rm -f "$EXT_CNF"' EXIT
+cat > "$EXT_CNF" <<'CNF'
+[req]
+distinguished_name = dn
+x509_extensions = v3
+prompt = no
+[dn]
+CN = CrispASR TTS
+O = Self-Signed C2PA
+[v3]
+basicConstraints = critical, CA:FALSE
+keyUsage = critical, digitalSignature
+extendedKeyUsage = critical, emailProtection
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always
+CNF
 openssl req -x509 \
     -newkey ec \
     -pkeyopt ec_paramgen_curve:P-256 \
@@ -38,7 +60,7 @@ openssl req -x509 \
     -out "$CERT" \
     -days 3650 \
     -nodes \
-    -subj '/CN=CrispASR TTS/O=Self-Signed C2PA'
+    -config "$EXT_CNF"
 
 echo ""
 echo "Certificate: $CERT"

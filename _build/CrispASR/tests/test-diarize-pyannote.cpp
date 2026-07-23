@@ -20,7 +20,9 @@
 #include <vector>
 
 using crispasr_diarize_internal::assign_speakers_from_log_posteriors;
+using crispasr_diarize_internal::group_words_into_speaker_runs;
 using crispasr_diarize_internal::score_speaker_for_range;
+using crispasr_diarize_internal::SpeakerRun;
 
 namespace {
 
@@ -272,4 +274,110 @@ TEST_CASE("score_speaker_for_range: invalid inputs -> -1", "[unit][diarize][pyan
     REQUIRE(score_speaker_for_range(nullptr, 10, kFrameDurS, 0, 100) == -1);
     REQUIRE(score_speaker_for_range(&p, 0, kFrameDurS, 0, 100) == -1);
     REQUIRE(score_speaker_for_range(&p, 1, 0.0, 0, 100) == -1);
+}
+
+// -----------------------------------------------------------------------
+// group_words_into_speaker_runs — word→speaker-turn grouping + short-run
+// stability fold shared by the pyannote / sherpa segment splitters. This
+// is the logic issue #267 relies on: once external CTC alignment (-am)
+// has populated seg.words, a segment straddling a speaker turn is split
+// into single-speaker runs here. Pure; no model, no audio.
+// -----------------------------------------------------------------------
+
+namespace {
+// Build back-to-back words of `dur_cs` each; word i covers [i*dur, (i+1)*dur).
+void make_words(size_t n, int64_t dur_cs, std::vector<int64_t>& t0, std::vector<int64_t>& t1) {
+    t0.resize(n);
+    t1.resize(n);
+    for (size_t i = 0; i < n; i++) {
+        t0[i] = (int64_t)i * dur_cs;
+        t1[i] = (int64_t)(i + 1) * dur_cs;
+    }
+}
+} // namespace
+
+TEST_CASE("group_words: single speaker yields one run", "[unit][diarize][words]") {
+    std::vector<int64_t> t0, t1;
+    make_words(3, 30, t0, t1);
+    const auto runs = group_words_into_speaker_runs({1, 1, 1}, t0, t1, 50);
+    REQUIRE(runs.size() == 1);
+    REQUIRE(runs[0].start == 0);
+    REQUIRE(runs[0].end == 3);
+    REQUIRE(runs[0].speaker == 1);
+}
+
+TEST_CASE("group_words: two sustained speakers keep a genuine turn", "[unit][diarize][words]") {
+    std::vector<int64_t> t0, t1;
+    make_words(6, 30, t0, t1); // each run spans 90 cs >= 50, no fold
+    const auto runs = group_words_into_speaker_runs({1, 1, 1, 2, 2, 2}, t0, t1, 50);
+    REQUIRE(runs.size() == 2);
+    REQUIRE(runs[0].speaker == 1);
+    REQUIRE(runs[0].start == 0);
+    REQUIRE(runs[0].end == 3);
+    REQUIRE(runs[1].speaker == 2);
+    REQUIRE(runs[1].start == 3);
+    REQUIRE(runs[1].end == 6);
+}
+
+TEST_CASE("group_words: a lone short mid-phrase flip is folded away", "[unit][diarize][words]") {
+    // spk1 spk1 [spk2] spk1 spk1 — the single 30 cs spk2 word is < 50 cs
+    // and gets absorbed, so the phrase does not fragment into a spurious
+    // "(speaker 2)" stub. Result: same-speaker runs (no genuine turn).
+    std::vector<int64_t> t0, t1;
+    make_words(5, 30, t0, t1);
+    const auto runs = group_words_into_speaker_runs({1, 1, 2, 1, 1}, t0, t1, 50);
+    for (const auto& r : runs)
+        REQUIRE(r.speaker == 1);
+    // No two distinct speakers survive -> caller treats as single-speaker.
+    bool multi = false;
+    int first = -1;
+    for (const auto& r : runs) {
+        if (r.speaker < 0)
+            continue;
+        if (first < 0)
+            first = r.speaker;
+        else if (r.speaker != first)
+            multi = true;
+    }
+    REQUIRE_FALSE(multi);
+}
+
+TEST_CASE("group_words: leading short flip folds into its only neighbour", "[unit][diarize][words]") {
+    // [spk2] spk1 spk1 spk1 — the boundary spk2 word (30 cs < 50) folds
+    // forward into the spk1 run.
+    std::vector<int64_t> t0, t1;
+    make_words(4, 30, t0, t1);
+    const auto runs = group_words_into_speaker_runs({2, 1, 1, 1}, t0, t1, 50);
+    REQUIRE(runs.size() == 1);
+    REQUIRE(runs[0].speaker == 1);
+    REQUIRE(runs[0].start == 0);
+    REQUIRE(runs[0].end == 4);
+}
+
+TEST_CASE("group_words: min_run_cs <= 0 disables folding (split on every change)", "[unit][diarize][words]") {
+    std::vector<int64_t> t0, t1;
+    make_words(3, 30, t0, t1);
+    const auto runs = group_words_into_speaker_runs({1, 2, 1}, t0, t1, 0);
+    REQUIRE(runs.size() == 3);
+    REQUIRE(runs[0].speaker == 1);
+    REQUIRE(runs[1].speaker == 2);
+    REQUIRE(runs[2].speaker == 1);
+}
+
+TEST_CASE("group_words: empty input yields no runs", "[unit][diarize][words]") {
+    const auto runs = group_words_into_speaker_runs({}, {}, {}, 50);
+    REQUIRE(runs.empty());
+}
+
+TEST_CASE("group_words: a real two-speaker turn survives the fold", "[unit][diarize][words]") {
+    // Longer words so both sides clear MIN_RUN — the #267 target case:
+    // one ASR segment "…project | I will now present…" splits in two.
+    std::vector<int64_t> t0, t1;
+    make_words(4, 60, t0, t1); // 60 cs words -> each 2-word run spans 120 cs
+    const auto runs = group_words_into_speaker_runs({0, 0, 1, 1}, t0, t1, 50);
+    REQUIRE(runs.size() == 2);
+    REQUIRE(runs[0].speaker == 0);
+    REQUIRE(runs[1].speaker == 1);
+    REQUIRE(runs[1].start == 2);
+    REQUIRE(runs[1].end == 4);
 }

@@ -8,11 +8,13 @@
 // Tensor naming follows export_gguf.py / cohere-arch.h.
 
 #include "cohere.h"
+#include "core/crispasr_env.h"
 #include "cohere-arch.h"
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "crispasr_imatrix.h"
 #if defined(GGML_USE_METAL)
 #include "ggml-metal.h"
 #endif
@@ -22,6 +24,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -52,7 +55,7 @@ static bool cohere_debug_enabled(void) {
     static bool init = false;
     static bool enabled = false;
     if (!init) {
-        enabled = getenv("COHERE_DEBUG") != nullptr;
+        enabled = crispasr_env::get("CRISPASR_COHERE_DEBUG") != nullptr;
         init = true;
     }
     return enabled;
@@ -62,11 +65,28 @@ static bool cohere_bench_enabled(void) {
     static bool init = false;
     static bool enabled = false;
     if (!init) {
-        enabled = getenv("COHERE_BENCH") != nullptr;
+        enabled = crispasr_env::get("CRISPASR_COHERE_BENCH") != nullptr;
         init = true;
     }
     return enabled;
 }
+
+// ===========================================================================
+// Bench instrumentation — `COHERE_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+struct cohere_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit cohere_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~cohere_bench_stage() {
+        if (!cohere_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  cohere_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 static void cohere_debug(const char* fmt, ...) {
     if (!cohere_debug_enabled())
@@ -112,15 +132,17 @@ static void cohere_log_tensor(const char* name, const struct ggml_tensor* t) {
 // ---------------------------------------------------------------------------
 
 struct cohere_perf {
-    int64_t t_features_us = 0;    // STFT + mel filterbank
-    int64_t t_enc_build_us = 0;   // encoder graph construction
-    int64_t t_enc_alloc_us = 0;   // encoder ggml_backend_sched_alloc_graph
-    int64_t t_enc_compute_us = 0; // encoder ggml_backend_sched_graph_compute
-    int64_t t_cross_kv_us = 0;    // copying cross-KV tensors from encoder output
-    int64_t t_dec_build_us = 0;   // decoder graph build (all steps summed)
-    int64_t t_dec_alloc_us = 0;   // decoder sched alloc (all steps summed)
-    int64_t t_dec_compute_us = 0; // decoder compute (all steps summed)
-    int64_t t_dec_logits_us = 0;  // decoder ggml_backend_tensor_get logits (all steps)
+    int64_t t_features_us = 0;     // STFT + mel filterbank
+    int64_t t_enc_build_us = 0;    // encoder graph construction
+    int64_t t_enc_alloc_us = 0;    // encoder ggml_backend_sched_alloc_graph
+    int64_t t_enc_compute_us = 0;  // encoder ggml_backend_sched_graph_compute
+    int64_t t_cross_kv_us = 0;     // copying cross-KV tensors from encoder output
+    int64_t t_crosskv_read_us = 0; // GPU->CPU readback of per-chunk cross-KV (#161 probe)
+    int64_t t_reserve_us = 0;      // one-time sched reserve of max-ctx decoder graph (#161 probe)
+    int64_t t_dec_build_us = 0;    // decoder graph build (all steps summed)
+    int64_t t_dec_alloc_us = 0;    // decoder sched alloc (all steps summed)
+    int64_t t_dec_compute_us = 0;  // decoder compute (all steps summed)
+    int64_t t_dec_logits_us = 0;   // decoder ggml_backend_tensor_get logits (all steps)
     int64_t t_dec_step_min_us = INT64_MAX;
     int64_t t_dec_step_max_us = 0;
     int n_dec_steps = 0;    // total autoregressive steps (prompt + generated)
@@ -179,6 +201,22 @@ static void cohere_perf_print(const cohere_perf& p, int n_samples, int sample_ra
                 p.t_dec_logits_us / 1e3 / p.n_dec_steps);
         fprintf(stderr, "cohere:  dec total        %7.1f ms\n",
                 (p.t_dec_build_us + p.t_dec_alloc_us + p.t_dec_compute_us + p.t_dec_logits_us) / 1e3);
+    }
+    // #161 probes: host-side work that lives in the gaps between the timed
+    // stages above (cross-KV GPU->CPU readback, one-time max-ctx sched
+    // reserve, and a UNACCOUNTED residual that catches any remaining gap —
+    // e.g. the beam-search KV snapshot that drove the #161 regression).
+    // Opt-in via COHERE_GAPS=1 (or COHERE_BENCH=1) to keep the default
+    // report compact.
+    if (crispasr_env::get("CRISPASR_COHERE_GAPS") || crispasr_env::get("CRISPASR_COHERE_BENCH")) {
+        const int64_t accounted = p.t_features_us + p.t_enc_build_us + p.t_enc_alloc_us + p.t_enc_compute_us +
+                                  p.t_cross_kv_us + p.t_crosskv_read_us + p.t_reserve_us + p.t_dec_build_us +
+                                  p.t_dec_alloc_us + p.t_dec_compute_us + p.t_dec_logits_us;
+        fprintf(stderr, "cohere: ----- untimed gaps (#161) -----\n");
+        fprintf(stderr, "cohere:  cross-kv readback%7.1f ms\n", p.t_crosskv_read_us / 1e3);
+        fprintf(stderr, "cohere:  sched reserve    %7.1f ms\n", p.t_reserve_us / 1e3);
+        fprintf(stderr, "cohere:  UNACCOUNTED     %7.1f ms   <- residual = total - all stages\n",
+                (p.t_total_us - accounted) / 1e3);
     }
     fprintf(stderr, "cohere: ----- memory -----\n");
     fprintf(stderr, "cohere:  model weights    %7.1f MiB\n", p.mem_model_buf / 1048576.0);
@@ -551,6 +589,9 @@ static struct ggml_cgraph* cohere_build_graph_encoder(struct cohere_context* ctx
     const int n_heads = hp.enc_n_heads;
     const int head_dim = hp.enc_head_dim;
     const int n_mels = hp.n_mels;
+    // Gated per-stage encoder snapshots (mel + per-block + pre-proj final) for
+    // the crispasr-diff / transcribe.cpp comparison. No overhead when unset.
+    const bool dump_stages = std::getenv("CRISPASR_COHERE_DUMP_STAGES") != nullptr;
 
     struct ggml_init_params params = {
         .mem_size = ctx->compute_meta.size(),
@@ -719,7 +760,37 @@ static struct ggml_cgraph* cohere_build_graph_encoder(struct cohere_context* ctx
         cur = ggml_norm(ctx0, cur, 1e-5f);
         cur = ggml_mul_inplace(ctx0, cur, layer.out_norm_w);
         cur = ggml_add_inplace(ctx0, cur, layer.out_norm_b);
+
+        // Per-block encoder dump (gated). ggml_cont escapes the in-place norm
+        // aliasing so the snapshot is not overwritten by buffer reuse. Used to
+        // bisect encoder divergence against transcribe.cpp (see §231: a corrupt
+        // GGUF zeroed layers 20/24 → block output collapsed to 0 from there).
+        if (dump_stages) {
+            struct ggml_tensor* bdbg = ggml_cont(ctx0, cur);
+            char bn[32];
+            snprintf(bn, sizeof(bn), "enc_block_%d", il);
+            ggml_set_name(bdbg, bn);
+            ggml_set_output(bdbg);
+            ggml_build_forward_expand(gf, bdbg);
+        }
     }
+
+    // Full-T pre-projection encoder output (gated), the direct analog of
+    // transcribe.cpp's enc.final [T,1280] for numeric comparison.
+    if (dump_stages) {
+        struct ggml_tensor* enc_final_dbg = ggml_cont(ctx0, cur);
+        ggml_set_name(enc_final_dbg, "enc_final_preproj");
+        ggml_set_output(enc_final_dbg);
+        ggml_build_forward_expand(gf, enc_final_dbg);
+    }
+
+    // DEBUG: full-T pre-projection encoder output (analog of transcribe.cpp's
+    // enc.final [T,1280]). ggml_cont forces a fresh buffer so the preceding
+    // in-place norm ops can't be overwritten by downstream buffer reuse.
+    struct ggml_tensor* enc_final_dbg = ggml_cont(ctx0, cur);
+    ggml_set_name(enc_final_dbg, "enc_final_preproj");
+    ggml_set_output(enc_final_dbg);
+    ggml_build_forward_expand(gf, enc_final_dbg);
 
     // Encoder-decoder projection
     cur = ggml_add(ctx0, ggml_mul_mat(ctx0, model.enc_proj_w, cur), model.enc_proj_b);
@@ -1039,6 +1110,7 @@ static ggml_tensor* ct_get_tensor_fmt(cohere_model& model, const char* fmt, int 
 // ---------------------------------------------------------------------------
 
 #include "core/attention.h"
+#include "core/cpu_ops.h" // core_cpu::to_f32 (quantized-safe weight read)
 #include "core/beam_decode.h"
 #include "core/audio_chunking.h"
 #include "core/gguf_loader.h"
@@ -1387,6 +1459,7 @@ static void cohere_fft_r2c(const float* in, int N, float* out) {
 // ---------------------------------------------------------------------------
 
 #include "core/mel.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1427,7 +1500,13 @@ static std::vector<float> cohere_compute_features(const cohere_hparams& hp, cons
     p.layout = core_mel::Layout::TimeMels;
     p.log_eps = (float)(1.0 / (1 << 24));
     p.center_pad = true;
-    p.drop_last_frame = true; // NeMo returns feat_len = floor(n_samples/hop) frames
+    // NeMo FilterbankFeatures returns feat_len = floor(n_samples/hop) + 1 (the
+    // centered first frame adds one). Dropping the last frame made T_mel one
+    // short, which flips T_enc down by one whenever floor(n/hop) is a multiple
+    // of the 8x subsampling (e.g. an 11 s clip -> 138 vs the reference's 139).
+    // Verified against the transformers reference mel (128, 1105) for an
+    // 11.04 s clip.
+    p.drop_last_frame = false;
 
     auto mel =
         core_mel::compute(pe.data(), n_samples, fe_window_data, win, fe_mel_fb_data, n_freqs, cohere_fft_r2c, p, T_out);
@@ -1555,21 +1634,48 @@ static struct ggml_cgraph* cohere_build_graph_decoder(struct cohere_context* ctx
         struct ggml_tensor* Q = ggml_permute(ctx0, ggml_reshape_3d(ctx0, Qcur, head_dim, n_heads, n_tokens), 0, 2, 1,
                                              3); // [hd, n_tok, n_heads]
 
-        // PLAN #73: ggml_flash_attn_ext fuses K-mul-Q + softmax + V-mul
-        // into one op and natively handles quant K/V (no cast tax).
+        // Self-attention: KV cache views for this layer.
         struct ggml_tensor* K =
             ggml_view_3d(ctx0, ctx->kv_k, head_dim, sa_L, n_heads, ctx->kv_k->nb[1], ctx->kv_k->nb[2],
                          il * ctx->kv_k->nb[3]); // [hd, L, n_heads]
         struct ggml_tensor* V =
             ggml_view_3d(ctx0, ctx->kv_v, head_dim, sa_L, n_heads, ctx->kv_v->nb[1], ctx->kv_v->nb[2],
                          il * ctx->kv_v->nb[3]); // [hd, L, n_heads]
-        struct ggml_tensor* sa_out =
-            ggml_flash_attn_ext(ctx0, ggml_cont(ctx0, Q), K, V, sa_mask, 1.0f / sqrtf((float)head_dim), 0.0f, 0.0f);
-        // flash_attn_ext output is [hd, n_heads, n_tokens] — same layout
-        // as the legacy ggml_permute(sa_out, 0,2,1,3), so the additional
-        // permute+cont is gone. reshape_2d packs the inner two dims into
-        // d = hd * n_heads.
-        cur = ggml_reshape_2d(ctx0, sa_out, d, n_tokens);
+
+        // CRISPASR_COHERE_LEGACY_SA=1: fall back to the pre-v0.7 manual
+        // mul_mat self-attention path. The flash_attn_ext path (PLAN #73)
+        // fuses Q·K + softmax + V into a single op, but caused a ~10×
+        // CUDA regression on some Windows setups (#161). This env var
+        // lets users bisect whether flash_attn_ext is the culprit.
+        static const bool legacy_sa = (getenv("CRISPASR_COHERE_LEGACY_SA") != nullptr);
+
+        if (legacy_sa) {
+            // Legacy path: explicit mul_mat attention (pre-v0.7).
+            struct ggml_tensor* K_c = ggml_cont(ctx0, K);
+            struct ggml_tensor* KQ = ggml_mul_mat(ctx0, K_c, Q); // [L, n_tok, n_heads]
+            KQ = ggml_scale_inplace(ctx0, KQ, 1.0f / sqrtf((float)head_dim));
+            if (n_tokens > 1) {
+                KQ = ggml_diag_mask_inf_inplace(ctx0, KQ, offset);
+            }
+            KQ = ggml_soft_max_inplace(ctx0, KQ);
+
+            struct ggml_tensor* V_trans = ggml_cont(ctx0, ggml_permute(ctx0, V, 1, 0, 2, 3)); // [L, hd, n_heads]
+            struct ggml_tensor* sa_out = ggml_mul_mat(ctx0, V_trans, KQ);                     // [hd, n_tok, n_heads]
+
+            sa_out = ggml_permute(ctx0, sa_out, 0, 2, 1, 3); // [hd, n_heads, n_tok]
+            sa_out = ggml_cont(ctx0, sa_out);
+            cur = ggml_reshape_2d(ctx0, sa_out, d, n_tokens);
+        } else {
+            // PLAN #73: ggml_flash_attn_ext fuses K-mul-Q + softmax + V-mul
+            // into one op and natively handles quant K/V (no cast tax).
+            struct ggml_tensor* sa_out =
+                ggml_flash_attn_ext(ctx0, ggml_cont(ctx0, Q), K, V, sa_mask, 1.0f / sqrtf((float)head_dim), 0.0f, 0.0f);
+            // flash_attn_ext output is [hd, n_heads, n_tokens] — same layout
+            // as the legacy ggml_permute(sa_out, 0,2,1,3), so the additional
+            // permute+cont is gone. reshape_2d packs the inner two dims into
+            // d = hd * n_heads.
+            cur = ggml_reshape_2d(ctx0, sa_out, d, n_tokens);
+        }
 
         // out projection
         cur = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.attn_o_w, cur), layer.attn_o_b);
@@ -1808,7 +1914,7 @@ struct cohere_context* cohere_init_from_file(const char* path_model, struct cohe
     // NOTE: ggml_backend_cpu_set_n_threads is NOT called by default —
     // profiling showed it regressed perf for our small matrix sizes.
     {
-        const char* env = getenv("COHERE_THREADS");
+        const char* env = crispasr_env::get("CRISPASR_COHERE_THREADS");
         if (env) {
             int n = atoi(env);
             if (n > 0)
@@ -1826,7 +1932,7 @@ struct cohere_context* cohere_init_from_file(const char* path_model, struct cohe
     }
 
     {
-        const char* dev_env = getenv("COHERE_DEVICE");
+        const char* dev_env = crispasr_env::get("CRISPASR_COHERE_DEVICE");
         if (dev_env && strlen(dev_env) > 0) {
             ctx->ggml_backend = ggml_backend_init_by_name(dev_env, nullptr);
             if (!ctx->ggml_backend) {
@@ -1834,7 +1940,7 @@ struct cohere_context* cohere_init_from_file(const char* path_model, struct cohe
             }
         }
         if (!ctx->ggml_backend) {
-            ctx->ggml_backend = params.use_gpu ? ggml_backend_init_best() : ggml_backend_cpu_init();
+            ctx->ggml_backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
         }
         if (!ctx->ggml_backend) {
             fprintf(stderr, "cohere: failed to initialize any ggml backend\n");
@@ -1850,7 +1956,7 @@ struct cohere_context* cohere_init_from_file(const char* path_model, struct cohe
     COHERE_VLOG(vb, "cohere: backend: %s%s\n", ggml_backend_name(ctx->ggml_backend), using_gpu ? "" : " (CPU-only)");
 
     // Apply thread count only when explicitly requested via env var
-    if (getenv("COHERE_THREADS")) {
+    if (crispasr_env::get("CRISPASR_COHERE_THREADS")) {
         COHERE_VLOG(vb, "cohere: applying n_threads=%d to CPU backend [COHERE_THREADS override]\n", params.n_threads);
         ggml_backend_cpu_set_n_threads(ctx->ggml_backend_cpu, params.n_threads);
         if (!using_gpu) {
@@ -1904,9 +2010,11 @@ struct cohere_context* cohere_init_from_file(const char* path_model, struct cohe
     if (using_gpu) {
         ggml_backend_t backends[] = {ctx->ggml_backend, ctx->ggml_backend_cpu};
         ctx->ggml_alloc = ggml_backend_sched_new(backends, nullptr, 2, 16384, false, false);
+        crispasr_imatrix_install(ctx->ggml_alloc); // no-op unless CRISPASR_IMATRIX_OUT is set
     } else {
         ggml_backend_t backends[] = {ctx->ggml_backend};
         ctx->ggml_alloc = ggml_backend_sched_new(backends, nullptr, 1, 16384, false, false);
+        crispasr_imatrix_install(ctx->ggml_alloc); // no-op unless CRISPASR_IMATRIX_OUT is set
     }
 
     ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + 1024);
@@ -1975,20 +2083,7 @@ int cohere_str_to_token(struct cohere_context* ctx, const char* s) {
 // ---------------------------------------------------------------------------
 
 static std::vector<float> ct_get_f32(const ggml_tensor* t) {
-    const int n = (int)ggml_nelements(t);
-    std::vector<float> res(n);
-    if (t->type == GGML_TYPE_F32) {
-        ggml_backend_tensor_get(t, res.data(), 0, n * sizeof(float));
-    } else if (t->type == GGML_TYPE_F16) {
-        std::vector<ggml_fp16_t> tmp(n);
-        ggml_backend_tensor_get(t, tmp.data(), 0, n * sizeof(ggml_fp16_t));
-        for (int i = 0; i < n; i++)
-            res[i] = ggml_fp16_to_fp32(tmp[i]);
-    } else {
-        fprintf(stderr, "ct_get_f32: unsupported type %d\n", (int)t->type);
-        abort();
-    }
-    return res;
+    return core_cpu::to_f32(t); // F32/F16/quantized-safe
 }
 
 // ---------------------------------------------------------------------------
@@ -2157,6 +2252,7 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
     }
 
     // --- Feature extraction (single chunk ≤ 30s) ---
+    cohere_bench_stage _b_total("total");
     auto mel_fb = ct_get_f32(ctx->model.fe_mel_fb);
     auto window = ct_get_f32(ctx->model.fe_window);
 
@@ -2183,9 +2279,10 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
 
     // Optional per-op profiling (COHERE_PROF=1, single-chunk only)
     cohere_prof_state prof_state;
-    bool do_prof = !do_chunked && (getenv("COHERE_PROF") != nullptr);
+    bool do_prof = !do_chunked && (crispasr_env::get("CRISPASR_COHERE_PROF") != nullptr);
 
     {
+        cohere_bench_stage _b_enc("encoder (all chunks)");
         int n_chunks = 0;
         for (int sample_offset = 0; sample_offset < n_samples; sample_offset += CHUNK_SAMPLES) {
             int chunk_n = std::min(CHUNK_SAMPLES, n_samples - sample_offset);
@@ -2241,6 +2338,17 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
                 return nullptr;
             }
             ggml_backend_tensor_set(mel_t, mel_c.data(), 0, mel_c.size() * sizeof(float));
+            if (const char* mp = std::getenv("CRISPASR_COHERE_DUMP_MEL")) {
+                FILE* mf = std::fopen(mp, "wb");
+                if (mf) {
+                    int32_t nm = hp.n_mels, tm = T_mel_c; // mel_c layout: [n_mels, T] (n_mels contiguous)
+                    std::fwrite(&nm, 4, 1, mf);
+                    std::fwrite(&tm, 4, 1, mf);
+                    std::fwrite(mel_c.data(), sizeof(float), mel_c.size(), mf);
+                    std::fclose(mf);
+                    fprintf(stderr, "cohere: dumped mel [n_mels=%d, T=%d] to %s\n", nm, tm, mp);
+                }
+            }
 
             int H1c = (T_mel_c + 2 - 3) / 2 + 1;
             int H2c = (H1c + 2 - 3) / 2 + 1;
@@ -2276,6 +2384,45 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
                 ggml_backend_sched_set_eval_callback(ctx->ggml_alloc, nullptr, nullptr);
             }
 
+            // Per-stage encoder snapshots for crispasr-diff / transcribe.cpp
+            // comparison (CRISPASR_COHERE_DUMP_STAGES=<dir>). Writes raw
+            // [ne0,ne1] f32 (2 int32 dims + data): crisp.mel.bin, crisp.enc_final.bin,
+            // crisp.block<N>.bin — matching transcribe.cpp's TRANSCRIBE_DUMP_DIR.
+            if (const char* sd = std::getenv("CRISPASR_COHERE_DUMP_STAGES")) {
+                auto dump_named = [&](const char* tname, const char* fname) {
+                    struct ggml_tensor* t = ggml_graph_get_tensor(gf_enc, tname);
+                    if (!t)
+                        return;
+                    std::vector<float> v((size_t)t->ne[0] * t->ne[1]);
+                    ggml_backend_tensor_get(t, v.data(), 0, v.size() * sizeof(float));
+                    char path[1024];
+                    std::snprintf(path, sizeof(path), "%s/%s", sd, fname);
+                    if (FILE* f = std::fopen(path, "wb")) {
+                        int32_t d0 = (int32_t)t->ne[0], d1 = (int32_t)t->ne[1];
+                        std::fwrite(&d0, 4, 1, f);
+                        std::fwrite(&d1, 4, 1, f);
+                        std::fwrite(v.data(), sizeof(float), v.size(), f);
+                        std::fclose(f);
+                    }
+                };
+                char mpath[1024];
+                std::snprintf(mpath, sizeof(mpath), "%s/crisp.mel.bin", sd);
+                if (FILE* f = std::fopen(mpath, "wb")) {
+                    int32_t d0 = (int32_t)hp.n_mels, d1 = (int32_t)T_mel_c;
+                    std::fwrite(&d0, 4, 1, f);
+                    std::fwrite(&d1, 4, 1, f);
+                    std::fwrite(mel_c.data(), sizeof(float), mel_c.size(), f);
+                    std::fclose(f);
+                }
+                dump_named("enc_final_preproj", "crisp.enc_final.bin");
+                for (int bi = 0; bi < hp.enc_n_layers; bi++) {
+                    char tn[32], fn[48];
+                    std::snprintf(tn, sizeof(tn), "enc_block_%d", bi);
+                    std::snprintf(fn, sizeof(fn), "crisp.block%d.bin", bi);
+                    dump_named(tn, fn);
+                }
+            }
+
             // Extract T_enc for this chunk
             struct ggml_tensor* enc_out_t = ggml_graph_get_tensor(gf_enc, "enc_out");
             if (!enc_out_t) {
@@ -2286,9 +2433,63 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
             T_enc_total += T_enc_c;
             T_enc_chunks.push_back(T_enc_c);
 
+            // Debug: dump mel + pre-proj encoder output as raw [ne0,ne1] f32
+            // (2 int32 header dims + data) to compare against transcribe.cpp's
+            // enc.mel.in / enc.final dumps. CRISPASR_COHERE_DUMP_STAGES=dir.
+            if (const char* sd = std::getenv("CRISPASR_COHERE_DUMP_STAGES")) {
+                auto dump_named = [&](const char* tname, const char* fname) {
+                    struct ggml_tensor* t = ggml_graph_get_tensor(gf_enc, tname);
+                    if (!t)
+                        return;
+                    std::vector<float> v((size_t)t->ne[0] * t->ne[1]);
+                    ggml_backend_tensor_get(t, v.data(), 0, v.size() * sizeof(float));
+                    char path[1024];
+                    std::snprintf(path, sizeof(path), "%s/%s", sd, fname);
+                    if (FILE* f = std::fopen(path, "wb")) {
+                        int32_t d0 = (int32_t)t->ne[0], d1 = (int32_t)t->ne[1];
+                        std::fwrite(&d0, 4, 1, f);
+                        std::fwrite(&d1, 4, 1, f);
+                        std::fwrite(v.data(), sizeof(float), v.size(), f);
+                        std::fclose(f);
+                        fprintf(stderr, "cohere: dumped %s [%d,%d] -> %s\n", tname, d0, d1, path);
+                    }
+                };
+                // mel_c is host-side [n_mels, T_mel] (ggml col-major).
+                char mpath[1024];
+                std::snprintf(mpath, sizeof(mpath), "%s/crisp.mel.bin", sd);
+                if (FILE* f = std::fopen(mpath, "wb")) {
+                    int32_t d0 = (int32_t)hp.n_mels, d1 = (int32_t)T_mel_c;
+                    std::fwrite(&d0, 4, 1, f);
+                    std::fwrite(&d1, 4, 1, f);
+                    std::fwrite(mel_c.data(), sizeof(float), mel_c.size(), f);
+                    std::fclose(f);
+                    fprintf(stderr, "cohere: dumped mel [%d,%d] -> %s\n", d0, d1, mpath);
+                }
+                dump_named("enc_final_preproj", "crisp.enc_final.bin");
+                dump_named("enc_block_0", "crisp.block0.bin");
+                dump_named("enc_block_23", "crisp.block23.bin");
+            }
+
+            // Debug: dump post-enc_proj encoder output to compare against the
+            // reference cross-attention context (CRISPASR_COHERE_DUMP_ENCOUT=path).
+            if (const char* dp = std::getenv("CRISPASR_COHERE_DUMP_ENCOUT")) {
+                std::vector<float> eo((size_t)enc_out_t->ne[0] * enc_out_t->ne[1]);
+                ggml_backend_tensor_get(enc_out_t, eo.data(), 0, eo.size() * sizeof(float));
+                FILE* f = std::fopen(dp, "wb");
+                if (f) {
+                    int32_t d0 = (int32_t)enc_out_t->ne[0], d1 = (int32_t)enc_out_t->ne[1];
+                    std::fwrite(&d0, 4, 1, f);
+                    std::fwrite(&d1, 4, 1, f);
+                    std::fwrite(eo.data(), sizeof(float), eo.size(), f);
+                    std::fclose(f);
+                    fprintf(stderr, "cohere: dumped enc_out [%d, %d] to %s\n", d0, d1, dp);
+                }
+            }
+
             // Extract cross-KV from this chunk's encoder graph into CPU vectors.
             // K shape: [head_dim, T_enc_c, n_heads] (raw F32 from encoder graph)
             // V shape: [T_enc_c, head_dim, n_heads] (raw F32 from encoder graph)
+            const int64_t t_ckr0 = ggml_time_us();
             for (int il = 0; il < hp.dec_n_layers; il++) {
                 char ck_name[32], cv_name[32];
                 snprintf(ck_name, sizeof(ck_name), "ck_%d", il);
@@ -2304,6 +2505,7 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
                 ggml_backend_tensor_get(ck_src, partial_k[il].back().data(), 0, ggml_nbytes(ck_src));
                 ggml_backend_tensor_get(cv_src, partial_v[il].back().data(), 0, ggml_nbytes(cv_src));
             }
+            perf.t_crosskv_read_us += (ggml_time_us() - t_ckr0);
         } // end chunk loop
 
         if (do_chunked) {
@@ -2318,6 +2520,7 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
 
     // Assemble cross-KV from per-chunk CPU data and upload to backend buffer.
     {
+        cohere_bench_stage _b_ckv("cross-kv assembly");
         t0 = ggml_time_us();
 
         if (ctx->cross_kv_ctx)
@@ -2413,6 +2616,7 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
     const int T_enc = T_enc_total;
 
     // --- Decoder prompt ---
+    cohere_bench_stage _b_dec("decoder (total)");
     auto tid = [&](const std::string& s) { return voc.token_id(s); };
     const char* lang_tok = lang ? lang : "en";
     char lang_tok_str[32];
@@ -2420,6 +2624,10 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
 
     const char* pnc_tok = ctx->params.no_punctuation ? "<|nopnc|>" : "<|pnc|>";
     std::vector<int> prompt = {
+        // decoder_start_token_id = 13764 ("▁"). The reference processor prepends
+        // it to decoder_input_ids; omitting it shifts every decoder position by
+        // one and gives every prompt token the wrong positional embedding.
+        tid("▁"),
         tid("<|startofcontext|>"),
         tid("<|startoftranscript|>"),
         tid("<|emo:undefined|>"),
@@ -2465,9 +2673,11 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
     // the gallocr's size_max covers all future autoregressive steps, so
     // ggml_gallocr_needs_realloc returns false for every step and the plan is reused.
     {
+        const int64_t t_rsv0 = ggml_time_us();
         const int dummy_tok = 0;
         struct ggml_cgraph* gf_max = cohere_build_graph_decoder(ctx, &dummy_tok, 1, hp.dec_max_ctx - 1);
         ggml_backend_sched_reserve(ctx->ggml_alloc, gf_max);
+        perf.t_reserve_us += (ggml_time_us() - t_rsv0);
     }
 
     std::vector<int> generated;
@@ -2477,28 +2687,16 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
     // Cross-attention KV (cross_kv_k/v) is shared across beams; only self-attention
     // KV (kv_k/kv_v) is snapshotted per beam.
     if (ctx->beam_size > 1) {
-        struct cohere_kv_snap {
-            std::vector<uint8_t> k_data;
-            std::vector<uint8_t> v_data;
-        };
+        // GH #161: snapshot/restore self-attention KV on-device via a recycled
+        // buffer pool (no PCIe round-trip + sync per beam per step). The pool
+        // outlives every snapshot produced by the beam search below.
+        core_attn::kv_snapshot_pool kv_pool(ctx->kv_k, ctx->kv_v);
 
-        auto save_fn = [](cohere_context* c) -> cohere_kv_snap* {
-            auto* s = new cohere_kv_snap();
-            size_t kb = ggml_nbytes(c->kv_k);
-            size_t vb = ggml_nbytes(c->kv_v);
-            s->k_data.resize(kb);
-            s->v_data.resize(vb);
-            ggml_backend_tensor_get(c->kv_k, s->k_data.data(), 0, kb);
-            ggml_backend_tensor_get(c->kv_v, s->v_data.data(), 0, vb);
-            return s;
-        };
+        auto save_fn = [&kv_pool](cohere_context*) -> core_attn::kv_snapshot* { return kv_pool.save(); };
 
-        auto restore_fn = [](cohere_context* c, cohere_kv_snap* s) {
-            ggml_backend_tensor_set(c->kv_k, s->k_data.data(), 0, s->k_data.size());
-            ggml_backend_tensor_set(c->kv_v, s->v_data.data(), 0, s->v_data.size());
-        };
+        auto restore_fn = [&kv_pool](cohere_context*, core_attn::kv_snapshot* s) { kv_pool.restore(s); };
 
-        auto snap_free_fn = [](cohere_kv_snap* s) { delete s; };
+        auto snap_free_fn = [&kv_pool](core_attn::kv_snapshot* s) { kv_pool.release(s); };
 
         // Capture T_enc so step_fn can pass it to cohere_decode_step.
         const int beam_T_enc = T_enc;
@@ -2927,7 +3125,7 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
         // Set COHERE_DUMP_ATTN=/path/to/file.bin to activate.
         // Format: int32 n_tok, int32 n_heads, int32 T_enc, then
         //         n_tok × n_heads × T_enc float32 row-major.
-        if (const char* dump_path = getenv("COHERE_DUMP_ATTN")) {
+        if (const char* dump_path = crispasr_env::get("CRISPASR_COHERE_DUMP_ATTN")) {
             if (FILE* fp = fopen(dump_path, "wb")) {
                 int32_t hdr[3] = {n_tok, n_heads, T_enc};
                 fwrite(hdr, sizeof(hdr), 1, fp);

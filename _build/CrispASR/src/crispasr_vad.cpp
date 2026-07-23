@@ -21,13 +21,86 @@
 #include "crispasr_vad_encdec.h" // Whisper-encoder + decoder VAD (ONNX-converted)
 #define CA_HAVE_WVAD_ENCDEC 1
 #endif
+#if __has_include("webrtc_vad.h")
+#include "webrtc_vad.h" // WebRTC GMM-based VAD (no model file)
+#define CA_HAVE_WEBRTC_VAD 1
+#endif
 
 #include <algorithm>
+#include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <cmath>
 #include <string>
+
+// ---- FireRed VAD context cache (§176e) ----
+// Same pattern as MarbleNet/Silero: avoid init/free per call.
+// firered_vad_context holds only immutable model weights + backend —
+// no per-call mutable state — so the mutex is only needed to prevent
+// concurrent GPU backend access, not for state isolation.
+static std::mutex g_firered_cache_mtx;
+static firered_vad_context* g_firered_cache_ctx = nullptr;
+static std::string g_firered_cache_path;
+
+static firered_vad_context* firered_vad_get_cached_locked(const char* path) {
+    if (g_firered_cache_ctx && g_firered_cache_path == path)
+        return g_firered_cache_ctx;
+    if (g_firered_cache_ctx) {
+        firered_vad_free(g_firered_cache_ctx);
+        g_firered_cache_ctx = nullptr;
+        g_firered_cache_path.clear();
+    }
+    g_firered_cache_ctx = firered_vad_init(path);
+    if (g_firered_cache_ctx)
+        g_firered_cache_path = path;
+    return g_firered_cache_ctx;
+}
+
+// ---- MarbleNet VAD context cache (§176e) ----
+// Same pattern as Silero: avoid init/free per call.
+#ifdef CA_HAVE_MARBLENET_VAD
+static std::mutex g_marblenet_cache_mtx;
+static marblenet_vad_context* g_marblenet_cache_ctx = nullptr;
+static std::string g_marblenet_cache_path;
+
+static marblenet_vad_context* marblenet_vad_get_cached_locked(const char* path) {
+    if (g_marblenet_cache_ctx && g_marblenet_cache_path == path)
+        return g_marblenet_cache_ctx;
+    if (g_marblenet_cache_ctx) {
+        marblenet_vad_free(g_marblenet_cache_ctx);
+        g_marblenet_cache_ctx = nullptr;
+        g_marblenet_cache_path.clear();
+    }
+    g_marblenet_cache_ctx = marblenet_vad_init(path);
+    if (g_marblenet_cache_ctx)
+        g_marblenet_cache_path = path;
+    return g_marblenet_cache_ctx;
+}
+#endif
+
+// ---- WhisperEncDec VAD context cache (§176e) ----
+#ifdef CA_HAVE_WVAD_ENCDEC
+static std::mutex g_encdec_cache_mtx;
+static whisper_vad_encdec_context* g_encdec_cache_ctx = nullptr;
+static std::string g_encdec_cache_path;
+
+static whisper_vad_encdec_context* encdec_vad_get_cached_locked(const char* path) {
+    if (g_encdec_cache_ctx && g_encdec_cache_path == path)
+        return g_encdec_cache_ctx;
+    if (g_encdec_cache_ctx) {
+        whisper_vad_encdec_free(g_encdec_cache_ctx);
+        g_encdec_cache_ctx = nullptr;
+        g_encdec_cache_path.clear();
+    }
+    g_encdec_cache_ctx = whisper_vad_encdec_init(path);
+    if (g_encdec_cache_ctx)
+        g_encdec_cache_path = path;
+    return g_encdec_cache_ctx;
+}
+#endif
 
 // ---- Silero VAD context cache (fixes #132) ----
 // Creating and destroying the ggml scheduler + backend on every request
@@ -68,12 +141,34 @@ static whisper_vad_context* silero_vad_get_cached_locked(const char* vad_model_p
 }
 
 void crispasr_vad_free_cache() {
-    std::lock_guard<std::mutex> lock(g_silero_cache_mtx);
-    if (g_silero_cache_ctx) {
-        whisper_vad_free(g_silero_cache_ctx);
-        g_silero_cache_ctx = nullptr;
-        g_silero_cache_path.clear();
+    {
+        std::lock_guard<std::mutex> lock(g_silero_cache_mtx);
+        if (g_silero_cache_ctx) {
+            whisper_vad_free(g_silero_cache_ctx);
+            g_silero_cache_ctx = nullptr;
+            g_silero_cache_path.clear();
+        }
     }
+#ifdef CA_HAVE_MARBLENET_VAD
+    {
+        std::lock_guard<std::mutex> lock(g_marblenet_cache_mtx);
+        if (g_marblenet_cache_ctx) {
+            marblenet_vad_free(g_marblenet_cache_ctx);
+            g_marblenet_cache_ctx = nullptr;
+            g_marblenet_cache_path.clear();
+        }
+    }
+#endif
+#ifdef CA_HAVE_WVAD_ENCDEC
+    {
+        std::lock_guard<std::mutex> lock(g_encdec_cache_mtx);
+        if (g_encdec_cache_ctx) {
+            whisper_vad_encdec_free(g_encdec_cache_ctx);
+            g_encdec_cache_ctx = nullptr;
+            g_encdec_cache_path.clear();
+        }
+    }
+#endif
 }
 
 // Check if a model path is a FireRedVAD model (by filename pattern)
@@ -91,7 +186,8 @@ static std::vector<crispasr_audio_slice> compute_firered_vad_slices(const float*
                                                                     const crispasr_vad_options& opts) {
     std::vector<crispasr_audio_slice> slices;
 
-    firered_vad_context* vctx = firered_vad_init(vad_model_path);
+    std::unique_lock<std::mutex> lock(g_firered_cache_mtx);
+    firered_vad_context* vctx = firered_vad_get_cached_locked(vad_model_path);
     if (!vctx) {
         fprintf(stderr, "crispasr: warning: failed to load FireRedVAD model '%s'\n", vad_model_path);
         return slices;
@@ -114,8 +210,7 @@ static std::vector<crispasr_audio_slice> compute_firered_vad_slices(const float*
         }
     }
     free(segs);
-    firered_vad_free(vctx);
-    return slices;
+    return slices; // vctx stays cached; lock released here
 }
 
 std::vector<crispasr_audio_slice> crispasr_compute_vad_slices(const float* samples, int n_samples, int sample_rate,
@@ -132,7 +227,8 @@ std::vector<crispasr_audio_slice> crispasr_compute_vad_slices(const float* sampl
     }
 #ifdef CA_HAVE_MARBLENET_VAD
     else if (vpath.find("marblenet") != std::string::npos && vpath.find(".gguf") != std::string::npos) {
-        marblenet_vad_context* vctx = marblenet_vad_init(vad_model_path);
+        std::lock_guard<std::mutex> vad_lock(g_marblenet_cache_mtx);
+        marblenet_vad_context* vctx = marblenet_vad_get_cached_locked(vad_model_path);
         if (vctx) {
             marblenet_vad_segment* segs = nullptr;
             int n_segs = 0;
@@ -150,7 +246,7 @@ std::vector<crispasr_audio_slice> crispasr_compute_vad_slices(const float* sampl
             }
             if (segs)
                 free(segs);
-            marblenet_vad_free(vctx);
+            // Do NOT free vctx — it's cached.
         }
     }
 #endif
@@ -158,7 +254,8 @@ std::vector<crispasr_audio_slice> crispasr_compute_vad_slices(const float* sampl
     else if (std::string(vad_model_path).find("whisper") != std::string::npos &&
              std::string(vad_model_path).find("vad") != std::string::npos &&
              std::string(vad_model_path).find(".gguf") != std::string::npos) {
-        whisper_vad_encdec_context* vctx = whisper_vad_encdec_init(vad_model_path);
+        std::lock_guard<std::mutex> vad_lock(g_encdec_cache_mtx);
+        whisper_vad_encdec_context* vctx = encdec_vad_get_cached_locked(vad_model_path);
         if (vctx) {
             whisper_vad_encdec_segment* segs = nullptr;
             int n_segs = 0;
@@ -191,8 +288,32 @@ std::vector<crispasr_audio_slice> crispasr_compute_vad_slices(const float* sampl
             }
             if (segs)
                 free(segs);
-            whisper_vad_encdec_free(vctx);
+            // Do NOT free vctx — it's cached.
         }
+    }
+#endif
+#ifdef CA_HAVE_WEBRTC_VAD
+    else if (vpath.find("webrtc") != std::string::npos) {
+        // WebRTC VAD: pure algorithmic GMM, no model file needed.
+        // The "model path" is just a sentinel (e.g. "webrtc" or "--vad-model webrtc").
+        webrtc_vad_segment* segs = nullptr;
+        int n_segs = 0;
+        float min_speech_sec = opts.min_speech_duration_ms / 1000.0f;
+        float min_silence_sec = opts.min_silence_duration_ms / 1000.0f;
+        int rc =
+            webrtc_vad_detect(samples, n_samples, &segs, &n_segs, opts.threshold, min_speech_sec, min_silence_sec, -1);
+        if (rc == 0 && segs && n_segs > 0) {
+            for (int i = 0; i < n_segs; i++) {
+                int64_t t0_cs = (int64_t)(segs[i].start_sec * 100.0f);
+                int64_t t1_cs = (int64_t)(segs[i].end_sec * 100.0f);
+                int s = std::max(0, (int)(segs[i].start_sec * sample_rate));
+                int e = std::min(n_samples, (int)(segs[i].end_sec * sample_rate));
+                if (e > s)
+                    slices.push_back({s, e, t0_cs, t1_cs});
+            }
+        }
+        if (segs)
+            free(segs);
     }
 #endif
     else {
@@ -240,34 +361,52 @@ std::vector<crispasr_audio_slice> crispasr_compute_vad_slices(const float* sampl
     slices = crispasr_post_merge_vad_slices(slices, sample_rate, opts);
 
     // Post-split: break any VAD segment that exceeds chunk_seconds into
-    // sub-segments. Prevents OOM on very long continuous speech (10+ min
-    // lectures). We split into roughly equal parts.
-    if (opts.chunk_seconds > 0) {
-        const int max_samples = opts.chunk_seconds * sample_rate;
-        std::vector<crispasr_audio_slice> split;
-        for (auto& sl : slices) {
-            const int dur = sl.end - sl.start;
-            if (dur <= max_samples) {
-                split.push_back(sl);
-            } else {
-                const int n_parts = (dur + max_samples - 1) / max_samples;
-                const int part_samples = dur / n_parts;
-                for (int p = 0; p < n_parts; p++) {
-                    const int s = sl.start + p * part_samples;
-                    const int e = (p == n_parts - 1) ? sl.end : sl.start + (p + 1) * part_samples;
-                    split.push_back({
-                        s,
-                        e,
-                        (int64_t)((double)s / sample_rate * 100.0),
-                        (int64_t)((double)e / sample_rate * 100.0),
-                    });
-                }
-            }
-        }
-        slices = std::move(split);
-    }
+    // sub-segments. See crispasr_rechunk_slices — the same step is reused on the
+    // import path so a raw-segment export (issue #227) can be re-chunked to
+    // whatever chunk length the importing run wants.
+    if (opts.chunk_seconds > 0)
+        slices = crispasr_rechunk_slices(slices, samples, n_samples, sample_rate, opts.chunk_seconds);
 
     return slices;
+}
+
+std::vector<crispasr_audio_slice> crispasr_rechunk_slices(const std::vector<crispasr_audio_slice>& in,
+                                                          const float* samples, int n_samples, int sample_rate,
+                                                          int chunk_seconds) {
+    // Break any segment longer than chunk_seconds into sub-segments. Prevents
+    // OOM on very long continuous speech (10+ min lectures). Cuts land on the
+    // lowest-RMS 100 ms inside a ±2 s window around each target rather than at
+    // equal parts, so a cut inside continuous speech does not slice mid-word
+    // (issue #89: words spanning an arbitrary cut are lost by both adjacent
+    // slices). Segments already within the limit pass through untouched, so a
+    // raw-VAD-segment export re-chunked at any length reproduces exactly what a
+    // fresh run at that length would have computed.
+    if (chunk_seconds <= 0 || n_samples <= 0)
+        return in;
+    const int max_samples = chunk_seconds * sample_rate;
+    const size_t search_window_samples = (size_t)(2.0 * sample_rate);
+    const size_t energy_win_samples = (size_t)((double)sample_rate * 0.1); // 100 ms
+    std::vector<crispasr_audio_slice> split;
+    for (const auto& sl : in) {
+        const int dur = sl.end - sl.start;
+        if (dur <= max_samples || sl.start < 0 || sl.end > n_samples) {
+            split.push_back(sl);
+        } else {
+            auto ranges = audio_chunking::split_at_energy_minima(samples + sl.start, (size_t)dur, (size_t)max_samples,
+                                                                 search_window_samples, energy_win_samples);
+            for (auto& r : ranges) {
+                const int s = sl.start + (int)r.first;
+                const int e = sl.start + (int)r.second;
+                split.push_back({
+                    s,
+                    e,
+                    (int64_t)((double)s / sample_rate * 100.0),
+                    (int64_t)((double)e / sample_rate * 100.0),
+                });
+            }
+        }
+    }
+    return split;
 }
 
 std::vector<crispasr_audio_slice> crispasr_fixed_chunk_slices(int n_samples, int sample_rate, int chunk_seconds) {
@@ -376,4 +515,153 @@ int64_t crispasr_vad_remap_timestamp(const std::vector<crispasr_vad_mapping>& ma
         return a.original_cs;
     const double frac = (double)(stitched_cs - a.stitched_cs) / (double)(b.stitched_cs - a.stitched_cs);
     return a.original_cs + (int64_t)(frac * (double)(b.original_cs - a.original_cs));
+}
+
+// ---- VAD segment boundary export / import (issue #227) ----
+
+bool crispasr_vad_chunk_mismatch(float imported_chunk, float requested_chunk) {
+    const float req = requested_chunk > 0.0f ? requested_chunk : 30.0f;
+    return imported_chunk > 0.0f && std::fabs(imported_chunk - req) > 0.01f;
+}
+
+std::string crispasr_serialize_vad_slices(const std::vector<crispasr_audio_slice>& slices, int sample_rate,
+                                          float chunk_seconds, bool is_raw_segments) {
+    std::string out;
+    out.reserve(80 + slices.size() * 96);
+    out += "{\n  \"crispasr_vad\": {\n";
+    out += "    \"version\": 1,\n";
+    // "kind" distinguishes the two exportable forms (issue #227):
+    //   "chunks"       -- chunk boundaries; valid only for the chunk length that
+    //                     produced them, hence chunk_cs and the import gate.
+    //   "vad_segments" -- raw speech segments; chunk-length-independent, re-chunked
+    //                     per run on import. chunk_cs is 0/absent for these.
+    // Absent "kind" (files written before this field) is read as "chunks", which
+    // is the historical behaviour.
+    out += std::string("    \"kind\": \"") + (is_raw_segments ? "vad_segments" : "chunks") + "\",\n";
+    out += "    \"sample_rate\": " + std::to_string(sample_rate) + ",\n";
+    // The slices are CHUNK boundaries, not raw speech segments, so they depend
+    // on the chunk length that produced them (issue #227: exporting at 30 s and
+    // importing at 5 s silently reuses the wrong chunking). Recorded in
+    // centiseconds so the existing integer field parser can read it back; 0
+    // means "written by a version that did not record it".
+    if (!is_raw_segments)
+        out += "    \"chunk_cs\": " + std::to_string((long long)(chunk_seconds * 100.0f + 0.5f)) + ",\n";
+    out += "    \"num_slices\": " + std::to_string(slices.size()) + ",\n";
+    out += "    \"slices\": [";
+    for (size_t i = 0; i < slices.size(); ++i) {
+        const auto& s = slices[i];
+        out += (i == 0) ? "\n" : ",\n";
+        out += "      { \"start\": " + std::to_string(s.start) + ", \"end\": " + std::to_string(s.end) +
+               ", \"t0_cs\": " + std::to_string((long long)s.t0_cs) +
+               ", \"t1_cs\": " + std::to_string((long long)s.t1_cs) + " }";
+    }
+    out += slices.empty() ? "]\n" : "\n    ]\n";
+    out += "  }\n}\n";
+    return out;
+}
+
+namespace {
+
+// Find the value of an integer field `"<key>"` starting at or after `from`
+// within [begin, end) of `text`. Returns true and sets `value` + `next`
+// (index just past the parsed number) on success. Tolerant of whitespace
+// between the key, the colon, and the number.
+bool ca_vad_find_int(const std::string& text, size_t from, size_t end, const char* key, int64_t& value, size_t& next) {
+    const std::string needle = std::string("\"") + key + "\"";
+    size_t k = text.find(needle, from);
+    if (k == std::string::npos || k >= end)
+        return false;
+    size_t p = k + needle.size();
+    while (p < end && (text[p] == ' ' || text[p] == '\t' || text[p] == '\n' || text[p] == '\r'))
+        p++;
+    if (p >= end || text[p] != ':')
+        return false;
+    p++;
+    while (p < end && (text[p] == ' ' || text[p] == '\t' || text[p] == '\n' || text[p] == '\r'))
+        p++;
+    if (p >= end)
+        return false;
+    size_t num_start = p;
+    if (text[p] == '+' || text[p] == '-')
+        p++;
+    size_t digits = 0;
+    while (p < end && text[p] >= '0' && text[p] <= '9') {
+        p++;
+        digits++;
+    }
+    if (digits == 0)
+        return false;
+    value = (int64_t)std::strtoll(text.c_str() + num_start, nullptr, 10);
+    next = p;
+    return true;
+}
+
+} // namespace
+
+bool crispasr_parse_vad_slices(const std::string& text, std::vector<crispasr_audio_slice>& out, int* sample_rate_out,
+                               float* chunk_seconds_out, bool* is_raw_segments_out) {
+    out.clear();
+    if (sample_rate_out)
+        *sample_rate_out = 0;
+    if (chunk_seconds_out)
+        *chunk_seconds_out = 0.0f;
+    if (is_raw_segments_out) {
+        // Default "chunks": a file with no "kind" predates the field and is a
+        // chunk export by definition.
+        size_t arr0 = text.find("\"slices\"");
+        *is_raw_segments_out = arr0 != std::string::npos && text.rfind("\"vad_segments\"", arr0) != std::string::npos;
+    }
+
+    // Optional top-level sample_rate (before the slices array).
+    size_t arr = text.find("\"slices\"");
+    if (arr == std::string::npos)
+        return false;
+    if (sample_rate_out) {
+        int64_t sr = 0;
+        size_t tmp = 0;
+        if (ca_vad_find_int(text, 0, arr, "sample_rate", sr, tmp))
+            *sample_rate_out = (int)sr;
+    }
+    if (chunk_seconds_out) {
+        int64_t cs = 0;
+        size_t tmp = 0;
+        if (ca_vad_find_int(text, 0, arr, "chunk_cs", cs, tmp))
+            *chunk_seconds_out = (float)cs / 100.0f;
+    }
+
+    size_t lb = text.find('[', arr);
+    if (lb == std::string::npos)
+        return false;
+    size_t rb = text.find(']', lb);
+    if (rb == std::string::npos)
+        return false;
+
+    // Walk each { ... } object inside the array.
+    size_t p = lb + 1;
+    while (p < rb) {
+        size_t obj_lb = text.find('{', p);
+        if (obj_lb == std::string::npos || obj_lb >= rb)
+            break;
+        size_t obj_rb = text.find('}', obj_lb);
+        if (obj_rb == std::string::npos || obj_rb > rb)
+            return false;
+
+        int64_t start = 0, endv = 0, t0 = 0, t1 = 0;
+        size_t nx = 0;
+        if (!ca_vad_find_int(text, obj_lb, obj_rb, "start", start, nx) ||
+            !ca_vad_find_int(text, obj_lb, obj_rb, "end", endv, nx) ||
+            !ca_vad_find_int(text, obj_lb, obj_rb, "t0_cs", t0, nx) ||
+            !ca_vad_find_int(text, obj_lb, obj_rb, "t1_cs", t1, nx)) {
+            out.clear();
+            return false;
+        }
+        crispasr_audio_slice s;
+        s.start = (int)start;
+        s.end = (int)endv;
+        s.t0_cs = t0;
+        s.t1_cs = t1;
+        out.push_back(s);
+        p = obj_rb + 1;
+    }
+    return true;
 }

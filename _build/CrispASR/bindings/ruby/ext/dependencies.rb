@@ -60,7 +60,8 @@ class Dependencies
             "-D", "BUILD_SHARED_LIBS=OFF",
             "-D", "CRISPASR_BUILD_TESTS=OFF",
             "-D", "CRISPASR_BUILD_EXAMPLES=OFF",
-            "-D", "CRISPASR_BUILD_SERVER=OFF"]
+            "-D", "CRISPASR_BUILD_SERVER=OFF",
+            "-D", "CRISPASR_OPUS_FETCH=ON"]
     args << @options.to_s unless @options.to_s.empty?
     system @cmake, *args, exception: true
   end

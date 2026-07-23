@@ -42,7 +42,7 @@ static std::vector<float> load_wav_mono(const char* path, int* out_sr) {
     }
 
     char riff[4];
-    fread(riff, 1, 4, f);
+    (void)!fread(riff, 1, 4, f);
     if (memcmp(riff, "RIFF", 4)) {
         fclose(f);
         fprintf(stderr, "%s: not a RIFF file\n", path);
@@ -50,9 +50,9 @@ static std::vector<float> load_wav_mono(const char* path, int* out_sr) {
     }
 
     uint32_t chunk_size;
-    fread(&chunk_size, 4, 1, f);
+    (void)!fread(&chunk_size, 4, 1, f);
     char wave[4];
-    fread(wave, 1, 4, f);
+    (void)!fread(wave, 1, 4, f);
     if (memcmp(wave, "WAVE", 4)) {
         fclose(f);
         fprintf(stderr, "%s: not WAVE\n", path);
@@ -67,14 +67,14 @@ static std::vector<float> load_wav_mono(const char* path, int* out_sr) {
     uint32_t sz;
     while (fread(id, 1, 4, f) == 4 && fread(&sz, 4, 1, f) == 1) {
         if (!memcmp(id, "fmt ", 4)) {
-            fread(&audio_fmt, 2, 1, f);
-            fread(&n_ch, 2, 1, f);
-            fread(&sr, 4, 1, f);
+            (void)!fread(&audio_fmt, 2, 1, f);
+            (void)!fread(&n_ch, 2, 1, f);
+            (void)!fread(&sr, 4, 1, f);
             uint32_t byte_rate;
-            fread(&byte_rate, 4, 1, f);
+            (void)!fread(&byte_rate, 4, 1, f);
             uint16_t block_align;
-            fread(&block_align, 2, 1, f);
-            fread(&bps, 2, 1, f);
+            (void)!fread(&block_align, 2, 1, f);
+            (void)!fread(&bps, 2, 1, f);
             if (sz > 16)
                 fseek(f, sz - 16, SEEK_CUR);
         } else if (!memcmp(id, "data", 4)) {
@@ -85,7 +85,7 @@ static std::vector<float> load_wav_mono(const char* path, int* out_sr) {
             }
             size_t n = sz / sizeof(int16_t);
             std::vector<int16_t> raw(n);
-            fread(raw.data(), sizeof(int16_t), n, f);
+            (void)!fread(raw.data(), sizeof(int16_t), n, f);
             // downmix to mono
             size_t n_mono = (n_ch > 1) ? n / n_ch : n;
             samples.resize(n_mono);

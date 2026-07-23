@@ -43,7 +43,7 @@ struct chatterbox_context_params {
                               // + min_p=0 to match HF inference_turbo defaults
                               // (tts_turbo.py:248-260, t3.py:415).
     int max_speech_tokens;    // upper bound on T3 AR decode (default 1000)
-    int cfm_steps;            // number of CFM Euler steps (default 10)
+    int cfm_steps;            // CFM Euler steps; 0 = auto (standard 6, meanflow 2)
     bool flash_attn;          // PLAN #89 plumbing — T3 Llama-style AR
                               // loop. Highest-impact target alongside
                               // orpheus for the kernel wiring in #86.
@@ -73,6 +73,14 @@ float* chatterbox_synthesize_mel(struct chatterbox_context* ctx, const char* tex
 // Run only the T3 stage: text → speech tokens. Caller frees with
 // chatterbox_tokens_free. *out_n is set to token count.
 int32_t* chatterbox_synthesize_tokens(struct chatterbox_context* ctx, const char* text, int* out_n);
+
+// Diff-only: deterministic text-token ids fed into the T3 prefill — the
+// output of normalize() + BPE tokenize + [lang] prepend, BEFORE SOT/EOT
+// wrapping and the (stochastic) AR decode. This is the stage where NFKD
+// normalization matters (issue #170): the multilingual path must produce the
+// same ids as upstream MTLTokenizer.encode. Caller frees with
+// chatterbox_tokens_free. *out_n is set to token count.
+int32_t* chatterbox_dump_text_tokens(struct chatterbox_context* ctx, const char* text, int* out_n);
 
 // Synthesise from pre-generated speech tokens (bypasses T3, runs S3Gen+vocoder).
 // Uses precomputed conditioning from conds.pt. Caller frees with chatterbox_pcm_free.
@@ -132,6 +140,12 @@ void chatterbox_set_top_k(struct chatterbox_context* ctx, int top_k);
 void chatterbox_set_repetition_penalty(struct chatterbox_context* ctx, float r);
 void chatterbox_set_max_speech_tokens(struct chatterbox_context* ctx, int n);
 void chatterbox_set_seed(struct chatterbox_context* ctx, uint32_t seed);
+
+// Set language for multilingual models (chatterbox multilingual, lahgtna-chatterbox).
+// lang is an ISO 639-1 code: "ar", "de", "fr", "es", "it", etc.
+// Pass NULL or "" to clear (English default, no prefix).
+// The runtime inserts the [lang] token into the model input if the vocab contains it.
+void chatterbox_set_language(struct chatterbox_context* ctx, const char* lang);
 
 void chatterbox_tokens_free(int32_t* tokens);
 void chatterbox_pcm_free(float* pcm);

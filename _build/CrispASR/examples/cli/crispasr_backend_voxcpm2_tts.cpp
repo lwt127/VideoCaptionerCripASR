@@ -10,6 +10,7 @@
 
 #include "core/audio_resample.h"
 #include "core/wav_reader.h"
+#include "core/crispasr_env.h"
 
 #include "voxcpm2_tts.h"
 
@@ -46,15 +47,15 @@ public:
 
         // CFM inference steps (quality vs speed tradeoff)
         // Default 10; can be lowered to 3 for real-time on slow hardware
-        const char* env_steps = getenv("VOXCPM2_INFERENCE_STEPS");
+        const char* env_steps = crispasr_env::get("CRISPASR_VOXCPM2_INFERENCE_STEPS");
         if (env_steps)
             cp.inference_steps = atoi(env_steps);
 
-        const char* env_cfg = getenv("VOXCPM2_CFG_VALUE");
+        const char* env_cfg = crispasr_env::get("CRISPASR_VOXCPM2_CFG_VALUE");
         if (env_cfg)
             cp.cfg_value = (float)atof(env_cfg);
 
-        const char* env_max = getenv("VOXCPM2_MAX_LEN");
+        const char* env_max = crispasr_env::get("CRISPASR_VOXCPM2_MAX_LEN");
         if (env_max)
             cp.max_len = atoi(env_max);
 
@@ -80,25 +81,36 @@ public:
         // Voice cloning path: load WAV, resample to 16 kHz mono float32, hand to
         // voxcpm2_synthesize_clone. The encoder pads internally to the patch
         // length, so any ref duration ≥ ~2 s should work.
+        // params.tts_voice is the per-call voice — always takes precedence over
+        // the init-time voice_path_. This is critical for disclaimer synthesis:
+        // the disclaimer code clears tts_voice to request zero-shot even when a
+        // voice was set at init time. Fallback to voice_path_ only when the
+        // caller never set tts_voice (empty params from a bare API call).
+        // By value, not by reference: the `""` branch yields a temporary
+        // std::string, so the ternary is a prvalue. Binding it to a
+        // reference trips cppcheck's danglingTemporaryLifetime; a copy of a
+        // short path string is cheap and unambiguous.
+        const std::string ref_path =
+            !params.tts_voice.empty() ? params.tts_voice : (params.tts_voice_clone_consent ? "" : voice_path_);
         std::vector<float> ref_pcm;
-        if (!voice_path_.empty()) {
+        if (!ref_path.empty()) {
             int sr = 0;
-            if (crispasr::core::read_wav_mono_pcm16(voice_path_, ref_pcm, sr)) {
+            if (crispasr::core::read_wav_mono_pcm16(ref_path, ref_pcm, sr)) {
                 if (sr != 16000 && sr > 0) {
                     ref_pcm = core_audio::resample_polyphase(ref_pcm.data(), (int)ref_pcm.size(), sr, 16000);
                     if (!params.no_prints) {
                         fprintf(stderr, "crispasr[voxcpm2-tts]: resampled reference '%s' from %d Hz to 16000 Hz\n",
-                                voice_path_.c_str(), sr);
+                                ref_path.c_str(), sr);
                     }
                 }
                 if (!params.no_prints) {
                     fprintf(stderr, "crispasr[voxcpm2-tts]: loaded reference audio '%s' (%zu samples @ 16 kHz)\n",
-                            voice_path_.c_str(), ref_pcm.size());
+                            ref_path.c_str(), ref_pcm.size());
                 }
             } else {
                 fprintf(stderr,
                         "crispasr[voxcpm2-tts]: failed to load reference audio '%s' — falling back to zero-shot\n",
-                        voice_path_.c_str());
+                        ref_path.c_str());
             }
         }
 

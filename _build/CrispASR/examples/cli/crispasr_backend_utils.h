@@ -1,6 +1,7 @@
 #pragma once
 
 #include "whisper_params.h"
+#include "core/lang_names.h"
 
 #include <cctype>
 #include <string>
@@ -56,4 +57,12 @@ inline void crispasr_lowercase_ascii(std::string& s) {
         if (u >= 'A' && u <= 'Z')
             c = (char)(u + 32);
     }
+}
+
+// Map an ISO-639-1 code to a plain English language name for prompt
+// injection in instruct-tuned audio-LLM backends. Thin alias over the
+// shared core_lang::iso_to_english() (src/core/lang_names.h); kept as a
+// named CLI-side function so existing adapter call sites are unchanged.
+inline std::string crispasr_iso_to_english_lang(const std::string& code) {
+    return core_lang::iso_to_english(code);
 }

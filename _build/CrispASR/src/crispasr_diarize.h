@@ -75,3 +75,7 @@ struct CrispasrDiarizeOptions {
 /// to pick a label.
 bool crispasr_diarize_segments(const float* left, const float* right, int n_samples, bool is_stereo,
                                std::vector<CrispasrDiarizeSegment>& segs, const CrispasrDiarizeOptions& opts);
+
+/// Free the cached pyannote segmentation context (§176e). Call at shutdown
+/// or when the model is no longer needed.
+void crispasr_diarize_free_pyannote_cache();

@@ -248,6 +248,11 @@ class _LowMemMimoAudio:
             self.path, args=args, torch_dtype=dtype, device_map={"": self.device},
         )
         self.model.eval()
+        try:
+            from . import _reload_guard
+        except ImportError:
+            import _reload_guard
+        _reload_guard.reload_if_random_init(self.model, self.path)
 
     # --- Methods mirroring the upstream MimoAudio surface used by the dumper ---
 

@@ -107,7 +107,7 @@ def write_markdown(backends: list[dict],
     lines.append(f"All {len(backends)} backends compiled into the `crispasr` binary, "
                  f"with their declared capability bits. For an interactive "
                  f"sortable/filterable view, open "
-                 f"[`feature-matrix.html`](feature-matrix.html).")
+                 f"[`feature-matrix.html`](https://htmlpreview.github.io/?https://github.com/CrispStrobe/CrispASR/blob/main/docs/feature-matrix.html).")
     lines.append("")
     # Header
     headers = ["Backend"] + [label for _, label in caps]

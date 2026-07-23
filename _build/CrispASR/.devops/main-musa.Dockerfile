@@ -16,7 +16,13 @@ RUN apt-get update && \
 
 COPY . .
 # Enable muBLAS
-RUN cmake -B build -DCRISPASR_BUILD_TESTS=OFF -DGGML_MUSA=1 && \
+# NOTE (#261): GGML_NATIVE=OFF does NOT restrict the ISA to the flags listed —
+# ggml sets INS_ENB=ON in that case, so BMI2/SSE42/AVX default ON anyway. The
+# real baseline is Haswell-class (AVX2+FMA+F16C+BMI2); spelled out explicitly
+# so it's visible. See .devops/main-cuda.Dockerfile for the full explanation.
+RUN cmake -B build -DCRISPASR_BUILD_TESTS=OFF -DGGML_MUSA=1 \
+    -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
+    -DGGML_BMI2=ON -DGGML_SSE42=ON -DGGML_AVX=ON -DGGML_AVX512=OFF && \
     cmake --build build -j"$(nproc)" --target crispasr-cli
 
 RUN find /app/build -name "*.o" -delete && \

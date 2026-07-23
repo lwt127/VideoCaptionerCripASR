@@ -56,12 +56,10 @@ static inline ggml_tensor* swiglu_fused_gate_up(ggml_context* ctx, ggml_tensor* 
     ggml_tensor* gate_up = ggml_mul_mat(ctx, gate_up_w, x);
     const int T = (int)gate_up->ne[1];
     const size_t row_bytes = gate_up->nb[1];
-    ggml_tensor* gate = ggml_view_2d(ctx, gate_up, ff_dim, T, row_bytes, 0);
-    ggml_tensor* up = ggml_view_2d(ctx, gate_up, ff_dim, T, row_bytes, ff_dim * ggml_type_size(gate_up->type));
-    // No ggml_cont: silu and mul are elementwise and accept strided views,
-    // and the downstream matmul (down_w × mlp) materialises mlp into its
-    // own contiguous output. Avoiding cont here saves a buffer copy on
-    // every decode step and ~30 ms on a JFK 11s decode.
+    // ggml_cont: non-contiguous views segfault on Vulkan/RDNA4 (issue #184).
+    ggml_tensor* gate = ggml_cont(ctx, ggml_view_2d(ctx, gate_up, ff_dim, T, row_bytes, 0));
+    ggml_tensor* up =
+        ggml_cont(ctx, ggml_view_2d(ctx, gate_up, ff_dim, T, row_bytes, ff_dim * ggml_type_size(gate_up->type)));
     ggml_tensor* mlp = ggml_mul(ctx, ggml_silu(ctx, gate), up);
     return ggml_mul_mat(ctx, down_w, mlp);
 }

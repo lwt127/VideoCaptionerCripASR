@@ -219,9 +219,11 @@ int main(int argc, char** argv) {
             }
         }
 
-        // Enrollment
+        // Enrollment (dev harness — synthetic/local test data, consent
+        // attestation is the harness operator's)
         if (!enroll_name.empty() && !enroll_dir.empty()) {
-            speaker_db_enroll(enroll_dir.c_str(), enroll_name.c_str(), af.embedding.data(), dim);
+            speaker_db_enroll(enroll_dir.c_str(), enroll_name.c_str(), af.embedding.data(), dim,
+                              /*consent_attested=*/true);
         }
 
         // Matching

@@ -20,7 +20,7 @@
 // ── Helpers: build synthetic segments and sherpa caches ──────────────
 
 static crispasr_segment make_seg(int64_t t0, int64_t t1, const std::string& text,
-                                  const std::vector<std::pair<int64_t, int64_t>>& word_times = {}) {
+                                 const std::vector<std::pair<int64_t, int64_t>>& word_times = {}) {
     crispasr_segment s;
     s.t0 = t0;
     s.t1 = t1;
@@ -31,13 +31,15 @@ static crispasr_segment make_seg(int64_t t0, int64_t t1, const std::string& text
         std::string w;
         for (char c : text) {
             if (c == ' ') {
-                if (!w.empty()) words_text.push_back(w);
+                if (!w.empty())
+                    words_text.push_back(w);
                 w.clear();
             } else {
                 w += c;
             }
         }
-        if (!w.empty()) words_text.push_back(w);
+        if (!w.empty())
+            words_text.push_back(w);
     }
     for (size_t i = 0; i < words_text.size(); i++) {
         crispasr_word w;
@@ -51,8 +53,7 @@ static crispasr_segment make_seg(int64_t t0, int64_t t1, const std::string& text
     return s;
 }
 
-static CrispasrSherpaCache make_sherpa_cache(
-    const std::vector<std::tuple<double, double, int>>& regions) {
+static CrispasrSherpaCache make_sherpa_cache(const std::vector<std::tuple<double, double, int>>& regions) {
     CrispasrSherpaCache cache;
     for (auto& [t0, t1, spk] : regions)
         cache.segments.push_back({t0, t1, spk});
@@ -118,7 +119,7 @@ TEST_CASE("global diarize: segment inside single speaker region", "[diarize][uni
     auto seg = make_seg(100, 400, "hello world");
     // Check overlap: the segment [1.0, 4.0] overlaps [0, 5] by 3.0s
     // and overlaps [5, 10] by 0.0s → speaker 0 wins
-    double ov0 = std::min(4.0, 5.0) - std::max(1.0, 0.0); // 3.0
+    double ov0 = std::min(4.0, 5.0) - std::max(1.0, 0.0);  // 3.0
     double ov1 = std::min(4.0, 10.0) - std::max(1.0, 5.0); // -1.0 → 0
     REQUIRE(ov0 > 0.0);
     REQUIRE(ov1 <= 0.0);
@@ -132,14 +133,15 @@ TEST_CASE("global diarize: segment spanning two speakers", "[diarize][unit]") {
         {3.0, 6.0, 1},
     });
     // Segment [0.0s, 6.0s] = [0cs, 600cs] with 6 words
-    auto seg = make_seg(0, 600, "word1 word2 word3 word4 word5 word6", {
-        {0, 100},    // word1: 0-1s → speaker 0
-        {100, 200},  // word2: 1-2s → speaker 0
-        {200, 300},  // word3: 2-3s → speaker 0
-        {300, 400},  // word4: 3-4s → speaker 1
-        {400, 500},  // word5: 4-5s → speaker 1
-        {500, 600},  // word6: 5-6s → speaker 1
-    });
+    auto seg = make_seg(0, 600, "word1 word2 word3 word4 word5 word6",
+                        {
+                            {0, 100},   // word1: 0-1s → speaker 0
+                            {100, 200}, // word2: 1-2s → speaker 0
+                            {200, 300}, // word3: 2-3s → speaker 0
+                            {300, 400}, // word4: 3-4s → speaker 1
+                            {400, 500}, // word5: 4-5s → speaker 1
+                            {500, 600}, // word6: 5-6s → speaker 1
+                        });
 
     // Verify the word assignment: words 1-3 overlap speaker 0, words 4-6 overlap speaker 1
     for (int i = 0; i < 3; i++) {
@@ -197,9 +199,15 @@ TEST_CASE("global diarize: rapid speaker alternation", "[diarize][unit]") {
     REQUIRE(cache.segments.size() == 6);
 
     // A single 3-second ASR segment covering all turns
-    auto seg = make_seg(0, 300, "a b c d e f", {
-        {0, 50}, {50, 100}, {100, 150}, {150, 200}, {200, 250}, {250, 300},
-    });
+    auto seg = make_seg(0, 300, "a b c d e f",
+                        {
+                            {0, 50},
+                            {50, 100},
+                            {100, 150},
+                            {150, 200},
+                            {200, 250},
+                            {250, 300},
+                        });
     REQUIRE(seg.words.size() == 6);
 }
 
@@ -223,14 +231,14 @@ TEST_CASE("global diarize: same speaker ID across slices", "[diarize][unit]") {
     // The whole point of #110: speaker IDs from a global timeline
     // must be consistent whether we look at slice 1 or slice 2.
     auto cache = make_sherpa_cache({
-        {0.0, 10.0, 0},    // speaker 0 for first 10s
-        {10.0, 20.0, 1},   // speaker 1 for 10-20s
-        {20.0, 30.0, 0},   // speaker 0 returns at 20-30s
+        {0.0, 10.0, 0},  // speaker 0 for first 10s
+        {10.0, 20.0, 1}, // speaker 1 for 10-20s
+        {20.0, 30.0, 0}, // speaker 0 returns at 20-30s
     });
 
     // Slice 1: segment at [2s, 8s] → should be speaker 0
     auto seg1 = make_seg(200, 800, "slice one");
-    double ov_spk0 = std::min(8.0, 10.0) - std::max(2.0, 0.0); // 6.0
+    double ov_spk0 = std::min(8.0, 10.0) - std::max(2.0, 0.0);  // 6.0
     double ov_spk1 = std::min(8.0, 20.0) - std::max(2.0, 10.0); // 0 (negative)
     REQUIRE(ov_spk0 > 0);
     REQUIRE(ov_spk1 <= 0);
@@ -254,7 +262,7 @@ TEST_CASE("global diarize: overlap math edge cases", "[diarize][unit]") {
     // Segment [4.9s, 5.1s] straddles the boundary → speaker 0 and 1 each get 0.1s
     // Tie-breaking: first match wins in assign_speakers_from_sherpa
     auto seg = make_seg(490, 510, "boundary");
-    double ov0 = std::min(5.1, 5.0) - std::max(4.9, 0.0); // 0.1
+    double ov0 = std::min(5.1, 5.0) - std::max(4.9, 0.0);  // 0.1
     double ov1 = std::min(5.1, 10.0) - std::max(4.9, 5.0); // 0.1
     REQUIRE_THAT(ov0, Catch::Matchers::WithinAbs(0.1, 1e-9));
     REQUIRE_THAT(ov1, Catch::Matchers::WithinAbs(0.1, 1e-9));
@@ -274,20 +282,29 @@ TEST_CASE("global diarize: overlap math edge cases", "[diarize][unit]") {
 
 TEST_CASE("global diarize: split text reconstruction", "[diarize][unit]") {
     // Simulate splitting a 4-word segment into two speaker runs
-    auto seg = make_seg(0, 400, "hello world foo bar", {
-        {0, 100}, {100, 200}, {200, 300}, {300, 400},
-    });
+    auto seg = make_seg(0, 400, "hello world foo bar",
+                        {
+                            {0, 100},
+                            {100, 200},
+                            {200, 300},
+                            {300, 400},
+                        });
 
     // Words 0-1 → "hello world", words 2-3 → "foo bar"
     std::string part1, part2;
     for (size_t j = 0; j < 2; j++) {
-        if (!part1.empty()) part1 += ' ';
+        if (!part1.empty())
+            part1 += ' ';
         part1 += seg.words[j].text;
     }
     for (size_t j = 2; j < 4; j++) {
-        if (!part2.empty()) part2 += ' ';
+        if (!part2.empty())
+            part2 += ' ';
         part2 += seg.words[j].text;
     }
     REQUIRE(part1 == "hello world");
     REQUIRE(part2 == "foo bar");
 }
+
+// Issue #267 tests live in test_diarize_align_order.cpp — they need
+// whisper_params.h which requires linking crispasr-lib.

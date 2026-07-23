@@ -15,6 +15,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "core/crispasr_env.h"
 
 class GraniteNleBackend : public CrispasrBackend {
 public:
@@ -27,14 +28,14 @@ public:
         // post-steps work even though the runtime is encoder+projector only
         // with no LLM decode features.
         return CAP_AUTO_DOWNLOAD | CAP_FLASH_ATTN | CAP_TIMESTAMPS_CTC | CAP_DIARIZE | CAP_PUNCTUATION_NATIVE |
-               CAP_UNBOUNDED_INPUT;
+               CAP_UNBOUNDED_INPUT | CAP_BEAM_SEARCH;
     }
 
     bool init(const whisper_params& params) override {
         granite_nle_context_params cp = granite_nle_context_default_params();
         cp.n_threads = params.n_threads;
         cp.verbosity = params.no_prints ? 0 : 1;
-        if (getenv("CRISPASR_VERBOSE") || getenv("GRANITE_NLE_BENCH"))
+        if (getenv("CRISPASR_VERBOSE") || crispasr_env::get("CRISPASR_GRANITE_NLE_BENCH"))
             cp.verbosity = 2;
         cp.use_gpu = params.use_gpu;
         ctx_ = granite_nle_init_from_file(params.model.c_str(), cp);
@@ -42,11 +43,17 @@ public:
     }
 
     std::vector<crispasr_segment> transcribe(const float* samples, int n_samples, int64_t t_offset_cs,
-                                             const whisper_params& /*params*/) override {
+                                             const whisper_params& params) override {
         std::vector<crispasr_segment> out;
         if (!ctx_)
             return out;
 
+        // Large BPE vocab (100K+) needs aggressive gamma pruning for beam to
+        // finish in time. Default gamma=2.3 matches parakeet/sensevoice tuning.
+        float gamma = 2.3f;
+        if (const char* v = std::getenv("CRISPASR_MAES_GAMMA"))
+            gamma = (float)atof(v);
+        granite_nle_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1, gamma);
         char* text = granite_nle_transcribe(ctx_, samples, n_samples);
         if (!text || !text[0]) {
             free(text);

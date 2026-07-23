@@ -40,9 +40,15 @@
 #include "core/conv.h"
 #include "core/dac_decoder.h"
 #include "core/gguf_loader.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (§232 dia GPU path)
+#include "core/crispasr_env.h"
+#if defined(GGML_USE_METAL)
+#include "ggml-metal.h" // ggml_backend_is_metal (§232 Metal-only GPU default)
+#endif
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -50,6 +56,32 @@
 #include <random>
 #include <string>
 #include <vector>
+
+// ===========================================================================
+// Bench instrumentation — `DIA_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool dia_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_DIA_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct dia_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit dia_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~dia_bench_stage() {
+        if (!dia_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  dia_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // -----------------------------------------------------------------------
 // Model structures
@@ -142,6 +174,8 @@ struct dia_model {
     // DAC codec weight context (separate GGUF)
     ggml_context* ctx_dac = nullptr;
     ggml_backend_buffer_t buf_dac = nullptr;
+    ggml_context* ctx_perm = nullptr;
+    ggml_backend_buffer_t buf_perm = nullptr;
 };
 
 // -----------------------------------------------------------------------
@@ -195,6 +229,15 @@ struct dia_tts_context {
 // -----------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------
+
+static bool dia_ensure_sched(dia_tts_context* ctx) {
+    if (ctx->sched)
+        return true;
+    ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
+    int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
+    ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+    return ctx->sched != nullptr;
+}
 
 static uint32_t read_u32(gguf_context* meta, const char* key, uint32_t def) {
     int idx = gguf_find_key(meta, key);
@@ -521,9 +564,9 @@ static bool dia_kv_cache_init(dia_kv_cache& cache, const dia_model& m) {
         cache.k_l[i] = ggml_new_tensor_1d(cache.ctx, GGML_TYPE_F32, attn_size * m.max_generation_size * 2);
         cache.v_l[i] = ggml_new_tensor_1d(cache.ctx, GGML_TYPE_F32, attn_size * m.max_generation_size * 2);
 
-        // Cross-attention: (attn_size, max_enc_ctx) * 2
-        cache.cross_k_l[i] = ggml_new_tensor_1d(cache.ctx, GGML_TYPE_F32, attn_size * m.max_encoder_context * 2);
-        cache.cross_v_l[i] = ggml_new_tensor_1d(cache.ctx, GGML_TYPE_F32, attn_size * m.max_encoder_context * 2);
+        // Cross-attention: (attn_size, max_enc_ctx) * 2 — F16 (§176i: read-only after projection)
+        cache.cross_k_l[i] = ggml_new_tensor_1d(cache.ctx, GGML_TYPE_F16, attn_size * m.max_encoder_context * 2);
+        cache.cross_v_l[i] = ggml_new_tensor_1d(cache.ctx, GGML_TYPE_F16, attn_size * m.max_encoder_context * 2);
 
         ggml_format_name(cache.k_l[i], "cache_k_l%d", i);
         ggml_format_name(cache.v_l[i], "cache_v_l%d", i);
@@ -644,7 +687,13 @@ static ggml_tensor* build_dia_decoder_embedding(ggml_context* ctx, dia_model& m,
         ggml_tensor* view = ggml_view_1d(ctx, audio_tokens, B, i * ggml_element_size(audio_tokens));
         view->nb[0] = m.n_output_heads * ggml_element_size(audio_tokens);
 
-        ggml_tensor* e = ggml_get_rows(ctx, m.decoder.embeddings[i], view);
+        // §232 GPU: ggml_get_rows requires a CONTIGUOUS index tensor on CUDA
+        // (GGML_ASSERT(src1->nb[0] == ggml_type_size) — the strided view above
+        // aborts the CUDA decode; CPU/Metal tolerate the stride). ggml_cont
+        // materialises the 2 indices contiguously — negligible cost, correct on
+        // every backend.
+        ggml_tensor* idx = ggml_cont(ctx, view);
+        ggml_tensor* e = ggml_get_rows(ctx, m.decoder.embeddings[i], idx);
         emb = (i == 0) ? e : ggml_add(ctx, emb, e);
     }
     return emb;
@@ -779,53 +828,68 @@ struct dia_tts_context* dia_tts_init_from_file(const char* path_model, struct di
     m.decoder.embeddings.resize(m.n_output_heads, nullptr);
     m.decoder.heads.resize(m.n_output_heads, nullptr);
 
-    // Count tensors and create ggml context for weights
-    int n_tensors = gguf_get_n_tensors(meta);
-    ggml_init_params weight_params = {
-        (size_t)(n_tensors + 1) * ggml_tensor_overhead(),
-        nullptr,
-        true,
-    };
-    ggml_context* ctx_data = ggml_init(weight_params);
-    if (!ctx_data) {
-        fprintf(stderr, "dia_tts: failed to create weight context\n");
-        gguf_free(meta);
-        delete ctx;
-        return nullptr;
-    }
-
-    // Load weights from GGUF with data
-    gguf_init_params gguf_data_params = {false, &ctx_data};
-    gguf_context* meta_data = gguf_init_from_file(path_model, gguf_data_params);
-    if (!meta_data) {
-        fprintf(stderr, "dia_tts: failed to load GGUF data\n");
-        ggml_free(ctx_data);
-        gguf_free(meta);
-        delete ctx;
-        return nullptr;
-    }
-
-    // Assign weights
-    for (int i = 0; i < n_tensors; i++) {
-        const char* name = gguf_get_tensor_name(meta_data, i);
-        ggml_tensor* tensor = ggml_get_tensor(ctx_data, name);
-        if (tensor) {
-            dia_assign_weight(m, name, tensor);
-        } else if (params.verbosity >= 2) {
-            fprintf(stderr, "dia_tts: tensor '%s' not found in context\n", name);
+    // Initialize backends BEFORE loading weights so the main model lands on a GPU
+    // backend BUFFER (a GPU sched can't use weights in a plain CPU malloc ctx —
+    // "sched no longer auto-copies CPU-buffer tensors"; dev-guide GPU notes),
+    // which is why dia historically pinned CPU here. Backend selection (§232):
+    //   * DIA_TTS_GPU=1 forces GPU on ANY backend (opt-in for the CUDA/Vulkan A/B).
+    //   * DIA_TTS_GPU=0 forces CPU (regression-bisection gate; never removed).
+    //   * default: GPU on Metal ONLY — the Metal path is generate->ASR-roundtrip
+    //     validated and wins every stage (encoder ~94x, decode ~1.5x, DAC ~4.9x).
+    //     CUDA/Vulkan decode is NOT yet validated: a P100 A/B aborted in the
+    //     decoder on a strided get_rows index (GGML_ASSERT src1->nb[0]; fixed in
+    //     build_dia_decoder_embedding), so those backends fall back to CPU until a
+    //     Kaggle CUDA re-run confirms the fix. Mirrors LEARNING 34's
+    //     ggml_backend_is_metal gate (here Metal is the *validated* one).
+    ctx->backend_cpu = ggml_backend_cpu_init();
+    const char* gpu_env = crispasr_env::get("CRISPASR_DIA_TTS_GPU");
+    const bool force_gpu = gpu_env && std::atoi(gpu_env) != 0;
+    const bool force_cpu = gpu_env && std::atoi(gpu_env) == 0;
+    ctx->backend = ctx->backend_cpu;
+    if (!force_cpu && (force_gpu || params.use_gpu)) {
+        ggml_backend_t gpu = crispasr_init_gpu_backend();
+        if (gpu) {
+            bool is_metal = false;
+#if defined(GGML_USE_METAL)
+            is_metal = ggml_backend_is_metal(gpu);
+#endif
+            if (is_metal || force_gpu) {
+                ctx->backend = gpu;
+                if (params.verbosity >= 1)
+                    fprintf(stderr, "dia_tts: GPU backend enabled (%s)\n", ggml_backend_name(ctx->backend));
+            } else {
+                ggml_backend_free(gpu);
+                if (params.verbosity >= 1)
+                    fprintf(stderr, "dia_tts: GPU default limited to Metal pending CUDA/Vulkan decode "
+                                    "validation (§232); set DIA_TTS_GPU=1 to force\n");
+            }
         }
     }
 
-    m.ctx_w = ctx_data;
-
-    // Initialize backend
-    ctx->backend_cpu = ggml_backend_cpu_init();
-    ctx->backend = ctx->backend_cpu; // CPU-only for now
+    // Load main-model weights onto the selected backend's buffer, mirroring the
+    // DAC's core_gguf::load_weights path (replaces the old plain-CPU
+    // gguf_init_from_file data load). core_gguf allocates the backend buffer,
+    // mmaps/copies the data, and returns a name->tensor map we bind via
+    // dia_assign_weight exactly as before.
+    core_gguf::WeightLoad wl;
+    if (!core_gguf::load_weights(path_model, ctx->backend, "dia", wl)) {
+        fprintf(stderr, "dia_tts: failed to load weights from '%s'\n", path_model);
+        if (ctx->backend != ctx->backend_cpu)
+            ggml_backend_free(ctx->backend);
+        ggml_backend_free(ctx->backend_cpu);
+        gguf_free(meta);
+        delete ctx;
+        return nullptr;
+    }
+    for (const auto& named : wl.tensors) {
+        dia_assign_weight(m, named.first, named.second);
+    }
+    m.ctx_w = wl.ctx;
+    m.buf_w = wl.buf;
 
     // Initialize KV cache
     if (!dia_kv_cache_init(ctx->kv, m)) {
         fprintf(stderr, "dia_tts: failed to init KV cache\n");
-        gguf_free(meta_data);
         gguf_free(meta);
         delete ctx;
         return nullptr;
@@ -835,7 +899,6 @@ struct dia_tts_context* dia_tts_init_from_file(const char* path_model, struct di
         fprintf(stderr, "dia_tts: model loaded from '%s'\n", path_model);
     }
 
-    gguf_free(meta_data);
     gguf_free(meta);
     return ctx;
 }
@@ -967,6 +1030,15 @@ int dia_tts_set_codec_path(struct dia_tts_context* ctx, const char* path) {
     m.buf_dac = wl.buf;
     m.has_dac = true;
 
+    // Permute ConvTranspose1d weights for decomposed path
+    {
+        const int n = 4; // DAC has 4 decoder blocks
+        ggml_tensor* srcs[4] = {m.dac.blocks[0].up_w, m.dac.blocks[1].up_w, m.dac.blocks[2].up_w, m.dac.blocks[3].up_w};
+        ggml_tensor** dsts[4] = {&m.dac.blocks[0].up_w_perm, &m.dac.blocks[1].up_w_perm, &m.dac.blocks[2].up_w_perm,
+                                 &m.dac.blocks[3].up_w_perm};
+        core_convt::permute_convt1d_weights_batch(srcs, dsts, n, backend, &m.ctx_perm, &m.buf_perm);
+    }
+
     if (verbosity >= 1) {
         fprintf(stderr, "dia_tts: DAC codec loaded from '%s'\n", path);
     }
@@ -1005,8 +1077,13 @@ static ggml_tensor* dac_residual_unit(ggml_context* ctx, ggml_tensor* x, const c
 static ggml_tensor* dac_decoder_block(ggml_context* ctx, ggml_tensor* x, const core_dac::DacDecoderBlock& blk,
                                       int stride) {
     x = core_act::snake_alpha(ctx, x, blk.snake_alpha);
-    x = core_convt::convt1d_crop(ctx, x, blk.up_w, blk.up_b, stride,
-                                 /*crop_left*/ stride / 2, /*crop_right*/ stride / 2);
+    if (blk.up_w_perm) {
+        const int K = (int)blk.up_w->ne[0];
+        x = core_convt::convt1d_decomp(ctx, x, blk.up_w_perm, blk.up_b, stride, K, stride / 2, stride / 2);
+    } else {
+        x = core_convt::convt1d_crop(ctx, x, blk.up_w, blk.up_b, stride,
+                                     /*crop_left*/ stride / 2, /*crop_right*/ stride / 2);
+    }
     static const int dilations[3] = {1, 3, 9};
     for (int r = 0; r < 3; r++) {
         x = dac_residual_unit(ctx, x, blk.res[r], dilations[r]);
@@ -1116,15 +1193,13 @@ static float* dac_decode(dia_tts_context* ctx, const std::vector<uint32_t>& filt
     ggml_cgraph* gf = dac_build_decode_graph(m.dac, ctx0, (int)n_frames);
 
     // Allocate graph buffers
-    ggml_backend_t backend = ctx->backend ? ctx->backend : ctx->backend_cpu;
-    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    if (!galloc) {
+    if (!dia_ensure_sched(ctx)) {
         ggml_free(ctx0);
         return nullptr;
     }
-    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
         fprintf(stderr, "dia_dac: failed to allocate decode graph\n");
-        ggml_gallocr_free(galloc);
         ggml_free(ctx0);
         return nullptr;
     }
@@ -1136,7 +1211,6 @@ static float* dac_decode(dia_tts_context* ctx, const std::vector<uint32_t>& filt
         ggml_tensor* inp = ggml_graph_get_tensor(gf, name);
         if (!inp) {
             fprintf(stderr, "dia_dac: input tensor '%s' not in graph\n", name);
-            ggml_gallocr_free(galloc);
             ggml_free(ctx0);
             return nullptr;
         }
@@ -1148,10 +1222,9 @@ static float* dac_decode(dia_tts_context* ctx, const std::vector<uint32_t>& filt
     }
 
     // Compute
-    ggml_status st = ggml_backend_graph_compute(backend, gf);
+    ggml_status st = ggml_backend_sched_graph_compute(ctx->sched, gf);
     if (st != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "dia_dac: graph compute failed (status=%d)\n", (int)st);
-        ggml_gallocr_free(galloc);
         ggml_free(ctx0);
         return nullptr;
     }
@@ -1160,7 +1233,6 @@ static float* dac_decode(dia_tts_context* ctx, const std::vector<uint32_t>& filt
     ggml_tensor* pcm_out = ggml_graph_get_tensor(gf, "dac_pcm");
     if (!pcm_out) {
         fprintf(stderr, "dia_dac: pcm output tensor not in graph\n");
-        ggml_gallocr_free(galloc);
         ggml_free(ctx0);
         return nullptr;
     }
@@ -1168,7 +1240,6 @@ static float* dac_decode(dia_tts_context* ctx, const std::vector<uint32_t>& filt
     const int n_samples = (int)ggml_nelements(pcm_out);
     float* pcm = (float*)malloc(n_samples * sizeof(float));
     if (!pcm) {
-        ggml_gallocr_free(galloc);
         ggml_free(ctx0);
         return nullptr;
     }
@@ -1181,7 +1252,6 @@ static float* dac_decode(dia_tts_context* ctx, const std::vector<uint32_t>& filt
                 (float)n_samples / cfg.sample_rate, cfg.sample_rate);
     }
 
-    ggml_gallocr_free(galloc);
     ggml_free(ctx0);
     return pcm;
 }
@@ -1196,7 +1266,7 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
 
     // DIA_DECODE_CODES=path: isolate the DAC. Load post-revert codebook (T*9 int32,
     // interleaved [frame*9+ch]) and decode it directly, bypassing generation.
-    if (const char* cp = getenv("DIA_DECODE_CODES")) {
+    if (const char* cp = crispasr_env::get("CRISPASR_DIA_DECODE_CODES")) {
         std::vector<uint32_t> codes;
         FILE* f = fopen(cp, "rb");
         if (f) {
@@ -1216,7 +1286,11 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
     }
 
     // Tokenize text
-    auto tokens = dia_tokenize(text, m.max_encoder_context);
+    std::vector<uint32_t> tokens;
+    {
+        dia_bench_stage _b("tokenize");
+        tokens = dia_tokenize(text, m.max_encoder_context);
+    }
     if (tokens.empty()) {
         fprintf(stderr, "dia_tts: empty text after tokenization\n");
         return nullptr;
@@ -1247,7 +1321,7 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
     // TEMP: limit for CPU testing (full 3072 steps impractical on this CPU).
     // Override with DIA_MAX_STEPS for longer prompts on faster backends.
     uint32_t step_cap = 200;
-    if (const char* ms = getenv("DIA_MAX_STEPS"))
+    if (const char* ms = crispasr_env::get("CRISPASR_DIA_MAX_STEPS"))
         step_cap = (uint32_t)atoi(ms);
     if (max_gen > step_cap)
         max_gen = step_cap;
@@ -1258,12 +1332,12 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
     // DIA_FORCE_TOKENS=f   : teacher-force per-step input from file f (N*9 int32 raw); caps max_gen=N
     // DIA_DUMP_STEPLOGITS=f: append per-step [uncond(9*V) | cond(9*V)] f32 to file f
     // DIA_DUMP_DIR=d       : write step-0 stage dumps (encoder/cross/ca/final/logits) under dir d
-    const bool dia_greedy = getenv("DIA_GREEDY") != nullptr;
-    const bool dia_dump_tokens = getenv("DIA_DUMP_TOKENS") != nullptr;
-    const char* dia_dump_dir = getenv("DIA_DUMP_DIR");
+    const bool dia_greedy = crispasr_env::get("CRISPASR_DIA_GREEDY") != nullptr;
+    const bool dia_dump_tokens = crispasr_env::get("CRISPASR_DIA_DUMP_TOKENS") != nullptr;
+    const char* dia_dump_dir = crispasr_env::get("CRISPASR_DIA_DUMP_DIR");
     auto dia_dpath = [&](const char* name) { return std::string(dia_dump_dir ? dia_dump_dir : ".") + "/" + name; };
     std::vector<int32_t> dia_forced;
-    if (const char* fp = getenv("DIA_FORCE_TOKENS")) {
+    if (const char* fp = crispasr_env::get("CRISPASR_DIA_FORCE_TOKENS")) {
         FILE* f = fopen(fp, "rb");
         if (f) {
             int32_t v;
@@ -1275,7 +1349,7 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
                 dia_forced.size() / m.n_output_heads);
     }
     const bool dia_force = !dia_forced.empty();
-    const char* dia_steplogits_path = getenv("DIA_DUMP_STEPLOGITS");
+    const char* dia_steplogits_path = crispasr_env::get("CRISPASR_DIA_DUMP_STEPLOGITS");
     if (dia_force)
         max_gen = (uint32_t)(dia_forced.size() / m.n_output_heads);
     if (dia_steplogits_path)
@@ -1331,6 +1405,7 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
     // Encoder graph
     std::vector<float> encoder_output;
     {
+        dia_bench_stage _b("encoder");
         size_t ctx_size = 256 * 1024 * 1024; // 256 MB for graph metadata
         ggml_init_params gp = {ctx_size, nullptr, true};
         ggml_context* ctx0 = ggml_init(gp);
@@ -1358,11 +1433,13 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
         ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 32768, false);
         ggml_build_forward_expand(gf, enc_out);
 
-        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
-        if (!alloc || !ggml_gallocr_alloc_graph(alloc, gf)) {
+        if (!dia_ensure_sched(ctx)) {
+            ggml_free(ctx0);
+            return nullptr;
+        }
+        ggml_backend_sched_reset(ctx->sched);
+        if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
             fprintf(stderr, "dia_tts: encoder graph alloc failed\n");
-            if (alloc)
-                ggml_gallocr_free(alloc);
             ggml_free(ctx0);
             return nullptr;
         }
@@ -1375,10 +1452,9 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
         ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "enc_mask"), enc_mask.data(), 0,
                                 enc_mask.size() * sizeof(float));
 
-        ggml_status st = ggml_backend_graph_compute(ctx->backend, gf);
+        ggml_status st = ggml_backend_sched_graph_compute(ctx->sched, gf);
         if (st != GGML_STATUS_SUCCESS) {
             fprintf(stderr, "dia_tts: encoder compute failed (status=%d)\n", (int)st);
-            ggml_gallocr_free(alloc);
             ggml_free(ctx0);
             return nullptr;
         }
@@ -1388,7 +1464,6 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
         encoder_output.resize(enc_hidden * T_enc * B);
         ggml_backend_tensor_get(enc_result, encoder_output.data(), 0, encoder_output.size() * sizeof(float));
 
-        ggml_gallocr_free(alloc);
         ggml_free(ctx0);
     }
 
@@ -1417,10 +1492,12 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
     // ===================================================================
     // cross_k[layer]: (cross_kv_dim=2048, T_enc, B) — projected from encoder output
     // cross_v[layer]: (cross_kv_dim=2048, T_enc, B)
-    std::vector<std::vector<float>> cross_k(m.n_decoder_layers);
-    std::vector<std::vector<float>> cross_v(m.n_decoder_layers);
+    // Stored as F16 (§176i: read-only after projection, halves memory)
+    std::vector<std::vector<ggml_fp16_t>> cross_k(m.n_decoder_layers);
+    std::vector<std::vector<ggml_fp16_t>> cross_v(m.n_decoder_layers);
 
     {
+        dia_bench_stage _b("cross_attn_kv");
         size_t ctx_size = 64 * 1024 * 1024;
         ggml_init_params gp = {ctx_size, nullptr, true};
         ggml_context* ctx0 = ggml_init(gp);
@@ -1454,11 +1531,9 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
         for (auto* o : outputs)
             ggml_build_forward_expand(gf, o);
 
-        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
-        if (!alloc || !ggml_gallocr_alloc_graph(alloc, gf)) {
+        ggml_backend_sched_reset(ctx->sched);
+        if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
             fprintf(stderr, "dia_tts: cross-attn graph alloc failed\n");
-            if (alloc)
-                ggml_gallocr_free(alloc);
             ggml_free(ctx0);
             return nullptr;
         }
@@ -1466,10 +1541,9 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
         ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "enc_in"), encoder_output.data(), 0,
                                 encoder_output.size() * sizeof(float));
 
-        ggml_status st = ggml_backend_graph_compute(ctx->backend, gf);
+        ggml_status st = ggml_backend_sched_graph_compute(ctx->sched, gf);
         if (st != GGML_STATUS_SUCCESS) {
             fprintf(stderr, "dia_tts: cross-attn compute failed\n");
-            ggml_gallocr_free(alloc);
             ggml_free(ctx0);
             return nullptr;
         }
@@ -1477,30 +1551,35 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
         for (int l = 0; l < (int)m.n_decoder_layers; l++) {
             std::string kname = "cross_k_" + std::to_string(l);
             std::string vname = "cross_v_" + std::to_string(l);
-            cross_k[l].resize(cross_kv_dim * T_enc * B);
-            cross_v[l].resize(cross_kv_dim * T_enc * B);
-            ggml_backend_tensor_get(ggml_graph_get_tensor(gf, kname.c_str()), cross_k[l].data(), 0,
-                                    cross_k[l].size() * sizeof(float));
-            ggml_backend_tensor_get(ggml_graph_get_tensor(gf, vname.c_str()), cross_v[l].data(), 0,
-                                    cross_v[l].size() * sizeof(float));
+            const size_t n_elem = (size_t)cross_kv_dim * T_enc * B;
+            std::vector<float> tmp(n_elem);
+            cross_k[l].resize(n_elem);
+            cross_v[l].resize(n_elem);
+            ggml_backend_tensor_get(ggml_graph_get_tensor(gf, kname.c_str()), tmp.data(), 0, n_elem * sizeof(float));
+            ggml_fp32_to_fp16_row(tmp.data(), cross_k[l].data(), (int)n_elem);
+            ggml_backend_tensor_get(ggml_graph_get_tensor(gf, vname.c_str()), tmp.data(), 0, n_elem * sizeof(float));
+            ggml_fp32_to_fp16_row(tmp.data(), cross_v[l].data(), (int)n_elem);
         }
 
         if (dia_dump_dir) {
-            // cross_k[0]/cross_v[0] layout (cross_kv_dim, T_enc, B)
+            // cross_k[0]/cross_v[0] layout (cross_kv_dim, T_enc, B) — stored as F16
+            // dump as F32 for diff-harness compatibility
+            std::vector<float> dump(cross_k[0].size());
             FILE* fk = fopen(dia_dpath("cpp_cross_k0.f32").c_str(), "wb");
             FILE* fv = fopen(dia_dpath("cpp_cross_v0.f32").c_str(), "wb");
             if (fk) {
-                fwrite(cross_k[0].data(), sizeof(float), cross_k[0].size(), fk);
+                ggml_fp16_to_fp32_row(cross_k[0].data(), dump.data(), (int)dump.size());
+                fwrite(dump.data(), sizeof(float), dump.size(), fk);
                 fclose(fk);
             }
             if (fv) {
-                fwrite(cross_v[0].data(), sizeof(float), cross_v[0].size(), fv);
+                ggml_fp16_to_fp32_row(cross_v[0].data(), dump.data(), (int)dump.size());
+                fwrite(dump.data(), sizeof(float), dump.size(), fv);
                 fclose(fv);
             }
             fprintf(stderr, "DIA_DUMP: cpp_cross_{k,v}0.f32 (cross_kv_dim=%d T_enc=%d B=%d)\n", cross_kv_dim, T_enc, B);
         }
 
-        ggml_gallocr_free(alloc);
         ggml_free(ctx0);
     }
 
@@ -1516,491 +1595,517 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
     std::vector<std::vector<float>> self_k(m.n_decoder_layers);
     std::vector<std::vector<float>> self_v(m.n_decoder_layers);
 
-    for (uint32_t step = 0; step < max_gen; step++) {
-        ctx->current_position = step;
-        if (step == 0 && p.verbosity >= 1)
-            fprintf(stderr, "dia_tts: starting decoder loop (max_gen=%u, T_past=%d)\n", max_gen, (int)step);
+    {
+        dia_bench_stage _b("decoder_ar");
+        // §176c measurement: isolate the host<->device self-attn KV round-trip
+        // (upload of the reordered past KV + readback/append of new K/V) vs the
+        // total decode, to decide whether a device-resident KV rewrite is worth
+        // its correctness risk. Gated by DIA_BENCH.
+        const bool kv_bench = crispasr_env::get("CRISPASR_DIA_BENCH") != nullptr;
+        double kv_up_us = 0.0, kv_rb_us = 0.0;
+        for (uint32_t step = 0; step < max_gen; step++) {
+            ctx->current_position = step;
+            if (step == 0 && p.verbosity >= 1)
+                fprintf(stderr, "dia_tts: starting decoder loop (max_gen=%u, T_past=%d)\n", max_gen, (int)step);
 
-        // Step input tokens. Free-run: read the delayed-domain buffer (channels held at
-        // BOS until their delay elapses). Teacher-forcing: use the reference sequence.
-        if (dia_force) {
-            for (uint32_t h = 0; h < m.n_output_heads; h++)
-                ctx->current_audio_tokens[h] = (uint32_t)dia_forced[(size_t)step * m.n_output_heads + h];
-        } else {
-            for (uint32_t h = 0; h < m.n_output_heads; h++) {
-                int32_t g = gen[step][h];
-                ctx->current_audio_tokens[h] = (g >= 0) ? (uint32_t)g : m.bos_token_id;
+            // Step input tokens. Free-run: read the delayed-domain buffer (channels held at
+            // BOS until their delay elapses). Teacher-forcing: use the reference sequence.
+            if (dia_force) {
+                for (uint32_t h = 0; h < m.n_output_heads; h++)
+                    ctx->current_audio_tokens[h] = (uint32_t)dia_forced[(size_t)step * m.n_output_heads + h];
+            } else {
+                for (uint32_t h = 0; h < m.n_output_heads; h++) {
+                    int32_t g = gen[step][h];
+                    ctx->current_audio_tokens[h] = (g >= 0) ? (uint32_t)g : m.bos_token_id;
+                }
             }
-        }
 
-        // Build decoder step graph
-        size_t ctx_size = 128 * 1024 * 1024;
-        ggml_init_params gp = {ctx_size, nullptr, true};
-        ggml_context* ctx0 = ggml_init(gp);
-        if (!ctx0) {
-            fprintf(stderr, "dia_tts: failed to allocate decoder step context at step %u\n", step);
-            return nullptr;
-        }
-
-        const int T_past = (int)step; // number of past positions in KV cache
-        const int T_cur = 1;          // single position
-
-        // --- Input: audio tokens for current step (n_output_heads * B interleaved) ---
-        ggml_tensor* audio_tokens_t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, m.n_output_heads * B);
-        ggml_set_name(audio_tokens_t, "audio_tokens");
-        ggml_set_input(audio_tokens_t);
-
-        // --- Decoder embedding: sum of codebook embeddings -> (dec_hidden, 1, B) ---
-        ggml_tensor* cur = build_dia_decoder_embedding(ctx0, m, audio_tokens_t);
-        // cur shape: (dec_hidden, B) from get_rows -> reshape to (dec_hidden, 1, B)
-        cur = ggml_reshape_3d(ctx0, cur, dec_hidden, T_cur, B);
-
-        // --- Self-attention KV past inputs ---
-        std::vector<ggml_tensor*> past_k_inputs(m.n_decoder_layers);
-        std::vector<ggml_tensor*> past_v_inputs(m.n_decoder_layers);
-        // Cross-attention K/V inputs (full encoder length)
-        std::vector<ggml_tensor*> cross_k_inputs(m.n_decoder_layers);
-        std::vector<ggml_tensor*> cross_v_inputs(m.n_decoder_layers);
-
-        for (int l = 0; l < (int)m.n_decoder_layers; l++) {
-            if (T_past > 0) {
-                past_k_inputs[l] = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, kv_dim, T_past, B);
-                past_v_inputs[l] = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, kv_dim, T_past, B);
-                std::string kn = "past_k_" + std::to_string(l);
-                std::string vn = "past_v_" + std::to_string(l);
-                ggml_set_name(past_k_inputs[l], kn.c_str());
-                ggml_set_name(past_v_inputs[l], vn.c_str());
-                ggml_set_input(past_k_inputs[l]);
-                ggml_set_input(past_v_inputs[l]);
+            // Build decoder step graph
+            size_t ctx_size = 128 * 1024 * 1024;
+            ggml_init_params gp = {ctx_size, nullptr, true};
+            ggml_context* ctx0 = ggml_init(gp);
+            if (!ctx0) {
+                fprintf(stderr, "dia_tts: failed to allocate decoder step context at step %u\n", step);
+                return nullptr;
             }
-            cross_k_inputs[l] = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, cross_kv_dim, T_enc, B);
-            cross_v_inputs[l] = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, cross_kv_dim, T_enc, B);
-            std::string ckn = "cross_k_in_" + std::to_string(l);
-            std::string cvn = "cross_v_in_" + std::to_string(l);
-            ggml_set_name(cross_k_inputs[l], ckn.c_str());
-            ggml_set_name(cross_v_inputs[l], cvn.c_str());
-            ggml_set_input(cross_k_inputs[l]);
-            ggml_set_input(cross_v_inputs[l]);
-        }
 
-        // --- Position for RoPE ---
-        ggml_tensor* dec_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T_cur);
-        ggml_set_name(dec_pos, "dec_pos");
-        ggml_set_input(dec_pos);
+            const int T_past = (int)step; // number of past positions in KV cache
+            const int T_cur = 1;          // single position
 
-        // --- New K/V outputs for self-attention (to append to cache) ---
-        std::vector<ggml_tensor*> new_k_outputs(m.n_decoder_layers);
-        std::vector<ggml_tensor*> new_v_outputs(m.n_decoder_layers);
+            // --- Input: audio tokens for current step (n_output_heads * B interleaved) ---
+            ggml_tensor* audio_tokens_t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, m.n_output_heads * B);
+            ggml_set_name(audio_tokens_t, "audio_tokens");
+            ggml_set_input(audio_tokens_t);
 
-        // --- Decoder layers ---
-        for (int l = 0; l < (int)m.n_decoder_layers; l++) {
-            auto& layer = m.decoder.layers[l];
-            ggml_tensor* residual = cur;
+            // --- Decoder embedding: sum of codebook embeddings -> (dec_hidden, 1, B) ---
+            ggml_tensor* cur = build_dia_decoder_embedding(ctx0, m, audio_tokens_t);
+            // cur shape: (dec_hidden, B) from get_rows -> reshape to (dec_hidden, 1, B)
+            cur = ggml_reshape_3d(ctx0, cur, dec_hidden, T_cur, B);
 
-            // Pre self-attention norm
-            cur = dia_rms_norm(ctx0, cur, layer.pre_sa_norm, m.rms_norm_eps);
+            // --- Self-attention KV past inputs ---
+            std::vector<ggml_tensor*> past_k_inputs(m.n_decoder_layers);
+            std::vector<ggml_tensor*> past_v_inputs(m.n_decoder_layers);
+            // Cross-attention K/V inputs (full encoder length)
+            std::vector<ggml_tensor*> cross_k_inputs(m.n_decoder_layers);
+            std::vector<ggml_tensor*> cross_v_inputs(m.n_decoder_layers);
 
-            // Self-attention
-            {
-                // Q/K/V projections for current position
-                ggml_tensor* Q = ggml_mul_mat(ctx0, layer.self_q_proj, cur);     // (dec_hidden, 1, B)
-                ggml_tensor* K_cur = ggml_mul_mat(ctx0, layer.self_k_proj, cur); // (kv_dim, 1, B)
-                ggml_tensor* V_cur = ggml_mul_mat(ctx0, layer.self_v_proj, cur); // (kv_dim, 1, B)
-
-                // Reshape Q to (head_dim, n_heads, 1, B) and apply RoPE
-                Q = ggml_reshape_4d(ctx0, Q, head_dim, n_heads, T_cur, B);
-                Q = ggml_rope(ctx0, Q, dec_pos, head_dim, DIA_ROPE_MODE);
-
-                // Reshape K to (head_dim, n_kv_heads, 1, B) and apply RoPE
-                K_cur = ggml_reshape_4d(ctx0, K_cur, head_dim, n_kv_heads, T_cur, B);
-                K_cur = ggml_rope(ctx0, K_cur, dec_pos, head_dim, DIA_ROPE_MODE);
-
-                // Store new K/V for cache (flatten back)
-                ggml_tensor* k_out = ggml_reshape_3d(ctx0, ggml_cont(ctx0, K_cur), kv_dim, T_cur, B);
-                ggml_tensor* v_out = V_cur; // already (kv_dim, 1, B)
-                std::string kon = "new_k_" + std::to_string(l);
-                std::string von = "new_v_" + std::to_string(l);
-                ggml_set_name(k_out, kon.c_str());
-                ggml_set_output(k_out);
-                ggml_set_name(v_out, von.c_str());
-                ggml_set_output(v_out);
-                new_k_outputs[l] = k_out;
-                new_v_outputs[l] = v_out;
-
-                // Concatenate past K/V with current for attention
-                // Full K: (head_dim, n_kv_heads, T_past+1, B)
-                ggml_tensor* K_full;
-                ggml_tensor* V_full;
+            for (int l = 0; l < (int)m.n_decoder_layers; l++) {
                 if (T_past > 0) {
-                    // past_k: (kv_dim, T_past, B) -> reshape to (head_dim, n_kv_heads, T_past, B)
-                    ggml_tensor* past_k_4d = ggml_reshape_4d(ctx0, past_k_inputs[l], head_dim, n_kv_heads, T_past, B);
-                    // Apply RoPE to past K with past positions - NO, past K already has RoPE applied
-                    // Actually we need to store post-RoPE K in cache. K_cur already has RoPE.
-                    // Concat on T dimension
-                    K_full =
-                        ggml_concat(ctx0, past_k_4d,
-                                    ggml_reshape_4d(ctx0, ggml_cont(ctx0, K_cur), head_dim, n_kv_heads, T_cur, B), 2);
-                    ggml_tensor* past_v_4d = ggml_reshape_4d(ctx0, past_v_inputs[l], head_dim, n_kv_heads, T_past, B);
-                    ggml_tensor* v_cur_4d = ggml_reshape_4d(ctx0, V_cur, head_dim, n_kv_heads, T_cur, B);
-                    V_full = ggml_concat(ctx0, past_v_4d, v_cur_4d, 2);
-                } else {
-                    K_full = ggml_reshape_4d(ctx0, ggml_cont(ctx0, K_cur), head_dim, n_kv_heads, T_cur, B);
-                    V_full = ggml_reshape_4d(ctx0, V_cur, head_dim, n_kv_heads, T_cur, B);
+                    past_k_inputs[l] = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, kv_dim, T_past, B);
+                    past_v_inputs[l] = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, kv_dim, T_past, B);
+                    std::string kn = "past_k_" + std::to_string(l);
+                    std::string vn = "past_v_" + std::to_string(l);
+                    ggml_set_name(past_k_inputs[l], kn.c_str());
+                    ggml_set_name(past_v_inputs[l], vn.c_str());
+                    ggml_set_input(past_k_inputs[l]);
+                    ggml_set_input(past_v_inputs[l]);
                 }
-
-                // GQA: repeat_interleave K/V heads to match Q heads
-                // n_heads=16, n_kv_heads=4 -> each KV head maps to 4 consecutive Q heads
-                // Pattern: insert unit dim before n_kv, repeat, flatten
-                // (hd, n_kv, T, B) -> (hd, 1, n_kv, T*B) -> repeat -> (hd, n_rep, n_kv, T*B) -> (hd, n_heads, T, B)
-                int n_rep = n_heads / n_kv_heads;
-                if (n_rep > 1) {
-                    int T_full = T_past + T_cur;
-                    K_full = ggml_reshape_4d(ctx0, K_full, head_dim, 1, n_kv_heads, T_full * B);
-                    K_full = ggml_repeat_4d(ctx0, K_full, head_dim, n_rep, n_kv_heads, T_full * B);
-                    K_full = ggml_cont(ctx0, ggml_reshape_4d(ctx0, K_full, head_dim, n_heads, T_full, B));
-                    V_full = ggml_reshape_4d(ctx0, V_full, head_dim, 1, n_kv_heads, T_full * B);
-                    V_full = ggml_repeat_4d(ctx0, V_full, head_dim, n_rep, n_kv_heads, T_full * B);
-                    V_full = ggml_cont(ctx0, ggml_reshape_4d(ctx0, V_full, head_dim, n_heads, T_full, B));
-                }
-
-                // Attention: Q @ K^T / sqrt(d)
-                // Q: (head_dim, n_heads, 1, B)
-                // K: (head_dim, n_heads, T_full, B)
-                // Permute Q to (head_dim, 1, n_heads, B) and K to (head_dim, T_full, n_heads, B)
-                ggml_tensor* q_perm = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
-                ggml_tensor* k_perm = ggml_cont(ctx0, ggml_permute(ctx0, K_full, 0, 2, 1, 3));
-                // kq: (T_full, 1, n_heads, B) — dot product contracts on head_dim
-                ggml_tensor* kq = ggml_mul_mat(ctx0, k_perm, q_perm);
-                // Scale by 1/sqrt(head_dim)
-                // Dia uses scale=1.0 (no 1/sqrt(d) scaling) — matching Python SelfAttention/CrossAttention
-                // Softmax (no mask needed for causal since we only have past + current)
-                kq = ggml_soft_max(ctx0, kq);
-
-                // V @ attn_weights
-                // V: (head_dim, n_heads, T_full, B) -> permute to (head_dim, T_full, n_heads, B)
-                ggml_tensor* v_perm = ggml_cont(ctx0, ggml_permute(ctx0, V_full, 0, 2, 1, 3));
-                // v_perm transposed: (T_full, head_dim, n_heads, B)
-                ggml_tensor* v_t = ggml_cont(ctx0, ggml_transpose(ctx0, v_perm));
-                // kqv: mul_mat(v_t, kq) contracts on T_full -> (head_dim, 1, n_heads, B)
-                ggml_tensor* kqv = ggml_mul_mat(ctx0, v_t, kq);
-                // Permute to (head_dim, n_heads, 1, B) then reshape to (dec_hidden, 1, B)
-                kqv = ggml_cont(ctx0, ggml_permute(ctx0, kqv, 0, 2, 1, 3));
-                cur = ggml_reshape_3d(ctx0, kqv, dec_hidden, T_cur, B);
-                cur = ggml_mul_mat(ctx0, layer.self_o_proj, cur);
+                cross_k_inputs[l] = ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, cross_kv_dim, T_enc, B);
+                cross_v_inputs[l] = ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, cross_kv_dim, T_enc, B);
+                std::string ckn = "cross_k_in_" + std::to_string(l);
+                std::string cvn = "cross_v_in_" + std::to_string(l);
+                ggml_set_name(cross_k_inputs[l], ckn.c_str());
+                ggml_set_name(cross_v_inputs[l], cvn.c_str());
+                ggml_set_input(cross_k_inputs[l]);
+                ggml_set_input(cross_v_inputs[l]);
             }
 
-            cur = ggml_add(ctx0, cur, residual);
-            residual = cur;
+            // --- Position for RoPE ---
+            ggml_tensor* dec_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T_cur);
+            ggml_set_name(dec_pos, "dec_pos");
+            ggml_set_input(dec_pos);
 
-            // Pre cross-attention norm
-            cur = dia_rms_norm(ctx0, cur, layer.pre_ca_norm, m.rms_norm_eps);
+            // --- New K/V outputs for self-attention (to append to cache) ---
+            std::vector<ggml_tensor*> new_k_outputs(m.n_decoder_layers);
+            std::vector<ggml_tensor*> new_v_outputs(m.n_decoder_layers);
 
-            // Cross-attention
-            {
-                // Q from decoder hidden state
-                ggml_tensor* Q = ggml_mul_mat(ctx0, layer.cross_q_proj, cur); // (dec_hidden, 1, B)
-                Q = ggml_reshape_4d(ctx0, Q, head_dim, n_heads, T_cur, B);
-                // No RoPE on cross-attention Q (cross-attn uses absolute position from encoder)
+            // --- Decoder layers ---
+            for (int l = 0; l < (int)m.n_decoder_layers; l++) {
+                auto& layer = m.decoder.layers[l];
+                ggml_tensor* residual = cur;
 
-                // K/V from precomputed cross-attention cache
-                // cross_k: (cross_kv_dim=2048, T_enc, B) -> (hd, n_heads, T_enc, B)
-                // MHA (16q, 16kv) — no GQA repeat needed
-                ggml_tensor* K_cross = ggml_reshape_4d(ctx0, cross_k_inputs[l], head_dim, n_heads, T_enc, B);
-                ggml_tensor* V_cross = ggml_reshape_4d(ctx0, cross_v_inputs[l], head_dim, n_heads, T_enc, B);
+                // Pre self-attention norm
+                cur = dia_rms_norm(ctx0, cur, layer.pre_sa_norm, m.rms_norm_eps);
 
-                // Attention
-                ggml_tensor* q_perm = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
-                ggml_tensor* k_perm = ggml_cont(ctx0, ggml_permute(ctx0, K_cross, 0, 2, 1, 3));
-                ggml_tensor* kq = ggml_mul_mat(ctx0, k_perm, q_perm);
-                // Dia uses scale=1.0 (no 1/sqrt(d) scaling) — matching Python SelfAttention/CrossAttention
-                kq = ggml_soft_max(ctx0, kq);
+                // Self-attention
+                {
+                    // Q/K/V projections for current position
+                    ggml_tensor* Q = ggml_mul_mat(ctx0, layer.self_q_proj, cur);     // (dec_hidden, 1, B)
+                    ggml_tensor* K_cur = ggml_mul_mat(ctx0, layer.self_k_proj, cur); // (kv_dim, 1, B)
+                    ggml_tensor* V_cur = ggml_mul_mat(ctx0, layer.self_v_proj, cur); // (kv_dim, 1, B)
 
-                ggml_tensor* v_perm = ggml_cont(ctx0, ggml_permute(ctx0, V_cross, 0, 2, 1, 3));
-                ggml_tensor* v_t = ggml_cont(ctx0, ggml_transpose(ctx0, v_perm));
-                ggml_tensor* kqv = ggml_mul_mat(ctx0, v_t, kq);
-                kqv = ggml_cont(ctx0, ggml_permute(ctx0, kqv, 0, 2, 1, 3));
-                cur = ggml_reshape_3d(ctx0, kqv, dec_hidden, T_cur, B);
-                cur = ggml_mul_mat(ctx0, layer.cross_o_proj, cur);
-                if (step == 0 && l == 0 && dia_dump_dir) {
-                    ggml_set_name(cur, "ca0_out");
-                    ggml_set_output(cur);
+                    // Reshape Q to (head_dim, n_heads, 1, B) and apply RoPE
+                    Q = ggml_reshape_4d(ctx0, Q, head_dim, n_heads, T_cur, B);
+                    Q = ggml_rope(ctx0, Q, dec_pos, head_dim, DIA_ROPE_MODE);
+
+                    // Reshape K to (head_dim, n_kv_heads, 1, B) and apply RoPE
+                    K_cur = ggml_reshape_4d(ctx0, K_cur, head_dim, n_kv_heads, T_cur, B);
+                    K_cur = ggml_rope(ctx0, K_cur, dec_pos, head_dim, DIA_ROPE_MODE);
+
+                    // Store new K/V for cache (flatten back)
+                    ggml_tensor* k_out = ggml_reshape_3d(ctx0, ggml_cont(ctx0, K_cur), kv_dim, T_cur, B);
+                    ggml_tensor* v_out = V_cur; // already (kv_dim, 1, B)
+                    std::string kon = "new_k_" + std::to_string(l);
+                    std::string von = "new_v_" + std::to_string(l);
+                    ggml_set_name(k_out, kon.c_str());
+                    ggml_set_output(k_out);
+                    ggml_set_name(v_out, von.c_str());
+                    ggml_set_output(v_out);
+                    new_k_outputs[l] = k_out;
+                    new_v_outputs[l] = v_out;
+
+                    // Concatenate past K/V with current for attention
+                    // Full K: (head_dim, n_kv_heads, T_past+1, B)
+                    ggml_tensor* K_full;
+                    ggml_tensor* V_full;
+                    if (T_past > 0) {
+                        // past_k: (kv_dim, T_past, B) -> reshape to (head_dim, n_kv_heads, T_past, B)
+                        ggml_tensor* past_k_4d =
+                            ggml_reshape_4d(ctx0, past_k_inputs[l], head_dim, n_kv_heads, T_past, B);
+                        // Apply RoPE to past K with past positions - NO, past K already has RoPE applied
+                        // Actually we need to store post-RoPE K in cache. K_cur already has RoPE.
+                        // Concat on T dimension
+                        K_full = ggml_concat(
+                            ctx0, past_k_4d,
+                            ggml_reshape_4d(ctx0, ggml_cont(ctx0, K_cur), head_dim, n_kv_heads, T_cur, B), 2);
+                        ggml_tensor* past_v_4d =
+                            ggml_reshape_4d(ctx0, past_v_inputs[l], head_dim, n_kv_heads, T_past, B);
+                        ggml_tensor* v_cur_4d = ggml_reshape_4d(ctx0, V_cur, head_dim, n_kv_heads, T_cur, B);
+                        V_full = ggml_concat(ctx0, past_v_4d, v_cur_4d, 2);
+                    } else {
+                        K_full = ggml_reshape_4d(ctx0, ggml_cont(ctx0, K_cur), head_dim, n_kv_heads, T_cur, B);
+                        V_full = ggml_reshape_4d(ctx0, V_cur, head_dim, n_kv_heads, T_cur, B);
+                    }
+
+                    // GQA: repeat_interleave K/V heads to match Q heads
+                    // n_heads=16, n_kv_heads=4 -> each KV head maps to 4 consecutive Q heads
+                    // Pattern: insert unit dim before n_kv, repeat, flatten
+                    // (hd, n_kv, T, B) -> (hd, 1, n_kv, T*B) -> repeat -> (hd, n_rep, n_kv, T*B) -> (hd, n_heads, T, B)
+                    int n_rep = n_heads / n_kv_heads;
+                    if (n_rep > 1) {
+                        int T_full = T_past + T_cur;
+                        K_full = ggml_reshape_4d(ctx0, K_full, head_dim, 1, n_kv_heads, T_full * B);
+                        K_full = ggml_repeat_4d(ctx0, K_full, head_dim, n_rep, n_kv_heads, T_full * B);
+                        K_full = ggml_cont(ctx0, ggml_reshape_4d(ctx0, K_full, head_dim, n_heads, T_full, B));
+                        V_full = ggml_reshape_4d(ctx0, V_full, head_dim, 1, n_kv_heads, T_full * B);
+                        V_full = ggml_repeat_4d(ctx0, V_full, head_dim, n_rep, n_kv_heads, T_full * B);
+                        V_full = ggml_cont(ctx0, ggml_reshape_4d(ctx0, V_full, head_dim, n_heads, T_full, B));
+                    }
+
+                    // Attention: Q @ K^T / sqrt(d)
+                    // Q: (head_dim, n_heads, 1, B)
+                    // K: (head_dim, n_heads, T_full, B)
+                    // Permute Q to (head_dim, 1, n_heads, B) and K to (head_dim, T_full, n_heads, B)
+                    ggml_tensor* q_perm = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
+                    ggml_tensor* k_perm = ggml_cont(ctx0, ggml_permute(ctx0, K_full, 0, 2, 1, 3));
+                    // kq: (T_full, 1, n_heads, B) — dot product contracts on head_dim
+                    ggml_tensor* kq = ggml_mul_mat(ctx0, k_perm, q_perm);
+                    // Scale by 1/sqrt(head_dim)
+                    // Dia uses scale=1.0 (no 1/sqrt(d) scaling) — matching Python SelfAttention/CrossAttention
+                    // Softmax (no mask needed for causal since we only have past + current)
+                    kq = ggml_soft_max(ctx0, kq);
+
+                    // V @ attn_weights
+                    // V: (head_dim, n_heads, T_full, B) -> permute to (head_dim, T_full, n_heads, B)
+                    ggml_tensor* v_perm = ggml_cont(ctx0, ggml_permute(ctx0, V_full, 0, 2, 1, 3));
+                    // v_perm transposed: (T_full, head_dim, n_heads, B)
+                    ggml_tensor* v_t = ggml_cont(ctx0, ggml_transpose(ctx0, v_perm));
+                    // kqv: mul_mat(v_t, kq) contracts on T_full -> (head_dim, 1, n_heads, B)
+                    ggml_tensor* kqv = ggml_mul_mat(ctx0, v_t, kq);
+                    // Permute to (head_dim, n_heads, 1, B) then reshape to (dec_hidden, 1, B)
+                    kqv = ggml_cont(ctx0, ggml_permute(ctx0, kqv, 0, 2, 1, 3));
+                    cur = ggml_reshape_3d(ctx0, kqv, dec_hidden, T_cur, B);
+                    cur = ggml_mul_mat(ctx0, layer.self_o_proj, cur);
                 }
-            }
 
-            cur = ggml_add(ctx0, cur, residual);
-            residual = cur;
+                cur = ggml_add(ctx0, cur, residual);
+                residual = cur;
 
-            // Pre MLP norm
-            cur = dia_rms_norm(ctx0, cur, layer.pre_mlp_norm, m.rms_norm_eps);
+                // Pre cross-attention norm
+                cur = dia_rms_norm(ctx0, cur, layer.pre_ca_norm, m.rms_norm_eps);
 
-            // MLP: SiLU(gate(x)) * up(x), then down
-            {
-                cur = ggml_mul(ctx0, ggml_silu(ctx0, ggml_mul_mat(ctx0, layer.gate, cur)),
-                               ggml_mul_mat(ctx0, layer.up, cur));
-                cur = ggml_mul_mat(ctx0, layer.wo_mlp, cur);
-            }
+                // Cross-attention
+                {
+                    // Q from decoder hidden state
+                    ggml_tensor* Q = ggml_mul_mat(ctx0, layer.cross_q_proj, cur); // (dec_hidden, 1, B)
+                    Q = ggml_reshape_4d(ctx0, Q, head_dim, n_heads, T_cur, B);
+                    // No RoPE on cross-attention Q (cross-attn uses absolute position from encoder)
 
-            cur = ggml_add(ctx0, cur, residual);
-        }
+                    // K/V from precomputed cross-attention cache
+                    // cross_k: (cross_kv_dim=2048, T_enc, B) -> (hd, n_heads, T_enc, B)
+                    // MHA (16q, 16kv) — no GQA repeat needed
+                    ggml_tensor* K_cross = ggml_reshape_4d(ctx0, cross_k_inputs[l], head_dim, n_heads, T_enc, B);
+                    ggml_tensor* V_cross = ggml_reshape_4d(ctx0, cross_v_inputs[l], head_dim, n_heads, T_enc, B);
 
-        // Final norm
-        cur = dia_rms_norm(ctx0, cur, m.decoder.norm, m.rms_norm_eps);
-        // cur: (dec_hidden, 1, B)
-        if (step == 0 && dia_dump_dir) {
-            ggml_set_name(cur, "dia_final_hidden");
-            ggml_set_output(cur);
-        }
+                    // Attention
+                    ggml_tensor* q_perm = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
+                    ggml_tensor* k_perm = ggml_cont(ctx0, ggml_permute(ctx0, K_cross, 0, 2, 1, 3));
+                    ggml_tensor* kq = ggml_mul_mat(ctx0, k_perm, q_perm);
+                    // Dia uses scale=1.0 (no 1/sqrt(d) scaling) — matching Python SelfAttention/CrossAttention
+                    kq = ggml_soft_max(ctx0, kq);
 
-        // Project to logits for each codebook head
-        // We need all 9 heads' logits. Output shape: (output_vocab_size * n_output_heads, 1, B)
-        std::vector<ggml_tensor*> head_logits(m.n_output_heads);
-        for (int h = 0; h < (int)m.n_output_heads; h++) {
-            head_logits[h] = ggml_mul_mat(ctx0, m.decoder.heads[h], cur); // (output_vocab_size, 1, B)
-            std::string hn = "logits_" + std::to_string(h);
-            ggml_set_name(head_logits[h], hn.c_str());
-            ggml_set_output(head_logits[h]);
-        }
-
-        // Build and compute graph
-        ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 32768, false);
-        for (int h = 0; h < (int)m.n_output_heads; h++) {
-            ggml_build_forward_expand(gf, head_logits[h]);
-        }
-        for (int l = 0; l < (int)m.n_decoder_layers; l++) {
-            ggml_build_forward_expand(gf, new_k_outputs[l]);
-            ggml_build_forward_expand(gf, new_v_outputs[l]);
-        }
-
-        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
-        if (!alloc || !ggml_gallocr_alloc_graph(alloc, gf)) {
-            fprintf(stderr, "dia_tts: decoder step %u graph alloc failed\n", step);
-            if (alloc)
-                ggml_gallocr_free(alloc);
-            ggml_free(ctx0);
-            return nullptr;
-        }
-
-        // Set inputs
-        // Audio tokens: interleaved [head0_cond, head0_uncond, head1_cond, head1_uncond, ...]
-        // Actually from build_dia_decoder_embedding: stride view picks every n_output_heads-th element
-        // So layout is: [cond_h0, cond_h1, ..., cond_h8, uncond_h0, ..., uncond_h8]
-        std::vector<int32_t> audio_input(m.n_output_heads * B);
-        for (int h = 0; h < (int)m.n_output_heads; h++) {
-            audio_input[h] = (int32_t)ctx->current_audio_tokens[h];                    // conditional
-            audio_input[m.n_output_heads + h] = (int32_t)ctx->current_audio_tokens[h]; // unconditional (same tokens)
-        }
-        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "audio_tokens"), audio_input.data(), 0,
-                                audio_input.size() * sizeof(int32_t));
-
-        // Position
-        int32_t pos_val = (int32_t)step;
-        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "dec_pos"), &pos_val, 0, sizeof(int32_t));
-
-        // Past self-attention K/V.
-        // The cache vectors accumulate per step in [step][batch] order:
-        //   self_k[l] = [s0b0, s0b1, s1b0, s1b1, ...]  (each block kv_dim floats)
-        // but the past_k_* input tensor is (kv_dim, T_past, B), i.e. ggml [batch][step]:
-        //   [b0: t0,t1,..,t_{T-1}][b1: t0,t1,...].
-        // These coincide only at T_past==1, so without reordering the cache the
-        // self-attention silently corrupts from the 3rd decode step on. Reorder here.
-        for (int l = 0; l < (int)m.n_decoder_layers; l++) {
-            if (T_past > 0) {
-                std::string kn = "past_k_" + std::to_string(l);
-                std::string vn = "past_v_" + std::to_string(l);
-                std::vector<float> pk((size_t)kv_dim * T_past * B), pv((size_t)kv_dim * T_past * B);
-                for (int t = 0; t < T_past; t++) {
-                    for (int b = 0; b < B; b++) {
-                        const size_t src = ((size_t)t * B + b) * kv_dim;      // [step][batch]
-                        const size_t dst = ((size_t)b * T_past + t) * kv_dim; // (kv_dim,T_past,B)
-                        std::memcpy(&pk[dst], &self_k[l][src], kv_dim * sizeof(float));
-                        std::memcpy(&pv[dst], &self_v[l][src], kv_dim * sizeof(float));
+                    ggml_tensor* v_perm = ggml_cont(ctx0, ggml_permute(ctx0, V_cross, 0, 2, 1, 3));
+                    ggml_tensor* v_t = ggml_cont(ctx0, ggml_transpose(ctx0, v_perm));
+                    ggml_tensor* kqv = ggml_mul_mat(ctx0, v_t, kq);
+                    kqv = ggml_cont(ctx0, ggml_permute(ctx0, kqv, 0, 2, 1, 3));
+                    cur = ggml_reshape_3d(ctx0, kqv, dec_hidden, T_cur, B);
+                    cur = ggml_mul_mat(ctx0, layer.cross_o_proj, cur);
+                    if (step == 0 && l == 0 && dia_dump_dir) {
+                        ggml_set_name(cur, "ca0_out");
+                        ggml_set_output(cur);
                     }
                 }
-                ggml_backend_tensor_set(ggml_graph_get_tensor(gf, kn.c_str()), pk.data(), 0, pk.size() * sizeof(float));
-                ggml_backend_tensor_set(ggml_graph_get_tensor(gf, vn.c_str()), pv.data(), 0, pv.size() * sizeof(float));
+
+                cur = ggml_add(ctx0, cur, residual);
+                residual = cur;
+
+                // Pre MLP norm
+                cur = dia_rms_norm(ctx0, cur, layer.pre_mlp_norm, m.rms_norm_eps);
+
+                // MLP: SiLU(gate(x)) * up(x), then down
+                {
+                    cur = ggml_mul(ctx0, ggml_silu(ctx0, ggml_mul_mat(ctx0, layer.gate, cur)),
+                                   ggml_mul_mat(ctx0, layer.up, cur));
+                    cur = ggml_mul_mat(ctx0, layer.wo_mlp, cur);
+                }
+
+                cur = ggml_add(ctx0, cur, residual);
             }
-            // Cross-attention K/V
-            std::string ckn = "cross_k_in_" + std::to_string(l);
-            std::string cvn = "cross_v_in_" + std::to_string(l);
-            ggml_backend_tensor_set(ggml_graph_get_tensor(gf, ckn.c_str()), cross_k[l].data(), 0,
-                                    cross_k[l].size() * sizeof(float));
-            ggml_backend_tensor_set(ggml_graph_get_tensor(gf, cvn.c_str()), cross_v[l].data(), 0,
-                                    cross_v[l].size() * sizeof(float));
-        }
 
-        // Compute
-        ggml_status st = ggml_backend_graph_compute(ctx->backend, gf);
-        if (st != GGML_STATUS_SUCCESS) {
-            fprintf(stderr, "dia_tts: decoder step %u compute failed\n", step);
-            ggml_gallocr_free(alloc);
-            ggml_free(ctx0);
-            return nullptr;
-        }
+            // Final norm
+            cur = dia_rms_norm(ctx0, cur, m.decoder.norm, m.rms_norm_eps);
+            // cur: (dec_hidden, 1, B)
+            if (step == 0 && dia_dump_dir) {
+                ggml_set_name(cur, "dia_final_hidden");
+                ggml_set_output(cur);
+            }
 
-        if (step == 0 && dia_dump_dir) {
-            ggml_tensor* fh = ggml_graph_get_tensor(gf, "dia_final_hidden");
-            if (fh) {
-                std::vector<float> hbuf(dec_hidden * B);
-                ggml_backend_tensor_get(fh, hbuf.data(), 0, hbuf.size() * sizeof(float));
-                FILE* f = fopen(dia_dpath("cpp_final_hidden.f32").c_str(), "wb");
-                if (f) {
-                    fwrite(hbuf.data(), sizeof(float), hbuf.size(), f);
-                    fclose(f);
+            // Project to logits for each codebook head
+            // We need all 9 heads' logits. Output shape: (output_vocab_size * n_output_heads, 1, B)
+            std::vector<ggml_tensor*> head_logits(m.n_output_heads);
+            for (int h = 0; h < (int)m.n_output_heads; h++) {
+                head_logits[h] = ggml_mul_mat(ctx0, m.decoder.heads[h], cur); // (output_vocab_size, 1, B)
+                std::string hn = "logits_" + std::to_string(h);
+                ggml_set_name(head_logits[h], hn.c_str());
+                ggml_set_output(head_logits[h]);
+            }
+
+            // Build and compute graph
+            ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 32768, false);
+            for (int h = 0; h < (int)m.n_output_heads; h++) {
+                ggml_build_forward_expand(gf, head_logits[h]);
+            }
+            for (int l = 0; l < (int)m.n_decoder_layers; l++) {
+                ggml_build_forward_expand(gf, new_k_outputs[l]);
+                ggml_build_forward_expand(gf, new_v_outputs[l]);
+            }
+
+            ggml_backend_sched_reset(ctx->sched);
+            if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+                fprintf(stderr, "dia_tts: decoder step %u graph alloc failed\n", step);
+                ggml_free(ctx0);
+                return nullptr;
+            }
+
+            // Set inputs
+            // Audio tokens: interleaved [head0_cond, head0_uncond, head1_cond, head1_uncond, ...]
+            // Actually from build_dia_decoder_embedding: stride view picks every n_output_heads-th element
+            // So layout is: [cond_h0, cond_h1, ..., cond_h8, uncond_h0, ..., uncond_h8]
+            std::vector<int32_t> audio_input(m.n_output_heads * B);
+            for (int h = 0; h < (int)m.n_output_heads; h++) {
+                audio_input[h] = (int32_t)ctx->current_audio_tokens[h]; // conditional
+                audio_input[m.n_output_heads + h] =
+                    (int32_t)ctx->current_audio_tokens[h]; // unconditional (same tokens)
+            }
+            ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "audio_tokens"), audio_input.data(), 0,
+                                    audio_input.size() * sizeof(int32_t));
+
+            // Position
+            int32_t pos_val = (int32_t)step;
+            ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "dec_pos"), &pos_val, 0, sizeof(int32_t));
+
+            // Past self-attention K/V.
+            // The cache vectors accumulate per step in [step][batch] order:
+            //   self_k[l] = [s0b0, s0b1, s1b0, s1b1, ...]  (each block kv_dim floats)
+            // but the past_k_* input tensor is (kv_dim, T_past, B), i.e. ggml [batch][step]:
+            //   [b0: t0,t1,..,t_{T-1}][b1: t0,t1,...].
+            // These coincide only at T_past==1, so without reordering the cache the
+            // self-attention silently corrupts from the 3rd decode step on. Reorder here.
+            for (int l = 0; l < (int)m.n_decoder_layers; l++) {
+                if (T_past > 0) {
+                    const int64_t _kt0 = kv_bench ? ggml_time_us() : 0;
+                    std::string kn = "past_k_" + std::to_string(l);
+                    std::string vn = "past_v_" + std::to_string(l);
+                    std::vector<float> pk((size_t)kv_dim * T_past * B), pv((size_t)kv_dim * T_past * B);
+                    for (int t = 0; t < T_past; t++) {
+                        for (int b = 0; b < B; b++) {
+                            const size_t src = ((size_t)t * B + b) * kv_dim;      // [step][batch]
+                            const size_t dst = ((size_t)b * T_past + t) * kv_dim; // (kv_dim,T_past,B)
+                            std::memcpy(&pk[dst], &self_k[l][src], kv_dim * sizeof(float));
+                            std::memcpy(&pv[dst], &self_v[l][src], kv_dim * sizeof(float));
+                        }
+                    }
+                    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, kn.c_str()), pk.data(), 0,
+                                            pk.size() * sizeof(float));
+                    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, vn.c_str()), pv.data(), 0,
+                                            pv.size() * sizeof(float));
+                    if (kv_bench)
+                        kv_up_us += (double)(ggml_time_us() - _kt0);
+                }
+                // Cross-attention K/V
+                std::string ckn = "cross_k_in_" + std::to_string(l);
+                std::string cvn = "cross_v_in_" + std::to_string(l);
+                ggml_backend_tensor_set(ggml_graph_get_tensor(gf, ckn.c_str()), cross_k[l].data(), 0,
+                                        cross_k[l].size() * sizeof(ggml_fp16_t));
+                ggml_backend_tensor_set(ggml_graph_get_tensor(gf, cvn.c_str()), cross_v[l].data(), 0,
+                                        cross_v[l].size() * sizeof(ggml_fp16_t));
+            }
+
+            // Compute
+            ggml_status st = ggml_backend_sched_graph_compute(ctx->sched, gf);
+            if (st != GGML_STATUS_SUCCESS) {
+                fprintf(stderr, "dia_tts: decoder step %u compute failed\n", step);
+                ggml_free(ctx0);
+                return nullptr;
+            }
+
+            if (step == 0 && dia_dump_dir) {
+                ggml_tensor* fh = ggml_graph_get_tensor(gf, "dia_final_hidden");
+                if (fh) {
+                    std::vector<float> hbuf(dec_hidden * B);
+                    ggml_backend_tensor_get(fh, hbuf.data(), 0, hbuf.size() * sizeof(float));
+                    FILE* f = fopen(dia_dpath("cpp_final_hidden.f32").c_str(), "wb");
+                    if (f) {
+                        fwrite(hbuf.data(), sizeof(float), hbuf.size(), f);
+                        fclose(f);
+                    }
+                }
+                ggml_tensor* ca = ggml_graph_get_tensor(gf, "ca0_out");
+                if (ca) {
+                    std::vector<float> cbuf(dec_hidden * B);
+                    ggml_backend_tensor_get(ca, cbuf.data(), 0, cbuf.size() * sizeof(float));
+                    FILE* f = fopen(dia_dpath("cpp_ca0_out.f32").c_str(), "wb");
+                    if (f) {
+                        fwrite(cbuf.data(), sizeof(float), cbuf.size(), f);
+                        fclose(f);
+                    }
                 }
             }
-            ggml_tensor* ca = ggml_graph_get_tensor(gf, "ca0_out");
-            if (ca) {
-                std::vector<float> cbuf(dec_hidden * B);
-                ggml_backend_tensor_get(ca, cbuf.data(), 0, cbuf.size() * sizeof(float));
-                FILE* f = fopen(dia_dpath("cpp_ca0_out.f32").c_str(), "wb");
-                if (f) {
-                    fwrite(cbuf.data(), sizeof(float), cbuf.size(), f);
-                    fclose(f);
+
+            // Read new K/V and append to self-attention cache
+            {
+                const int64_t _rt0 = kv_bench ? ggml_time_us() : 0;
+                for (int l = 0; l < (int)m.n_decoder_layers; l++) {
+                    std::string kon = "new_k_" + std::to_string(l);
+                    std::string von = "new_v_" + std::to_string(l);
+                    std::vector<float> k_new(kv_dim * T_cur * B);
+                    std::vector<float> v_new(kv_dim * T_cur * B);
+                    ggml_backend_tensor_get(ggml_graph_get_tensor(gf, kon.c_str()), k_new.data(), 0,
+                                            k_new.size() * sizeof(float));
+                    ggml_backend_tensor_get(ggml_graph_get_tensor(gf, von.c_str()), v_new.data(), 0,
+                                            v_new.size() * sizeof(float));
+                    self_k[l].insert(self_k[l].end(), k_new.begin(), k_new.end());
+                    self_v[l].insert(self_v[l].end(), v_new.begin(), v_new.end());
                 }
+                if (kv_bench)
+                    kv_rb_us += (double)(ggml_time_us() - _rt0);
             }
-        }
 
-        // Read new K/V and append to self-attention cache
-        for (int l = 0; l < (int)m.n_decoder_layers; l++) {
-            std::string kon = "new_k_" + std::to_string(l);
-            std::string von = "new_v_" + std::to_string(l);
-            std::vector<float> k_new(kv_dim * T_cur * B);
-            std::vector<float> v_new(kv_dim * T_cur * B);
-            ggml_backend_tensor_get(ggml_graph_get_tensor(gf, kon.c_str()), k_new.data(), 0,
-                                    k_new.size() * sizeof(float));
-            ggml_backend_tensor_get(ggml_graph_get_tensor(gf, von.c_str()), v_new.data(), 0,
-                                    v_new.size() * sizeof(float));
-            self_k[l].insert(self_k[l].end(), k_new.begin(), k_new.end());
-            self_v[l].insert(self_v[l].end(), v_new.begin(), v_new.end());
-        }
-
-        // Read logits and apply CFG, then sample
-        if (step == 0 && p.verbosity >= 1) {
-            fprintf(stderr, "dia_tts: decoder step 0 logits dump (for diff-testing):\n");
-        }
-        // Capture step-0 cond+uncond logits (9 x V) for DIA_DUMP_DIR, and per-step for STEPLOGITS.
-        const bool dia_dump_logits = (step == 0) && (dia_dump_dir != nullptr);
-        const bool dia_cap = dia_dump_logits || (dia_steplogits_path != nullptr);
-        std::vector<float> dump_cond, dump_uncond;
-        if (dia_cap) {
-            dump_cond.resize((size_t)m.n_output_heads * m.output_vocab_size);
-            dump_uncond.resize((size_t)m.n_output_heads * m.output_vocab_size);
-        }
-        for (int h = 0; h < (int)m.n_output_heads; h++) {
-            std::string hn = "logits_" + std::to_string(h);
-            // Logits shape: (output_vocab_size, 1, B) = (1028, 1, 2)
-            // Batch 0 = unconditional, Batch 1 = conditional (matches encoder input order)
-            std::vector<float> logits_raw(m.output_vocab_size * B);
-            ggml_backend_tensor_get(ggml_graph_get_tensor(gf, hn.c_str()), logits_raw.data(), 0,
-                                    logits_raw.size() * sizeof(float));
-
-            // CFG filtering (matching Python _decoder_step lines 442-445):
-            // 1. Compute CFG logits for top-k selection
-            // 2. Apply mask to CONDITIONAL logits (not CFG) for sampling
-            float* uncond = logits_raw.data();                     // batch 0
-            float* cond = logits_raw.data() + m.output_vocab_size; // batch 1
+            // Read logits and apply CFG, then sample
+            if (step == 0 && p.verbosity >= 1) {
+                fprintf(stderr, "dia_tts: decoder step 0 logits dump (for diff-testing):\n");
+            }
+            // Capture step-0 cond+uncond logits (9 x V) for DIA_DUMP_DIR, and per-step for STEPLOGITS.
+            const bool dia_dump_logits = (step == 0) && (dia_dump_dir != nullptr);
+            const bool dia_cap = dia_dump_logits || (dia_steplogits_path != nullptr);
+            std::vector<float> dump_cond, dump_uncond;
             if (dia_cap) {
-                std::memcpy(&dump_cond[(size_t)h * m.output_vocab_size], cond, m.output_vocab_size * sizeof(float));
-                std::memcpy(&dump_uncond[(size_t)h * m.output_vocab_size], uncond, m.output_vocab_size * sizeof(float));
+                dump_cond.resize((size_t)m.n_output_heads * m.output_vocab_size);
+                dump_uncond.resize((size_t)m.n_output_heads * m.output_vocab_size);
             }
-            // CFG combine (nari-labs/Dia-1.6B OLD checkpoint: official _decoder_step does
-            //   logits = cond + cfg_scale*(cond - uncond)
-            // and samples from THESE combined logits — NOT from cond masked to the CFG top-k
-            // (that masked scheme is the newer -0626 code and does not match this checkpoint).
-            std::vector<float> final_logits(m.output_vocab_size);
-            for (uint32_t i = 0; i < m.output_vocab_size; i++)
-                final_logits[i] = cond[i] + p.cfg_scale * (cond[i] - uncond[i]);
+            for (int h = 0; h < (int)m.n_output_heads; h++) {
+                std::string hn = "logits_" + std::to_string(h);
+                // Logits shape: (output_vocab_size, 1, B) = (1028, 1, 2)
+                // Batch 0 = unconditional, Batch 1 = conditional (matches encoder input order)
+                std::vector<float> logits_raw(m.output_vocab_size * B);
+                ggml_backend_tensor_get(ggml_graph_get_tensor(gf, hn.c_str()), logits_raw.data(), 0,
+                                        logits_raw.size() * sizeof(float));
 
-            if (step == 0 && h == 0 && p.verbosity >= 1) {
-                fprintf(stderr, "  cond h0 first4: %.4f %.4f %.4f %.4f argmax=%d\n", cond[0], cond[1], cond[2], cond[3],
-                        (int)(std::max_element(cond, cond + m.output_vocab_size) - cond));
-                fprintf(stderr, "  Python ref:     -2.8282 -1.6599 -4.0806 -0.2944 argmax=568\n");
-            }
+                // CFG filtering (matching Python _decoder_step lines 442-445):
+                // 1. Compute CFG logits for top-k selection
+                // 2. Apply mask to CONDITIONAL logits (not CFG) for sampling
+                float* uncond = logits_raw.data();                     // batch 0
+                float* cond = logits_raw.data() + m.output_vocab_size; // batch 1
+                if (dia_cap) {
+                    std::memcpy(&dump_cond[(size_t)h * m.output_vocab_size], cond, m.output_vocab_size * sizeof(float));
+                    std::memcpy(&dump_uncond[(size_t)h * m.output_vocab_size], uncond,
+                                m.output_vocab_size * sizeof(float));
+                }
+                // CFG combine (nari-labs/Dia-1.6B OLD checkpoint: official _decoder_step does
+                //   logits = cond + cfg_scale*(cond - uncond)
+                // and samples from THESE combined logits — NOT from cond masked to the CFG top-k
+                // (that masked scheme is the newer -0626 code and does not match this checkpoint).
+                std::vector<float> final_logits(m.output_vocab_size);
+                for (uint32_t i = 0; i < m.output_vocab_size; i++)
+                    final_logits[i] = cond[i] + p.cfg_scale * (cond[i] - uncond[i]);
 
-            // Dia logit masking (from Python _decoder_step):
-            // 1. Mask logits > audio_vocab_size (EOS/PAD/BOS region) to -inf for valid audio range
-            for (uint32_t i = m.audio_vocab_size + 1; i < m.output_vocab_size; i++) {
-                final_logits[i] = -INFINITY;
-            }
-            // 2. For channels 1-8: also mask EOS itself (only channel 0 can signal EOS)
-            if (h > 0) {
-                for (uint32_t i = m.audio_vocab_size; i < m.output_vocab_size; i++) {
+                if (step == 0 && h == 0 && p.verbosity >= 1) {
+                    fprintf(stderr, "  cond h0 first4: %.4f %.4f %.4f %.4f argmax=%d\n", cond[0], cond[1], cond[2],
+                            cond[3], (int)(std::max_element(cond, cond + m.output_vocab_size) - cond));
+                    fprintf(stderr, "  Python ref:     -2.8282 -1.6599 -4.0806 -0.2944 argmax=568\n");
+                }
+
+                // Dia logit masking (from Python _decoder_step):
+                // 1. Mask logits > audio_vocab_size (EOS/PAD/BOS region) to -inf for valid audio range
+                for (uint32_t i = m.audio_vocab_size + 1; i < m.output_vocab_size; i++) {
                     final_logits[i] = -INFINITY;
                 }
+                // 2. For channels 1-8: also mask EOS itself (only channel 0 can signal EOS)
+                if (h > 0) {
+                    for (uint32_t i = m.audio_vocab_size; i < m.output_vocab_size; i++) {
+                        final_logits[i] = -INFINITY;
+                    }
+                }
+
+                // Sample token for this codebook
+                uint32_t token = dia_sample_token(final_logits.data(), m.output_vocab_size,
+                                                  dia_greedy ? 0.0f : p.temperature, p.top_p, p.top_k, ctx->rng);
+                ctx->current_audio_tokens[h] = token;
             }
 
-            // Sample token for this codebook
-            uint32_t token = dia_sample_token(final_logits.data(), m.output_vocab_size,
-                                              dia_greedy ? 0.0f : p.temperature, p.top_p, p.top_k, ctx->rng);
-            ctx->current_audio_tokens[h] = token;
-        }
-
-        if (dia_dump_tokens) {
-            fprintf(stderr, "DIA_TOK step %u:", step);
-            for (int h = 0; h < (int)m.n_output_heads; h++)
-                fprintf(stderr, " %u", ctx->current_audio_tokens[h]);
-            fprintf(stderr, "\n");
-        }
-
-        if (dia_dump_logits) {
-            FILE* fc = fopen(dia_dpath("cpp_step0_cond.f32").c_str(), "wb");
-            FILE* fu = fopen(dia_dpath("cpp_step0_uncond.f32").c_str(), "wb");
-            if (fc) {
-                fwrite(dump_cond.data(), sizeof(float), dump_cond.size(), fc);
-                fclose(fc);
+            if (dia_dump_tokens) {
+                fprintf(stderr, "DIA_TOK step %u:", step);
+                for (int h = 0; h < (int)m.n_output_heads; h++)
+                    fprintf(stderr, " %u", ctx->current_audio_tokens[h]);
+                fprintf(stderr, "\n");
             }
-            if (fu) {
-                fwrite(dump_uncond.data(), sizeof(float), dump_uncond.size(), fu);
-                fclose(fu);
+
+            if (dia_dump_logits) {
+                FILE* fc = fopen(dia_dpath("cpp_step0_cond.f32").c_str(), "wb");
+                FILE* fu = fopen(dia_dpath("cpp_step0_uncond.f32").c_str(), "wb");
+                if (fc) {
+                    fwrite(dump_cond.data(), sizeof(float), dump_cond.size(), fc);
+                    fclose(fc);
+                }
+                if (fu) {
+                    fwrite(dump_uncond.data(), sizeof(float), dump_uncond.size(), fu);
+                    fclose(fu);
+                }
+                fprintf(stderr, "DIA_DUMP_DIR: wrote cpp_step0_{cond,uncond}.f32 (%zu floats each)\n",
+                        dump_cond.size());
             }
-            fprintf(stderr, "DIA_DUMP_DIR: wrote cpp_step0_{cond,uncond}.f32 (%zu floats each)\n", dump_cond.size());
-        }
-        if (dia_steplogits_path) {
-            // append per step: [uncond(9*V) | cond(9*V)] to match ref (N,2,9,V)
-            FILE* fs = fopen(dia_steplogits_path, "ab");
-            if (fs) {
-                fwrite(dump_uncond.data(), sizeof(float), dump_uncond.size(), fs);
-                fwrite(dump_cond.data(), sizeof(float), dump_cond.size(), fs);
-                fclose(fs);
+            if (dia_steplogits_path) {
+                // append per step: [uncond(9*V) | cond(9*V)] to match ref (N,2,9,V)
+                FILE* fs = fopen(dia_steplogits_path, "ab");
+                if (fs) {
+                    fwrite(dump_uncond.data(), sizeof(float), dump_uncond.size(), fs);
+                    fwrite(dump_cond.data(), sizeof(float), dump_cond.size(), fs);
+                    fclose(fs);
+                }
+            }
+
+            ggml_free(ctx0);
+
+            // EOS/delay override on the sampled tokens (end-of-sequence delay) + stop check.
+            bool stop = dia_check_stopping(*ctx);
+
+            if (dia_force) {
+                // teacher-forcing: emit sampled directly (output unused for diffing)
+                for (uint32_t h = 0; h < m.n_output_heads; h++)
+                    ctx->output_tokens.push_back(ctx->current_audio_tokens[h]);
+            } else {
+                // Write sampled (post-override) into the delayed buffer at step+1, with the
+                // start-of-sequence BOS mask (only fill positions still unwritten), mirroring
+                // Python update_one(pred, step+1, apply_mask=bos_countdown>0). Then emit gen[step+1].
+                const bool apply_mask = (bos_countdown > 0);
+                if (step + 1 < (uint32_t)gen_len) {
+                    for (uint32_t c = 0; c < m.n_output_heads; c++)
+                        if (!apply_mask || gen[step + 1][c] == -1)
+                            gen[step + 1][c] = (int32_t)ctx->current_audio_tokens[c];
+                    for (uint32_t c = 0; c < m.n_output_heads; c++)
+                        ctx->output_tokens.push_back((uint32_t)gen[step + 1][c]);
+                }
+                if (bos_countdown > 0)
+                    bos_countdown--;
+            }
+
+            if (stop) {
+                if (p.verbosity >= 1)
+                    fprintf(stderr, "dia_tts: stopped at step %u\n", step + 1);
+                break;
+            }
+
+            if (p.verbosity >= 2 && (step + 1) % 100 == 0) {
+                fprintf(stderr, "dia_tts: decoder step %u/%u\n", step + 1, max_gen);
             }
         }
-
-        ggml_gallocr_free(alloc);
-        ggml_free(ctx0);
-
-        // EOS/delay override on the sampled tokens (end-of-sequence delay) + stop check.
-        bool stop = dia_check_stopping(*ctx);
-
-        if (dia_force) {
-            // teacher-forcing: emit sampled directly (output unused for diffing)
-            for (uint32_t h = 0; h < m.n_output_heads; h++)
-                ctx->output_tokens.push_back(ctx->current_audio_tokens[h]);
-        } else {
-            // Write sampled (post-override) into the delayed buffer at step+1, with the
-            // start-of-sequence BOS mask (only fill positions still unwritten), mirroring
-            // Python update_one(pred, step+1, apply_mask=bos_countdown>0). Then emit gen[step+1].
-            const bool apply_mask = (bos_countdown > 0);
-            if (step + 1 < (uint32_t)gen_len) {
-                for (uint32_t c = 0; c < m.n_output_heads; c++)
-                    if (!apply_mask || gen[step + 1][c] == -1)
-                        gen[step + 1][c] = (int32_t)ctx->current_audio_tokens[c];
-                for (uint32_t c = 0; c < m.n_output_heads; c++)
-                    ctx->output_tokens.push_back((uint32_t)gen[step + 1][c]);
-            }
-            if (bos_countdown > 0)
-                bos_countdown--;
+        if (kv_bench) {
+            fprintf(stderr,
+                    "dia_bench: self_kv_roundtrip   upload=%.1f ms  readback=%.1f ms  total=%.1f ms "
+                    "(host<->device self-attn KV; §176c target)\n",
+                    kv_up_us / 1e3, kv_rb_us / 1e3, (kv_up_us + kv_rb_us) / 1e3);
         }
-
-        if (stop) {
-            if (p.verbosity >= 1)
-                fprintf(stderr, "dia_tts: stopped at step %u\n", step + 1);
-            break;
-        }
-
-        if (p.verbosity >= 2 && (step + 1) % 100 == 0) {
-            fprintf(stderr, "dia_tts: decoder step %u/%u\n", step + 1, max_gen);
-        }
-    }
+    } // decoder_ar bench scope
 
     if (p.verbosity >= 1) {
         fprintf(stderr, "dia_tts: generated %zu raw tokens (%zu steps)\n", ctx->output_tokens.size(),
@@ -2033,6 +2138,7 @@ float* dia_tts_synthesize(struct dia_tts_context* ctx, const char* text, int* ou
     }
 
     // DAC decode: codes (9, n_frames) -> PCM at 44.1 kHz
+    dia_bench_stage _b_dac("dac_decode");
     int n_samples = 0;
     float* pcm = dac_decode(ctx, filtered_codes, n_frames, &n_samples);
     if (!pcm || n_samples <= 0) {
@@ -2063,8 +2169,17 @@ void dia_tts_free(struct dia_tts_context* ctx) {
     if (ctx->buf_output) {
         ggml_backend_buffer_free(ctx->buf_output);
     }
+    if (ctx->model.buf_w) {
+        ggml_backend_buffer_free(ctx->model.buf_w);
+    }
     if (ctx->model.ctx_w) {
         ggml_free(ctx->model.ctx_w);
+    }
+    if (ctx->model.buf_perm) {
+        ggml_backend_buffer_free(ctx->model.buf_perm);
+    }
+    if (ctx->model.ctx_perm) {
+        ggml_free(ctx->model.ctx_perm);
     }
     if (ctx->model.buf_dac) {
         ggml_backend_buffer_free(ctx->model.buf_dac);
@@ -2074,6 +2189,9 @@ void dia_tts_free(struct dia_tts_context* ctx) {
     }
     if (ctx->sched) {
         ggml_backend_sched_free(ctx->sched);
+    }
+    if (ctx->backend && ctx->backend != ctx->backend_cpu) {
+        ggml_backend_free(ctx->backend);
     }
     if (ctx->backend_cpu) {
         ggml_backend_free(ctx->backend_cpu);

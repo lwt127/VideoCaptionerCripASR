@@ -11,11 +11,11 @@
 // third-party utilities
 // use your favorite implementations
 #define STB_VORBIS_HEADER_ONLY
-#include "stb_vorbis.c"    /* Enables Vorbis decoding. */
+#include "stb_vorbis.c" /* Enables Vorbis decoding. */
 
 #ifdef _WIN32
 #ifndef NOMINMAX
-    #define NOMINMAX
+#define NOMINMAX
 #endif
 #endif
 
@@ -38,13 +38,14 @@
 #include <io.h>
 #endif
 
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 
 #ifdef CRISPASR_FFMPEG
 // as implemented in ffmpeg_trancode.cpp only embedded in common lib if whisper built with ffmpeg support
-extern bool ffmpeg_decode_audio(const std::string & ifname, std::vector<uint8_t> & wav_data);
+extern bool ffmpeg_decode_audio(const std::string& ifname, std::vector<uint8_t>& wav_data);
 #endif
 
 // Decode any audio container that miniaudio can't handle (m4a/mp4/webm/aac/opus)
@@ -59,7 +60,10 @@ static bool ffmpeg_subprocess_decode(const std::string& fname, std::vector<float
     // Quote the path for the shell command — basic protection for spaces, no full shell escaping
     std::string cmd = "ffmpeg -loglevel error -i \"" + fname + "\" -f s16le -ar 16000 -ac 1 -";
     FILE* pipe = crispasr::crispasr_popen(cmd, "rb");
-    if (!pipe) return false;
+    if (!pipe) {
+        fprintf(stderr, "crispasr: ffmpeg popen failed: %s\n", strerror(errno));
+        return false;
+    }
 
     std::vector<int16_t> buf;
     int16_t tmp[4096];
@@ -68,7 +72,8 @@ static bool ffmpeg_subprocess_decode(const std::string& fname, std::vector<float
         buf.insert(buf.end(), tmp, tmp + n);
     }
     int ret = crispasr::crispasr_pclose(pipe);
-    if (ret != 0 || buf.empty()) return false;
+    if (ret != 0 || buf.empty())
+        return false;
 
     pcmf32.resize(buf.size());
     for (size_t i = 0; i < buf.size(); i++)
@@ -76,67 +81,104 @@ static bool ffmpeg_subprocess_decode(const std::string& fname, std::vector<float
     return true;
 }
 
-bool read_audio_data(const std::string & fname, std::vector<float>& pcmf32, std::vector<std::vector<float>>& pcmf32s, bool stereo) {
+bool read_audio_data(const std::string& fname, std::vector<float>& pcmf32, std::vector<std::vector<float>>& pcmf32s,
+                     bool stereo, int target_rate) {
+    // target_rate <= 0 → default 16 kHz (backward compat).
+    const int effective_rate = (target_rate > 0) ? target_rate : CRISPASR_SAMPLE_RATE;
+
     std::vector<uint8_t> audio_data; // used for pipe input from stdin or ffmpeg decoding output
 
     ma_result result;
     ma_decoder_config decoder_config;
     ma_decoder decoder;
 
-    decoder_config = ma_decoder_config_init(ma_format_f32, stereo ? 2 : 1, CRISPASR_SAMPLE_RATE);
+    decoder_config = ma_decoder_config_init(ma_format_f32, stereo ? 2 : 1, effective_rate);
 
     if (fname == "-") {
-		#ifdef _WIN32
-		_setmode(_fileno(stdin), _O_BINARY);
-		#endif
+#ifdef _WIN32
+        _setmode(_fileno(stdin), _O_BINARY);
+#endif
 
-		uint8_t buf[1024];
-		while (true)
-		{
-			const size_t n = fread(buf, 1, sizeof(buf), stdin);
-			if (n == 0) {
-				break;
-			}
-			audio_data.insert(audio_data.end(), buf, buf + n);
-		}
+        uint8_t buf[1024];
+        while (true) {
+            const size_t n = fread(buf, 1, sizeof(buf), stdin);
+            if (n == 0) {
+                break;
+            }
+            audio_data.insert(audio_data.end(), buf, buf + n);
+        }
 
-		if ((result = ma_decoder_init_memory(audio_data.data(), audio_data.size(), &decoder_config, &decoder)) != MA_SUCCESS) {
+        if ((result = ma_decoder_init_memory(audio_data.data(), audio_data.size(), &decoder_config, &decoder)) !=
+            MA_SUCCESS) {
+            fprintf(stderr, "Error: failed to open audio data from stdin (%s)\n", ma_result_description(result));
 
-			fprintf(stderr, "Error: failed to open audio data from stdin (%s)\n", ma_result_description(result));
+            return false;
+        }
 
-			return false;
-		}
-
-		fprintf(stderr, "%s: read %zu bytes from stdin\n", __func__, audio_data.size());
-    }
-    else if (((result = ma_decoder_init_file(fname.c_str(), &decoder_config, &decoder)) != MA_SUCCESS)) {
+        fprintf(stderr, "%s: read %zu bytes from stdin\n", __func__, audio_data.size());
+    } else if (((result = ma_decoder_init_file(fname.c_str(), &decoder_config, &decoder)) != MA_SUCCESS)) {
+        // Container miniaudio can't open (.opus / .aac / .m4a / .webm / .amr / …):
+        // decode via the crispasr_audio_load C ABI first — it covers these
+        // natively (glint AAC/Opus, AudioToolbox/fdk-aac, libopus WebM, opencore
+        // AMR, …) at the requested rate, no ffmpeg. Falls through to ffmpeg
+        // only if it can't handle the format either.
+        if (stereo) {
+            float* L = nullptr;
+            float* R = nullptr;
+            int fr = 0, sr = 0, ch = 0;
+            if (crispasr_audio_load_stereo(fname.c_str(), &L, &R, &fr, &sr, &ch) == 0) {
+                pcmf32.resize((size_t)fr);
+                pcmf32s.assign(2, std::vector<float>((size_t)fr));
+                for (int i = 0; i < fr; i++) {
+                    const float l = L[i];
+                    const float rr = (ch >= 2 && R) ? R[i] : l;
+                    pcmf32s[0][(size_t)i] = l;
+                    pcmf32s[1][(size_t)i] = rr;
+                    pcmf32[(size_t)i] = 0.5f * (l + rr);
+                }
+                crispasr_audio_free(L);
+                crispasr_audio_free(R);
+                return true;
+            }
+        } else {
+            float* buf = nullptr;
+            int fr = 0, sr = 0;
+            if (crispasr_audio_load_at_rate(fname.c_str(), effective_rate, &buf, &fr, &sr) == 0) {
+                pcmf32.assign(buf, buf + fr);
+                crispasr_audio_free(buf);
+                return true;
+            }
+        }
 #if defined(CRISPASR_FFMPEG)
-		if (ffmpeg_decode_audio(fname, audio_data) != 0) {
-			fprintf(stderr, "error: failed to ffmpeg decode '%s'\n", fname.c_str());
+        if (ffmpeg_decode_audio(fname, audio_data) != 0) {
+            fprintf(stderr, "error: failed to ffmpeg decode '%s'\n", fname.c_str());
 
-			return false;
-		}
+            return false;
+        }
 
-		if ((result = ma_decoder_init_memory(audio_data.data(), audio_data.size(), &decoder_config, &decoder)) != MA_SUCCESS) {
-			fprintf(stderr, "error: failed to read audio data as wav (%s)\n", ma_result_description(result));
+        if ((result = ma_decoder_init_memory(audio_data.data(), audio_data.size(), &decoder_config, &decoder)) !=
+            MA_SUCCESS) {
+            fprintf(stderr, "error: failed to read audio data as wav (%s)\n", ma_result_description(result));
 
-			return false;
-		}
+            return false;
+        }
 #else
-		// Fallback: try ffmpeg subprocess (handles m4a, mp4, webm, aac, opus, etc.)
-		if (ffmpeg_subprocess_decode(fname, pcmf32)) {
-			// ffmpeg already produced mono 16kHz float PCM; skip the miniaudio path
-			if (stereo) {
-				// duplicate mono channel into both stereo channels
-				pcmf32s.resize(2, std::vector<float>(pcmf32.size()));
-				pcmf32s[0] = pcmf32;
-				pcmf32s[1] = pcmf32;
-			}
-			return true;
-		}
-		fprintf(stderr, "error: failed to read audio '%s': miniaudio and ffmpeg both failed\n"
-		                "       Install ffmpeg or convert to wav/mp3/flac first.\n", fname.c_str());
-		return false;
+        // Fallback: try ffmpeg subprocess (handles m4a, mp4, webm, aac, opus, etc.)
+        if (ffmpeg_subprocess_decode(fname, pcmf32)) {
+            // ffmpeg already produced mono 16kHz float PCM; skip the miniaudio path
+            if (stereo) {
+                // duplicate mono channel into both stereo channels
+                pcmf32s.resize(2, std::vector<float>(pcmf32.size()));
+                pcmf32s[0] = pcmf32;
+                pcmf32s[1] = pcmf32;
+            }
+            return true;
+        }
+        fprintf(stderr,
+                "error: failed to read audio '%s': miniaudio and ffmpeg both failed\n"
+                "       Install ffmpeg or convert to wav/mp3/flac first.\n",
+                fname.c_str());
+        return false;
 #endif
     }
 
@@ -144,17 +186,17 @@ bool read_audio_data(const std::string & fname, std::vector<float>& pcmf32, std:
     ma_uint64 frames_read;
 
     if ((result = ma_decoder_get_length_in_pcm_frames(&decoder, &frame_count)) != MA_SUCCESS) {
-		fprintf(stderr, "error: failed to retrieve the length of the audio data (%s)\n", ma_result_description(result));
+        fprintf(stderr, "error: failed to retrieve the length of the audio data (%s)\n", ma_result_description(result));
 
-		return false;
+        return false;
     }
 
-    pcmf32.resize(stereo ? frame_count*2 : frame_count);
+    pcmf32.resize(stereo ? frame_count * 2 : frame_count);
 
     if ((result = ma_decoder_read_pcm_frames(&decoder, pcmf32.data(), frame_count, &frames_read)) != MA_SUCCESS) {
-		fprintf(stderr, "error: failed to read the frames of the audio data (%s)\n", ma_result_description(result));
+        fprintf(stderr, "error: failed to read the frames of the audio data (%s)\n", ma_result_description(result));
 
-		return false;
+        return false;
     }
 
     if (stereo) {
@@ -162,15 +204,15 @@ bool read_audio_data(const std::string & fname, std::vector<float>& pcmf32, std:
         pcmf32.resize(frame_count);
 
         for (uint64_t i = 0; i < frame_count; i++) {
-            pcmf32[i] = 0.5f * (stereo_data[2*i] + stereo_data[2*i + 1]);
+            pcmf32[i] = 0.5f * (stereo_data[2 * i] + stereo_data[2 * i + 1]);
         }
 
         pcmf32s.resize(2);
         pcmf32s[0].resize(frame_count);
         pcmf32s[1].resize(frame_count);
         for (uint64_t i = 0; i < frame_count; i++) {
-            pcmf32s[0][i] = stereo_data[2*i];
-            pcmf32s[1][i] = stereo_data[2*i + 1];
+            pcmf32s[0][i] = stereo_data[2 * i];
+            pcmf32s[1][i] = stereo_data[2 * i + 1];
         }
     }
 
@@ -191,19 +233,22 @@ std::string to_timestamp(int64_t t, bool comma) {
     msec = msec - sec * 1000;
 
     char buf[32];
-    snprintf(buf, sizeof(buf), "%02d:%02d:%02d%s%03d", (int) hr, (int) min, (int) sec, comma ? "," : ".", (int) msec);
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d%s%03d", (int)hr, (int)min, (int)sec, comma ? "," : ".", (int)msec);
 
     return std::string(buf);
 }
 
 int timestamp_to_sample(int64_t t, int n_samples, int whisper_sample_rate) {
-    return std::max(0, std::min((int) n_samples - 1, (int) ((t*whisper_sample_rate)/100)));
+    return std::max(0, std::min((int)n_samples - 1, (int)((t * whisper_sample_rate) / 100)));
 }
 
-bool speak_with_file(const std::string & command, const std::string & text, const std::string & path, int voice_id) {
+bool speak_with_file(const std::string& command, const std::string& text, const std::string& path, int voice_id) {
 #if defined(__APPLE__) && (TARGET_OS_IPHONE || TARGET_OS_TV || TARGET_OS_WATCH)
     // system() is unavailable on iOS / tvOS / watchOS.
-    (void) command; (void) text; (void) path; (void) voice_id;
+    (void)command;
+    (void)text;
+    (void)path;
+    (void)voice_id;
     fprintf(stderr, "%s: not supported on this platform (system() unavailable)\n", __func__);
     return false;
 #else

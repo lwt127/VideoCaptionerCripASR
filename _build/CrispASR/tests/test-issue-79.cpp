@@ -26,7 +26,7 @@ int main(int argc, char** argv) {
     const char* model_path = argv[1];
     struct vibevoice_context_params params = vibevoice_context_default_params();
     params.verbosity = 1;
-    params.use_gpu = false; // CPU is enough for crash reproduction
+    params.use_gpu = false;    // CPU is enough for crash reproduction
     params.max_new_tokens = 1; // Speed up test: we only care about KV allocation
 
     std::cout << "Initializing VibeVoice context with: " << model_path << std::endl;

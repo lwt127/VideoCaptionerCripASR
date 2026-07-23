@@ -102,6 +102,7 @@ void canary_set_temperature(struct canary_context* ctx, float temperature, uint6
 
 // §90 beam-search width. n > 1 activates beam search; n <= 0 clamped to 1 (greedy).
 void canary_set_beam_size(struct canary_context* ctx, int n);
+void canary_set_max_new_tokens(struct canary_context* ctx, int n);
 
 // Hyper-parameters
 int canary_frame_dur_cs(struct canary_context* ctx);

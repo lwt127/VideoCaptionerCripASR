@@ -9,6 +9,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "core/crispasr_env.h"
 
 class FireredAsrBackend : public CrispasrBackend {
 public:
@@ -18,22 +19,56 @@ public:
 
     uint32_t capabilities() const override {
         // firered-asr's encoder uses relative positional encoding with
-        // pe_maxlen=5000 (~50 s of post-subsample frames). Do NOT declare
-        // CAP_UNBOUNDED_INPUT: the dispatcher's VAD/chunking path keeps
-        // each call well under that window. Reports from issue #125
-        // showed 50 min files going OOB through the PE buffer.
-        return CAP_TIMESTAMPS_CTC | CAP_AUTO_DOWNLOAD | CAP_BEAM_SEARCH | CAP_TOKEN_CONFIDENCE | CAP_FLASH_ATTN |
-               CAP_DIARIZE;
+        // pe_maxlen=5000 (~200 s of post-subsample frames) and an O(T²)
+        // self-attention, so feeding a long file in one pass is both very
+        // slow and risks running off the PE center window (issue #125: >50 s
+        // audio hung indefinitely on CUDA).
+        //
+        // Declare CAP_UNBOUNDED_INPUT so the issue #89 long-audio dispatch
+        // (crispasr_run.cpp) auto-chunks at 30 s when the user passes neither
+        // --vad nor --chunk-seconds. Without the flag, should_auto_chunk_long()
+        // returns early and the backend receives the whole file in one pass —
+        // the earlier "do NOT declare it" reasoning was inverted (the
+        // dispatcher only chunks unbounded-input backends; bounded ones get
+        // the full audio). Short files still take the single-pass path; the
+        // pe_maxlen guard in firered_asr.cpp remains as a backstop.
+        return CAP_UNBOUNDED_INPUT | CAP_TIMESTAMPS_CTC | CAP_AUTO_DOWNLOAD | CAP_BEAM_SEARCH | CAP_TOKEN_CONFIDENCE |
+               CAP_FLASH_ATTN | CAP_DIARIZE;
     }
 
     bool init(const whisper_params& params) override {
         firered_asr_context_params cp = firered_asr_context_default_params();
         cp.n_threads = params.n_threads;
         cp.verbosity = params.no_prints ? 0 : 1;
-        if (getenv("CRISPASR_VERBOSE") || getenv("FIRERED_BENCH"))
+        if (getenv("CRISPASR_VERBOSE") || crispasr_env::get("CRISPASR_FIRERED_BENCH"))
             cp.verbosity = 2;
         cp.use_gpu = crispasr_backend_should_use_gpu(params);
         cp.beam_size = params.beam_size > 0 ? params.beam_size : 3;
+
+        // FireRedASR2-AED auto-detects the spoken language (built-in LID) among
+        // the languages it was trained on: Chinese (+ ~20 Chinese dialects),
+        // English, and Cantonese. It has no token for any other language and
+        // offers no per-request language override, so `-l <lang>` cannot steer
+        // it. Warn instead of silently ignoring an unsupported request — issue
+        // #199: `-l ja` on this Mandarin/English model produced hallucinations
+        // because there is no Japanese in the model at all. zh/en/yue are
+        // handled by auto-detection regardless of the flag, so only flag the
+        // genuinely unsupported codes.
+        if (!params.no_prints && !params.language.empty() && params.language != "auto") {
+            const std::string& l = params.language;
+            const bool firered_lang = (l == "zh" || l == "en" || l == "yue" || l == "zh-en" || l == "zh_en" ||
+                                       l == "chinese" || l == "english" || l == "cantonese");
+            if (!firered_lang) {
+                fprintf(stderr,
+                        "crispasr[firered-asr]: WARNING: this model only transcribes Chinese (+ Chinese "
+                        "dialects), English, and Cantonese; '-l %s' is not supported and will be ignored "
+                        "(expect hallucinations for non-Chinese/English audio). For %s, use a native backend "
+                        "— e.g. reazonspeech / parakeet (parakeet-tdt-0.6b-ja) / fastconformer-ctc / funasr "
+                        "(zh,yue,en,ja,ko).\n",
+                        l.c_str(), crispasr_iso_to_english_lang(l).c_str());
+            }
+        }
+
         ctx_ = firered_asr_init_from_file(params.model.c_str(), cp);
         return ctx_ != nullptr;
     }

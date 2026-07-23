@@ -11,9 +11,11 @@
 #include "ggml-cpu.h"
 
 #include "core/gguf_loader.h"
+#include "core/crispasr_env.h"
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -21,6 +23,32 @@
 #include <map>
 #include <string>
 #include <vector>
+
+// ===========================================================================
+// Bench instrumentation — `BERT_ENCODER_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool bert_encoder_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_BERT_ENCODER_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct bert_encoder_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit bert_encoder_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~bert_encoder_bench_stage() {
+        if (!bert_encoder_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  bert_encoder_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 // ── WordPiece tokenizer ───────────────────────────────────────────
 
@@ -146,9 +174,9 @@ static ggml_tensor* bert_layer_norm(ggml_context* ctx, ggml_tensor* x, ggml_tens
     return x;
 }
 
-// GELU approximation matching BERT's implementation
+// BERT hidden_act="gelu" is EXACT (erf) in HF/PyTorch, not the tanh approximation.
 static ggml_tensor* bert_gelu(ggml_context* ctx, ggml_tensor* x) {
-    return ggml_gelu(ctx, x);
+    return ggml_gelu_erf(ctx, x);
 }
 
 static bool bert_forward(bert_encoder_context* bctx, const std::vector<int>& token_ids,
@@ -433,6 +461,7 @@ extern "C" bool bert_encoder_forward(struct bert_encoder_context* ctx, const cha
                                      int* out_n_tokens) {
     if (!ctx || !text || !out_features || !out_n_tokens)
         return false;
+    bert_encoder_bench_stage _bs_total("forward_total");
 
     std::vector<int> token_ids = bert_tokenize(ctx->tok, text);
     int T = (int)token_ids.size();

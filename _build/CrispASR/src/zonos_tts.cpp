@@ -31,6 +31,8 @@
 #include "core/dac_decoder.h"
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
+#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/crispasr_env.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -38,6 +40,8 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -54,6 +58,32 @@
 // -----------------------------------------------------------------------
 
 namespace {
+
+// ===========================================================================
+// Bench instrumentation — `ZONOS_TTS_BENCH=1` for per-stage timings.
+// ===========================================================================
+
+static bool zonos_tts_bench_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = crispasr_env::get("CRISPASR_ZONOS_TTS_BENCH");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+struct zonos_tts_bench_stage {
+    const char* name;
+    std::chrono::steady_clock::time_point t0;
+    explicit zonos_tts_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    ~zonos_tts_bench_stage() {
+        if (!zonos_tts_bench_enabled())
+            return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "  zonos_tts_bench: %-22s %.2f ms\n", name, ms);
+    }
+};
 
 struct zonos_hp {
     uint32_t d_model = 2048;
@@ -169,6 +199,9 @@ struct zonos_tts_context {
     // Per-codebook embeddings and heads
     std::vector<ggml_tensor*> emb_w;  // [n_codebooks] each (emb_vocab_size, d_model)
     std::vector<ggml_tensor*> head_w; // [n_codebooks] each (head_vocab_size, d_model)
+    // §176g: CPU F32 cache of emb_w — eliminates per-step quantized tensor_get in AR loop.
+    // Size: n_codebooks × emb_vocab_size × d_model × 4 ≈ 75 MB for the default Zonos-0.1.
+    std::vector<std::vector<float>> emb_w_cache; // [k][tid * d_model + dim]
 
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
@@ -189,12 +222,29 @@ struct zonos_tts_context {
     ggml_tensor* kv_v_uncond = nullptr;
     int kv_max_ctx = 0;
 
+    // §176b: Lk-bucketed single-step AR graph cache.
+    struct ZonosBucket {
+        int lk = 0;
+        ggml_context* ctx = nullptr;
+        std::vector<uint8_t> meta;
+        ggml_cgraph* gf = nullptr;
+    };
+    static constexpr int kBucketN = 4;
+    static constexpr int kBucketLks[kBucketN] = {512, 1024, 2048, 4096};
+    std::array<ZonosBucket, kBucketN> ar_buckets{}; // conditioned KV
+    ggml_backend_sched_t ar_step_sched = nullptr;
+
     // DAC codec (loaded lazily on first synthesize call)
     std::string dac_codec_path;
     bool dac_loaded = false;
     core_dac::DacWeights dac_w;
+    // FASTCONV (docs/perf-sweep/PLAN.md): baked-F32 decode conv kernels. Gated
+    // CRISPASR_ZONOS_FASTCONV.
+    core_dac::fastconv_cache dac_fc;
     ggml_context* dac_ctx_w = nullptr;
     ggml_backend_buffer_t dac_buf_w = nullptr;
+    ggml_context* dac_ctx_perm = nullptr;
+    ggml_backend_buffer_t dac_buf_perm = nullptr;
 
     // Sampler RNG
     uint64_t rng_state = 0xdeadbeefcafebabeULL;
@@ -330,7 +380,7 @@ struct zonos_tts_context* zonos_tts_init_from_file(const char* path_model, struc
         return nullptr;
     }
     ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
-    ctx->backend = params.use_gpu ? ggml_backend_init_best() : ctx->backend_cpu;
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (ggml_backend_is_cpu(ctx->backend)) {
         ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
     }
@@ -424,7 +474,7 @@ struct zonos_tts_context* zonos_tts_init_from_file(const char* path_model, struc
     // Try to load speaker embedding from file, else use random Gaussian.
     ctx->cond_state.speaker_emb.resize(128);
     {
-        const char* spk_path = getenv("ZONOS_SPEAKER_EMB_PATH");
+        const char* spk_path = crispasr_env::get("CRISPASR_ZONOS_SPEAKER_EMB_PATH");
         if (!spk_path)
             spk_path = "/mnt/storage/zonos-tts/jfk_speaker_emb.bin";
         FILE* sf = fopen(spk_path, "rb");
@@ -469,6 +519,25 @@ struct zonos_tts_context* zonos_tts_init_from_file(const char* path_model, struc
         ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 4096, false, false);
     }
     ctx->compute_meta.resize(ggml_tensor_overhead() * 4096 + ggml_graph_overhead_custom(4096, false));
+
+    // §176g: pre-dequantize all codebook embedding tables into F32 CPU cache.
+    {
+        const int d = (int)hp.d_model;
+        const int v = (int)hp.emb_vocab_size;
+        ctx->emb_w_cache.resize(hp.n_codebooks);
+        for (uint32_t k = 0; k < hp.n_codebooks; k++) {
+            ctx->emb_w_cache[k].resize((size_t)v * d);
+            ggml_tensor* w = ctx->emb_w[k];
+            if (w->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_get(w, ctx->emb_w_cache[k].data(), 0, (size_t)v * d * sizeof(float));
+            } else {
+                const size_t nbytes = ggml_nbytes(w);
+                std::vector<uint8_t> raw(nbytes);
+                ggml_backend_tensor_get(w, raw.data(), 0, nbytes);
+                ggml_get_type_traits(w->type)->to_float(raw.data(), ctx->emb_w_cache[k].data(), v * d);
+            }
+        }
+    }
 
     return ctx;
 }
@@ -923,10 +992,13 @@ static void tensor_get_row_f32(ggml_tensor* t, int row_idx, float* out, int row_
             out[i] = ggml_fp16_to_fp32(raw[i]);
         }
     } else {
-        // For quantized types, read the full tensor and extract the row
-        // (quantized row sizes are block-aligned, so we dequant the whole thing)
-        auto all = tensor_to_float(t);
-        std::memcpy(out, &all[(size_t)row_idx * row_size], (size_t)row_size * sizeof(float));
+        // §176g: single-row quantized fetch — O(row_size) not O(vocab × row_size).
+        const size_t row_bytes = ggml_row_size(t->type, row_size);
+        static thread_local std::vector<uint8_t> raw_buf;
+        if (raw_buf.size() < row_bytes)
+            raw_buf.resize(row_bytes);
+        ggml_backend_tensor_get(t, raw_buf.data(), (size_t)row_idx * row_bytes, row_bytes);
+        ggml_get_type_traits(t->type)->to_float(raw_buf.data(), out, row_size);
     }
 }
 
@@ -1132,7 +1204,8 @@ namespace {
 // Input: embeddings (d_model, T). Output: logits for all 9 codebooks
 // concatenated: (head_vocab_size * n_codebooks, 1) for the last token.
 static ggml_cgraph* build_graph_backbone(zonos_tts_context* ctx, int n_past, int T, ggml_tensor* use_kv_k = nullptr,
-                                         ggml_tensor* use_kv_v = nullptr) {
+                                         ggml_tensor* use_kv_v = nullptr, int fixed_kv_len = 0,
+                                         ggml_context* arena_ctx = nullptr) {
     const auto& hp = ctx->hp;
     const int d = (int)hp.d_model;
     const int n_q = (int)hp.n_heads;
@@ -1142,7 +1215,7 @@ static ggml_cgraph* build_graph_backbone(zonos_tts_context* ctx, int n_past, int
     const float eps = hp.norm_eps;
     const float theta = hp.rope_theta;
     const float attn_scale = 1.0f / std::sqrt((float)hd);
-    const int Lk = n_past + T;
+    const int Lk = fixed_kv_len > 0 ? fixed_kv_len : (n_past + T);
 
     // Use specified KV cache or default to ctx->kv_k/kv_v
     ggml_tensor* kv_k_ptr = use_kv_k ? use_kv_k : ctx->kv_k;
@@ -1150,7 +1223,7 @@ static ggml_cgraph* build_graph_backbone(zonos_tts_context* ctx, int n_past, int
     GGML_ASSERT(kv_k_ptr && kv_v_ptr && Lk <= ctx->kv_max_ctx);
 
     ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
-    ggml_context* ctx0 = ggml_init(ip);
+    ggml_context* ctx0 = arena_ctx ? arena_ctx : ggml_init(ip);
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 4096, false);
 
     ggml_tensor* embeds = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d, T);
@@ -1160,7 +1233,7 @@ static ggml_cgraph* build_graph_backbone(zonos_tts_context* ctx, int n_past, int
     ggml_set_name(positions, "positions");
     ggml_set_input(positions);
     ggml_tensor* causal_mask = nullptr;
-    if (T > 1) {
+    if (T > 1 || fixed_kv_len > 0) {
         causal_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, Lk, T);
         ggml_set_name(causal_mask, "causal_mask");
         ggml_set_input(causal_mask);
@@ -1181,6 +1254,8 @@ static ggml_cgraph* build_graph_backbone(zonos_tts_context* ctx, int n_past, int
     };
     // Zonos uses consecutive-pair RoPE (x[2i],x[2i+1]) not half-split (x[i],x[i+d/2]).
     kvp.rope_type = GGML_ROPE_TYPE_NORMAL;
+
+    ggml_tensor* eff_kv_indices = fixed_kv_len > 0 ? positions : nullptr;
 
     // Helper to upcast F16 tensors to F32 for elementwise ops
     auto cast_f32 = [&](ggml_tensor* t) -> ggml_tensor* {
@@ -1203,9 +1278,12 @@ static ggml_cgraph* build_graph_backbone(zonos_tts_context* ctx, int n_past, int
         cur = ggml_add(ctx0, cur, cast_f32(layer.attn_norm_b));
 
         // Self-attention with fused QKV and KV cache
-        ggml_tensor* attn = core_attn::kv_self_attn(ctx0, gf, cur, nullptr, nullptr, nullptr, layer.attn_output_w,
-                                                    nullptr, nullptr, positions, (T == 1) ? nullptr : causal_mask,
-                                                    kv_k_ptr, kv_v_ptr, (int)il, n_past, kvp, layer.attn_qkv_w);
+        ggml_tensor* attn =
+            core_attn::kv_self_attn(ctx0, gf, cur, nullptr, nullptr, nullptr, layer.attn_output_w, nullptr, nullptr,
+                                    positions, (T == 1 && !fixed_kv_len) ? nullptr : causal_mask, kv_k_ptr, kv_v_ptr,
+                                    (int)il, n_past, kvp, layer.attn_qkv_w,
+                                    /*fixed_kv_len=*/fixed_kv_len,
+                                    /*kv_indices=*/eff_kv_indices);
         cur = ggml_add(ctx0, residual, attn);
 
         // Pre-FFN LayerNorm (with bias)
@@ -1222,8 +1300,10 @@ static ggml_cgraph* build_graph_backbone(zonos_tts_context* ctx, int n_past, int
             ggml_tensor* gate_up = ggml_mul_mat(ctx0, layer.ffn_gate_up_w, cur);
             const int ff = (int)hp.ff_dim;
             const size_t ts = ggml_type_size(gate_up->type);
-            ggml_tensor* y = ggml_view_2d(ctx0, gate_up, ff, (int)gate_up->ne[1], gate_up->nb[1], 0);
-            ggml_tensor* gate = ggml_view_2d(ctx0, gate_up, ff, (int)gate_up->ne[1], gate_up->nb[1], (size_t)ff * ts);
+            // ggml_cont: non-contiguous views segfault on Vulkan/RDNA4 (issue #184).
+            ggml_tensor* y = ggml_cont(ctx0, ggml_view_2d(ctx0, gate_up, ff, (int)gate_up->ne[1], gate_up->nb[1], 0));
+            ggml_tensor* gate =
+                ggml_cont(ctx0, ggml_view_2d(ctx0, gate_up, ff, (int)gate_up->ne[1], gate_up->nb[1], (size_t)ff * ts));
             cur = ggml_add(ctx0, residual,
                            ggml_mul_mat(ctx0, layer.ffn_down_w, ggml_mul(ctx0, y, ggml_silu(ctx0, gate))));
         }
@@ -1255,8 +1335,83 @@ static ggml_cgraph* build_graph_backbone(zonos_tts_context* ctx, int n_past, int
     }
     ggml_set_name(all_logits, "logits");
     ggml_build_forward_expand(gf, all_logits);
-    ggml_free(ctx0);
+    if (!arena_ctx)
+        ggml_free(ctx0);
     return gf;
+}
+
+// §176b: Lk-bucketed single-step AR decode helpers.
+static int zonos_pick_bucket(zonos_tts_context* ctx, int needed_lk) {
+    for (int i = 0; i < zonos_tts_context::kBucketN; i++) {
+        const int bk_lk = zonos_tts_context::kBucketLks[i];
+        if (bk_lk >= needed_lk && bk_lk <= ctx->kv_max_ctx)
+            return i;
+    }
+    return -1;
+}
+
+static ggml_backend_sched_t zonos_step_sched_lazy(zonos_tts_context* ctx) {
+    if (ctx->ar_step_sched)
+        return ctx->ar_step_sched;
+    ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
+    int n_be = (ctx->backend && ctx->backend != ctx->backend_cpu) ? 2 : 1;
+    ctx->ar_step_sched = ggml_backend_sched_new(backends, nullptr, n_be, 4096, false, false);
+    return ctx->ar_step_sched;
+}
+
+static ggml_cgraph* zonos_get_or_build_bucket(zonos_tts_context* ctx, int idx) {
+    auto& bk = ctx->ar_buckets[idx];
+    if (bk.gf)
+        return bk.gf;
+    bk.lk = zonos_tts_context::kBucketLks[idx];
+    bk.meta.assign(ctx->compute_meta.size(), 0);
+    ggml_init_params ip = {bk.meta.size(), bk.meta.data(), true};
+    bk.ctx = ggml_init(ip);
+    if (!bk.ctx)
+        return nullptr;
+    bk.gf = build_graph_backbone(ctx, /*n_past=*/0, /*n_tokens=*/1,
+                                 /*use_kv_k=*/nullptr, /*use_kv_v=*/nullptr,
+                                 /*fixed_kv_len=*/bk.lk, /*arena_ctx=*/bk.ctx);
+    return bk.gf;
+}
+
+static float* run_backbone_bucket(zonos_tts_context* ctx, const float* embeds, int n_past) {
+    const int idx = zonos_pick_bucket(ctx, n_past + 1);
+    if (idx < 0)
+        return nullptr;
+
+    ggml_cgraph* gf = zonos_get_or_build_bucket(ctx, idx);
+    if (!gf)
+        return nullptr;
+
+    ggml_backend_sched_t step_sched = zonos_step_sched_lazy(ctx);
+    ggml_backend_sched_reset(step_sched);
+    if (!ggml_backend_sched_alloc_graph(step_sched, gf))
+        return nullptr;
+
+    const int d = (int)ctx->hp.d_model;
+    const int Lk = ctx->ar_buckets[idx].lk;
+    const int total_logits = (int)ctx->hp.head_vocab_size * (int)ctx->hp.n_codebooks;
+
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "inputs_embeds"), embeds, 0, (size_t)d * sizeof(float));
+    int32_t pos = n_past;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "positions"), &pos, 0, sizeof(int32_t));
+
+    // Causal mask: allow [0..n_past], mask [n_past+1..Lk-1].
+    std::vector<ggml_fp16_t> mask((size_t)Lk);
+    const ggml_fp16_t zero_h = ggml_fp32_to_fp16(0.0f);
+    const ggml_fp16_t ninf_h = ggml_fp32_to_fp16(-INFINITY);
+    for (int k = 0; k < Lk; k++)
+        mask[k] = (k <= n_past) ? zero_h : ninf_h;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "causal_mask"), mask.data(), 0,
+                            mask.size() * sizeof(ggml_fp16_t));
+
+    if (ggml_backend_sched_graph_compute(step_sched, gf) != GGML_STATUS_SUCCESS)
+        return nullptr;
+
+    float* r = (float*)malloc((size_t)total_logits * sizeof(float));
+    ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "logits"), r, 0, (size_t)total_logits * sizeof(float));
+    return r;
 }
 
 // Run the backbone graph, return logits for all 9 codebooks at the last position.
@@ -1266,6 +1421,13 @@ static ggml_cgraph* build_graph_backbone(zonos_tts_context* ctx, int n_past, int
 static float* run_backbone(zonos_tts_context* ctx, const float* embeds, int T, int n_past,
                            ggml_tensor* use_kv_k = nullptr, ggml_tensor* use_kv_v = nullptr,
                            float* out_hidden = nullptr) {
+    // §176b: Lk-bucketed fast path for single-step decode on the default
+    // (conditioned) KV cache, when no hidden-state extraction is needed.
+    if (T == 1 && !use_kv_k && !use_kv_v && !out_hidden) {
+        if (float* r = run_backbone_bucket(ctx, embeds, n_past))
+            return r;
+    }
+
     if (n_past + T > ctx->kv_max_ctx) {
         fprintf(stderr, "zonos_tts: kv overflow (%d+%d > %d)\n", n_past, T, ctx->kv_max_ctx);
         return nullptr;
@@ -1318,7 +1480,7 @@ static float* run_backbone(zonos_tts_context* ctx, const float* embeds, int T, i
         if (out_hidden) {
             ggml_backend_tensor_get(hs, out_hidden, 0, (size_t)d * sizeof(float));
         } else if (n_past == 0) {
-            const char* ddir = getenv("ZONOS_CPP_DUMP_DIR");
+            const char* ddir = crispasr_env::get("CRISPASR_ZONOS_CPP_DUMP_DIR");
             if (ddir) {
                 std::vector<float> hs_buf(d);
                 ggml_backend_tensor_get(hs, hs_buf.data(), 0, (size_t)d * sizeof(float));
@@ -1359,13 +1521,12 @@ static void embed_codebook_tokens(zonos_tts_context* ctx, const int32_t* tokens,
     const int d = (int)hp.d_model;
     std::memset(out_embed, 0, (size_t)d * sizeof(float));
 
-    std::vector<float> row(d);
     for (uint32_t k = 0; k < hp.n_codebooks; k++) {
         int tid = tokens[k];
         if (tid < 0 || tid >= (int)hp.emb_vocab_size)
             tid = (int)hp.masked_token_id;
-        // emb_w[k]: ne = [d_model, emb_vocab_size]
-        tensor_get_row_f32(ctx->emb_w[k], tid, row.data(), d);
+        // §176g: direct memcpy from pre-dequantized CPU cache — no GPU round-trip.
+        const float* row = ctx->emb_w_cache[k].data() + (size_t)tid * d;
         for (int i = 0; i < d; i++) {
             out_embed[i] += row[i];
         }
@@ -1527,9 +1688,8 @@ float* zonos_tts_get_prefill_hidden(struct zonos_tts_context* ctx, const char* t
     // Append mask frame
     {
         std::vector<float> mask_emb(d, 0.0f);
-        std::vector<float> row(d);
         for (uint32_t k = 0; k < hp.n_codebooks; k++) {
-            tensor_get_row_f32(ctx->emb_w[k], (int)hp.masked_token_id, row.data(), d);
+            const float* row = ctx->emb_w_cache[k].data() + (size_t)hp.masked_token_id * d;
             for (int i = 0; i < d; i++)
                 mask_emb[i] += row[i];
         }
@@ -1612,9 +1772,8 @@ float* zonos_tts_run_ar_steps_dump(struct zonos_tts_context* ctx, const char* te
     // Append mask frame to each prefix
     {
         std::vector<float> mask_emb(d, 0.0f);
-        std::vector<float> row(d);
         for (uint32_t k = 0; k < hp.n_codebooks; k++) {
-            tensor_get_row_f32(ctx->emb_w[k], mask_id, row.data(), d);
+            const float* row = ctx->emb_w_cache[k].data() + (size_t)mask_id * d;
             for (int i = 0; i < d; i++)
                 mask_emb[i] += row[i];
         }
@@ -1798,7 +1957,7 @@ int32_t* zonos_tts_synthesize_codes(struct zonos_tts_context* ctx, const char* t
     // Python prepare_conditioning() returns cat([cond, uncond]) → (2, T, d_model).
     // We write the same layout: cond rows first, then uncond rows.
     {
-        const char* dump_dir = getenv("ZONOS_CPP_DUMP_DIR");
+        const char* dump_dir = crispasr_env::get("CRISPASR_ZONOS_CPP_DUMP_DIR");
         if (dump_dir) {
             // Write phoneme IDs
             {
@@ -1861,9 +2020,8 @@ int32_t* zonos_tts_synthesize_codes(struct zonos_tts_context* ctx, const char* t
     // Without this, the model predicts EOS immediately.
     {
         std::vector<float> mask_frame_embed(d, 0.0f);
-        std::vector<float> row(d);
         for (uint32_t k = 0; k < hp.n_codebooks; k++) {
-            tensor_get_row_f32(ctx->emb_w[k], (int)hp.masked_token_id, row.data(), d);
+            const float* row = ctx->emb_w_cache[k].data() + (size_t)hp.masked_token_id * d;
             for (int i = 0; i < d; i++)
                 mask_frame_embed[i] += row[i];
         }
@@ -1930,7 +2088,7 @@ int32_t* zonos_tts_synthesize_codes(struct zonos_tts_context* ctx, const char* t
                     best_u = i;
             fprintf(stderr, "zonos_tts: DIFF uncond prefill cb0 argmax=%d (%.2f)\n", best_u, logits_uncond[best_u]);
         }
-        const char* dump_dir = getenv("ZONOS_CPP_DUMP_DIR");
+        const char* dump_dir = crispasr_env::get("CRISPASR_ZONOS_CPP_DUMP_DIR");
         if (!dump_dir)
             dump_dir = "/mnt/storage/zonos-tts";
         char df_path[512];
@@ -1995,7 +2153,7 @@ int32_t* zonos_tts_synthesize_codes(struct zonos_tts_context* ctx, const char* t
 
         // Dump CFG-blended logits at step 0 for comparison with Python
         if (step == 0) {
-            const char* ddir = getenv("ZONOS_CPP_DUMP_DIR");
+            const char* ddir = crispasr_env::get("CRISPASR_ZONOS_CPP_DUMP_DIR");
             if (ddir) {
                 char dp[512];
                 snprintf(dp, sizeof(dp), "%s/cpp_cfg_step0_logits.npy", ddir);
@@ -2289,7 +2447,39 @@ static bool load_dac_codec(zonos_tts_context* ctx) {
         return false;
     }
 
+    // Permute DAC ConvTranspose1d weights for decomposed col2im path
+    {
+        const int n = 4;
+        ggml_tensor* srcs[4];
+        ggml_tensor** dsts_arr[4];
+        for (int i = 0; i < n; i++) {
+            srcs[i] = dw.blocks[i].up_w;
+            dsts_arr[i] = &dw.blocks[i].up_w_perm;
+        }
+        core_convt::permute_convt1d_weights_batch(srcs, dsts_arr, n, ctx->backend, &ctx->dac_ctx_perm,
+                                                  &ctx->dac_buf_perm);
+    }
+
     ctx->dac_loaded = true;
+
+    // FASTCONV (docs/perf-sweep/PLAN.md): bake F32 copies of the decode conv
+    // kernels via the shared cache so the per-graph F16→F32 cast becomes a no-op
+    // (k=1 → matmul). up_w already has an F32 w_perm (decomp path), so baking it is
+    // a no-op there. Gated CRISPASR_ZONOS_FASTCONV (default on); =0 = legacy.
+    {
+        const char* e = std::getenv("CRISPASR_ZONOS_FASTCONV");
+        const bool on = !(e && e[0] == '0');
+        std::vector<ggml_tensor*> convs = {dw.in_conv_w, dw.out_conv_w};
+        for (int b = 0; b < 4; b++) {
+            convs.push_back(dw.blocks[b].up_w);
+            for (int r = 0; r < 3; r++) {
+                convs.push_back(dw.blocks[b].res[r].conv0_w);
+                convs.push_back(dw.blocks[b].res[r].conv1_w);
+            }
+        }
+        ctx->dac_fc.bake(ctx->backend, convs, on);
+    }
+
     if (ctx->params.verbosity >= 1) {
         fprintf(stderr, "zonos_tts: DAC codec loaded (%zu tensors)\n", wl.tensors.size());
     }
@@ -2322,7 +2512,7 @@ static float* dac_decode(zonos_tts_context* ctx, const int32_t* codes, int n_cod
     }
 
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 8192, false);
-    ggml_tensor* pcm_out = core_dac::build_decode_graph(ctx0, dw, codes_in, T, gf);
+    ggml_tensor* pcm_out = core_dac::build_decode_graph(ctx0, dw, codes_in, T, gf, &ctx->dac_fc);
 
     // Allocate + set inputs
     ggml_backend_sched_reset(ctx->sched);
@@ -2368,6 +2558,8 @@ float* zonos_tts_synthesize(struct zonos_tts_context* ctx, const char* text, int
         return nullptr;
     *out_n_samples = 0;
 
+    zonos_tts_bench_stage _bs_synth("synthesize");
+
     // Generate codes. Retry up to 3× if EOS is sampled at step 0 — this
     // manifests as zero output frames and is the known failure mode for
     // Q4_K quantization (EOS logit inflated by ~0.9 units at the first
@@ -2376,7 +2568,11 @@ float* zonos_tts_synthesize(struct zonos_tts_context* ctx, const char* text, int
     // RNG state is restored after the loop.
     int n_codes = 0, n_codebooks = 0;
     const uint64_t orig_rng = ctx->rng_state;
-    int32_t* codes = zonos_tts_synthesize_codes(ctx, text, &n_codes, &n_codebooks);
+    int32_t* codes;
+    {
+        zonos_tts_bench_stage _bs("ar_decode");
+        codes = zonos_tts_synthesize_codes(ctx, text, &n_codes, &n_codebooks);
+    }
     for (int retry = 1; retry <= 3 && (!codes || n_codes <= 0); retry++) {
         if (codes) {
             free(codes);
@@ -2425,9 +2621,48 @@ float* zonos_tts_synthesize(struct zonos_tts_context* ctx, const char* text, int
         return nullptr;
     }
 
-    // DAC decode: codes -> 44.1 kHz PCM
+    // DAC decode: codes -> 44.1 kHz PCM. Overlap-save chunking bounds peak
+    // decode memory on long outputs; the descript-DAC decoder is the same
+    // SAME-padded conv family proven exact for irodori (cos=1.0), so the center
+    // crop is exact when ctx_frames covers the receptive field. Auto for long
+    // outputs; CRISPASR_ZONOS_DECODE_CHUNK=0 disables, _CHUNK/_CTX tune.
     int n_samples = 0;
-    float* pcm = dac_decode(ctx, codes, n_codes, n_codebooks, &n_samples);
+    float* pcm = nullptr;
+    {
+        zonos_tts_bench_stage _bs("dac_decode");
+        const auto& dcfg = ctx->dac_w.config;
+        int hop = 1;
+        for (int b = 0; b < dcfg.n_decoder_blocks; b++)
+            hop *= dcfg.upsampling_ratios[b];
+        int chunk = 800, ctx_frames = 32;
+        if (const char* e = getenv("CRISPASR_ZONOS_DECODE_CHUNK"))
+            chunk = atoi(e);
+        if (const char* e = getenv("CRISPASR_ZONOS_DECODE_CTX"))
+            ctx_frames = std::max(0, atoi(e));
+        // Window [start,start+n): repack codes (codebook-major codes[k*n_codes+t])
+        // into a contiguous n-frame buffer, then decode it.
+        std::vector<int32_t> win_codes;
+        auto decode_window = [&](int start, int n) -> std::vector<float> {
+            win_codes.resize((size_t)n_codebooks * n);
+            for (int k = 0; k < n_codebooks; k++)
+                std::memcpy(&win_codes[(size_t)k * n], &codes[(size_t)k * n_codes + start],
+                            (size_t)n * sizeof(int32_t));
+            int ns = 0;
+            float* p = dac_decode(ctx, win_codes.data(), n, n_codebooks, &ns);
+            if (!p || ns <= 0)
+                return {};
+            std::vector<float> out(p, p + ns);
+            free(p);
+            return out;
+        };
+        std::vector<float> full = core_dac::decode_overlap_save(n_codes, hop, chunk, ctx_frames, decode_window);
+        if (!full.empty()) {
+            n_samples = (int)full.size();
+            pcm = (float*)malloc(full.size() * sizeof(float));
+            if (pcm)
+                std::memcpy(pcm, full.data(), full.size() * sizeof(float));
+        }
+    }
     free(codes);
     if (!pcm) {
         return nullptr;
@@ -2451,8 +2686,19 @@ void zonos_tts_pcm_free(float* pcm) {
 void zonos_tts_free(struct zonos_tts_context* ctx) {
     if (!ctx)
         return;
+    // §176b bucket cleanup
+    if (ctx->ar_step_sched)
+        ggml_backend_sched_free(ctx->ar_step_sched);
+    for (auto& bk : ctx->ar_buckets)
+        if (bk.ctx)
+            ggml_free(bk.ctx);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
+    ctx->dac_fc.free(); // FASTCONV baked-kernel buffer
+    if (ctx->dac_buf_perm)
+        ggml_backend_buffer_free(ctx->dac_buf_perm);
+    if (ctx->dac_ctx_perm)
+        ggml_free(ctx->dac_ctx_perm);
     if (ctx->dac_buf_w)
         ggml_backend_buffer_free(ctx->dac_buf_w);
     if (ctx->dac_ctx_w)
