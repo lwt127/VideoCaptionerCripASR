@@ -93,3 +93,7 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# ---- CrispASR engine binaries (large, downloaded at runtime) ----
+resource/bin/CrispASR/
+
