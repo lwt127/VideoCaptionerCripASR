@@ -121,6 +121,7 @@ class CrispASR(BaseASR):
         backend="whisper",
         model="auto",
         vad_method="silero",
+        lid_method=None,
         use_gpu: bool = True,
         use_vad: bool = True,
         use_cache: bool = False,
@@ -165,6 +166,7 @@ class CrispASR(BaseASR):
         self.crisp_asr_path = Path(crisp_asr_path) if crisp_asr_path else CRISP_ASR_BIN
 
         self.language = language
+        self.lid_method = lid_method
         self.use_gpu = use_gpu
         self.use_vad = use_vad
         self.need_word_time_stamp = need_word_time_stamp
@@ -407,6 +409,13 @@ class CrispASR(BaseASR):
             params.append("--vad")
             if self.vad_method and self.vad_method != "silero":
                 params.extend(["--vad-model", self.vad_method])
+
+        # 语种自动检测：对没有原生 LID 能力的后端（cohere/canary/granite/voxtral/
+        # voxtral4b），CrispASR 靠额外的 audio-LID 预处理模型实现 "-l auto"，
+        # 通过 --lid-backend 指定该预处理模型（默认 FireRed，见 crisp_asr_catalog）。
+        # 对有原生 LID 能力的后端，"-l auto" 本身已足够，不需要也不应传该参数。
+        if self.language == "auto" and self.lid_method:
+            params.extend(["--lid-backend", self.lid_method])
 
         # 中文模式下添加提示语（whisper 后端支持 --prompt）
         if self.language == "zh" and self.backend == "whisper":

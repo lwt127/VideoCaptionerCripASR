@@ -172,6 +172,7 @@ class Config(QConfig):
     crisp_asr_backend = ConfigItem("CrispASR", "CrispAsrBackend", "")
     crisp_asr_model = ConfigItem("CrispASR", "CrispAsrModel", "")
     crisp_asr_vad_method = ConfigItem("CrispASR", "CrispAsrVadMethod", "")
+    crisp_asr_lid_method = ConfigItem("CrispASR", "CrispAsrLidMethod", "")
     crisp_asr_use_gpu = ConfigItem("CrispASR", "CrispAsrUseGpu", True, BoolValidator())
     crisp_asr_use_vad = ConfigItem("CrispASR", "CrispAsrUseVad", True, BoolValidator())
 

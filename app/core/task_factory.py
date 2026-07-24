@@ -73,6 +73,7 @@ class TaskFactory:
             crisp_asr_backend=cfg.crisp_asr_backend.value,
             crisp_asr_model=cfg.crisp_asr_model.value,
             crisp_asr_vad_method=cfg.crisp_asr_vad_method.value,
+            crisp_asr_lid_method=cfg.crisp_asr_lid_method.value,
             crisp_asr_use_gpu=cfg.crisp_asr_use_gpu.value,
             crisp_asr_use_vad=cfg.crisp_asr_use_vad.value,
             # Whisper API 配置

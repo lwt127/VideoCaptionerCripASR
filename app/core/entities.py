@@ -244,6 +244,7 @@ class TargetLanguageEnum(Enum):
 class TranscribeLanguageEnum(Enum):
     """转录语言"""
 
+    AUTO = "自动检测"
     ENGLISH = "英语"
     CHINESE = "中文"
     JAPANESE = "日本語"
@@ -369,6 +370,7 @@ class FasterWhisperModelEnum(Enum):
 
 
 LANGUAGES = {
+    "自动检测": "auto",
     "英语": "en",
     "中文": "zh",
     "日本語": "ja",
@@ -514,6 +516,7 @@ class TranscribeConfig:
     crisp_asr_backend: Optional[str] = None
     crisp_asr_model: Optional[str] = None
     crisp_asr_vad_method: Optional[str] = None
+    crisp_asr_lid_method: Optional[str] = None
     crisp_asr_use_gpu: bool = True
     crisp_asr_use_vad: bool = True
     # Whisper API 配置

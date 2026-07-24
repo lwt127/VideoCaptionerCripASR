@@ -56,18 +56,29 @@ def transcribe(audio_path: str, config: TranscribeConfig, callback=None) -> ASRD
             }
         )
     elif config.transcribe_model == TranscribeModelEnum.CRISP_ASR:
-        from app.core.bk_asr.crisp_asr_catalog import resolve_model, resolve_vad_method
+        from app.core.bk_asr.crisp_asr_catalog import (
+            needs_lid_pre_step,
+            resolve_lid_method,
+            resolve_model,
+            resolve_vad_method,
+        )
 
         backend, model = resolve_model(
             config.crisp_asr_backend or "", config.crisp_asr_model or ""
         )
         vad_method = resolve_vad_method(config.crisp_asr_vad_method or "")
+        lid_method = None
+        if config.transcribe_language == "auto" and needs_lid_pre_step(
+            config.crisp_asr_backend or "", config.crisp_asr_model or ""
+        ):
+            lid_method = resolve_lid_method(config.crisp_asr_lid_method or "")
         asr_args.update(
             {
                 "language": config.transcribe_language,
                 "backend": backend,
                 "model": model,
                 "vad_method": vad_method,
+                "lid_method": lid_method,
                 "use_gpu": config.crisp_asr_use_gpu,
                 "use_vad": config.crisp_asr_use_vad,
             }
