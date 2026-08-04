@@ -104,7 +104,7 @@ class CrispASR(BaseASR):
     funasr / sensevoice / voxtral 等），输出标准 SRT 字幕。
 
     - 后端通过 ``--backend <name>`` 选择；
-    - 模型通过 ``-m <auto|filename>`` 选择（auto 首次运行时自动下载）；
+    - 模型通过 ``-m <auto|filename>`` 选择，缺失模型通过 ``--auto-download`` 下载；
     - VAD 通过 ``--vad -vm <method>`` 选择；
     - 默认启用 GPU，可通过 ``--no-gpu`` 关闭。
 
@@ -135,7 +135,7 @@ class CrispASR(BaseASR):
         self.vad_method = vad_method or "silero"
 
         # 解析模型参数：
-        #  - "auto" → 交由 CrispASR 自动下载该后端默认模型（缓存到 ~/.cache/crispasr）
+        #  - "auto" → 交由 CrispASR 下载该后端默认模型（缓存到其默认用户缓存目录）
         #  - "ggml-*.bin"（whisper 后端）→ 优先用本地 models 目录的文件；
         #    若本地不存在，则回退为 "auto"，让 CrispASR 自动下载默认 whisper 模型。
         if model and model != "auto" and "ggml" in model.lower():
@@ -156,7 +156,7 @@ class CrispASR(BaseASR):
                         f"本地未找到模型 '{model}'，改用自动下载 (backend={self.backend})"
                     )
         else:
-            # 自动下载（CrispASR 会缓存到 ~/.cache/crispasr）
+            # 自动下载（CrispASR 使用其默认用户缓存目录）
             self.model_arg = model or "auto"
             logger.info(
                 f"使用自动下载模型: backend={self.backend}, model={self.model_arg}"
@@ -391,6 +391,7 @@ class CrispASR(BaseASR):
             self.backend,
             "-m",
             str(self.model_arg),
+            "--auto-download",
             "-f",
             str(wav_path),
             "-l",
@@ -429,7 +430,7 @@ class CrispASR(BaseASR):
         if callback is None:
             callback = lambda x, y: None
 
-        # 确保引擎可用：缺失/版本过低则自动下载升级（模型由 CrispASR 自身按需下载）
+        # 确保引擎可用：缺失/版本过低则自动下载升级（模型由 CrispASR 按需下载）
         self._ensure_engine(callback)
 
         total_duration = self.get_audio_duration(self.audio_path) or 600

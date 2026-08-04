@@ -95,7 +95,7 @@ the task. On first use:
   downloads/uses the **CUDA build** of the engine for much faster transcription;
   otherwise it uses the CPU build.
 - The selected **model** is **automatically downloaded** by CrispASR on first run
-  (cached under `~/.cache/crispasr/`).
+  (cached under `C:\Users\<username>\.cache\crispasr\` on Windows).
 
 So users only need to *select* a backend/model and press start — everything else
 (engine, GPU build, model) is fetched automatically.
