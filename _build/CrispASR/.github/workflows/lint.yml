@@ -23,6 +23,19 @@ on:
       # README language drift check (issue #50)
       - 'README.md'
       - 'tools/check-readme-langs.py'
+      # Release-tooling consistency (release-consistency job). A version bump
+      # touches NONE of the C++ paths above, so without these the check would
+      # never run on the commits it exists to guard.
+      - 'VERSION'
+      - 'scripts/sync-version.py'
+      - 'scripts/bump-version.sh'
+      - 'python/pyproject.toml'
+      - 'python/crispasr/__init__.py'
+      - 'flutter/crispasr/pubspec.yaml'
+      - 'flutter/crispasr/CHANGELOG.md'
+      - 'bindings/javascript/package.json'
+      - 'crispasr/Cargo.toml'
+      - 'crispasr-sys/Cargo.toml'
   pull_request:
     branches: [main, master]
     paths:
@@ -37,6 +50,19 @@ on:
       # README language drift check (issue #50)
       - 'README.md'
       - 'tools/check-readme-langs.py'
+      # Release-tooling consistency (release-consistency job). A version bump
+      # touches NONE of the C++ paths above, so without these the check would
+      # never run on the commits it exists to guard.
+      - 'VERSION'
+      - 'scripts/sync-version.py'
+      - 'scripts/bump-version.sh'
+      - 'python/pyproject.toml'
+      - 'python/crispasr/__init__.py'
+      - 'flutter/crispasr/pubspec.yaml'
+      - 'flutter/crispasr/CHANGELOG.md'
+      - 'bindings/javascript/package.json'
+      - 'crispasr/Cargo.toml'
+      - 'crispasr-sys/Cargo.toml'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -220,7 +246,12 @@ jobs:
     name: model-registry URLs resolve
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request'
-    continue-on-error: true
+    # continue-on-error was REMOVED. It existed because the checker exited 1 on
+    # any unreachable URL, including a transient HF connection reset — but it
+    # also meant this job could never go red, so a genuinely deleted model would
+    # have been reported in a log nobody opens. check-registry-urls.py now fails
+    # only on 404/410 (a server that answered "gone") and downgrades timeouts,
+    # resets and 5xx to warnings, so the job can be strict without being flaky.
     steps:
       - uses: actions/checkout@v6
       - name: Set up Python
@@ -229,6 +260,23 @@ jobs:
           python-version: '3.11'
       - name: HEAD every registry download URL
         run: python tools/check-registry-urls.py --jobs 8 --timeout 25
+
+  # Release tooling only ever ran at release time, so its bugs stayed invisible
+  # until a release was half-published: v0.8.24 was first tagged with
+  # crispasr.__version__ still reading 0.8.23 (bump-version.sh's staged file list
+  # had drifted from sync-version.py), and 0.8.23 never reached pub.dev at all
+  # because the Flutter CHANGELOG lacked its version. Both are now a red check on
+  # the commit that causes them. No network, no models — a few seconds.
+  release-consistency:
+    name: version files agree with VERSION
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Every versioned file matches VERSION
+        run: python scripts/sync-version.py --check
 
   readme-langs:
     name: README language metadata

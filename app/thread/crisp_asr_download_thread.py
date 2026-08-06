@@ -28,8 +28,8 @@ logger = setup_logger("crisp_asr_download")
 
 
 # 固定下载的 CrispASR 引擎版本（确定性升级；置为 None 时回退到 releases/latest）。
-# v0.8.21 提供完整的 Windows CUDA 可执行包（crispasr-windows-x86_64-cuda.zip）。
-CRISP_ASR_PINNED_TAG = "v0.8.21"
+# v0.8.25 提供完整的 Windows CUDA 可执行包（crispasr-windows-x86_64-cuda.zip）。
+CRISP_ASR_PINNED_TAG = "v0.8.25"
 
 
 def _windows_asset_name(prefer_gpu: bool = False) -> str:

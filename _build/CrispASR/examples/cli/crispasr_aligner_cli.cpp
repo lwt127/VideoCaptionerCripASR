@@ -8,9 +8,11 @@
 #include "crispasr_aligner.h" // shared library header from src/
 
 std::vector<crispasr_word> crispasr_ctc_align(const std::string& aligner_model, const std::string& transcript,
-                                              const float* samples, int n_samples, int64_t t_offset_cs, int n_threads) {
+                                              const float* samples, int n_samples, int64_t t_offset_cs, int n_threads,
+                                              bool* out_load_failed) {
     std::vector<crispasr_word> out;
-    auto lib = crispasr_align_words(aligner_model, transcript, samples, n_samples, t_offset_cs, n_threads);
+    auto lib =
+        crispasr_align_words(aligner_model, transcript, samples, n_samples, t_offset_cs, n_threads, out_load_failed);
     out.reserve(lib.size());
     for (auto& w : lib) {
         crispasr_word cw;

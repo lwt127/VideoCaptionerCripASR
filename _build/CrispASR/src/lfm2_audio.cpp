@@ -32,6 +32,7 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1324,14 +1325,20 @@ char* lfm2_audio_transcribe(lfm2_audio_context* ctx, const float* samples, int n
     }
 
     for (int step = 0; step < max_tokens; step++) {
-        // Greedy argmax
-        int best_id = 0;
-        float best_val = logits[0];
-        for (int i = 1; i < (int)logits.size(); i++) {
-            if (logits[i] > best_val) {
+        // Greedy argmax — NaN-robust: a non-finite logits[0] would freeze best_id
+        // at 0 (x > NaN is always false), silently spewing token 0. Seed from
+        // -inf, skip non-finite, and abort if the whole row is non-finite.
+        int best_id = -1;
+        float best_val = -std::numeric_limits<float>::infinity();
+        for (int i = 0; i < (int)logits.size(); i++) {
+            if (std::isfinite(logits[i]) && logits[i] > best_val) {
                 best_val = logits[i];
                 best_id = i;
             }
+        }
+        if (best_id < 0) {
+            fprintf(stderr, "lfm2_audio: non-finite logits — aborting decode\n");
+            break;
         }
 
         // Stop on <|im_end|> or <|endoftext|>

@@ -135,6 +135,23 @@ std::unique_ptr<CrispasrSpeakerEmbedder> crispasr_make_speaker_embedder(const st
     if (model_spec.empty())
         return nullptr;
 
+    // The caller's thread count is forwarded as-is. An earlier revision forced
+    // this to 1, on the theory that a per-segment graph is too small to amortise
+    // ggml's thread sync — that theory came from a SEQUENTIAL -t 1/4/8 loop on a
+    // contended box, i.e. a load ramp, and interleaving the arms disproved it
+    // (threads help these graphs: 20.5 s -> 10.3 s from 1 to 4 on the wespeaker
+    // path). Unlike core_foxnose, this path embeds one segment at a time, so
+    // intra-graph threads are the ONLY parallelism it has; taking them away
+    // would be a straight regression.
+    //
+    // CRISPASR_SPEAKER_EMBED_THREADS overrides, for A/B against a
+    // cross-segment-parallel version if one is ever written.
+    if (const char* e = std::getenv("CRISPASR_SPEAKER_EMBED_THREADS")) {
+        const int v = std::atoi(e);
+        if (v > 0)
+            n_threads = v;
+    }
+
     // Dispatch order:
     //   1. Model spec or resolved path mentions "indextts" -> IndexTTS-
     //      BigVGAN ECAPA-TDNN adapter.

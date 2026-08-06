@@ -7,6 +7,7 @@ import com.sun.jna.Pointer;
 import com.sun.jna.ptr.DoubleByReference;
 import com.sun.jna.ptr.IntByReference;
 import com.sun.jna.ptr.LongByReference;
+import com.sun.jna.ptr.PointerByReference;
 
 /**
  * Minimal TTS surface for the Java binding. Exposes the unified
@@ -42,9 +43,18 @@ public final class CrispasrSession implements AutoCloseable {
         int     crispasr_session_n_speakers(Pointer session);
         String  crispasr_session_get_speaker_name(Pointer session, int i);
         int     crispasr_session_set_instruct(Pointer session, String instruct);
+        // #316: synthesize these phonemes verbatim, skipping the G2P. Empty clears. kokoro and piper only (rc=-2 otherwise).
+        int          crispasr_session_set_tts_phonemes(Pointer session, String phonemes);
         int     crispasr_session_is_custom_voice(Pointer session);
         int     crispasr_session_is_voice_design(Pointer session);
         Pointer crispasr_session_synthesize(Pointer session, String text, IntByReference outNSamples);
+        // UNMARKED synthesis — refused unless crispasr_session_accept_marking_responsibility() was called first.
+        Pointer crispasr_session_synthesize_raw(Pointer session, String text, IntByReference outNSamples);
+        int     crispasr_session_accept_marking_responsibility(Pointer session, String attestation);
+        // Speech-to-speech (lfm2-audio, mini-omni2, sidon, voxcpm2-vae). outText receives the intermediate transcript.
+        Pointer crispasr_session_speech_to_speech(Pointer session, float[] inSamples, int nInSamples,
+                                                  PointerByReference outText, IntByReference outNSamples);
+        int     crispasr_session_input_sample_rate(Pointer session);
         void    crispasr_pcm_free(Pointer pcm);
         int     crispasr_session_kokoro_clear_phoneme_cache(Pointer session);
         int     crispasr_session_set_source_language(Pointer session, String lang);
@@ -107,6 +117,9 @@ public final class CrispasrSession implements AutoCloseable {
         long         crispasr_session_result_word_t1(Pointer result, int iSeg, int iWord);
         float        crispasr_session_result_word_p(Pointer result, int iSeg, int iWord);
         float        crispasr_session_result_segment_no_speech_prob(Pointer result, int iSeg);
+        // #300: native per-segment speaker label ("(Speaker N) "), or "" when the
+        // backend does not diarize natively. Never NULL.
+        String       crispasr_session_result_segment_speaker(Pointer result, int i);
         // Per-frame CTC logits (opted in via crispasr_session_set_return_logits)
         // for backends with a dense CTC grid (Omni CTC, wav2vec2/hubert/data2vec,
         // canary-ctc). _logits returns a const float* (frame-major;
@@ -665,6 +678,13 @@ public final class CrispasrSession implements AutoCloseable {
         if (rc != 0) throw new IllegalStateException("set_instruct failed (rc=" + rc + ")");
     }
 
+    /** #316: synthesize these phonemes verbatim, skipping the G2P. Empty clears. kokoro and piper only (rc=-2 otherwise). */
+    public void setTtsPhonemes(String phonemes) {
+        int rc = Lib.INSTANCE.crispasr_session_set_tts_phonemes(handle, phonemes == null ? "" : phonemes);
+        if (rc == -2) throw new RuntimeException("backend has no phonemes-in entry point (kokoro and piper do)");
+        if (rc != 0) throw new RuntimeException("set_tts_phonemes failed (rc=" + rc + ")");
+    }
+
     /**
      * Whether the loaded model is a qwen3-tts CustomVoice variant
      * (use {@link #setSpeakerName(String)} for it).
@@ -696,6 +716,91 @@ public final class CrispasrSession implements AutoCloseable {
         } finally {
             Lib.INSTANCE.crispasr_pcm_free(pcm);
         }
+    }
+
+    /**
+     * UNMARKED synthesis — identical to {@link #synthesize(String)} but skips
+     * the audible/inaudible watermark. Hard-refused (returns no audio) unless
+     * {@link #acceptMarkingResponsibility(String)} was called first. Under the
+     * EU AI Act (Art. 50) the integrator becomes responsible for marking the
+     * output as AI-generated.
+     */
+    public float[] synthesizeRaw(String text) {
+        IntByReference n = new IntByReference(0);
+        Pointer pcm = Lib.INSTANCE.crispasr_session_synthesize_raw(handle, text, n);
+        if (pcm == null || n.getValue() <= 0) {
+            throw new IllegalStateException("synthesizeRaw returned no audio "
+                    + "(did you call acceptMarkingResponsibility()?)");
+        }
+        try {
+            return pcm.getFloatArray(0, n.getValue());
+        } finally {
+            Lib.INSTANCE.crispasr_pcm_free(pcm);
+        }
+    }
+
+    /**
+     * Attest that the integrator takes responsibility for marking generated
+     * audio as AI-generated (EU AI Act Art. 50). REQUIRED before
+     * {@link #synthesizeRaw(String)} will produce audio.
+     */
+    public void acceptMarkingResponsibility(String attestation) {
+        int rc = Lib.INSTANCE.crispasr_session_accept_marking_responsibility(
+                handle, attestation == null ? "" : attestation);
+        if (rc != 0) {
+            throw new IllegalStateException(
+                    "accept_marking_responsibility failed (rc=" + rc + ")");
+        }
+    }
+
+    /** Result of {@link #speechToSpeech(float[])}: output PCM plus the intermediate transcript. */
+    public static final class SpeechToSpeechResult {
+        /** 24 kHz mono float32 PCM produced by the backend. */
+        public final float[] pcm;
+        /** Intermediate transcript of the input speech (may be {@code null}). */
+        public final String text;
+
+        SpeechToSpeechResult(float[] pcm, String text) {
+            this.pcm = pcm;
+            this.text = text;
+        }
+    }
+
+    /**
+     * Speech-to-speech: transform input PCM to output PCM, returning the
+     * intermediate transcript alongside. Requires an S2S-capable backend
+     * (lfm2-audio / mini-omni2 / sidon / voxcpm2-vae).
+     *
+     * @param inSamples input float32 PCM at {@link #inputSampleRate()}
+     */
+    public SpeechToSpeechResult speechToSpeech(float[] inSamples) {
+        IntByReference n = new IntByReference(0);
+        PointerByReference outText = new PointerByReference();
+        Pointer pcm = Lib.INSTANCE.crispasr_session_speech_to_speech(
+                handle, inSamples, inSamples.length, outText, n);
+        if (pcm == null || n.getValue() <= 0) {
+            throw new IllegalStateException(
+                    "speechToSpeech returned no audio (backend may not support S2S)");
+        }
+        String text = null;
+        Pointer tp = outText.getValue();
+        if (tp != null) {
+            text = tp.getString(0);
+            Lib.INSTANCE.crispasr_session_translate_text_free(tp);
+        }
+        try {
+            return new SpeechToSpeechResult(pcm.getFloatArray(0, n.getValue()), text);
+        } finally {
+            Lib.INSTANCE.crispasr_pcm_free(pcm);
+        }
+    }
+
+    /**
+     * Sample rate the backend expects for input PCM (e.g. 16000 for
+     * Whisper-family backends). Returns 0 on error.
+     */
+    public int inputSampleRate() {
+        return Lib.INSTANCE.crispasr_session_input_sample_rate(handle);
     }
 
     /**
@@ -828,8 +933,15 @@ public final class CrispasrSession implements AutoCloseable {
         /** Whisper's per-segment no-speech probability (the {@code <|nospeech|>}
          *  posterior) in [0, 1]. Whisper-only; other backends leave -1.0 ("no data"). */
         public final float noSpeechProb;
-        Segment(String text, long t0, long t1, Word[] words, float noSpeechProb) {
+        /** Native per-segment speaker label from a backend that diarizes on its own,
+         *  in the {@code "(Speaker N) "} form the CLI prefixes into text/srt/vtt output,
+         *  or {@code ""} when the backend produced none. Populated today by vibevoice.
+         *  The ordinals are CHUNK-LOCAL: {@code Speaker 1} from one transcribe call is
+         *  not necessarily the same voice as {@code Speaker 1} from the next. */
+        public final String speaker;
+        Segment(String text, long t0, long t1, Word[] words, float noSpeechProb, String speaker) {
             this.text = text; this.t0 = t0; this.t1 = t1; this.words = words; this.noSpeechProb = noSpeechProb;
+            this.speaker = speaker == null ? "" : speaker;
         }
     }
 
@@ -951,7 +1063,8 @@ public final class CrispasrSession implements AutoCloseable {
                     Lib.INSTANCE.crispasr_session_result_word_p(r, i, j));
             }
             float noSpeechProb = Lib.INSTANCE.crispasr_session_result_segment_no_speech_prob(r, i);
-            segs[i] = new Segment(text, t0, t1, words, noSpeechProb);
+            String speaker = Lib.INSTANCE.crispasr_session_result_segment_speaker(r, i);
+            segs[i] = new Segment(text, t0, t1, words, noSpeechProb, speaker);
         }
         return segs;
     }

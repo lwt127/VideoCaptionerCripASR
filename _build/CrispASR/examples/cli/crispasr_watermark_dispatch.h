@@ -39,8 +39,27 @@ inline void set_disabled(bool value) {
     disabled_flag() = value;
 }
 
-// True if watermarking has been turned off via the CLI flag or the env var.
+// Watertight override. When set, is_disabled() always returns false — even
+// against --no-watermark / CRISPASR_NO_WATERMARK. The CLI sets this for outputs
+// that cannot carry a C2PA manifest (raw ADTS .aac / Ogg .opus, and the raw PCM
+// --tts-stream), where the audio watermark is the ONLY robust machine-readable
+// AI mark. This guarantees no CLI path can ever emit a fully unmarked AI file:
+// the watermark opt-out is honored only when C2PA still marks the output.
+inline bool& forced_flag() {
+    static bool forced = false;
+    return forced;
+}
+
+// Force watermarking on for this process regardless of the opt-out.
+inline void set_forced(bool value) {
+    forced_flag() = value;
+}
+
+// True if watermarking has been turned off via the CLI flag or the env var,
+// UNLESS a watertight override forces it on.
 inline bool is_disabled() {
+    if (forced_flag())
+        return false;
     return disabled_flag() || std::getenv("CRISPASR_NO_WATERMARK") != nullptr;
 }
 

@@ -213,7 +213,7 @@ struct vibevoice_context {
 extern "C" struct vibevoice_context_params vibevoice_context_default_params(void) {
     vibevoice_context_params p;
     p.n_threads = 4;
-    p.max_new_tokens = 512;
+    p.max_new_tokens = 0;
     p.verbosity = 1;
     p.use_gpu = true;
     p.tts_steps = 20;
@@ -221,6 +221,13 @@ extern "C" struct vibevoice_context_params vibevoice_context_default_params(void
     p.cfg_scale = 0.0f;
     p.flash_attn = true;
     return p;
+}
+
+extern "C" int vibevoice_resolve_max_new_tokens(int configured, int n_samples) {
+    if (configured > 0)
+        return configured;
+    const int audio_seconds = std::max(0, (int)(((int64_t)n_samples + 24000 - 1) / 24000));
+    return std::max(512, audio_seconds * 8);
 }
 
 // ===========================================================================
@@ -414,6 +421,11 @@ extern "C" void vibevoice_set_tts_steps(struct vibevoice_context* ctx, int steps
     if (steps > 100)
         steps = 100;
     ctx->params.tts_steps = steps;
+}
+
+extern "C" void vibevoice_set_max_new_tokens(struct vibevoice_context* ctx, int n) {
+    if (ctx)
+        ctx->params.max_new_tokens = n > 0 ? n : 0;
 }
 
 extern "C" void vibevoice_set_seed(struct vibevoice_context* ctx, uint32_t seed) {
@@ -1415,7 +1427,7 @@ static char* vibevoice_transcribe_impl(struct vibevoice_context* ctx, const floa
         fprintf(stderr, "vibevoice: prefix embedded (%d tokens)\n", prefix_len);
 
     // 7. Allocate KV cache for Qwen2 decoder
-    int max_gen = ctx->params.max_new_tokens > 0 ? ctx->params.max_new_tokens : 512;
+    int max_gen = vibevoice_resolve_max_new_tokens(ctx->params.max_new_tokens, n_samples);
     int max_ctx = prefix_len + max_gen;
     const ggml_type asr_kv_type = GGML_TYPE_F16;
     if (!ctx->kv_k || ctx->kv_max_ctx < max_ctx || ctx->kv_k->type != asr_kv_type) {
@@ -3128,8 +3140,13 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
         int n_voice_frames = 0;
 
         // Try loading voice audio from the voice GGUF path (reused as audio path for 1.5B)
-        // For the Base models, --voice points to a reference .wav
-        if (ctx->voice.tts_seq_len == 0) {
+        // For the Base models, --voice points to a reference .wav.
+        // #299: the base model conditions on a reference WAV (acoustic+semantic
+        // frames), NOT on a realtime voice pack's tts_lm KV cache. Always take the
+        // WAV route for the base model even if a (realtime) pack happens to be
+        // loaded — that pack is unusable here, and gating on tts_seq_len==0 would
+        // otherwise suppress a perfectly good WAV reference.
+        if (is_base_model || ctx->voice.tts_seq_len == 0) {
             const char* voice_wav = crispasr_env::get("CRISPASR_VIBEVOICE_VOICE_AUDIO");
             if (voice_wav && voice_wav[0]) {
                 FILE* fv = fopen(voice_wav, "rb");
@@ -3225,6 +3242,22 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
                     }
                 }
             }
+        }
+
+        // #299: a realtime voice pack (vibevoice-voice-*.gguf) carries tts_lm KV
+        // for vibevoice-realtime and is unusable by the 1.5B/7B base model, which
+        // needs a reference WAV to encode. If such a pack was loaded but no WAV was
+        // encoded, the base model has NO voice reference and would emit
+        // unconditioned garbage/static. Fail with an actionable message instead of
+        // silently producing noise.
+        if (ctx->voice.tts_seq_len > 0 && n_voice_frames == 0) {
+            fprintf(stderr, "vibevoice TTS: the 1.5B/7B base model cannot use realtime voice packs — "
+                            "'vibevoice-voice-*.gguf' are built for vibevoice-realtime (they carry tts_lm "
+                            "KV, not a reference the base model can encode). It needs a reference WAV:\n"
+                            "    --voice /path/to/reference.wav\n"
+                            "  or set CRISPASR_VIBEVOICE_VOICE_AUDIO=/path/to/reference.wav\n"
+                            "  (or use the vibevoice-realtime model with these voice packs).\n");
+            return nullptr;
         }
 
         // Dump voice clone intermediates for diff harness

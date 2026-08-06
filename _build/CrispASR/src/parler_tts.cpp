@@ -736,6 +736,7 @@ struct parler_tts_context_params parler_tts_context_default_params(void) {
 }
 
 struct parler_tts_context* parler_tts_init_from_file(const char* path_model, struct parler_tts_context_params params) {
+    // cppcheck-suppress uninitvar
     auto* ctx = new parler_tts_context{};
     ctx->params = params;
 

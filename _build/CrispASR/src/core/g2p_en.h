@@ -21,7 +21,11 @@
 #include <cstring>
 #include <map>
 #include <string>
+#include <functional>
 #include <vector>
+
+#include "core/g2p_ctxwords.h"
+#include "core/num2words_en.h"
 
 namespace g2p_en {
 
@@ -761,6 +765,162 @@ struct ipa_dict {
 };
 
 // Load espeak/open-dict-data format: "word\t/IPA/\n"
+// #316: read misaki's lexicon JSON directly, so CrispASR can auto-download it
+// from UPSTREAM instead of re-hosting it. The shape is a flat object whose
+// values are either a phoneme string or a POS-keyed object:
+//
+//   {"believe": "bəlˈiv",
+//    "that":    {"DEFAULT": "ðæt", "DT": "ðˈæt"},
+//    "this":    {"DEFAULT": "ðɪs", "None": "ðˈɪs"}}
+//
+// "None" is NOT a part-of-speech tag — it is misaki's phrase-final reading,
+// chosen when nothing follows the word — so it is collected separately into
+// `final_out`. Every other POS key is dropped: we ship no tagger, and DEFAULT is
+// what misaki itself falls back to.
+//
+// A targeted scanner rather than a JSON library: the file is machine-generated
+// and this avoids pulling a parser into the phonemizer for one call site.
+// Returns the number of DEFAULT entries loaded.
+inline int load_misaki_json(ipa_dict& out, ipa_dict& final_out, const std::string& path) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f)
+        return 0;
+    std::string buf;
+    char chunk[65536];
+    size_t n;
+    while ((n = fread(chunk, 1, sizeof(chunk), f)) > 0)
+        buf.append(chunk, n);
+    fclose(f);
+
+    auto read_string = [&](size_t& i, std::string& sv) -> bool {
+        if (i >= buf.size() || buf[i] != '"')
+            return false;
+        i++;
+        sv.clear();
+        while (i < buf.size()) {
+            const char c = buf[i];
+            if (c == '"') {
+                i++;
+                return true;
+            }
+            if (c == '\\' && i + 1 < buf.size()) {
+                // The lexicon has no \u escapes; pass the escaped char through.
+                sv += buf[i + 1];
+                i += 2;
+                continue;
+            }
+            sv += c;
+            i++;
+        }
+        return false;
+    };
+
+    int count = 0;
+    size_t i = 0;
+    // Skip to the opening brace of the top-level object.
+    while (i < buf.size() && buf[i] != '{')
+        i++;
+    if (i < buf.size())
+        i++;
+    while (i < buf.size()) {
+        while (i < buf.size() && (unsigned char)buf[i] <= ' ')
+            i++;
+        if (i >= buf.size() || buf[i] == '}')
+            break;
+        if (buf[i] == ',') {
+            i++;
+            continue;
+        }
+        std::string key;
+        if (!read_string(i, key))
+            break;
+        while (i < buf.size() && ((unsigned char)buf[i] <= ' ' || buf[i] == ':'))
+            i++;
+        std::string lower = key;
+        for (auto& c : lower)
+            c = (char)tolower((unsigned char)c);
+        if (i < buf.size() && buf[i] == '"') {
+            std::string val;
+            if (!read_string(i, val))
+                break;
+            if (!val.empty() && !out.entries.count(lower)) {
+                out.entries[lower] = val;
+                count++;
+            }
+        } else if (i < buf.size() && buf[i] == '{') {
+            // POS-keyed object: take DEFAULT, and "None" as the phrase-final form.
+            //
+            // …except for a handful of words where DEFAULT measurably loses. We
+            // ship no part-of-speech tagger, so the collapse must pick ONE
+            // reading, and which one is a measurable question: each entry below
+            // won >=75% of its occurrences over 2500 sentences of running prose
+            // (n>=3). Words where DEFAULT already wins are deliberately left
+            // alone even when they are frequent error sources — "that" wants
+            // ðˈæt 31% of the time but ðæt 68%, so flipping it would lose two
+            // tokens for every one gained. Mirrors POS_OVERRIDES in
+            // tools/convert-misaki-lexicon.py; keep the two in step.
+            struct PosOverride {
+                const char* word;
+                const char* tag;
+            };
+            static const PosOverride kOverrides[] = {
+                {"live", "VERB"},     // the verb (lˈɪv) dominates; DEFAULT is the adjective
+                {"contents", "NOUN"}, // the noun (kˈɑntɛnts) dominates
+                {"thee", "None"},
+            };
+            const char* want = nullptr;
+            for (const auto& o : kOverrides)
+                if (lower == o.word)
+                    want = o.tag;
+            i++;
+            std::string dflt, fin, chosen;
+            while (i < buf.size()) {
+                while (i < buf.size() && (unsigned char)buf[i] <= ' ')
+                    i++;
+                if (i >= buf.size() || buf[i] == '}') {
+                    i++;
+                    break;
+                }
+                if (buf[i] == ',') {
+                    i++;
+                    continue;
+                }
+                std::string tag;
+                if (!read_string(i, tag))
+                    break;
+                while (i < buf.size() && ((unsigned char)buf[i] <= ' ' || buf[i] == ':'))
+                    i++;
+                if (i < buf.size() && buf[i] == '"') {
+                    std::string val;
+                    if (!read_string(i, val))
+                        break;
+                    if (tag == "DEFAULT")
+                        dflt = val;
+                    else if (tag == "None")
+                        fin = val;
+                    if (want && tag == want)
+                        chosen = val;
+                } else {
+                    // null or another literal — skip to the next delimiter.
+                    while (i < buf.size() && buf[i] != ',' && buf[i] != '}')
+                        i++;
+                }
+            }
+            const std::string& pick = chosen.empty() ? dflt : chosen;
+            if (!pick.empty() && !out.entries.count(lower)) {
+                out.entries[lower] = pick;
+                count++;
+            }
+            if (!fin.empty() && !final_out.entries.count(lower))
+                final_out.entries[lower] = fin;
+        } else {
+            while (i < buf.size() && buf[i] != ',' && buf[i] != '}')
+                i++;
+        }
+    }
+    return count;
+}
+
 inline int load_ipa_dict_file(ipa_dict& dict, const std::string& path) {
     FILE* f = fopen(path.c_str(), "r");
     if (!f)
@@ -768,8 +928,16 @@ inline int load_ipa_dict_file(ipa_dict& dict, const std::string& path) {
     char line[512];
     int count = 0;
     while (fgets(line, sizeof(line), f)) {
-        if (line[0] == '#' || line[0] == 'w' || line[0] == '\n')
-            continue; // skip header/comments
+        // Skip comments, blank lines, and a literal "word<TAB>..." CSV header.
+        // The header test used to be `line[0] == 'w'`, which silently dropped
+        // EVERY entry whose word begins with w — "with", "was", "world",
+        // "would", "water"… ~2% of a real lexicon, and among the most common
+        // words in English. They fell through to the lower G2P tiers, so
+        // nothing looked broken; the dict just quietly did not cover them.
+        if (line[0] == '#' || line[0] == '\n')
+            continue;
+        if (strncmp(line, "word\t", 5) == 0)
+            continue;
         size_t len = strlen(line);
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
             line[--len] = 0;
@@ -806,6 +974,24 @@ struct context {
     ipa_dict espeak_ipa; // Pre-generated espeak IPA (highest priority)
     cmudict dict;        // CMUdict ARPAbet (converted to IPA)
     neural_model neural; // Neural G2P for OOV
+
+    // #316: optional Tier 0.5 — pronounce a regular inflection from its stem
+    // when the Tier-0 dict has the stem but not the inflected form. Empty by
+    // default, so the espeak/piper path is byte-for-byte unchanged; the misaki
+    // path sets it because that lexicon stores stems (only 46% of inflected
+    // forms are listed verbatim, against 100% in CMUdict). See
+    // core/g2p_inflect.h.
+    std::function<std::string(const std::string&)> inflect_fallback;
+
+    // #316: apply the contextual function-word rules (the/to/a/an/in), which
+    // need to see the NEXT word's phonemes. Off by default — piper's dict is
+    // espeak-derived and already encodes its own reductions.
+    bool context_words = false;
+
+    // #316: phrase-final pronunciations — misaki's "None" lexicon key, chosen
+    // when NOTHING follows the word ("…is she?" -> ʃˌi). 32 entries; empty
+    // unless the companion dict is loaded.
+    ipa_dict phrase_final;
 };
 
 // ── Text normalization (technical tokens) ──────────────────────────
@@ -898,17 +1084,23 @@ inline bool is_word_end(const std::string& text, size_t pos) {
            next == '-' || next == '\n' || next == '\t' || next == '(' || next == ')' || next == '"' || next == '\'';
 }
 
+// #316: spell numbers out first. Digits are in no pronunciation dictionary and
+// no letter-to-sound rule, so a numeric token used to phonemize to the EMPTY
+// string and disappear from the audio entirely ("with 82 million" was spoken
+// "with million"). core_num2words_en follows misaki's reading, including the
+// year-style pair rule for four-digit numbers.
 inline std::string normalize_technical_tokens(const std::string& text) {
+    const std::string expanded = core_num2words_en::expand(text);
     std::string result;
-    result.reserve(text.size() + 32);
+    result.reserve(expanded.size() + 32);
     const auto& rules = tech_token_rules();
     size_t i = 0;
-    while (i < text.size()) {
+    while (i < expanded.size()) {
         bool matched = false;
-        if (is_word_start(text, i)) {
+        if (is_word_start(expanded, i)) {
             for (const auto& rule : rules) {
                 size_t plen = strlen(rule.pattern);
-                if (match_icase(text, i, rule.pattern, plen) && is_word_end(text, i + plen)) {
+                if (match_icase(expanded, i, rule.pattern, plen) && is_word_end(expanded, i + plen)) {
                     result += rule.replacement;
                     i += plen;
                     matched = true;
@@ -917,14 +1109,53 @@ inline std::string normalize_technical_tokens(const std::string& text) {
             }
         }
         if (!matched)
-            result += text[i++];
+            result += expanded[i++];
     }
     return result;
 }
 
 // ── Tokenizer ───────────────────────────────────────────────────────
 
-inline std::vector<std::string> tokenize(const std::string& text) {
+// #316: real prose is not ASCII. Gutenberg-class text is full of em dashes and
+// curly quotes, and the tokenizer used to split on ASCII punctuation only — so
+// "always—most" arrived as ONE token, missed every dictionary, and came out of
+// the letter-to-sound rules as `ˈælwAsmɑst`, two words fused into noise. Curly
+// apostrophes did the same to contractions ("she'd" -> `ʃ`). Normalizing them to
+// their ASCII equivalents first costs nothing and fixes both.
+inline std::string normalize_unicode_punct(const std::string& text) {
+    static const struct {
+        const char* from;
+        const char* to;
+    } kMap[] = {
+        {"\xe2\x80\x94", "-"}, // — em dash
+        {"\xe2\x80\x93", "-"}, // – en dash
+        {"\xe2\x80\x99", "'"}, // ’ right single quote (apostrophe)
+        {"\xe2\x80\x98", " "}, // ‘ left single quote
+        {"\xe2\x80\x9c", " "}, // " left double quote
+        {"\xe2\x80\x9d", " "}, // " right double quote
+        {"\xe2\x80\xa6", " "}, // … ellipsis
+    };
+    std::string out;
+    out.reserve(text.size());
+    for (size_t i = 0; i < text.size();) {
+        bool hit = false;
+        for (const auto& m : kMap) {
+            const size_t n = strlen(m.from);
+            if (text.compare(i, n, m.from) == 0) {
+                out += m.to;
+                i += n;
+                hit = true;
+                break;
+            }
+        }
+        if (!hit)
+            out += text[i++];
+    }
+    return out;
+}
+
+inline std::vector<std::string> tokenize(const std::string& text_raw) {
+    const std::string text = normalize_unicode_punct(text_raw);
     std::vector<std::string> tokens;
     std::string cur;
     for (char c : text) {
@@ -982,6 +1213,16 @@ inline std::string word_to_ipa(const context& ctx, const std::string& word) {
         auto it = ctx.espeak_ipa.entries.find(lower);
         if (it != ctx.espeak_ipa.entries.end())
             return it->second;
+    }
+
+    // Tier 0.5: regular inflection from a stem in the Tier-0 dict (#316).
+    // Deliberately ABOVE CMUdict: falling through to CMUdict is exactly what
+    // used to lose the misaki-lexicon agreement for every plural and past
+    // tense.
+    if (ctx.inflect_fallback) {
+        std::string infl = ctx.inflect_fallback(lower);
+        if (!infl.empty())
+            return infl;
     }
 
     // Tier 1: espeak override table (handful of irregular words)
@@ -1083,18 +1324,68 @@ inline std::string word_to_ipa(const context& ctx, const std::string& word) {
 // Convert full text to IPA string.
 inline std::string text_to_ipa(const context& ctx, const std::string& text) {
     auto words = tokenize(normalize_technical_tokens(text));
-    std::string ipa;
+    // Two passes: a contextual function word ("the", "to") needs to know
+    // whether the FOLLOWING word starts with a vowel, so every word is
+    // phonemized first and the rules are applied afterwards (#316).
+    std::vector<std::string> parts;
+    std::vector<bool> is_punct;
+    parts.reserve(words.size());
+    is_punct.reserve(words.size());
     for (const auto& w : words) {
-        if (w.size() == 1 &&
-            (w[0] == ',' || w[0] == '.' || w[0] == '!' || w[0] == '?' || w[0] == ';' || w[0] == ':' || w[0] == '-')) {
-            // Keep punctuation as-is (piper's phoneme map includes them)
+        const bool punct = w.size() == 1 && (w[0] == ',' || w[0] == '.' || w[0] == '!' || w[0] == '?' || w[0] == ';' ||
+                                             w[0] == ':' || w[0] == '-');
+        is_punct.push_back(punct);
+        parts.push_back(punct ? std::string() : word_to_ipa(ctx, w));
+    }
+    if (ctx.context_words) {
+        for (size_t i = 0; i < words.size(); i++) {
+            if (is_punct[i])
+                continue;
+            std::string lower = words[i];
+            for (auto& c : lower)
+                c = (char)tolower((unsigned char)c);
+            // The next PRONOUNCED word decides the reduction; punctuation in
+            // between is not a word, but it does end the phrase, so treat a
+            // following punctuation mark as "nothing follows".
+            auto next = core_g2p_ctxwords::NextVowel::Unknown;
+            for (size_t j = i + 1; j < words.size(); j++) {
+                if (is_punct[j])
+                    break;
+                next = core_g2p_ctxwords::starts_with_vowel(parts[j]) ? core_g2p_ctxwords::NextVowel::Yes
+                                                                      : core_g2p_ctxwords::NextVowel::No;
+                break;
+            }
+            // Phrase-final variant first: it is the lexicon's own answer for
+            // "nothing follows", so it outranks the capitalisation rule.
+            if (next == core_g2p_ctxwords::NextVowel::Unknown && ctx.phrase_final.loaded) {
+                auto pf = ctx.phrase_final.entries.find(lower);
+                if (pf != ctx.phrase_final.entries.end()) {
+                    parts[i] = pf->second;
+                    continue;
+                }
+            }
+            std::string over = core_g2p_ctxwords::lookup(lower, next, parts[i]);
+            if (!over.empty()) {
+                // A special-cased word takes its contextual form and NOTHING
+                // else: misaki's get_special_case returns before apply_stress,
+                // so "The box" is `ðə bˈɑks`, never `ðˌə`. Applying the
+                // capitalisation rule on top was worth 29 wrong tokens.
+                parts[i] = over;
+            } else {
+                parts[i] = core_g2p_ctxwords::apply_caps_stress(words[i], parts[i]);
+            }
+        }
+    }
+    std::string ipa;
+    for (size_t i = 0; i < parts.size(); i++) {
+        if (is_punct[i]) {
             if (!ipa.empty() && ipa.back() != ' ')
                 ipa += ' ';
             continue;
         }
         if (!ipa.empty())
             ipa += ' ';
-        ipa += word_to_ipa(ctx, w);
+        ipa += parts[i];
     }
     return ipa;
 }

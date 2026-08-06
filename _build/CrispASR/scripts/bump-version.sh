@@ -14,19 +14,30 @@ VERSION="$1"
 REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
+# Anything already modified before we start is the caller's, not ours — record it
+# so the release commit cannot sweep up unrelated work-in-progress.
+PRE_DIRTY="$(git diff --name-only | sort)"
+
 echo "$VERSION" > VERSION
 python scripts/sync-version.py
 
-# Stage only the files sync-version.py touches (plus VERSION itself).
+# Stage VERSION plus exactly the files sync-version.py just touched.
+#
+# COMPUTED, not hardcoded. The old hardcoded list drifted silently: when
+# python/crispasr/__init__.py was added to sync-version.py it was not added here,
+# so v0.8.24 was first tagged on a tree whose crispasr.__version__ still read
+# 0.8.23 while the wheel metadata claimed 0.8.24 — the kind of mismatch nobody
+# notices until a user reports it. Diffing the working tree keeps the two scripts
+# in step by construction.
 git add VERSION
-for f in \
-    bindings/javascript/package.json \
-    python/pyproject.toml \
-    crispasr/Cargo.toml \
-    crispasr-sys/Cargo.toml \
-    flutter/crispasr/pubspec.yaml; do
-    [ -f "$f" ] && git add "$f" || true
-done
+NOW_DIRTY="$(git diff --name-only | sort)"
+TOUCHED="$(comm -13 <(printf '%s\n' "$PRE_DIRTY") <(printf '%s\n' "$NOW_DIRTY"))"
+while IFS= read -r f; do
+    [ -n "$f" ] && git add "$f"
+done <<< "$TOUCHED"
+
+echo "Staged for the release commit:"
+git diff --cached --name-only | sed 's/^/  /'
 
 git commit -m "release: bump VERSION to $VERSION"
 git tag -a "v$VERSION" -m "Release v$VERSION"

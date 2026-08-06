@@ -49,6 +49,7 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <fstream>
@@ -385,6 +386,14 @@ struct cosyvoice3_tts_context {
     cosyvoice3_tts_context_params params{};
     int n_threads = 4;
     uint64_t seed = 42;
+    // #304 cross-lingual: the requested synthesis/target language (ISO-ish, e.g.
+    // "en","de","zh"). When set and it differs from the reference voice's own
+    // language, synth switches to cross-lingual mode — it keeps the "helpful
+    // assistant" framing + the reference SPEECH tokens (timbre) but DROPS the
+    // reference TRANSCRIPT, which otherwise biases phonetics toward the
+    // reference's language (the accent reported in #304). Empty = zero-shot
+    // (reference transcript kept), the same-language default.
+    std::string target_language;
 
     cv3_hp hp;
     cv3_lm lm;
@@ -392,6 +401,27 @@ struct cosyvoice3_tts_context {
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_sched_t sched = nullptr;
+    // §304 native-Vulkan: ggml_backend_sched requires a CPU backend as its last
+    // entry, so it always keeps a CPU↔GPU split available — and CV3's graphs
+    // begin with a weight-less rms_norm on an input leaf, which the scheduler
+    // then mis-assigns to CPU and miscomputes the copy on Vulkan (blank/garbled
+    // synthesis, #304). When running natively on Vulkan we instead dispatch
+    // every graph through a single-backend gallocr on `backend` (all weights +
+    // KV are GPU-resident, so no cross-backend copy is needed), bypassing the
+    // scheduler entirely. Opt-in via CRISPASR_COSYVOICE3_VULKAN_NATIVE=1.
+    ggml_gallocr_t gpu_gallocr = nullptr;
+    bool use_gpu_gallocr = false;
+    // §304 HYBRID native-Vulkan: the LM + flow (DiT-CFM) compute correctly on
+    // Vulkan, but the HiFT vocoder's conv graphs hit the subtle ggml-vulkan
+    // conv miscompute (finite-but-wrong → noise) — verified on Tesla P100. So
+    // in native-Vulkan mode we keep LM+flow on the Vulkan gallocr (the heavy
+    // DiT-CFM is GPU-accelerated) but load the HiFT weights on CPU and dispatch
+    // its F0 + decode graphs on CPU. `hift_on_cpu` is latched at init;
+    // `dispatch_cpu` is toggled on around the HiFT compute so the cv3_sched_*
+    // shims route those graphs to cpu_gallocr + the CPU backend.
+    ggml_gallocr_t cpu_gallocr = nullptr;
+    bool hift_on_cpu = false;
+    bool dispatch_cpu = false;
     ggml_context* ctx_w = nullptr;
     ggml_backend_buffer_t buf_w = nullptr;
     ggml_backend_buffer_t buf_w_cpu = nullptr;
@@ -446,6 +476,44 @@ struct cosyvoice3_tts_context {
 };
 
 namespace {
+
+// §304 dispatch shims — route every compute graph through either the shared
+// scheduler (default) or, on native Vulkan, a single-backend gallocr on
+// ctx->backend that sidesteps the scheduler's mandatory CPU fallback and the
+// weight-less-first-op miscompute it triggers. Inputs are set between alloc and
+// compute at every call site (unchanged); with gallocr the graph tensors are
+// GPU-resident, so ggml_backend_graph_compute runs the whole graph on Vulkan.
+inline void cv3_sched_reset(cosyvoice3_tts_context* ctx) {
+    // gallocr paths (GPU, or the hybrid HiFT-on-CPU path) have no reset.
+    if (!ctx->use_gpu_gallocr && !ctx->dispatch_cpu)
+        ggml_backend_sched_reset(ctx->sched);
+}
+inline bool cv3_sched_alloc(cosyvoice3_tts_context* ctx, ggml_cgraph* gf) {
+    if (ctx->dispatch_cpu) // §304 hybrid: HiFT graphs on the CPU gallocr
+        return ggml_gallocr_alloc_graph(ctx->cpu_gallocr, gf);
+    return ctx->use_gpu_gallocr ? ggml_gallocr_alloc_graph(ctx->gpu_gallocr, gf)
+                                : ggml_backend_sched_alloc_graph(ctx->sched, gf);
+}
+inline ggml_status cv3_sched_compute(cosyvoice3_tts_context* ctx, ggml_cgraph* gf) {
+    if (ctx->dispatch_cpu) // §304 hybrid: compute HiFT on the CPU backend
+        return ggml_backend_graph_compute(ctx->backend_cpu, gf);
+    return ctx->use_gpu_gallocr ? ggml_backend_graph_compute(ctx->backend, gf)
+                                : ggml_backend_sched_graph_compute(ctx->sched, gf);
+}
+
+inline bool cv3_env_true(const char* name) {
+    const char* v = crispasr_env::get(name);
+    return v && v[0] == '1';
+}
+
+// §304 hybrid: RAII toggle of dispatch_cpu (restored on every return path) so
+// the HiFT stage functions route their graphs to the CPU gallocr/backend.
+struct cv3_dispatch_guard {
+    cosyvoice3_tts_context* ctx;
+    bool saved;
+    cv3_dispatch_guard(cosyvoice3_tts_context* c, bool cpu) : ctx(c), saved(c->dispatch_cpu) { c->dispatch_cpu = cpu; }
+    ~cv3_dispatch_guard() { ctx->dispatch_cpu = saved; }
+};
 
 uint32_t cv3_kv_u32(gguf_context* ctx, const char* key, uint32_t def) {
     int64_t id = gguf_find_key(ctx, key);
@@ -639,14 +707,14 @@ float* cv3_run_embed(cosyvoice3_tts_context* ctx, ggml_tensor* table, const int3
     ctx->step_t1_gf = nullptr;
     ctx->step_t1_fixed_kv_len = 0;
     ggml_cgraph* gf = cv3_build_embed_graph(ctx, table, n_tokens);
-    ggml_backend_sched_reset(ctx->sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+    cv3_sched_reset(ctx);
+    if (!cv3_sched_alloc(ctx, gf)) {
         fprintf(stderr, "cosyvoice3_tts: embed alloc_graph failed\n");
         return nullptr;
     }
     ggml_tensor* ids_t = ggml_graph_get_tensor(gf, "embed_ids");
     ggml_backend_tensor_set(ids_t, ids, 0, (size_t)n_tokens * sizeof(int32_t));
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+    if (cv3_sched_compute(ctx, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "cosyvoice3_tts: embed compute failed\n");
         return nullptr;
     }
@@ -819,8 +887,8 @@ std::vector<int32_t> cv3_tokenize_s3tok(cosyvoice3_tts_context* ctx, const float
     ctx->step_t1_gf = nullptr;
     ctx->step_t1_fixed_kv_len = 0;
     ggml_cgraph* gf = cv3_build_s3tok_graph(ctx, T_use);
-    ggml_backend_sched_reset(ctx->sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+    cv3_sched_reset(ctx);
+    if (!cv3_sched_alloc(ctx, gf)) {
         fprintf(stderr, "cosyvoice3_tts: s3tok alloc_graph failed\n");
         return out;
     }
@@ -832,7 +900,7 @@ std::vector<int32_t> cv3_tokenize_s3tok(cosyvoice3_tts_context* ctx, const float
             pos[(size_t)i] = i;
         ggml_backend_tensor_set(pos_t, pos.data(), 0, pos.size() * sizeof(int32_t));
     }
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+    if (cv3_sched_compute(ctx, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "cosyvoice3_tts: s3tok graph compute failed\n");
         return out;
     }
@@ -983,6 +1051,29 @@ extern "C" struct cosyvoice3_tts_context* cosyvoice3_tts_init_from_file(const ch
         }
         ctx->backend = ctx->backend_cpu;
     }
+    // #304: every CosyVoice3 stage miscomputes on the Vulkan backend — the AR
+    // LLM decode collapses to ~12 near-silent speech tokens and the flow
+    // (DiT+CFM) / HiFT vocoder graphs corrupt, so synthesis is blank/garbled on
+    // BOTH q4_k and f16 (a graph-corruption signature, not quantisation). This
+    // is the same graph-scale gallocr/conv-at-length Vulkan miscompute already
+    // gated to CPU in the sibling conv-heavy TTS backends (tada-codec #192,
+    // moss #215, sidon, silero #222). SubtitleEdit ships the Vulkan Windows
+    // build to EVERY Windows user, so this was the default CV3 experience there.
+    // Metal + CUDA render correctly. Run the whole pipeline on CPU when the GPU
+    // backend is Vulkan (identical to the verified-good --no-gpu path); opt back
+    // into the native Vulkan path for debugging with
+    // CRISPASR_COSYVOICE3_VULKAN_NATIVE=1.
+    if (ctx->backend != ctx->backend_cpu && std::strstr(ggml_backend_name(ctx->backend), "Vulkan")) {
+        const char* keep = crispasr_env::get("CRISPASR_COSYVOICE3_VULKAN_NATIVE");
+        if (!(keep && keep[0] == '1')) {
+            if (params.verbosity >= 1) {
+                fprintf(stderr, "cosyvoice3_tts: Vulkan backend detected — running on CPU (#304 Vulkan "
+                                "miscompute; set CRISPASR_COSYVOICE3_VULKAN_NATIVE=1 to override)\n");
+            }
+            ggml_backend_free(ctx->backend);
+            ctx->backend = ctx->backend_cpu;
+        }
+    }
     if (ggml_backend_is_cpu(ctx->backend)) {
         ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
     }
@@ -1058,6 +1149,38 @@ extern "C" struct cosyvoice3_tts_context* cosyvoice3_tts_init_from_file(const ch
             backends[n_be++] = ctx->backend_cpu;
         ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
     }
+    // §304: on native Vulkan, dispatch every graph through a single-backend
+    // gallocr (see the struct comment) instead of the scheduler. Reaching here
+    // with a Vulkan GPU backend means CRISPASR_COSYVOICE3_VULKAN_NATIVE=1 kept
+    // it (the default routes Vulkan → CPU above).
+    if (ctx->backend != ctx->backend_cpu && std::strstr(ggml_backend_name(ctx->backend), "Vulkan") != nullptr) {
+        ctx->gpu_gallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+        ctx->use_gpu_gallocr = ctx->gpu_gallocr != nullptr;
+        // §304 HYBRID: LM + flow run correctly on Vulkan, but the HiFT vocoder's
+        // conv graphs miscompute there (P100-verified). Keep the heavy flow on
+        // the GPU and route only HiFT to the CPU: load its weights on the CPU
+        // backend (init_hift) and dispatch its graphs via cpu_gallocr. Disable
+        // by also setting CRISPASR_COSYVOICE3_HIFT_ON_GPU=1 (for op-bisection).
+        const char* hift_gpu = crispasr_env::get("CRISPASR_COSYVOICE3_HIFT_ON_GPU");
+        if (ctx->use_gpu_gallocr && ctx->backend_cpu && !(hift_gpu && hift_gpu[0] == '1')) {
+            ctx->cpu_gallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend_cpu));
+            ctx->hift_on_cpu = ctx->cpu_gallocr != nullptr;
+        }
+        if (params.verbosity >= 1) {
+            fprintf(stderr, "cosyvoice3_tts: native Vulkan — LM+flow via single-backend gallocr%s (#304)\n",
+                    ctx->hift_on_cpu ? ", HiFT on CPU (hybrid)" : "");
+        }
+    }
+    // §304 DIAGNOSTIC: force the single-backend gallocr dispatch on ANY backend
+    // (incl. CPU/Metal) so gallocr-vs-scheduler can be A/B'd on a known-good
+    // backend — isolates a gallocr-dispatch bug from a Vulkan op miscompute.
+    if (!ctx->use_gpu_gallocr && cv3_env_true("CRISPASR_COSYVOICE3_FORCE_GALLOCR")) {
+        ctx->gpu_gallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+        ctx->use_gpu_gallocr = ctx->gpu_gallocr != nullptr;
+        if (params.verbosity >= 1)
+            fprintf(stderr, "cosyvoice3_tts: FORCE_GALLOCR — dispatching all graphs via gallocr on %s\n",
+                    ggml_backend_name(ctx->backend));
+    }
     ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
 
     if (params.verbosity >= 1) {
@@ -1098,6 +1221,10 @@ extern "C" void cosyvoice3_tts_free(struct cosyvoice3_tts_context* ctx) {
         ggml_free(ctx->kv_ctx);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
+    if (ctx->gpu_gallocr)
+        ggml_gallocr_free(ctx->gpu_gallocr);
+    if (ctx->cpu_gallocr)
+        ggml_gallocr_free(ctx->cpu_gallocr);
     if (ctx->buf_w)
         ggml_backend_buffer_free(ctx->buf_w);
     if (ctx->buf_w_cpu)
@@ -1147,6 +1274,14 @@ extern "C" void cosyvoice3_tts_set_temperature(struct cosyvoice3_tts_context* ct
     if (!ctx)
         return;
     ctx->params.temperature = temperature;
+}
+
+// #304 cross-lingual: set the synthesis/target language (ISO-ish code, or "" /
+// nullptr / "auto" to clear = zero-shot). See ctx->target_language.
+extern "C" void cosyvoice3_tts_set_target_language(struct cosyvoice3_tts_context* ctx, const char* lang) {
+    if (!ctx)
+        return;
+    ctx->target_language = (lang && std::strcmp(lang, "auto") != 0) ? lang : "";
 }
 
 extern "C" int cosyvoice3_tts_get_hparams(struct cosyvoice3_tts_context* ctx, uint32_t* d_model, uint32_t* n_layers,
@@ -1214,8 +1349,8 @@ extern "C" float* cosyvoice3_tts_prefill_with_embeds(struct cosyvoice3_tts_conte
     ctx->step_t1_fixed_kv_len = 0;
 
     ggml_cgraph* gf = cv3_build_lm_graph(ctx, n_tokens, n_past, /*fixed_kv_len*/ 0);
-    ggml_backend_sched_reset(ctx->sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+    cv3_sched_reset(ctx);
+    if (!cv3_sched_alloc(ctx, gf)) {
         fprintf(stderr, "cosyvoice3_tts: prefill alloc_graph failed\n");
         return nullptr;
     }
@@ -1247,7 +1382,7 @@ extern "C" float* cosyvoice3_tts_prefill_with_embeds(struct cosyvoice3_tts_conte
     if (!set_t("lm_causal_mask", mask.data(), mask.size() * sizeof(ggml_fp16_t)))
         return nullptr;
 
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+    if (cv3_sched_compute(ctx, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "cosyvoice3_tts: prefill compute failed\n");
         return nullptr;
     }
@@ -1326,8 +1461,8 @@ extern "C" float* cosyvoice3_tts_step_speech(struct cosyvoice3_tts_context* ctx,
         ctx->step_t1_fixed_kv_len = fixed_kv;
     }
 
-    ggml_backend_sched_reset(ctx->sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+    cv3_sched_reset(ctx);
+    if (!cv3_sched_alloc(ctx, gf)) {
         fprintf(stderr, "cosyvoice3_tts: step alloc_graph failed\n");
         free(embed_alloc);
         return nullptr;
@@ -1359,7 +1494,7 @@ extern "C" float* cosyvoice3_tts_step_speech(struct cosyvoice3_tts_context* ctx,
     if (!set_t("lm_causal_mask", mask.data(), mask.size() * sizeof(ggml_fp16_t)))
         return nullptr;
 
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+    if (cv3_sched_compute(ctx, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "cosyvoice3_tts: step compute failed\n");
         return nullptr;
     }
@@ -1529,7 +1664,7 @@ extern "C" int32_t* cosyvoice3_tts_generate_tokens_from_embeds(struct cosyvoice3
 
     std::vector<int32_t> out;
     out.reserve((size_t)max_steps);
-    const bool greedy = !(ctx->params.temperature > 0.0f);
+    const bool greedy = !(ctx->params.temperature > 0.0f) || cv3_env_true("CRISPASR_COSYVOICE3_GREEDY");
 
     int n_past = n_tokens;
     for (int step = 0; step < max_steps; step++) {
@@ -1632,8 +1767,8 @@ extern "C" float* cosyvoice3_tts_extract_stage(struct cosyvoice3_tts_context* ct
             return nullptr;
         const int T_use = n_embed_tokens;
         ggml_cgraph* gf = cv3_build_s3tok_graph(ctx, T_use);
-        ggml_backend_sched_reset(ctx->sched);
-        if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        cv3_sched_reset(ctx);
+        if (!cv3_sched_alloc(ctx, gf)) {
             fprintf(stderr, "cosyvoice3_tts: %s alloc_graph failed\n", stage_name);
             return nullptr;
         }
@@ -1647,7 +1782,7 @@ extern "C" float* cosyvoice3_tts_extract_stage(struct cosyvoice3_tts_context* ct
                 pos[(size_t)i] = i;
             ggml_backend_tensor_set(pos_t, pos.data(), 0, pos.size() * sizeof(int32_t));
         }
-        if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        if (cv3_sched_compute(ctx, gf) != GGML_STATUS_SUCCESS) {
             fprintf(stderr, "cosyvoice3_tts: %s compute failed\n", stage_name);
             return nullptr;
         }
@@ -2339,8 +2474,8 @@ extern "C" float* cosyvoice3_tts_run_flow_dit_block(struct cosyvoice3_tts_contex
     ggml_cgraph* gf = cv3_build_flow_dit_block_graph(ctx, block_idx, T);
     if (!gf)
         return nullptr;
-    ggml_backend_sched_reset(ctx->sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+    cv3_sched_reset(ctx);
+    if (!cv3_sched_alloc(ctx, gf)) {
         fprintf(stderr, "cosyvoice3_tts: dit_block alloc_graph failed\n");
         return nullptr;
     }
@@ -2363,7 +2498,7 @@ extern "C" float* cosyvoice3_tts_run_flow_dit_block(struct cosyvoice3_tts_contex
     if (!set_t("dit_positions", pos.data(), pos.size() * sizeof(int32_t)))
         return nullptr;
 
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+    if (cv3_sched_compute(ctx, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "cosyvoice3_tts: dit_block compute failed\n");
         return nullptr;
     }
@@ -2401,8 +2536,8 @@ float* cv3_extract_flow_dit_stage(cosyvoice3_tts_context* ctx, int block_idx, co
     ggml_cgraph* gf = cv3_build_flow_dit_block_graph(ctx, block_idx, T);
     if (!gf)
         return nullptr;
-    ggml_backend_sched_reset(ctx->sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
+    cv3_sched_reset(ctx);
+    if (!cv3_sched_alloc(ctx, gf))
         return nullptr;
 
     auto set_t = [&](const char* nm, const void* data, size_t bytes) {
@@ -2421,7 +2556,7 @@ float* cv3_extract_flow_dit_stage(cosyvoice3_tts_context* ctx, int block_idx, co
         pos[i] = i;
     if (!set_t("dit_positions", pos.data(), pos.size() * sizeof(int32_t)))
         return nullptr;
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS)
+    if (cv3_sched_compute(ctx, gf) != GGML_STATUS_SUCCESS)
         return nullptr;
 
     ggml_tensor* out_t = ggml_graph_get_tensor(gf, tensor_name);
@@ -2662,8 +2797,8 @@ float* cv3_extract_pre_la_stage(cosyvoice3_tts_context* ctx, const int32_t* ids,
     ggml_cgraph* gf = cv3_build_pre_la_graph(ctx, T_tok);
     if (!gf)
         return nullptr;
-    ggml_backend_sched_reset(ctx->sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
+    cv3_sched_reset(ctx);
+    if (!cv3_sched_alloc(ctx, gf))
         return nullptr;
 
     ggml_tensor* ids_t = ggml_graph_get_tensor(gf, "pre_la_ids_in");
@@ -2671,7 +2806,7 @@ float* cv3_extract_pre_la_stage(cosyvoice3_tts_context* ctx, const int32_t* ids,
         return nullptr;
     ggml_backend_tensor_set(ids_t, ids, 0, (size_t)T_tok * sizeof(int32_t));
 
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+    if (cv3_sched_compute(ctx, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "cosyvoice3_tts: pre_la compute failed\n");
         return nullptr;
     }
@@ -2810,8 +2945,8 @@ float* cv3_extract_in_pipe_stage(cosyvoice3_tts_context* ctx, const float* pre_l
     ggml_cgraph* gf = cv3_build_in_pipe_graph(ctx, T_mel);
     if (!gf)
         return nullptr;
-    ggml_backend_sched_reset(ctx->sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+    cv3_sched_reset(ctx);
+    if (!cv3_sched_alloc(ctx, gf)) {
         fprintf(stderr, "cosyvoice3_tts: in_pipe alloc_graph failed\n");
         return nullptr;
     }
@@ -2832,7 +2967,7 @@ float* cv3_extract_in_pipe_stage(cosyvoice3_tts_context* ctx, const float* pre_l
     if (!set_t("in_pipe_cond_in", cond, (size_t)mel * T_mel * sizeof(float)))
         return nullptr;
 
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+    if (cv3_sched_compute(ctx, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "cosyvoice3_tts: in_pipe compute failed\n");
         return nullptr;
     }
@@ -3052,8 +3187,8 @@ float* cv3_extract_dit_full_stage(cosyvoice3_tts_context* ctx, const float* x, i
     ggml_cgraph* gf = cv3_build_dit_full_graph(ctx, T_mel);
     if (!gf)
         return nullptr;
-    ggml_backend_sched_reset(ctx->sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+    cv3_sched_reset(ctx);
+    if (!cv3_sched_alloc(ctx, gf)) {
         fprintf(stderr, "cosyvoice3_tts: dit_full alloc_graph failed\n");
         return nullptr;
     }
@@ -3075,7 +3210,7 @@ float* cv3_extract_dit_full_stage(cosyvoice3_tts_context* ctx, const float* x, i
     if (!set_t("dit_full_positions", pos.data(), pos.size() * sizeof(int32_t)))
         return nullptr;
 
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+    if (cv3_sched_compute(ctx, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "cosyvoice3_tts: dit_full compute failed\n");
         return nullptr;
     }
@@ -3349,8 +3484,8 @@ float* cv3_run_estimator_cfg(cosyvoice3_tts_context* ctx, const float* x, int T_
     ggml_cgraph* gf = cv3_build_estimator_cfg_graph(ctx, T_mel);
     if (!gf)
         return nullptr;
-    ggml_backend_sched_reset(ctx->sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
+    cv3_sched_reset(ctx);
+    if (!cv3_sched_alloc(ctx, gf))
         return nullptr;
     auto set_t = [&](const char* name, const void* data, size_t bytes) {
         ggml_tensor* t = ggml_graph_get_tensor(gf, name);
@@ -3371,7 +3506,7 @@ float* cv3_run_estimator_cfg(cosyvoice3_tts_context* ctx, const float* x, int T_
         pos[(size_t)i] = i;
     if (!set_t("cfg_positions", pos.data(), pos.size() * sizeof(int32_t)))
         return nullptr;
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+    if (cv3_sched_compute(ctx, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "cosyvoice3_tts: batched CFG estimator compute failed\n");
         return nullptr;
     }
@@ -3398,8 +3533,8 @@ float* cv3_run_estimator_full(cosyvoice3_tts_context* ctx, const float* x, int T
     ggml_cgraph* gf = cv3_build_estimator_full_graph(ctx, T_mel);
     if (!gf)
         return nullptr;
-    ggml_backend_sched_reset(ctx->sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
+    cv3_sched_reset(ctx);
+    if (!cv3_sched_alloc(ctx, gf))
         return nullptr;
 
     auto set_t = [&](const char* nm, const void* data, size_t bytes) {
@@ -3426,7 +3561,7 @@ float* cv3_run_estimator_full(cosyvoice3_tts_context* ctx, const float* x, int T
     if (!set_t("est_positions", pos.data(), pos.size() * sizeof(int32_t)))
         return nullptr;
 
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+    if (cv3_sched_compute(ctx, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "cosyvoice3_tts: estimator_full compute failed\n");
         return nullptr;
     }
@@ -3690,6 +3825,7 @@ ggml_cgraph* cv3_build_hift_f0_graph(cosyvoice3_tts_context* ctx, int T_mel) {
 float* cv3_extract_hift_f0_stage(cosyvoice3_tts_context* ctx, const float* mel, int T_mel) {
     if (!ctx || !ctx->hift.loaded || !mel || T_mel <= 0)
         return nullptr;
+    cv3_dispatch_guard _dg(ctx, ctx->hift_on_cpu); // §304 hybrid: HiFT on CPU
     const int mel_dim = (int)ctx->hift.hp.mel_dim;
 
     ctx->step_t1_gf = nullptr;
@@ -3698,8 +3834,8 @@ float* cv3_extract_hift_f0_stage(cosyvoice3_tts_context* ctx, const float* mel, 
     ggml_cgraph* gf = cv3_build_hift_f0_graph(ctx, T_mel);
     if (!gf)
         return nullptr;
-    ggml_backend_sched_reset(ctx->sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+    cv3_sched_reset(ctx);
+    if (!cv3_sched_alloc(ctx, gf)) {
         fprintf(stderr, "cosyvoice3_tts: hift_f0 alloc_graph failed\n");
         return nullptr;
     }
@@ -3707,7 +3843,7 @@ float* cv3_extract_hift_f0_stage(cosyvoice3_tts_context* ctx, const float* mel, 
     if (!in_t)
         return nullptr;
     ggml_backend_tensor_set(in_t, mel, 0, (size_t)mel_dim * T_mel * sizeof(float));
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+    if (cv3_sched_compute(ctx, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "cosyvoice3_tts: hift_f0 compute failed\n");
         return nullptr;
     }
@@ -4296,6 +4432,7 @@ float* cv3_extract_hift_decode_stage(cosyvoice3_tts_context* ctx, const float* m
                                      const char* stage_name, int* out_n) {
     if (!ctx || !ctx->hift.loaded || !mel || T_mel <= 0 || !s_stft_in || !stage_name || !out_n)
         return nullptr;
+    cv3_dispatch_guard _dg(ctx, ctx->hift_on_cpu); // §304 hybrid: HiFT on CPU
     *out_n = 0;
     const auto& h = ctx->hift;
     const int mel_dim = (int)h.hp.mel_dim;
@@ -4310,8 +4447,8 @@ float* cv3_extract_hift_decode_stage(cosyvoice3_tts_context* ctx, const float* m
     ggml_cgraph* gf = cv3_build_hift_decode_graph(ctx, T_mel);
     if (!gf)
         return nullptr;
-    ggml_backend_sched_reset(ctx->sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+    cv3_sched_reset(ctx);
+    if (!cv3_sched_alloc(ctx, gf)) {
         fprintf(stderr, "cosyvoice3_tts: hift_decode alloc_graph failed\n");
         return nullptr;
     }
@@ -4321,7 +4458,7 @@ float* cv3_extract_hift_decode_stage(cosyvoice3_tts_context* ctx, const float* m
         return nullptr;
     ggml_backend_tensor_set(mel_t, mel, 0, (size_t)mel_dim * T_mel * sizeof(float));
     ggml_backend_tensor_set(s_t, s_stft_in, 0, (size_t)T_stft * s_stft_ch * sizeof(float));
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+    if (cv3_sched_compute(ctx, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "cosyvoice3_tts: hift_decode compute failed\n");
         return nullptr;
     }
@@ -4456,6 +4593,44 @@ float* cv3_extract_hift_inference(cosyvoice3_tts_context* ctx, const float* mel,
         fprintf(stderr, "cosyvoice3_tts: hift_inference: decode forward failed (n=%d)\n", dec_n);
         return nullptr;
     }
+
+    // #304 debug: dump per-stage stats to localize the HiFT Vulkan miscompute.
+    // s_stft carries the F0-graph (GPU) + source-path (CPU) result; the decode
+    // stages are the GPU conv stack. A garbage s_stft => F0 graph is the
+    // breaker; a healthy s_stft with garbage decode stages => decode graph.
+    if (crispasr_env::get("CRISPASR_COSYVOICE3_DUMP_HIFT")) {
+        auto stat = [](const char* nm, const float* p, int n) {
+            if (!p || n <= 0) {
+                fprintf(stderr, "  HIFT %-26s <null>\n", nm);
+                return;
+            }
+            double mn = 1e30, mx = -1e30, s = 0, sq = 0;
+            size_t nan = 0;
+            for (int i = 0; i < n; i++) {
+                float v = p[i];
+                if (std::isnan(v) || std::isinf(v)) {
+                    nan++;
+                    continue;
+                }
+                mn = std::min(mn, (double)v);
+                mx = std::max(mx, (double)v);
+                s += v;
+                sq += (double)v * v;
+            }
+            fprintf(stderr, "  HIFT %-26s n=%d min=%.4f max=%.4f mean=%.4f rms=%.4f nan=%zu\n", nm, n, mn, mx, s / n,
+                    std::sqrt(sq / n), nan);
+        };
+        stat("s_stft(F0gpu+src_cpu)", s_stft.data(), (int)s_stft.size());
+        for (const char* sn : {"hift_decode_post_stage_0_x", "hift_decode_post_stage_1_x", "hift_decode_post_stage_2_x",
+                               "hift_decode_conv_post_out", "hift_decode_mag", "hift_decode_phase"}) {
+            int sn_n = 0;
+            float* sp = cv3_extract_hift_decode_stage(ctx, mel, T_mel, s_stft.data(), sn, &sn_n);
+            stat(sn, sp, sn_n);
+            free(sp);
+        }
+        stat("audio_final", audio, T_audio);
+    }
+
     *out_n = T_audio;
     return audio;
 }
@@ -4526,8 +4701,11 @@ extern "C" int cosyvoice3_tts_init_hift_from_file(struct cosyvoice3_tts_context*
     gguf_free(gctx);
 
     // ---- Weight pass ----
+    // §304 hybrid: on native Vulkan the HiFT vocoder is CPU-routed (its conv
+    // graphs miscompute on Vulkan), so load its weights on the CPU backend.
+    ggml_backend_t hift_backend = ctx->hift_on_cpu ? ctx->backend_cpu : ctx->backend;
     core_gguf::WeightLoad wl;
-    if (!core_gguf::load_weights(path, ctx->backend, "cosyvoice3_tts:hift", wl)) {
+    if (!core_gguf::load_weights(path, hift_backend, "cosyvoice3_tts:hift", wl)) {
         fprintf(stderr, "cosyvoice3_tts: init_hift: load_weights failed for '%s'\n", path);
         return -1;
     }
@@ -4654,7 +4832,9 @@ extern "C" int cosyvoice3_tts_init_hift_from_file(struct cosyvoice3_tts_context*
         kernels.reserve(fields.size());
         for (ggml_tensor** f : fields)
             kernels.push_back(*f);
-        hf.hift_fc.bake(ctx->backend, kernels, fc_on);
+        // §304 hybrid: bake onto the same backend the HiFT weights live on
+        // (CPU when hift_on_cpu) so the baked F32 kernels stay co-resident.
+        hf.hift_fc.bake(hift_backend, kernels, fc_on);
         int swapped = 0;
         for (ggml_tensor** f : fields) {
             ggml_tensor* baked = hf.hift_fc.get(*f);
@@ -4944,6 +5124,82 @@ extern "C" int cosyvoice3_tts_init_campplus_from_file(struct cosyvoice3_tts_cont
 // ===========================================================================
 
 namespace {
+
+// #304 cross-lingual helpers ------------------------------------------------
+// Normalize a language tag to a lowercase 2-letter base for comparison
+// ("en-US"->"en", "cmn"/"zho"->"zh", "jpn"->"ja", …).
+std::string cv3_lang_norm(const std::string& s) {
+    std::string t;
+    for (char c : s) {
+        if (c == '-' || c == '_')
+            break;
+        t += (char)std::tolower((unsigned char)c);
+    }
+    if (t == "cmn" || t == "zho" || t == "chi")
+        return "zh";
+    if (t == "jpn")
+        return "ja";
+    if (t == "kor")
+        return "ko";
+    if (t == "eng")
+        return "en";
+    if (t == "deu" || t == "ger")
+        return "de";
+    if (t == "fra" || t == "fre")
+        return "fr";
+    if (t == "spa")
+        return "es";
+    return t.size() > 2 ? t.substr(0, 2) : t;
+}
+
+// Infer the reference voice's language. Built-in voices are named
+// "fleurs-<lang>"; otherwise best-effort script detection of the reference
+// transcript (the text after "<|endofprompt|>") for the non-Latin scripts.
+// Returns "" when undeterminable (Latin/unknown) → synth stays zero-shot.
+std::string cv3_voice_language(const std::string& name, const std::string& prompt_text) {
+    const std::string pfx = "fleurs-";
+    if (name.rfind(pfx, 0) == 0)
+        return cv3_lang_norm(name.substr(pfx.size()));
+    const std::string delim = "<|endofprompt|>";
+    size_t q = prompt_text.find(delim);
+    const std::string body = (q == std::string::npos) ? prompt_text : prompt_text.substr(q + delim.size());
+    bool hangul = false, kana = false, han = false, cyr = false;
+    for (size_t i = 0; i < body.size();) {
+        unsigned char c = (unsigned char)body[i];
+        uint32_t cp = c;
+        int n = 1;
+        if (c >= 0xF0) {
+            cp = c & 0x07;
+            n = 4;
+        } else if (c >= 0xE0) {
+            cp = c & 0x0F;
+            n = 3;
+        } else if (c >= 0xC0) {
+            cp = c & 0x1F;
+            n = 2;
+        }
+        for (int k = 1; k < n && i + (size_t)k < body.size(); k++)
+            cp = (cp << 6) | ((unsigned char)body[i + k] & 0x3F);
+        i += (size_t)n;
+        if (cp >= 0xAC00 && cp <= 0xD7A3)
+            hangul = true;
+        else if (cp >= 0x3040 && cp <= 0x30FF)
+            kana = true;
+        else if (cp >= 0x4E00 && cp <= 0x9FFF)
+            han = true;
+        else if (cp >= 0x0400 && cp <= 0x04FF)
+            cyr = true;
+    }
+    if (hangul)
+        return "ko";
+    if (kana)
+        return "ja";
+    if (han)
+        return "zh";
+    if (cyr)
+        return "ru";
+    return ""; // Latin or unknown — can't disambiguate en/de/fr/es here
+}
 
 // Tokenise a CV3 prompt fragment. The only special marker we expect in
 // user-supplied prompt_text is `<|endofprompt|>`; everything around it
@@ -5236,7 +5492,16 @@ bool cv3_extract_native_runtime_voice(cosyvoice3_tts_context* ctx, const char* w
         return false;
 
     out_voice.name = "runtime";
-    out_voice.prompt_text = ref_text;
+    // #310: the CosyVoice3 LLM expects the fixed system prompt + the
+    // `<|endofprompt|>` boundary BEFORE the reference transcript — this is
+    // exactly how the baked voices store prompt_text (see
+    // convert-cosyvoice3-voices-to-gguf.py: "You are a helpful
+    // assistant.<|endofprompt|>" + <ref transcript>). The WAV-clone path stored
+    // the bare `--ref-text`, so the model ran out-of-distribution and
+    // re-rendered the reference transcript as speech before the requested text
+    // (the reference "leaked" into the start of the clone). Prepend the same
+    // prefix so the zero-shot WAV path matches the baked-voice format.
+    out_voice.prompt_text = std::string("You are a helpful assistant.<|endofprompt|>") + ref_text;
     out_voice.prompt_speech_tokens = std::move(native_tokens);
     out_voice.spk_emb = std::move(native_spk);
     out_voice.ref_mel = std::move(native_ref_mel);
@@ -5383,7 +5648,7 @@ std::vector<int32_t> cv3_generate_tokens_with_stop_floor(cosyvoice3_tts_context*
     if (!logits)
         return out;
 
-    const bool greedy = !(ctx->params.temperature > 0.0f);
+    const bool greedy = !(ctx->params.temperature > 0.0f) || cv3_env_true("CRISPASR_COSYVOICE3_GREEDY");
     int n_past = n_tokens;
     for (int step = 0; step < max_steps; step++) {
         int32_t pick = -1;
@@ -5526,10 +5791,35 @@ float* cv3_synth_with_voice(cosyvoice3_tts_context* ctx, const char* text, const
     const int aligned_t_ref_mel = prompt_token_len * mel_ratio;
 
     // ---- 1. Tokenise prompt_text + user_text ----
+    // #304 cross-lingual: when a target language is set and differs from the
+    // reference voice's language, mirror upstream frontend_cross_lingual — it
+    // deletes BOTH prompt_text AND llm_prompt_speech_token, keeping only the
+    // flow's reference speech (timbre). So here we (a) DROP the reference
+    // transcript from the LM text (keep the "You are a helpful
+    // assistant.<|endofprompt|>" framing, required per #310), and (b) feed the
+    // LM EMPTY reference speech tokens below — the flow still gets the reference
+    // tokens + ref_mel for timbre. Dropping the transcript but keeping the LM's
+    // reference speech tokens (the first attempt) leaves them un-anchored to any
+    // text and collapses the AR decode to 1-2 tokens. Same-language / no target
+    // set stays full zero-shot (reference transcript + speech), the default.
+    std::string prompt_for_lm = voice->prompt_text;
+    const std::string cv3_tgt = cv3_lang_norm(ctx->target_language);
+    const std::string cv3_vlang = cv3_voice_language(voice->name, voice->prompt_text);
+    const bool cross_lingual = !cv3_tgt.empty() && !cv3_vlang.empty() && cv3_tgt != cv3_vlang;
+    if (cross_lingual) {
+        const std::string delim = "<|endofprompt|>";
+        const size_t eop = prompt_for_lm.find(delim);
+        prompt_for_lm = (eop == std::string::npos) ? std::string() : prompt_for_lm.substr(0, eop + delim.size());
+        if (ctx->params.verbosity >= 1)
+            fprintf(stderr,
+                    "cosyvoice3_tts: cross-lingual (voice=%s[%s] → target=%s): dropping reference transcript + LM "
+                    "reference speech tokens (flow keeps them for timbre)\n",
+                    voice->name.c_str(), cv3_vlang.c_str(), cv3_tgt.c_str());
+    }
     std::vector<int32_t> text_ids;
     {
         cosyvoice3_bench_stage _b("tokenize");
-        std::vector<int32_t> prompt_ids = cv3_tokenise_prompt(ctx->vocab, voice->prompt_text);
+        std::vector<int32_t> prompt_ids = cv3_tokenise_prompt(ctx->vocab, prompt_for_lm);
         std::vector<int32_t> user_ids = cv3_tokenise_prompt(ctx->vocab, std::string(text));
         text_ids.reserve(prompt_ids.size() + user_ids.size());
         text_ids.insert(text_ids.end(), prompt_ids.begin(), prompt_ids.end());
@@ -5545,9 +5835,20 @@ float* cv3_synth_with_voice(cosyvoice3_tts_context* ctx, const char* text, const
     }
 
     // ---- 2. Build LM input embeddings + AR-decode speech tokens ----
+    // #304 cross-lingual: the LM gets EMPTY reference speech tokens (upstream
+    // deletes llm_prompt_speech_token). Otherwise (#310) the LM must see the
+    // FULL reference speech tokens (matching the full reference transcript in
+    // text_ids), NOT the mel-aligned truncated set: the `prompt_token_len` cap
+    // exists only to align the FLOW's prompt region with the 10 s-capped
+    // reference mel; feeding the truncated tokens to the LM would leave it with
+    // more reference TEXT than SPEECH, so a reference longer than the mel cap
+    // makes the AR decoder render the leftover reference tail before the target
+    // (a residual of the same leak). The flow below still uses the truncated
+    // `prompt_tokens` (aligned to ref_mel) for timbre in both cases.
+    const std::vector<int32_t> lm_prompt_tokens = cross_lingual ? std::vector<int32_t>() : voice->prompt_speech_tokens;
     std::vector<float> lm_embeds;
     int n_lm = 0;
-    if (!cv3_build_lm_input_embeds(ctx, text_ids, prompt_tokens, lm_embeds, n_lm))
+    if (!cv3_build_lm_input_embeds(ctx, text_ids, lm_prompt_tokens, lm_embeds, n_lm))
         return nullptr;
 
     const int stop_floor = (int)ctx->hp.speech_codebook;
@@ -5656,6 +5957,29 @@ float* cv3_synth_with_voice(cosyvoice3_tts_context* ctx, const char* text, const
                 (size_t)T_mel_out * (size_t)mel * sizeof(float));
     free(mel_full);
 
+    // #304 debug: dump the pre-HiFT mel (raw f32 [T_mel_out, mel]) + stats so
+    // the flow (mel gen) can be isolated from HiFT (vocoder) across backends.
+    if (const char* dm = crispasr_env::get("CRISPASR_COSYVOICE3_DUMP_MEL")) {
+        double mn = 1e30, mx = -1e30, sum = 0, sq = 0;
+        size_t nnan = 0, N = mel_out.size();
+        for (float v : mel_out) {
+            if (std::isnan(v) || std::isinf(v)) {
+                nnan++;
+                continue;
+            }
+            mn = std::min(mn, (double)v);
+            mx = std::max(mx, (double)v);
+            sum += v;
+            sq += (double)v * v;
+        }
+        fprintf(stderr, "cosyvoice3_tts: MEL[%dx%d] min=%.4f max=%.4f mean=%.4f rms=%.4f nan/inf=%zu\n", T_mel_out, mel,
+                mn, mx, sum / (double)N, std::sqrt(sq / (double)N), nnan);
+        if (FILE* f = std::fopen(dm, "wb")) {
+            std::fwrite(mel_out.data(), sizeof(float), mel_out.size(), f);
+            std::fclose(f);
+        }
+    }
+
     // ---- 9. HiFT inference → 24 kHz audio ----
     float* audio;
     {
@@ -5686,7 +6010,13 @@ extern "C" float* cosyvoice3_tts_synth(struct cosyvoice3_tts_context* ctx, const
                         "tokenizer.ggml.tokens?)\n");
         return nullptr;
     }
-    std::string vname = voice_name ? voice_name : ctx->voices.voices.front().name;
+    // "default" / "auto" are the project-wide sentinels for "pick for me" — the
+    // same ones this file already honours for the flow GGUF path. Without this a
+    // caller passing --voice default got 'voice "default" not found (have 8)',
+    // even though a null voice_name already falls back to the first voice.
+    std::string vname = voice_name ? voice_name : std::string();
+    if (vname.empty() || vname == "default" || vname == "auto")
+        vname = ctx->voices.voices.front().name;
     const cv3_voice* voice = cv3_find_voice(ctx->voices, vname);
     if (!voice) {
         fprintf(stderr, "cosyvoice3_tts: synth: voice '%s' not found (have %zu)\n", vname.c_str(),

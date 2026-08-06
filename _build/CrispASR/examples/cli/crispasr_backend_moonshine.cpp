@@ -16,6 +16,10 @@ public:
 
     const char* name() const override { return "moonshine"; }
 
+    // Moonshine (Useful Sensors) is English-only — skip external LID on -l auto
+    // (no whisper-tiny download just to "detect" a language it can't change). #227.
+    const char* sole_language() const override { return "en"; }
+
     uint32_t capabilities() const override {
         // Best-of-N is implemented in transcribe() as a sequential loop over
         // _transcribe_with_probs with a sticky seed. There's no CAP_BEST_OF_N

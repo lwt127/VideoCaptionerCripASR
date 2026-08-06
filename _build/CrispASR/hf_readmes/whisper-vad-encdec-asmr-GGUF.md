@@ -26,7 +26,7 @@ GGUF conversion of [`TransWithAI/Whisper-Vad-EncDec-ASMR-onnx`](https://huggingf
 | File | Type | Size | Notes |
 |---|---|---:|---|
 | `whisper-vad-asmr.gguf` | F32 | 114 MB | Full precision |
-| `whisper-vad-asmr-q4_k.gguf` | Q4_K | 22 MB | 4-bit quantized, recommended |
+| `whisper-vad-asmr-q4_k.gguf` | Q4_K | 25 MB | 4-bit quantized, recommended (positional embedding kept at full precision) |
 
 ## Model details
 
@@ -37,7 +37,7 @@ GGUF conversion of [`TransWithAI/Whisper-Vad-EncDec-ASMR-onnx`](https://huggingf
 - **Training data:** ~500 hours of Japanese ASMR audio
 - **License:** MIT (see [original repo](https://huggingface.co/TransWithAI/Whisper-Vad-EncDec-ASMR-onnx))
 
-## Benchmark (CrispASR, CPU, 4 threads)
+## Benchmark
 
 Tested on 10 diverse audio files (English, German, 1s-89s, clean/noisy):
 
@@ -45,9 +45,12 @@ Tested on 10 diverse audio files (English, German, 1s-89s, clean/noisy):
 |---|---:|---:|---|
 | Silero VAD v5 | 0.9 MB | 10-725 ms | Over-segments (10-55 segments per file) |
 | **FireRedVAD** | **2.4 MB** | **~50 ms** | **Clean (1-2 slices)** |
-| Whisper-VAD-ASMR (Q4_K) | 22 MB | ~1000 ms | Clean (1-2 slices) |
+| Whisper-VAD-ASMR (Q4_K) | 25 MB | ~650 ms CPU / ~200 ms Metal per 30 s window | Clean (1-2 slices) |
 
-FireRedVAD remains recommended for production use (smallest, fastest, best F1). This model is useful as an alternative VAD option or for research purposes.
+This model runs on the GPU (Metal / CUDA / Vulkan) by default in CrispASR — about
+3.3x faster than CPU on an M1 (measured at Q4_K). Force CPU with
+`CRISPASR_VAD_ENCDEC_CPU=1`. FireRedVAD is still the smallest/fastest option; this
+model is useful as an alternative VAD or for ensembling.
 
 ## Usage with CrispASR
 

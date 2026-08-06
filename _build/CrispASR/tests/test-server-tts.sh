@@ -462,29 +462,70 @@ else
     FAILED_NAMES="$FAILED_NAMES\n    - clone consent gate"
 fi
 
-# spoken_disclaimer=false should be accepted (JSON boolean field).
-# The server should log spoken_disclaimer=no in the CONSENT line.
-code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+# spoken_disclaimer=false WITH marking_attestation → opt-out honoured:
+# accepted, logged as no_spoken_disclaimer=yes, disclaimer skipped.
+hdrs=$(curl -s -o /dev/null -D - -X POST \
     -H 'Content-Type: application/json' \
-    -d '{"input":"disclaimer opt-out","voice":"clone.wav","consent_attestation":"I have consent","spoken_disclaimer":false}' \
+    -d '{"input":"disclaimer opt-out","voice":"clone.wav","consent_attestation":"I have consent","spoken_disclaimer":false,"marking_attestation":"I will disclose this is AI-generated"}' \
     "http://127.0.0.1:$PORT/v1/audio/speech")
+code=$(printf '%s' "$hdrs" | head -1 | awk '{print $2}')
 if [ "$code" != "400" ]; then
-    echo "  ✓ spoken_disclaimer=false accepted (HTTP $code)"
+    echo "  ✓ attested spoken_disclaimer=false accepted (HTTP $code)"
     PASS=$((PASS + 1))
 else
-    echo "  ✗ spoken_disclaimer=false rejected as 400"
+    echo "  ✗ attested spoken_disclaimer=false rejected as 400"
     FAIL=$((FAIL + 1))
-    FAILED_NAMES="$FAILED_NAMES\n    - spoken_disclaimer opt-out"
+    FAILED_NAMES="$FAILED_NAMES\n    - attested spoken_disclaimer opt-out"
+fi
+# Headers only exist on a 200 (synthesis may 500 on CustomVoice, which
+# cannot clone from a .wav) — the audit log below is the load-bearing check.
+if [ "$code" = "200" ]; then
+    assert_contains "attested opt-out → X-Crispasr-Spoken-Disclaimer: skipped" \
+        "X-Crispasr-Spoken-Disclaimer: skipped" "$hdrs"
 fi
 
-# Verify the audit log records spoken_disclaimer=no
-if grep -q 'spoken_disclaimer=no' "$SERVER_LOG"; then
-    echo "  ✓ audit log records spoken_disclaimer=no"
+# Verify the audit log records the honoured opt-out
+if grep -q 'spoken_disclaimer=no' "$SERVER_LOG" && grep -q 'no_spoken_disclaimer=yes' "$SERVER_LOG"; then
+    echo "  ✓ audit log records the attested opt-out"
     PASS=$((PASS + 1))
 else
-    echo "  ✗ audit log missing spoken_disclaimer=no"
+    echo "  ✗ audit log missing the attested opt-out"
     FAIL=$((FAIL + 1))
     FAILED_NAMES="$FAILED_NAMES\n    - audit log spoken_disclaimer"
+fi
+
+# #312: spoken_disclaimer=false WITHOUT marking_attestation → the OPT-OUT is
+# denied, not the request. Must never 400 (that broke every Subtitle Edit build
+# up to v5.1.0-rc16), and the response must say the disclaimer was applied.
+hdrs=$(curl -s -o /dev/null -D - -X POST \
+    -H 'Content-Type: application/json' \
+    -d '{"input":"unattested opt-out","voice":"clone.wav","consent_attestation":"I have consent","spoken_disclaimer":false}' \
+    "http://127.0.0.1:$PORT/v1/audio/speech")
+code=$(printf '%s' "$hdrs" | head -1 | awk '{print $2}')
+if [ "$code" != "400" ]; then
+    echo "  ✓ unattested spoken_disclaimer=false not refused (HTTP $code)"
+    PASS=$((PASS + 1))
+else
+    echo "  ✗ unattested spoken_disclaimer=false refused with 400 (#312 regression)"
+    FAIL=$((FAIL + 1))
+    FAILED_NAMES="$FAILED_NAMES\n    - #312 unattested opt-out refused"
+fi
+if [ "$code" = "200" ]; then
+    assert_contains "unattested opt-out → X-Crispasr-Spoken-Disclaimer: applied" \
+        "X-Crispasr-Spoken-Disclaimer: applied" "$hdrs"
+    assert_contains "unattested opt-out → X-Crispasr-Marking-Warning" \
+        "X-Crispasr-Marking-Warning" "$hdrs"
+fi
+
+# The denial must be in the audit log, and the CONSENT line must record the
+# EFFECTIVE state (disclaimer applied), not what was asked for.
+if grep -q 'no_spoken_disclaimer=DENIED' "$SERVER_LOG"; then
+    echo "  ✓ audit log records the denied opt-out"
+    PASS=$((PASS + 1))
+else
+    echo "  ✗ audit log missing no_spoken_disclaimer=DENIED"
+    FAIL=$((FAIL + 1))
+    FAILED_NAMES="$FAILED_NAMES\n    - audit log marking denial"
 fi
 
 # ─────────────────────── streaming synthesis (PR #177) ───────────────────

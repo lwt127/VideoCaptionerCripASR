@@ -11,6 +11,7 @@
 //   set_speaker_name(handle, name)             # orpheus + qwen3-tts CV
 //   speakers(handle) -> Array<String>
 //   set_instruct(handle, instruct)             # qwen3-tts VoiceDesign
+//   set_tts_phonemes(handle, ipa)              # kokoro/piper: skip the G2P
 //   is_custom_voice(handle) -> Boolean         # qwen3-tts variant detect
 //   is_voice_design(handle) -> Boolean         # qwen3-tts variant detect
 //   synthesize(handle, text) -> Array<Float>   # 24 kHz mono PCM
@@ -41,9 +42,16 @@ extern int crispasr_session_set_g2p_dict(struct CrispasrSession* s, const char* 
 extern int crispasr_session_n_speakers(struct CrispasrSession* s);
 extern const char* crispasr_session_get_speaker_name(struct CrispasrSession* s, int i);
 extern int crispasr_session_set_instruct(struct CrispasrSession* s, const char* instruct);
+/* #316: synthesize these phonemes verbatim, skipping the G2P. Empty clears. kokoro and piper only (rc=-2 otherwise). */
+extern int crispasr_session_set_tts_phonemes(struct CrispasrSession* s, const char* phonemes);
 extern int crispasr_session_is_custom_voice(struct CrispasrSession* s);
 extern int crispasr_session_is_voice_design(struct CrispasrSession* s);
 extern float* crispasr_session_synthesize(struct CrispasrSession* s, const char* text, int* out_n_samples);
+extern float* crispasr_session_synthesize_raw(struct CrispasrSession* s, const char* text, int* out_n_samples);
+extern int crispasr_session_accept_marking_responsibility(struct CrispasrSession* s, const char* attestation);
+extern float* crispasr_session_speech_to_speech(struct CrispasrSession* s, const float* in_samples, int n_in_samples,
+                                                char** out_text, int* out_n_samples);
+extern int crispasr_session_input_sample_rate(struct CrispasrSession* s);
 extern void crispasr_pcm_free(float* pcm);
 extern int crispasr_session_kokoro_clear_phoneme_cache(struct CrispasrSession* s);
 extern int crispasr_session_set_source_language(struct CrispasrSession* s, const char* lang);
@@ -101,6 +109,9 @@ extern int64_t crispasr_session_result_word_t0(struct crispasr_session_result* r
 extern int64_t crispasr_session_result_word_t1(struct crispasr_session_result* r, int i_seg, int i_word);
 extern float crispasr_session_result_word_p(struct crispasr_session_result* r, int i_seg, int i_word);
 extern float crispasr_session_result_segment_no_speech_prob(struct crispasr_session_result* r, int i_seg);
+/* #300: native per-segment speaker label ("(Speaker N) "), "" when the backend
+   does not diarize natively. Never NULL. */
+extern const char* crispasr_session_result_segment_speaker(struct crispasr_session_result* r, int i);
 // Per-frame CTC logits (opted in via set_return_logits) for backends with a
 // dense CTC grid (Omni CTC, wav2vec2/hubert/data2vec, canary-ctc); frame-major:
 // logits[t * n_logit_vocab + v]. Raw pre-softmax for Omni & wav2vec2;
@@ -702,6 +713,18 @@ static VALUE rb_session_set_instruct(VALUE self, VALUE handle, VALUE instruct) {
     return Qnil;
 }
 
+/* #316: synthesize these phonemes verbatim, skipping the G2P. Empty clears. kokoro and piper only (rc=-2 otherwise). */
+static VALUE rb_session_set_tts_phonemes(VALUE self, VALUE handle, VALUE phonemes) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_tts_phonemes(s, StringValueCStr(phonemes));
+    if (rc == -2)
+        rb_raise(rb_eRuntimeError,
+                 "backend has no phonemes-in entry point; set_tts_phonemes applies to kokoro and piper");
+    if (rc != 0)
+        rb_raise(rb_eRuntimeError, "set_tts_phonemes failed (rc=%d)", rc);
+    return Qnil;
+}
+
 static VALUE rb_session_is_custom_voice(VALUE self, VALUE handle) {
     struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
     return crispasr_session_is_custom_voice(s) ? Qtrue : Qfalse;
@@ -726,6 +749,78 @@ static VALUE rb_session_synthesize(VALUE self, VALUE handle, VALUE text) {
         rb_ary_push(arr, DBL2NUM((double)pcm[i]));
     crispasr_pcm_free(pcm);
     return arr;
+}
+
+// UNMARKED synthesis — no audible/inaudible watermark. Hard-refused unless
+// accept_marking_responsibility was called first on the session. Otherwise
+// identical to synthesize; returns 24 kHz mono PCM as Array<Float>.
+static VALUE rb_session_synthesize_raw(VALUE self, VALUE handle, VALUE text) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int n = 0;
+    float* pcm = crispasr_session_synthesize_raw(s, StringValueCStr(text), &n);
+    if (!pcm || n <= 0) {
+        if (pcm)
+            crispasr_pcm_free(pcm);
+        rb_raise(rb_eRuntimeError, "synthesize_raw returned no audio");
+    }
+    VALUE arr = rb_ary_new_capa(n);
+    for (int i = 0; i < n; i++)
+        rb_ary_push(arr, DBL2NUM((double)pcm[i]));
+    crispasr_pcm_free(pcm);
+    return arr;
+}
+
+// Attest acceptance of the AI-content marking/disclosure duty (EU AI Act
+// Art. 50). Required before synthesize_raw returns UNMARKED audio; recorded for
+// audit. Returns the ABI status code as an Integer.
+static VALUE rb_session_accept_marking_responsibility(VALUE self, VALUE handle, VALUE attestation) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_accept_marking_responsibility(s, NIL_P(attestation) ? "" : StringValueCStr(attestation));
+    return INT2NUM(rc);
+}
+
+// CrispASR::Session.speech_to_speech(handle, pcm_array)
+//   -> [Array<Float> pcm, String|nil transcript]. Speech-to-speech backends
+//   (lfm2-audio, mini-omni2): the input PCM is answered as spoken audio; the
+//   optional transcript is the model's text of its own reply (nil when none).
+static VALUE rb_session_speech_to_speech(VALUE self, VALUE handle, VALUE pcm_arr) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    Check_Type(pcm_arr, T_ARRAY);
+    long n = RARRAY_LEN(pcm_arr);
+    float* in = (float*)malloc(sizeof(float) * (size_t)n);
+    if (!in)
+        rb_raise(rb_eNoMemError, "alloc failed");
+    for (long i = 0; i < n; i++)
+        in[i] = (float)NUM2DBL(rb_ary_entry(pcm_arr, i));
+    char* out_text = NULL;
+    int n_out = 0;
+    float* pcm = crispasr_session_speech_to_speech(s, in, (int)n, &out_text, &n_out);
+    free(in);
+    if (!pcm || n_out <= 0) {
+        if (pcm)
+            crispasr_pcm_free(pcm);
+        if (out_text)
+            crispasr_session_translate_text_free(out_text);
+        rb_raise(rb_eRuntimeError, "speech_to_speech returned no audio");
+    }
+    VALUE arr = rb_ary_new_capa(n_out);
+    for (int i = 0; i < n_out; i++)
+        rb_ary_push(arr, DBL2NUM((double)pcm[i]));
+    crispasr_pcm_free(pcm);
+    VALUE text = out_text ? rb_utf8_str_new_cstr(out_text) : Qnil;
+    if (out_text)
+        crispasr_session_translate_text_free(out_text);
+    VALUE out = rb_ary_new_capa(2);
+    rb_ary_push(out, arr);
+    rb_ary_push(out, text);
+    return out;
+}
+
+// CrispASR::Session.input_sample_rate(handle) -> Integer
+//   The native input sample rate the loaded backend expects, in Hz.
+static VALUE rb_session_input_sample_rate(VALUE self, VALUE handle) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    return INT2NUM(crispasr_session_input_sample_rate(s));
 }
 
 // --- ASR transcription (PLAN #59) ---
@@ -754,6 +849,10 @@ static VALUE rb_session_transcribe(VALUE self, VALUE handle, VALUE pcm_arr) {
         rb_hash_aset(seg, ID2SYM(rb_intern("t1")), LL2NUM(crispasr_session_result_segment_t1(r, i)));
         rb_hash_aset(seg, ID2SYM(rb_intern("no_speech_prob")),
                      DBL2NUM((double)crispasr_session_result_segment_no_speech_prob(r, i)));
+        {
+            const char* spk = crispasr_session_result_segment_speaker(r, i);
+            rb_hash_aset(seg, ID2SYM(rb_intern("speaker")), rb_utf8_str_new_cstr(spk ? spk : ""));
+        }
 
         int n_words = crispasr_session_result_n_words(r, i);
         VALUE words = rb_ary_new_capa(n_words);
@@ -805,6 +904,10 @@ static VALUE rb_session_transcribe_with_logits(VALUE self, VALUE handle, VALUE p
         rb_hash_aset(seg, ID2SYM(rb_intern("t1")), LL2NUM(crispasr_session_result_segment_t1(r, i)));
         rb_hash_aset(seg, ID2SYM(rb_intern("no_speech_prob")),
                      DBL2NUM((double)crispasr_session_result_segment_no_speech_prob(r, i)));
+        {
+            const char* spk = crispasr_session_result_segment_speaker(r, i);
+            rb_hash_aset(seg, ID2SYM(rb_intern("speaker")), rb_utf8_str_new_cstr(spk ? spk : ""));
+        }
 
         int n_words = crispasr_session_result_n_words(r, i);
         VALUE words = rb_ary_new_capa(n_words);
@@ -896,6 +999,10 @@ static VALUE rb_session_transcribe_chunked(VALUE self, VALUE handle, VALUE pcm_a
         rb_hash_aset(seg, ID2SYM(rb_intern("t1")), LL2NUM(crispasr_session_result_segment_t1(r, i)));
         rb_hash_aset(seg, ID2SYM(rb_intern("no_speech_prob")),
                      DBL2NUM((double)crispasr_session_result_segment_no_speech_prob(r, i)));
+        {
+            const char* spk = crispasr_session_result_segment_speaker(r, i);
+            rb_hash_aset(seg, ID2SYM(rb_intern("speaker")), rb_utf8_str_new_cstr(spk ? spk : ""));
+        }
 
         int n_words = crispasr_session_result_n_words(r, i);
         VALUE words = rb_ary_new_capa(n_words);
@@ -1640,9 +1747,14 @@ void init_ruby_crispasr_session(VALUE* mWhisper) {
     rb_define_singleton_method(mSession, "set_g2p_dict", rb_session_set_g2p_dict, 2);
     rb_define_singleton_method(mSession, "speakers", rb_session_speakers, 1);
     rb_define_singleton_method(mSession, "set_instruct", rb_session_set_instruct, 2);
+    rb_define_singleton_method(mSession, "set_tts_phonemes", rb_session_set_tts_phonemes, 2);
     rb_define_singleton_method(mSession, "is_custom_voice", rb_session_is_custom_voice, 1);
     rb_define_singleton_method(mSession, "is_voice_design", rb_session_is_voice_design, 1);
     rb_define_singleton_method(mSession, "synthesize", rb_session_synthesize, 2);
+    rb_define_singleton_method(mSession, "synthesize_raw", rb_session_synthesize_raw, 2);
+    rb_define_singleton_method(mSession, "accept_marking_responsibility", rb_session_accept_marking_responsibility, 2);
+    rb_define_singleton_method(mSession, "speech_to_speech", rb_session_speech_to_speech, 2);
+    rb_define_singleton_method(mSession, "input_sample_rate", rb_session_input_sample_rate, 1);
     rb_define_singleton_method(mSession, "transcribe", rb_session_transcribe, 2);
     rb_define_singleton_method(mSession, "transcribe_with_logits", rb_session_transcribe_with_logits, 2);
     rb_define_singleton_method(mSession, "ctc_vocab", rb_session_ctc_vocab, 1);

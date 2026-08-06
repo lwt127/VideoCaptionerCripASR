@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 #if defined(HAVE_BLAS)
@@ -123,7 +124,12 @@ std::vector<float> compute(const float* samples, int n_samples, const float* win
     // (audit: see Params::allow_parallel_stft) AND benched faster on the arch.
     // Measured (cohere, M1, 8 cores): warm STFT ~2.4× (43→18 ms / 800 frames).
     // Enabled by the global env var OR the per-backend Params flag.
-    const bool mel_parallel = (std::getenv("CRISPASR_MEL_PARALLEL") != nullptr) || p.allow_parallel_stft;
+    // #305: parallel STFT is now DEFAULT ON (opt out with CRISPASR_MEL_SERIAL=1).
+    // The §176f OpenMP path was `#ifdef _OPENMP` only and AppleClang ships no
+    // libomp → it was compiled out on macOS, so the win never reached this box;
+    // the portable std::thread path below fixes that. CRISPASR_MEL_PARALLEL and
+    // Params::allow_parallel_stft are kept for back-compat (now redundant).
+    const bool mel_parallel = (std::getenv("CRISPASR_MEL_SERIAL") == nullptr);
     const auto t_stft0 = std::chrono::steady_clock::now();
     bool ran_parallel = false;
 
@@ -142,12 +148,17 @@ std::vector<float> compute(const float* samples, int n_samples, const float* win
                 power[(size_t)t * n_freqs + k] = use_magnitude ? std::sqrt(pw) : pw;
             }
         };
-#ifdef _OPENMP
         // Threshold: below ~256 frames (≈2.5 s at 100 fps) thread-spawn overhead
         // dominates the handful of FFTs, so stay serial regardless of the flag.
         if (mel_parallel && T >= 256) {
             ran_parallel = true;
-#pragma omp parallel
+#ifdef _OPENMP
+            // Scope the thread count to this region via num_threads() rather than
+            // omp_set_num_threads() so a caller-supplied budget (p.n_threads) can't
+            // race with concurrent callers of the global OpenMP state. p.n_threads=0
+            // keeps the previous omp_get_max_threads() default.
+            const int omp_nt = p.n_threads > 0 ? p.n_threads : omp_get_max_threads();
+#pragma omp parallel num_threads(omp_nt)
             {
                 std::vector<float> fft_in((size_t)n_fft);
                 std::vector<float> fft_out((size_t)n_fft * 2);
@@ -155,9 +166,33 @@ std::vector<float> compute(const float* samples, int n_samples, const float* win
                 for (int t = 0; t < T; t++)
                     compute_frame(t, fft_in.data(), fft_out.data());
             }
-        } else
+#else
+            // Portable std::thread path (§305): AppleClang ships no libomp, so the
+            // OpenMP path above is compiled out on macOS — without this the STFT
+            // stayed single-threaded there. Each thread owns its FFT scratch and
+            // frames write disjoint `power` rows → data-race free, bit-identical.
+            const unsigned hw = std::thread::hardware_concurrency();
+            const int cap = p.n_threads > 0 ? p.n_threads : (int)((hw == 0) ? 1u : std::min(hw, 8u));
+            const int nt = std::min(cap, T);
+            std::vector<std::thread> pool;
+            pool.reserve(nt > 0 ? nt - 1 : 0);
+            const int chunk = (T + nt - 1) / nt;
+            auto run = [&](int t0, int t1) {
+                std::vector<float> fft_in((size_t)n_fft), fft_out((size_t)n_fft * 2);
+                for (int t = t0; t < t1; t++)
+                    compute_frame(t, fft_in.data(), fft_out.data());
+            };
+            for (int i = 1; i < nt; i++) {
+                const int a = i * chunk, b = std::min(T, a + chunk);
+                if (a >= b)
+                    break;
+                pool.emplace_back([&run, a, b]() { run(a, b); });
+            }
+            run(0, std::min(T, chunk));
+            for (auto& th : pool)
+                th.join();
 #endif
-        {
+        } else {
             std::vector<float> fft_in((size_t)n_fft);
             std::vector<float> fft_out((size_t)n_fft * 2);
             for (int t = 0; t < T; t++)
@@ -169,10 +204,15 @@ std::vector<float> compute(const float* samples, int n_samples, const float* win
         const double stft_ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_stft0).count();
         int nthreads = 1;
+        if (ran_parallel) {
 #ifdef _OPENMP
-        if (ran_parallel)
-            nthreads = omp_get_max_threads();
+            nthreads = p.n_threads > 0 ? p.n_threads : omp_get_max_threads();
+#else
+            const unsigned hw = std::thread::hardware_concurrency();
+            const int cap = p.n_threads > 0 ? p.n_threads : (int)((hw == 0) ? 1u : std::min(hw, 8u));
+            nthreads = std::min(cap, T);
 #endif
+        }
         fprintf(stderr, "core_mel: STFT %d frames (n_fft=%d) %.2f ms [%d thread(s)%s]\n", T, n_fft, stft_ms, nthreads,
                 ran_parallel ? "" : ", serial");
     }

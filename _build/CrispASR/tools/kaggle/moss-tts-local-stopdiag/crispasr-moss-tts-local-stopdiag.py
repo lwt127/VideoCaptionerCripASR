@@ -39,11 +39,18 @@ REPO = TMP / "CrispASR"
 RESULTS = WORK / "results"
 RESULTS.mkdir(parents=True, exist_ok=True)
 
-CRISPASR_REF = os.environ.get("CRISPASR_REF", "feat/moss-tts-local-4b")
+CRISPASR_REF = os.environ.get("CRISPASR_REF", "main")
 CRISPASR_REPO = os.environ.get("CRISPASR_REPO", "https://github.com/CrispStrobe/CrispASR.git")
 HF_MODEL = os.environ.get("MOSS_MODEL", "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5")
 MAXF = int(os.environ.get("MOSS_MAXF", "256"))
-SEED = int(os.environ.get("MOSS_SEED", "1234"))
+# Multiple seeds (incl. 0 = our C++ default p.seed=0) to measure STOP RELIABILITY,
+# not a single lucky/unlucky draw — the whole point is whether the reference's
+# sampled stop is dependable or as coin-flippy as our C++ port.
+SEEDS = [int(s) for s in os.environ.get("MOSS_SEEDS", "0,1234,7").split(",")]
+# Audio sampling MUST match our C++ backend defaults (model card: 1.7/0.8/25),
+# else we'd be comparing different trajectories. The stop head stays sampled at
+# text_temperature 1.0 (reference default).
+AUDIO_TEMP, AUDIO_TOP_P, AUDIO_TOP_K = 1.7, 0.8, 25
 
 SHORT_TEXT = "Hello world."
 LONG_TEXT = ("The quick brown fox jumps over the lazy dog. "
@@ -74,43 +81,51 @@ def run_reference(hf_token):
     proc = AutoProcessor.from_pretrained(HF_MODEL, trust_remote_code=True)  # public; token kwarg rejected by custom proc
     log("model + processor loaded")
 
+    import kaggle_harness as kh
     out = {}
     for tag, text in (("short", SHORT_TEXT), ("long", LONG_TEXT)):
-        stop_logits = []
-
-        def hook(_m, _i, o):
-            t = o.detach().float().reshape(-1, o.shape[-1])
-            stop_logits.append(t[-1].tolist())  # [continue, stop] (candidate order)
-
-        h = model.local_text_lm_head.register_forward_hook(hook)
+        msg = proc.build_user_message(text=text)
+        feat = proc([msg], mode="generation")
+        input_ids = feat["input_ids"] if isinstance(feat, dict) else feat.input_ids
         try:
-            msg = proc.build_user_message(text=text)
-            feat = proc([msg], mode="generation")
-            input_ids = feat["input_ids"] if isinstance(feat, dict) else feat.input_ids
-            # log the rendered prompt text (compare to the C++ mtl_build_prompt)
+            prompt_txt = proc.tokenizer.decode(input_ids.reshape(-1, input_ids.shape[-1])[:, 0].tolist())
+            (RESULTS / f"ref_prompt_{tag}.txt").write_text(prompt_txt)
+        except Exception:  # noqa: BLE001
+            pass
+        runs = []
+        for seed in SEEDS:
+            stop_logits = []
+
+            def hook(_m, _i, o):
+                t = o.detach().float().reshape(-1, o.shape[-1])
+                stop_logits.append(t[-1].tolist())  # [continue, stop]
+
+            h = model.local_text_lm_head.register_forward_hook(hook)
             try:
-                prompt_txt = proc.tokenizer.decode(input_ids.reshape(-1, input_ids.shape[-1])[:, 0].tolist())
-                (RESULTS / f"ref_prompt_{tag}.txt").write_text(prompt_txt)
-            except Exception:  # noqa: BLE001
-                pass
-            torch.manual_seed(SEED)
-            t0 = time.time()
-            model.generate(input_ids=input_ids, max_new_frames=MAXF, do_sample=True,
-                           text_temperature=1.0, temperature=1.0, top_p=0.95, top_k=50)
-            n = len(stop_logits)
-            stopped = n < MAXF
-            cross = next((i for i, (cl, sl) in enumerate(stop_logits) if sl >= cl), None)
-            traj = [(i, round(cl, 3), round(sl, 3)) for i, (cl, sl) in enumerate(stop_logits)]
-            out[tag] = {"frames": n, "stopped": stopped, "stop_crosses_at": cross,
-                        "min_gap": round(min((cl - sl for cl, sl in stop_logits), default=0), 3),
-                        "elapsed_s": round(time.time() - t0, 1),
-                        "logit_first": traj[:8], "logit_last": traj[-6:]}
-            log(f"REF {tag}: frames={n} stopped={stopped} cross_at={cross} min_gap={out[tag]['min_gap']}")
-        except Exception as e:  # noqa: BLE001
-            out[tag] = {"error": f"{type(e).__name__}: {e}", "tb": traceback.format_exc()[-1800:]}
-            log(f"REF {tag} ERROR: {e}")
-        finally:
-            h.remove()
+                torch.manual_seed(seed)
+                t0 = time.time()
+                with kh.build_heartbeat(f"ref.{tag}.seed{seed}"):
+                    model.generate(input_ids=input_ids, max_new_frames=MAXF, do_sample=True,
+                                   text_temperature=1.0, temperature=AUDIO_TEMP,
+                                   top_p=AUDIO_TOP_P, top_k=AUDIO_TOP_K)
+                n = len(stop_logits)
+                stopped = n < MAXF
+                cross = next((i for i, (cl, sl) in enumerate(stop_logits) if sl >= cl), None)
+                traj = [(i, round(cl, 3), round(sl, 3)) for i, (cl, sl) in enumerate(stop_logits)]
+                runs.append({"seed": seed, "frames": n, "stopped": stopped, "stop_crosses_at": cross,
+                             "min_gap": round(min((cl - sl for cl, sl in stop_logits), default=0), 3),
+                             "elapsed_s": round(time.time() - t0, 1),
+                             "logit_first": traj[:8], "logit_last": traj[-6:]})
+                log(f"REF {tag} seed={seed}: frames={n} stopped={stopped} cross_at={cross}")
+            except Exception as e:  # noqa: BLE001
+                runs.append({"seed": seed, "error": f"{type(e).__name__}: {e}"})
+                log(f"REF {tag} seed={seed} ERROR: {e}")
+            finally:
+                h.remove()
+        n_stopped = sum(1 for r in runs if r.get("stopped"))
+        out[tag] = {"runs": runs, "n_seeds": len(SEEDS), "n_stopped": n_stopped,
+                    "reliable": n_stopped == len(SEEDS)}
+        log(f"REF {tag}: {n_stopped}/{len(SEEDS)} seeds stopped (reliable={out[tag]['reliable']})")
     return out
 
 
@@ -137,12 +152,18 @@ def main():
 
     ref = summary.get("reference", {})
     rs = ref.get("short") if isinstance(ref, dict) else None
-    if isinstance(rs, dict) and "stopped" in rs:
-        summary["verdict"] = ("MODEL_BEHAVIOR: ref ALSO runs away on 'Hello world' -> "
-                              "fix = generation handling, not the port"
-                              if not rs["stopped"] else
-                              "C++_BUG: ref STOPS 'Hello world' at frame %s but C++ runs away -> "
-                              "compare trajectories / find the port divergence" % rs.get("frames"))
+    if isinstance(rs, dict) and "n_stopped" in rs:
+        ns, nt = rs["n_stopped"], rs["n_seeds"]
+        if ns == nt:
+            summary["verdict"] = (f"PORT/QUANT DIVERGENCE: reference STOPS 'Hello world' on all {nt} seeds "
+                                  f"(card params) — our C++ q4_k runs away on the same text, so the stop "
+                                  f"path or quant sensitivity is OURS to fix; compare trajectories.")
+        elif ns == 0:
+            summary["verdict"] = (f"MODEL BEHAVIOR: reference runs away on ALL {nt} seeds too — inherent; "
+                                  f"fix = a robust stop policy (repetition / frame-budget), not the port.")
+        else:
+            summary["verdict"] = (f"FRAGILE BY DESIGN: reference stops on only {ns}/{nt} seeds — the sampled "
+                                  f"stop is coin-flippy even in the reference; fix = a deterministic stop net.")
     else:
         summary["verdict"] = "INCONCLUSIVE (reference error — see tb)"
     (RESULTS / "summary.json").write_text(json.dumps(summary, indent=2))

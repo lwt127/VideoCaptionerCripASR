@@ -355,6 +355,8 @@ CRISPASR_API int whisper_n_vocab(struct whisper_context* ctx);
 CRISPASR_API int whisper_n_text_ctx(struct whisper_context* ctx);
 CRISPASR_API int whisper_n_audio_ctx(struct whisper_context* ctx);
 CRISPASR_API int whisper_is_multilingual(struct whisper_context* ctx);
+// Tiron (#295): 1 if the loaded model has <|speakerN|> tokens.
+CRISPASR_API int whisper_has_speaker_tokens(struct whisper_context* ctx);
 
 CRISPASR_API int whisper_model_n_vocab(struct whisper_context* ctx);
 CRISPASR_API int whisper_model_n_audio_ctx(struct whisper_context* ctx);
@@ -618,7 +620,14 @@ CRISPASR_API int crispasr_session_set_ask(struct crispasr_session* s, const char
 // TTS synthesis — returns malloc'd float32 PCM at 24 kHz mono.
 // Caller frees with crispasr_pcm_free(). Returns nullptr on failure.
 CRISPASR_API float* crispasr_session_synthesize(struct crispasr_session* s, const char* text, int* out_n_samples);
+// UNMARKED synthesis (no watermark) — hard-refused (returns nullptr) unless the
+// integrator first calls crispasr_session_accept_marking_responsibility(). Use
+// crispasr_session_synthesize() for the default watermarked output.
 CRISPASR_API float* crispasr_session_synthesize_raw(struct crispasr_session* s, const char* text, int* out_n_samples);
+// Attest that the integrator accepts AI-content marking/disclosure responsibility
+// (EU AI Act Art. 50). REQUIRED to use crispasr_session_synthesize_raw(); the
+// default marked paths do not need it. `attestation` is recorded for audit.
+CRISPASR_API int crispasr_session_accept_marking_responsibility(struct crispasr_session* s, const char* attestation);
 CRISPASR_API void crispasr_pcm_free(float* pcm);
 
 // Speech-to-Speech — audio in → audio out via a single model pass.

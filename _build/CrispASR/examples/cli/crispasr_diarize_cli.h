@@ -95,6 +95,20 @@ bool crispasr_apply_diarize(const std::vector<float>& left, const std::vector<fl
                             const CrispasrPyannoteCache* pyannote_cache = nullptr,
                             const CrispasrSherpaCache* sherpa_cache = nullptr);
 
+/// #324: run the FoxNose diarizer ONCE over the whole audio, using the final
+/// segment list as its speech regions, then relabel and split those segments.
+///
+/// Per-SLICE diarization cannot give consistent speaker identities: each slice
+/// clusters independently and restarts numbering at 0, so `speaker 0` in one
+/// slice is a different person from `speaker 0` in the next. This is the same
+/// problem the pyannote path solves with a pre-computed posterior cache
+/// (#107); FoxNose solves it here instead, after transcription, because it
+/// needs the segments as its speech regions and they do not exist beforehand.
+///
+/// Returns true when it ran (so the caller can skip the per-slice path).
+bool crispasr_apply_foxnose_global(std::vector<crispasr_segment>& all_segs, const std::vector<float>& samples,
+                                   const whisper_params& params);
+
 /// Re-label each segment's speaker by clustering speaker embeddings
 /// extracted from `full_audio`. Operates over the WHOLE finalized
 /// segment list (after per-slice diarize + segment splitting), so it

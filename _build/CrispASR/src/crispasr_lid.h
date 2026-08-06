@@ -25,7 +25,10 @@
 
 #pragma once
 
+#include "crispasr_vad.h"
+
 #include <string>
+#include <vector>
 
 enum class CrispasrLidMethod {
     Whisper = 0,
@@ -56,6 +59,13 @@ struct CrispasrLidOptions {
 /// true, and the function returns false.
 bool crispasr_detect_language(const float* samples, int n_samples, const CrispasrLidOptions& opts,
                               CrispasrLidResult& out);
+
+/// Compact the first 15 seconds of speech slices for request-level LID.
+/// Slices are sample indices into `pcm` at 16 kHz; short gaps are inserted
+/// between originally separate slices so the classifier does not see a hard
+/// waveform discontinuity. Returns empty when no valid slice contains audio.
+std::vector<float> crispasr_lid_speech_prefix(const std::vector<float>& pcm,
+                                              const std::vector<crispasr_audio_slice>& slices);
 
 /// Free the cached whisper LID context to release GPU memory.
 /// Call after LID is done and before loading the ASR model.

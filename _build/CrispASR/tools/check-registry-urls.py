@@ -25,6 +25,7 @@ and 404 only for genuinely missing ones.
 import argparse
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -73,26 +74,35 @@ def parse_registry(path: Path):
     return out
 
 
-def check(url: str, timeout: float):
+def check(url: str, timeout: float, attempts: int = 3):
     req = urllib.request.Request(url, method="HEAD",
                                  headers={"User-Agent": "crispasr-registry-check"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, ""
-    except urllib.error.HTTPError as e:
-        # Some hosts reject HEAD but serve GET. Retry once before failing, or a
-        # healthy URL gets reported broken.
-        if e.code in (403, 405, 501):
-            try:
-                g = urllib.request.Request(
-                    url, headers={"User-Agent": "crispasr-registry-check", "Range": "bytes=0-0"})
-                with urllib.request.urlopen(g, timeout=timeout) as r2:
-                    return r2.status, "(via GET)"
-            except Exception as e2:
-                return e.code, f"HEAD {e.code}, GET {type(e2).__name__}"
-        return e.code, str(e.reason)[:60]
-    except Exception as e:
-        return 0, f"{type(e).__name__}: {str(e)[:60]}"
+    last = "no attempt"
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.status, ""
+        except urllib.error.HTTPError as e:
+            # A real HTTP response (not transient). Some hosts reject HEAD but
+            # serve GET — retry once via GET before failing, or a healthy URL gets
+            # reported broken.
+            if e.code in (403, 405, 501):
+                try:
+                    g = urllib.request.Request(
+                        url, headers={"User-Agent": "crispasr-registry-check", "Range": "bytes=0-0"})
+                    with urllib.request.urlopen(g, timeout=timeout) as r2:
+                        return r2.status, "(via GET)"
+                except Exception as e2:
+                    return e.code, f"HEAD {e.code}, GET {type(e2).__name__}"
+            return e.code, str(e.reason)[:60]
+        except Exception as e:
+            # Transient network error (Connection reset, timeout, URLError). HF
+            # occasionally resets connections under the parallel HEAD burst — a
+            # blip must not red the lint job, so retry with backoff before failing.
+            last = f"{type(e).__name__}: {str(e)[:60]}"
+            if attempt + 1 < attempts:
+                time.sleep(1.5 * (attempt + 1))
+    return 0, last
 
 
 def main() -> int:
@@ -139,13 +149,33 @@ def main() -> int:
         for backend, url in gated:
             print(f"    {backend}: {url}")
     print()
-    if bad:
-        print(f"{len(bad)} of {len(uniq)} registry URLs do NOT resolve:", file=sys.stderr)
-        for backend, url, status, _ in bad:
-            print(f"  {backend}: HTTP {status} {url}", file=sys.stderr)
+    # Split "the artifact is GONE" from "the network misbehaved". Both used to
+    # exit 1, which forced the CI job to `continue-on-error: true` to survive HF
+    # flakiness — and that made this check unable to go red at all, including for
+    # a genuinely deleted model. 404/410 is a definitive answer from a server
+    # that responded; status 0 (retries exhausted) and 5xx are not.
+    missing = [r for r in bad if r[2] in (404, 410)]
+    flaky = [r for r in bad if r[2] not in (404, 410)]
+
+    if flaky:
+        print(f"{len(flaky)} URL(s) could not be checked (transient — not a failure):",
+              file=sys.stderr)
+        for backend, url, status, note in flaky:
+            label = "no response" if status == 0 else f"HTTP {status}"
+            print(f"  ::warning::{backend}: {label} {url} {note}", file=sys.stderr)
+
+    if missing:
+        print(f"\n{len(missing)} of {len(uniq)} registry URLs are GONE:", file=sys.stderr)
+        for backend, url, status, _ in missing:
+            print(f"  ::error::{backend}: HTTP {status} {url}", file=sys.stderr)
         print("\nAn unreachable URL means `-m auto` / --auto-download fails for that\n"
               "backend. Either publish the artifact or remove the entry.", file=sys.stderr)
         return 1
+
+    if flaky:
+        print(f"OK: {len(uniq) - len(flaky)} URLs resolve; {len(flaky)} unverified "
+              "(transient).")
+        return 0
     print(f"OK: all {len(uniq)} registry URLs resolve.")
     return 0
 

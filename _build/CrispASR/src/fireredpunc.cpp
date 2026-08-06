@@ -773,7 +773,24 @@ char* fireredpunc_process(fireredpunc_context* ctx, const char* text) {
         if (pred_idx < (int)all_preds.size()) {
             int pred = all_preds[pred_idx];
             if (pred > 0 && pred < (int)ctx->labels.size()) {
-                result += ctx->labels[pred];
+                // #300: never stack punctuation on punctuation. A word that
+                // ALREADY ends in a mark (the text came from a model that
+                // punctuates natively, or from an earlier restore pass) would
+                // otherwise collect a second one — "your country." + "." =
+                // "your country..". Appending to a bare word is unaffected.
+                const char last = result.empty() ? '\0' : result[result.size() - 1];
+                const bool already =
+                    (last == '.' || last == ',' || last == '?' || last == '!' || last == ';' || last == ':');
+                bool already_fullwidth = false;
+                if (result.size() >= 3) {
+                    const unsigned char b0 = (unsigned char)result[result.size() - 3];
+                    const unsigned char b1 = (unsigned char)result[result.size() - 2];
+                    const unsigned char b2 = (unsigned char)result[result.size() - 1];
+                    already_fullwidth = (b0 == 0xEF && b1 == 0xBC && (b2 == 0x8C || b2 == 0x9F || b2 == 0x81)) ||
+                                        (b0 == 0xE3 && b1 == 0x80 && b2 == 0x82);
+                }
+                if (!already && !already_fullwidth)
+                    result += ctx->labels[pred];
             }
         }
     }
@@ -838,6 +855,13 @@ char* fireredpunc_process(fireredpunc_context* ctx, const char* text) {
             cap_next = false;
         } else {
             fixed += c;
+            // #308: an already-uppercase letter satisfies a pending capitalisation
+            // (e.g. Whisper's sentence-cased text). Without clearing cap_next here,
+            // it stayed set past the capital and up-cased the NEXT letter too
+            // ("Hello" -> "HEllo").
+            if (c >= 'A' && c <= 'Z') {
+                cap_next = false;
+            }
             // Check for sentence enders (. ? ! and their full-width versions)
             if (c == '.' || c == '?' || c == '!') {
                 cap_next = true;
@@ -868,6 +892,8 @@ char* fireredpunc_process(fireredpunc_context* ctx, const char* text) {
         }
     }
 
+    if (std::getenv("FIREREDPUNC_DEBUG"))
+        fprintf(stderr, "[PUNCDBG] in=<%s>\n[PUNCDBG] out=<%s>\n", text, fixed.c_str());
     char* out = (char*)malloc(fixed.size() + 1);
     memcpy(out, fixed.c_str(), fixed.size() + 1);
     return out;

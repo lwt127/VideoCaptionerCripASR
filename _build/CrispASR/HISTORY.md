@@ -6,6 +6,486 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-08-01 — v0.8.25 release: two new backends, and a decode table that was wrong
+
+140 commits since v0.8.24. Headline additions are **GigaAM-v3** (Russian ASR,
+cosine 1.000000 at every stage on the first diff run) and **foxnose**
+diarization (WeSpeaker + spectral clustering, no external binary). But the
+theme that emerged while writing the notes was measurement being wrong:
+
+- **The pyannote powerset decode table had two entries transposed.** The head
+  emits a powerset over locally-active speakers; class 3 is spk2 ALONE and 4 is
+  the first PAIR, and we had them backwards — so every frame of a third speaker
+  was credited to the first two as simultaneous speech. 15 DER points. It
+  survived because every test used at most two speakers, where both tables
+  agree. Layout now lives once in `src/core/powerset.h`, derived not
+  transcribed, guarded by `tests/test-powerset.cpp`.
+- **`--diarize-max-speakers` was picking the count, not bounding it.**
+  Single-linkage clustering at a fixed 0.5 threshold never reached the
+  threshold, so the cap decided the answer — exactly 8 speakers on 4 of 8 files
+  with 4-7 real ones. 15.74% -> 7.81% DER.
+- **CI executed 1 unit test out of 162.** Turning the tier on surfaced two real
+  pre-existing failures, one of which (a transposed VAD matmul view violating
+  `llamafile_sgemm`'s `ldb >= k`) ran anyway in Release because NDEBUG compiled
+  the assert out.
+- **The DER numbers this project had been quoting came from an easy subset.**
+  Identical code scores 7.3% on the 8-file shard and 33.1% on a 40-file sample
+  of full VoxConverse dev. `tools/diarize_eval.py` + `tools/voxconverse_extract.py`
+  now provide a corpus and a two-metric (count accuracy AND DER) harness over a
+  tune/holdout split, because DER alone cannot see a count error — one file
+  predicts 2 speakers against a true 5 and still scores 6.88%.
+
+NME-SC speaker counting was implemented, measured on that harness, and **lost**
+(count exact 17/40 vs 18/40, DER 39.26% vs 33.06%). It cuts under-counting but
+converts it to over-counting. Left opt-in, default unchanged, holdout unspent.
+
+---
+
+## 2026-07-28 — v0.8.24 release: fixes that had never run
+
+83 commits since v0.8.23. The theme that emerged from writing the notes was not
+the individual bugs but a pattern across them — **four separate fixes that had
+shipped and never executed**, each green in CI the whole time:
+
+- **#308's capitalisation fix lived in a dead copy.** `src/CMakeLists.txt` prefers
+  the shared `crisp_punc/` library and builds the `src/` copy only as a fallback,
+  so `crisp_punc/src/fireredpunc.cpp` is what links — and the fix had gone into
+  the other file. Instrumenting the patched file produced NO output, and that
+  silence was the diagnosis. `tests/test-punc-copies-in-sync.cpp` now fails if
+  they diverge.
+- **The G2P dictionary auto-download had never fired.** Every download in
+  `phonemizer.cpp` is behind `#ifdef CRISPASR_BUILD`, defined only on
+  `crispasr-lib` — never on `kokoro`, which is where that file compiles. So
+  CMUdict never downloaded either, and a user without a pre-seeded cache got no
+  English dictionary at all and fell through to letter-to-sound rules
+  (`this` → `θˈɪs`). A large part of what #316 sounded like.
+- **#314's guard job ran one compiler family.** `linux-amr-fetch` existed
+  precisely for the AMR fetch path and stayed green while the path was broken,
+  because it installs g++ only and GCC downgrades to a warning the `register`
+  error clang raises. Now a `{gcc, clang}` matrix — both arms green on this tag.
+- **`bump-version.sh` staged a hardcoded file list that had drifted.** Caught
+  during this very cut: `python/crispasr/__init__.py` was added to
+  `sync-version.py` in `e3ed11eb` and never here, so the first `0.8.24` bump
+  committed 6 files instead of 7 and would have tagged a tree whose
+  `crispasr.__version__` still read `0.8.23`. Fixed by computing the staged set
+  from a before/after `git diff --name-only` rather than listing it.
+
+Transferable: a test or guard that has never failed is not evidence it works. All
+four were invisible because the thing meant to catch them was itself inert — a
+dead file, an undefined macro, a single-compiler matrix, a stale list. The
+recurring tell is **instrumenting the code you believe is running and getting
+nothing back**. See `LEARNINGS.md` and the release notes for the per-issue detail.
+
+Shipped in the release: #316 Kokoro English G2P (58% → 99.1% agreement with
+misaki, plus `--tts-phonemes` on every binding), #249 MOSS-TTS 4B stop runaway
+(the input tokens were wrong, not the forward pass), #304 CosyVoice3 cross-lingual,
+#300 VibeVoice speaker turns + timings and a new ABI accessor, #312 the Subtitle
+Edit voice-clone regression, #313 Rust on crates.io + bundled Python wheels,
+#314 and #315.
+
+---
+
+## 2026-07-28 — #316 follow-up 2: the G2P dictionary auto-download was dead code
+
+Wiring the misaki lexicon to download from upstream turned up why users see worse
+pronunciation than the code implies: `phonemizer.cpp` guards every auto-download
+behind `#ifdef CRISPASR_BUILD`, and that macro is set only on `crispasr-lib`, and
+only under `BUILD_SHARED_LIBS` — never on the `kokoro` target where
+phonemizer.cpp is actually compiled. So the block has never been true in any
+configuration, and **CMUdict never auto-downloaded either**. A user without a
+pre-seeded `~/.cache/crispasr/cmudict.dict` got no English dictionary at all and
+fell through to the letter-to-sound rules, which render "this" as `θˈɪs` — a
+large part of what #316 sounded like, and entirely separate from the alphabet and
+number bugs.
+
+Fixed by defining `CRISPASR_BUILD` on the kokoro target. crispasr_cache.cpp lives
+in crispasr-lib, which links kokoro, so kokoro cannot link it back; kokoro is a
+static library, so the reference resolves at the final executable — except in
+`test-kokoro-params`, which links kokoro ALONE and now compiles that one
+translation unit itself.
+
+With it enabled, the misaki lexicon is fetched from **upstream** rather than a
+CrispASR mirror: raw.githubusercontent.com/hexgrad/misaki pinned to a commit,
+parsed by a new `load_misaki_json()`. CrispASR therefore redistributes nothing —
+the user receives the data from hexgrad under hexgrad's terms, the same route
+`ensure_cmudict_loaded()` already used for cmusphinx/cmudict — and the
+Apache-2.0-in-an-MIT-repo question does not arise at all. Verified end to end
+from an empty cache: both files download, 178,399 entries + 32 phrase-final load,
+and "…with 82 million parameters" comes back correct through ASR. Sentence-corpus
+parity from the JSON path is 99.14%, marginally ahead of the generated TSV.
+
+Pinning matters: `main` can change a pronunciation under us, and a G2P that
+shifts silently between runs is not reproducible.
+
+## 2026-07-28 — #316 follow-up: traced the lexicon's provenance to espeak-ng
+
+The misaki lexicon that took kokoro's phoneme parity to 99% is Apache-2.0 by the
+package's licence, but upstream documents no provenance for the DATA and ships no
+NOTICE. Traced it by measurement: `us_silver.json` is **87% byte-identical to
+espeak-ng 1.52 `en-us` output** and `us_gold.json` 48%, while the word sets are
+largely disjoint from CMUdict (39% of CMUdict present, 72% of misaki absent) — so
+it is not a CMUdict derivative, silver is espeak-generated, and gold is the
+hand-verified subset. espeak-ng is GPL-3.0 including its dictionary, so
+redistributing silver under Apache-2.0 is a question upstream may not have had the
+right to answer.
+
+Nothing in CrispASR depends on it: the file is generated locally from the user's
+own install and the runtime degrades to the CMUdict path without it. Added
+`--gold-only` for the least espeak-derived subset, which costs 0.58 points
+(99.12% -> 98.54%). Also fixed a related error in the same change — the
+`--tts-phonemes` guard hardcoded "kokoro only", but piper's runtime has had
+`piper_tts_synthesize_phonemes()` all along and its adapter reached it only by
+accident; the policy is now explicit, piper honours the flag, and
+tests/test-tts-phonemes-policy.cpp pins it.
+
+## 2026-07-28 — #316: Kokoro skipped numbers and drifted British — both in the G2P
+
+Reported as "speaks like old English" and "it just skips the 82". Two separate
+G2P defects, and **neither is visible to `crispasr-diff`**: the kokoro harness is
+phoneme-IN (`KOKORO_PHONEMES` is embedded in the reference GGUF and both sides
+are fed the same string), so it starts at `token_ids`, downstream of everything
+that was wrong. It would have reported perfect parity while the audio was broken
+— HARD RULE 3b in its purest form.
+
+Scoped it by feeding misaki's phoneme string for the reporter's sentence into our
+own acoustic path: the audio came out correct, "82" included. Same model, same
+voice, only the phonemes differed. So the acoustic side was never at fault.
+
+1. **Numbers phonemized to the empty string.** Digits are in no pronunciation
+   dictionary and no letter-to-sound rule, so `"82"` produced NO phonemes and the
+   word simply vanished. Nothing errored. `core/num2words_en.h` spells numbers
+   out first, following misaki's reading — read off its behaviour, not guessed,
+   because the non-obvious cases are the audible ones: 1234 is "twelve thirty
+   four" but 1005 is "one thousand five"; 1100 is "eleven hundred" while 1000
+   stays "one thousand". This was a gap in the SHARED G2P, so piper dropped
+   numbers too.
+
+2. **We spoke the wrong phoneme alphabet.** Kokoro was trained on misaki's
+   output, which uses `ʧ`, `O`, `A`, `T` and NO length marks; our G2P emits
+   textbook espeak IPA (`tʃ`, `oʊ`, `ɾ`, `ː`) because it is "tuned to match
+   espeak-ng output for piper compatibility". Every one of those symbols is in
+   Kokoro's vocab, so nothing was dropped and nothing errored — the model just
+   received tokens from outside its training distribution and drifted. `ː` is the
+   RP length mark, which is most of "she becomes British", and it explains why
+   `CRISPASR_KOKORO_G2P=espeak-only` helped the reporter without fixing it:
+   espeak is a better G2P, still the wrong alphabet.
+
+Fixing the alphabet was only half of it. Even with the right symbols, our
+CMUdict-based G2P and misaki disagreed about stress and unstressed vowels on 42%
+of words, so kokoro was still being fed pronunciations from outside its training
+distribution. Closing that took four more measured steps — misaki's own lexicon
+as Tier 0 (Apache-2.0, generated locally by tools/convert-misaki-lexicon.py), a
+morphological fallback because that lexicon stores STEMS (only 46% of inflected
+forms are listed verbatim, against 100% in CMUdict), the contextual function-word
+rules, and Unicode-punctuation tokenization. Final agreement with misaki: **99.30%
+on a held-out 10k frequency list, 99.12% on 400 sentences of real prose**, from
+81.6%.
+
+The step that mattered most was the one I got wrong first. Having measured that
+86% of the residual errors were stress marks, I concluded they needed a
+part-of-speech tagger and were out of reach. Reading `Lexicon.__call__` showed
+misaki derives stress from **capitalisation** — `lowercase` keeps the lexicon
+form, `Titlecase` inserts secondary stress, `ALLCAPS` primary — so `and`/`And`/
+`AND` are `ænd`/`ˌænd`/`ˈænd`. Trivially computable, and worth 5.5 points. Its
+sibling: misaki's `'None'` lexicon key is not a POS tag either but the
+phrase-final reading (32 entries). What genuinely does need a tagger was left
+alone and measured rather than guessed — `that` wants `ðˈæt` 31% of the time and
+`ðæt` 68%, so DEFAULT is the better single choice and flipping it would lose two
+tokens for every one gained.
+
+The fix is a phoneme DIALECT (`core/phoneme_dialect.h`), not a kokoro-local hack:
+one G2P feeds several models that disagree about spelling. `EspeakIpa` is the
+identity and stays the default (piper would regress otherwise); `Misaki` is what
+Kokoro asks for. Measured over a 1508-word corpus against misaki 0.9.4: nothing
+we emit is outside Kokoro's vocab, nothing we emit is outside misaki's inventory,
+exact whole-word match 55.9% → 58.3% (a `ɜː`→`ɜɹ` NURSE rule alone recovered 56
+missing rhotics — "world" was `wˈɜld`, an r short of `wˈɜɹld`). The residue is
+dictionary-level — CMUdict stress and unstressed vowels vs misaki's lexicon —
+plus misaki's two reduced vowels `ᵊ`/`ᵻ`, which we never emit and which are worth
+about 5 more points.
+
+Also added `--tts-phonemes` (kokoro): synthesize a phoneme string verbatim,
+skipping the G2P. That seam separates "our G2P is wrong" from "our model is
+wrong" in one run, and it is how this was scoped — it had existed only as a stale
+comment and a throwaway harness. It refuses on backends without a phonemes-in
+entry point rather than silently synthesizing the text, because a silent fallback
+makes an A/B look like the phonemes changed nothing.
+
+## 2026-07-28 — #249: MOSS-TTS-Local 4B stop-runaway root-caused to prompt tokenization
+
+The 4B's binary stop head ran away (q6_k/q8_0 always, q4_k a per-text coin-flip),
+so only q4_k had shipped. Root cause found by diffing our forward against the HF
+reference AND a second working ggml port: we tokenized the whole generation prompt
+as **one string**, but BPE is non-compositional, so the user text embedded in the
+template merged ~2 tokens differently from the reference (which encodes each segment
+separately). Those interior tokens are amplified by the layer-10 attention sink,
+drifting the backbone hidden enough to keep the stop gap high. The forward was
+correct all along (f16≡f32, flash≡eager, every op machine-precision) — a long,
+wrong detour through "irreducible numerics" before checking prompt-token parity.
+Fix: piece-wise prompt assembly (`mtl_generate_grid`), mirroring
+`processing_moss_tts.py`. Validated: channel-0 ids == reference `input_ids` exactly,
+and q4_k + f16 now stop 4/4 at 11–39 frames → **q6_k/q8_0 are now shippable.** Full
+deep-dive + the meta-lesson in `LEARNINGS.md`.
+
+## 2026-07-27 — #314: opencore-amr's `register` keyword breaks every clang C++17 build
+
+Reported from Termux/aarch64 with clang 21: `-DCRISPASR_AMR_FETCH=ON` dies with
+`az_lsp.cpp:492:5: error: ISO C++17 does not allow 'register' storage class
+specifier [-Wregister]`. The vendored opencore-amr is 2000s-era code that still
+declares locals `register`, a storage class C++17 REMOVED. Reproduced verbatim
+here — same file, same line — by forcing `-DCMAKE_CXX_STANDARD=17`; Apple clang's
+older default only warns (`-Wdeprecated-register`), which is why it had never
+surfaced locally. The break is toolchain-dependent, not architecture-dependent:
+clang >= 16 defaults to C++17, so it was latent everywhere and fired the moment a
+user's compiler default moved.
+
+Fixed by scoping `-Wno-register` (+ clang's `-Wno-deprecated-register`) to the two
+vendored codec targets. Not the issue's global `CXXFLAGS` workaround — that also
+suppresses the same mistake in our own code, and we want that diagnostic. The
+POSITIVE flag is what gets probed with `check_cxx_compiler_flag`, because GCC
+accepts an unknown `-Wno-*` silently and only complains once another diagnostic
+fires; testing `-Wno-register` would report success on compilers that don't know
+it. CXX-only via a generator expression — the same targets compile `.c` sources,
+where clang rejects the flag outright.
+
+**The interesting part is why CI missed it.** `linux-amr-fetch` already existed
+precisely to guard this path (added after §219, when an over-inclusive glob broke
+the static build) and it compiles, links and decodes `samples/jfk.amr`
+end-to-end. It went green throughout, because it installs and uses **g++ only** —
+and GCC treats `register` in C++17 as a warning while clang makes it an error. A
+guard job that exercises one compiler family proves nothing about the other. The
+job is now a `{gcc, clang}` matrix.
+
+## 2026-07-27 — #308 audit: the capitalisation fix had been living in a dead copy
+
+Auditing the remaining ASR backends for the `CAP_PUNCTUATION_NATIVE` flag #308
+asked for turned up something bigger. `moonshine-streaming` and `canary-qwen`
+were printing `ANd so, my fellow Americans…` — the exact double-capital #308 had
+fixed. The guard was right there in `src/fireredpunc.cpp`, and instrumenting it
+produced no output at all, which was the tell: **there are two copies of that
+file.** `src/CMakeLists.txt` prefers the shared `crisp_punc/` library and builds
+the `src/` copy only as a fallback for a checkout missing that directory — so
+`crisp_punc/src/fireredpunc.cpp` is what links, and #308's fix had gone into the
+other one. The two files differed by exactly that hunk. It had been dead code for
+months while the shipping copy kept the bug.
+
+Fixed in both, plus a second defect the same trace exposed: the pass appended a
+mark to text that already ended in one (`your country..`), so the label insertion
+now refuses to stack punctuation on punctuation. `tests/test-punc-copies-in-sync.cpp`
+fails if the copies ever diverge again — it was written first and watched failing
+at line 841, the missing hunk.
+
+The audit itself needed a correction too. `--no-punctuation` looked like the way
+to see a model's raw output, but it *strips* punctuation after the fact, so every
+natively-punctuating model looked unpunctuated under it — on that reading the
+whole fleet needed the flag. `FIREREDPUNC_DEBUG=1` prints the pass's actual input,
+which settled it per backend: `moonshine-streaming` and `mimo-asr` emit punctuated,
+cased text and now declare `CAP_PUNCTUATION_NATIVE`; `canary-qwen` (cased, no
+punctuation) and `firered-asr` (ALL CAPS, no punctuation) genuinely need the pass
+and would have been damaged by a blanket flag; `higgs-stt` and `ark-asr` emit
+lowercase text with a trailing stop and are fixed by the no-double-punctuation
+guard alone. Six backends verified on real audio, before and after.
+
+## 2026-07-27 — #300 follow-up: vibevoice printed its speaker labels instead of reading them
+
+The reporter came back on the closed #300 with "What about vibevoice?" — and was
+right. VibeVoice-ASR is prompted for JSON ("transcribes audio input into text
+output in JSON format" + "please transcribe it with these keys: Start time, End
+time, Speaker ID, Content") and answers with an array of utterances. The adapter
+handed that whole blob back as ONE segment's text. So the speaker turns and their
+timings were present all along, just never read: `seg.speaker` stayed empty,
+`--stream` printed raw JSON, the per-utterance timings were dropped, and the
+`"speaker"` field #300 added to `--stream-json` finals could not fire for this
+backend at all — it reads `seg.speaker`. The closing note on #300 and three doc
+sites all said the change was a no-op here "because the speaker info is inline
+text". It was not inline text; it was structured data nobody parsed.
+
+Fixed by parsing it: one segment per utterance, `t0`/`t1` from the model's own
+Start/End (offset into the chunk and clamped to it), speaker as `"(Speaker N) "`,
+the same form moss-diarize emits. `CRISPASR_VIBEVOICE_RAW_TRANSCRIPT=1` keeps the
+old single-raw-segment path, which is also the fallback when nothing parses. The
+parser is a hand scanner rather than json.hpp on purpose — a decode that hits the
+token cap ends mid-array, and a strict parse of a truncated blob discards every
+COMPLETE utterance before the cut.
+
+Two things fell out of running it. First, the model really does diarize: on
+`samples/multispeaker.wav` it returns four utterances alternating Speaker 0/1 with
+plausible boundaries, so the labels are the model's, not an invention of the
+parse. Second, the transcript came out as `(Speaker 0) ANd so, … your country..` —
+double capital, doubled full stop. That is #308's audit item: the vibevoice
+adapter lacked `CAP_PUNCTUATION_NATIVE`, so the CLI auto-ran FireRedPunc over text
+an LLM had already punctuated and cased. Adding the flag cleans it up. The same
+pass had been mangling the raw blob's own KEYS (`"STart"`, `"SPeaker"`, `"ENd"`) —
+so anyone who had been parsing the pre-fix output was parsing corrupted JSON.
+
+The regression pin was re-captured: `expected_transcript` had been the bare
+Content since 2026-06-15, which could never have matched what the CLI actually
+printed (the blob), so that entry cannot have been passing.
+
+The session C-ABI needed the same fix and could not express it. `crispasr_c_api.cpp`
+reimplements every backend's transcribe inline (docs/contributing.md point 6), so
+the CLI-only parse left Python/Go/Flutter still receiving the raw blob — and
+`crispasr_session_seg` had no speaker field at all, so there was nowhere to put
+the label even after parsing. Added
+`crispasr_session_result_segment_speaker()` (a new accessor, so no ABI break —
+the result is opaque and read through getters), mirrored the parse in the inline
+dispatch, and split the per-token confidence list along the same utterance
+boundaries via `core_vibevoice::assign_tokens` — otherwise segment 2's "words"
+were segment 0's tokens plus every `[`, `{` and `"Speaker"` of the JSON. The
+parser moved to `src/core/vibevoice_transcript.h` so both surfaces share one copy.
+Wired through Python (`SessionSegment.speaker`), Go (`TranscribeSegment.Speaker`)
+and Dart (`SessionSegment.speaker`), each probing for the symbol so a newer
+binding keeps working against an older library.
+
+Validated on the shipping `cstr/vibevoice-asr-GGUF` q4_k both ways — Kaggle T4
+(`tools/kaggle/vibevoice-diarize-300/`, all gates PASS: raw arm 0 labels / 5 blob
+hits, new arm 4 labels / 0 blob, `--stream` 11 labels, `--stream-json` 4 of 7
+finals carrying `speaker`) and locally on M1 Metal. The A/B flips only the env
+gate on one binary, so the arms cannot differ by anything but the code path.
+
+## 2026-07-27 — #312: the marking-attestation gate 400'd every released Subtitle Edit
+
+Chatterbox voice cloning through Subtitle Edit failed with
+`400 marking_attestation_required`. Not a CUDA/Vulkan problem despite the report's
+title — the backend loaded fine and the failure is build-independent. Root cause:
+`ac232160` (shipped in v0.8.22) made `"spoken_disclaimer": false` on a voice clone
+a **hard refusal** unless the request also carried `marking_attestation`, and SE
+only started sending that field in `5b7f225a`/`8902b89e` (2026-07-26) — *after*
+its v5.1.0-rc16 release. So every released SE build hard-failed against CrispASR
+≥ 0.8.22 the moment the `voice` kept its `.wav` extension (chatterbox is SE's only
+engine that does). The reporter's log shows it exactly: the `[CONSENT]` line is
+printed, then the request 400s two lines later. The field was also undocumented —
+`docs/server.md` and `docs/tts.md` still described the opt-out with no mention of
+the attestation, so a client written from the docs was guaranteed to break.
+
+Fixed by making the unattested opt-out **denied, not refused**: the request is
+served with the spoken disclaimer applied (the documented default), and the denial
+is announced via `X-Crispasr-Spoken-Disclaimer: applied` +
+`X-Crispasr-Marking-Warning` headers and a `[MARKING] … no_spoken_disclaimer=DENIED`
+audit line. Serving the *stronger* default can never emit weaker-than-default
+output, which was the whole point of the gate, and it doesn't hard-break clients
+that predate the field. Also: a server launched with
+`--accept-marking-responsibility` now satisfies the per-request gate — the operator
+has already accepted the duty for every response the process serves, which subsumes
+the per-request field. The CLI keeps its hard refusal (there the operator can just
+add the flag). Docs updated on both surfaces; `tests/test-server-tts.sh` now covers
+attested-honoured, unattested-denied, and the audit lines — its pre-existing
+"spoken_disclaimer=false is accepted" assertion had silently been wrong since
+v0.8.22 (a live test, so CI never ran it).
+
+## 2026-07-27 — Binding release automation: bundled PyPI wheels + GPU index + tag-triggered CI
+
+Moved the wrappers from "user installs libcrispasr separately" to self-contained
+distribution. New `release-python-wheels.yml` builds native-lib-BUNDLED Python
+wheels — CPU (linux x86_64/arm64, macOS arm64/Metal, windows x86_64) → PyPI, and
+GPU (CUDA linux+windows, Vulkan windows, carrying `+cuda`/`+vulkan` local
+versions) → a PEP 503 simple index on GitHub Pages (`pip install crispasr
+--extra-index-url .../whl/cuda/`, llama-cpp-python style) — plus a pure-Python
+sdist fallback. It REUSES the relocatable `libcrispasr-<platform>` bundles
+release.yml already attaches to the Release (no native rebuild); runs on
+`workflow_run` after release.yml. `tools/stage_libs.py` stages the libs into the
+`crispasr` package and `_binding.py:_find_lib()` now probes the package dir FIRST
+so the bundled copy always wins over a stray system lib; wheels are retagged per
+platform with `wheel tags` (ctypes package → one wheel per platform covers all
+Python 3, no cibuildwheel per-version matrix). Verified end-to-end locally on
+macOS-arm64: assemble bundle → package-lib-bundle.sh → stage → build → retag →
+`pip install` in a clean venv → `_find_lib` resolves the in-wheel dylib →
+`ctypes.CDLL` loads it. `release-wrappers.yml` auto-trigger enabled (`push: tags
+v*`) for crates.io + pub.dev; its PyPI job removed (owned by the wheels
+workflow); fixed its crates.io existence probe (missing User-Agent → 403 → it
+always self-skipped) + added an idempotent version-exists gate. `sync-version.py`
+now also bumps `python/crispasr/__init__.py __version__`. Secrets set via `gh`:
+`PYPI_API_TOKEN` (pre-existing) + `CARGO_REGISTRY_TOKEN` (added, else the crates.io
+CI publish self-skipped). GPU index hosting: Pages already serves `main`/root
+(legacy Jekyll README landing), so the index is committed to `main` under `whl/`
+(Jekyll serves `.../whl/{cuda,vulkan}/`) rather than switching the Pages source —
+landing untouched. No operator setup remains.
+
+## 2026-07-27 — #313 follow-up: published crispasr + crispasr-sys to crates.io
+
+Reversed the "not on crates.io" state that #313 had documented: both crates are
+now live at 0.8.23. First hardened `crispasr-sys/build.rs` so the published
+crate degrades sanely off-repo — a `DOCS_RS` short-circuit (compile the FFI
+rlib without link directives so docs.rs builds) and, before the cmake fallback,
+a check for a parent `CMakeLists.txt`; absent, it panics with an actionable
+message (set `CRISPASR_LIB_DIR` or use the git dependency) instead of a cryptic
+cmake error. Published with `CRISPASR_LIB_DIR=/usr/local/lib` set so the
+isolated verification build takes build.rs path 1 (no cmake, no vendored
+sources needed). One gotcha: crates.io rejects a first publish until the
+account has a *verified email* (400 Bad Request). Consumption is now two modes:
+git dep = build-from-source (build.rs cmakes it), or `crispasr = "0.8"` from
+crates.io + a pre-built lib via `CRISPASR_LIB_DIR` (the package does not vendor
+the C/C++ sources). PyPI (0.8.23) and pub.dev (0.8.11) were already live, so all
+three registries are bootstrapped.
+
+## 2026-07-27 — #313: Rust bindings docs pointed at an unpublished crates.io crate
+
+The reporter's `cargo` failed with "no matching package named `crispasr-sys`,
+location searched: crates.io index". Root cause was docs, not code: both crate
+READMEs said `crispasr = "0.1"` / `crispasr-sys = "0.1"` and `docs/bindings.md`
+claimed the crates were "published on crates.io" — but neither is published
+(both 404, confirmed via the crates.io API), so a registry dependency can never
+resolve. The `crispasr-sys` `build.rs` also *needs* the CrispASR C/C++ checkout
+to cmake `libcrispasr`, so a registry-only publish could not build even if it
+existed — the correct consumption model is a **git dependency**
+(`crispasr = { git = "https://github.com/CrispStrobe/CrispASR" }`), which was
+verified to resolve `crispasr → crispasr-sys` cleanly via `cargo tree`. Fixed
+the two READMEs (git dep + accurate build story: `build.rs` cmakes by default,
+or links a pre-built lib via `CRISPASR_LIB_DIR`), `docs/bindings.md`, and the
+misleading `crispasr/Cargo.toml` comment. Docs-only; no engine change.
+
+## 2026-07-26 — #310: CosyVoice3 zero-shot clone leaked the reference transcript
+
+The `--voice ref.wav --ref-text` clone spoke part/all of the reference transcript
+before the requested text; baked presets were clean. Root cause was the LLM
+reference prompt, not the flow/HiFT numerics: the runtime clone set `prompt_text`
+to the bare `--ref-text`, missing the `"You are a helpful assistant.<|endofprompt|>"`
+system-prompt prefix the CosyVoice3 LLM expects (baked voices bake it in, per
+convert-cosyvoice3-voices-to-gguf.py) — so the model ran out-of-distribution and
+re-rendered the reference as speech. A second, smaller cause: the LLM got the
+mel-aligned *truncated* prompt speech tokens while the text carried the full
+transcript, leaving a one-word tail for references longer than the 10 s mel cap;
+fixed by feeding the LLM the full prompt speech tokens (the flow keeps the
+truncated set). Audio-confirmed on Metal (q4_k) via TTS→ASR: short + 11 s refs now
+speak only the target, voice unchanged, token counts back to normal (198→59).
+Merged 7dbb7564. The discriminator was dumping the baked voice's `prompt_text` and
+seeing it was the system prompt, not a bare transcript.
+
+## 2026-07-25 — #294: F5-TTS Chinese g2p + English de-truncation (audio-confirmed)
+
+Two quality bugs the reporter hit after the speed work. **Chinese** produced no
+audio: F5 needs Han text as pinyin (jieba + pypinyin TONE3 + sandhi, like upstream
+`convert_char_to_pinyin`) but CrispASR passed raw characters → unknown token →
+silence. Added `src/core/pinyin_g2p.*` — jieba-min forward-max-match segmentation +
+pypinyin TONE3 + 不/一/third-tone sandhi, with 41.6k char + 47.1k phrase readings
+embedded from pypinyin via `tools/gen_pinyin_data.py` (`pinyin_data.inc`, 3.3 MB);
+99.8% token parity vs the reference (`tests/test-pinyin-g2p`). That alone still
+gave garbled audio — f5 was concatenating the token list and re-tokenizing per
+UTF-8 byte, shattering each syllable (`zhong1`→`z,h,o,n,g,1`); fixed by mapping each
+element to its vocab id directly (`3167d014`). **English** "leaves out parts of
+sentences": a CrispASR-only rate clamp (`fixed_rate*2.5`, no upstream equivalent)
+cut the tail of a slow reference — made asymmetric/loose (`CRISPASR_F5_DURATION_CLAMP=0`
+= exact upstream). Audio-confirmed on M1 Metal (F16 GGUF + whisper-large-v3-turbo):
+ZH `今天天气很好，我们一起去公园散步。` → ASR exact; EN full sentence, no
+truncation. Merged 9a2fd7dc + 3167d014. Lesson in LEARNINGS: token-parity ≠ working
+audio (the char-split was invisible to the g2p's own test).
+
+## 2026-07-25 — #301 + follow-ups: concurrency docs; moonshine GPU crash; unreadable --model
+
+#301 (how does CrispASR scale?) was a discoverability gap, not a missing feature:
+the `CRISPASR_SERVER_WORKERS` in-process pool already existed but lived only in a
+docker-compose env-table row. Added `docs/concurrency.md` (the full ggml-threads →
+mutex-serialized server → worker pool → replicas+LB → CLI bulk fan-out story, plus
+honest "PagedAttention isn't the fit" / "no batched multi-stream" answers) and a
+`--server-workers N` CLI flag mirroring the env var (58b85235/8715b15a). Two bugs
+found while testing: (1) moonshine SIGSEGV'd on the 2nd `/v1/audio/transcriptions`
+on a GPU sched — the §176s cached encoder cgraph reused across `sched_reset`/`alloc`
+left the input leaves on freed GPU memory; gated the cache to CPU, rebuild-each-call
+on GPU (`4b30ff8c`; see LEARNINGS). (2) `crispasr_resolve_model_cli` conflated a
+missing `-m` path with an existing-but-unreadable one (dangling symlink / EPERM) and
+silently loaded a downloadable default — now a clear error, ENOENT still routes to
+the registry (`defb1db0`).
+
 ## 2026-07-22 — #292: --max-new-tokens honored across 10 ASR backends; chunk_id; CUDA-validated
 
 moss-diarize ignored `--max-new-tokens` (hardcoded 1024), truncating a long

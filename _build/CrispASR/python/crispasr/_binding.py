@@ -27,17 +27,19 @@ class Segment:
 def _find_lib():
     """Locate the crispasr / whisper shared library.
 
-    The wheel is pure-Python and does not bundle the native library —
-    matches crispasr's binding pattern. The user is expected to have
-    `libcrispasr.{so,dylib,dll}` on their system, either installed by
-    a package manager (Homebrew, apt) or built from source.
+    Platform wheels (CPU on PyPI, GPU on the extra index) bundle the native
+    library *next to this file*, so that copy is probed first and always wins.
+    The pure-Python sdist does not bundle it; there the user supplies
+    `libcrispasr.{so,dylib,dll}` via a package manager (Homebrew, apt), a
+    source build, or `$CRISPASR_LIB_PATH`.
 
     Probe order:
       1. $CRISPASR_LIB_PATH (explicit override — full path to the .so/.dylib/.dll)
-      2. sys.prefix/lib (pip install --user, virtualenv, conda)
-      3. Standard install prefixes (Homebrew arm64/x64, /usr/local, /usr)
-      4. Repo-relative `build/` paths (for `pip install -e .` from a clone)
-      5. The bare filename (lets the loader use $LD_LIBRARY_PATH /
+      2. This package directory (a lib bundled into the installed wheel)
+      3. sys.prefix/lib (pip install --user, virtualenv, conda)
+      4. Standard install prefixes (Homebrew arm64/x64, /usr/local, /usr)
+      5. Repo-relative `build/` paths (for `pip install -e .` from a clone)
+      6. The bare filename (lets the loader use $LD_LIBRARY_PATH /
          $DYLD_LIBRARY_PATH / PATH and the system loader cache)
 
     Both `libcrispasr.*` (preferred — all backends) and the legacy
@@ -55,18 +57,20 @@ def _find_lib():
 
     override = os.environ.get("CRISPASR_LIB_PATH")
     if override and Path(override).exists():
+        _register_dll_dir(Path(override).parent)
         return override
 
     search = [
+        # A lib bundled into the installed wheel — probed first so a platform
+        # wheel is self-contained and a stray system copy can't shadow it.
+        Path(__file__).parent,
         Path(sys.prefix) / "lib",
         Path("/opt/homebrew/lib"),  # macOS arm64 Homebrew
         Path("/usr/local/lib"),     # macOS x64 Homebrew, /usr/local installs
         Path("/usr/lib"),           # apt, dnf
         Path("/usr/lib/x86_64-linux-gnu"),  # Debian/Ubuntu multiarch
         Path("/usr/lib/aarch64-linux-gnu"),
-        # Repo-relative — last so `pip install crispasr` doesn't accidentally
-        # pick up an old build/ from cwd.
-        Path(__file__).parent,
+        # Repo-relative — for `pip install -e .` from a clone.
         Path(__file__).parent.parent.parent / "build",
         Path(__file__).parent.parent.parent / "build" / "src",
         Path(__file__).parent.parent.parent / "build" / "lib",
@@ -77,9 +81,42 @@ def _find_lib():
         for name in candidates:
             p = d / name
             if p.exists():
+                _register_dll_dir(p.parent)
                 return str(p)
     # Fall back to bare name; ctypes will use the system loader path.
     return candidates[0]
+
+
+def _register_dll_dir(directory: Path) -> None:
+    """Windows only: make `directory` searchable for DEPENDENT DLLs.
+
+    `crispasr.dll` needs `ggml.dll`, `ggml-base.dll` and `ggml-cpu.dll`, which a
+    platform wheel ships right beside it. Since Python 3.8 the directory of a DLL
+    loaded by full path is NOT searched for that DLL's own dependencies, so
+    `ctypes.CDLL(<path>/crispasr.dll)` raises "DLL load failed while importing"
+    even though every dependency is present in the same folder.
+    `os.add_dll_directory` is the documented remedy.
+
+    No-op off Windows, and deliberately quiet: on a system install the loader
+    already resolves these, so a failure here must not break a working setup.
+    """
+    if os.name != "nt":
+        return
+    add = getattr(os, "add_dll_directory", None)  # Python 3.8+
+    if add is None:
+        return
+    key = str(directory)
+    if key in _dll_dirs:
+        return
+    try:
+        add(key)          # keep the cookie alive for the process lifetime
+        _dll_dirs[key] = True
+    except OSError:
+        pass
+
+
+# Directories already handed to os.add_dll_directory (Windows).
+_dll_dirs: dict = {}
 
 
 # Whisper sampling strategies
@@ -447,6 +484,14 @@ class SessionSegment:
     # in [0, 1]. Whisper-only; other backends (and older libcrispasr builds
     # without the accessor) leave the -1.0 "no data" sentinel.
     no_speech_prob: float = -1.0
+    # Native per-segment speaker label from a backend that diarizes on its own,
+    # in the "(Speaker N) " form the CLI prefixes into text/srt/vtt output, or
+    # "" when the backend produced none (and on older libcrispasr builds without
+    # the accessor). Populated today by vibevoice, whose model answers with a
+    # Start/End/Speaker/Content array. The ordinals are CHUNK-LOCAL: "Speaker 1"
+    # in one transcribe call is not necessarily the same voice as "Speaker 1" in
+    # the next — use the diarize_* helpers for cross-recording clustering.
+    speaker: str = ""
 
 
 # =========================================================================
@@ -1309,6 +1354,12 @@ class Session:
         lib.crispasr_session_result_segment_t0.restype = ctypes.c_int64
         lib.crispasr_session_result_segment_t1.argtypes = [ctypes.c_void_p, ctypes.c_int]
         lib.crispasr_session_result_segment_t1.restype = ctypes.c_int64
+        # segment_speaker was added 2026-07-27 (#300). Older libcrispasr builds
+        # don't export it — probe with hasattr at the call site and fall back to
+        # "" so a new wheel keeps working against an older system library.
+        if hasattr(lib, "crispasr_session_result_segment_speaker"):
+            lib.crispasr_session_result_segment_speaker.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            lib.crispasr_session_result_segment_speaker.restype = ctypes.c_char_p
         lib.crispasr_session_result_n_words.argtypes = [ctypes.c_void_p, ctypes.c_int]
         lib.crispasr_session_result_n_words.restype = ctypes.c_int
         lib.crispasr_session_result_word_text.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
@@ -1425,6 +1476,9 @@ class Session:
                 wn = self._lib.crispasr_session_result_n_words(res, i)
                 has_nsp = hasattr(self._lib, "crispasr_session_result_segment_no_speech_prob")
                 nsp = self._lib.crispasr_session_result_segment_no_speech_prob(res, i) if has_nsp else -1.0
+                spk_b = (self._lib.crispasr_session_result_segment_speaker(res, i)
+                         if hasattr(self._lib, "crispasr_session_result_segment_speaker") else None)
+                spk = spk_b.decode("utf-8") if spk_b else ""
                 words: List[SessionWord] = []
                 has_word_p = hasattr(self._lib, "crispasr_session_result_word_p")
                 for j in range(wn):
@@ -1438,7 +1492,7 @@ class Session:
                         # surface 1.0 so callers can render uniformly.
                         confidence=1.0 if raw_p < 0 else raw_p,
                     ))
-                out.append(SessionSegment(text=text.strip(), start=t0, end=t1, words=words, no_speech_prob=nsp))
+                out.append(SessionSegment(text=text.strip(), start=t0, end=t1, words=words, no_speech_prob=nsp, speaker=spk))
             return out
         finally:
             self._lib.crispasr_session_result_free(res)
@@ -1508,6 +1562,9 @@ class Session:
                 wn = self._lib.crispasr_session_result_n_words(res, i)
                 has_nsp = hasattr(self._lib, "crispasr_session_result_segment_no_speech_prob")
                 nsp = self._lib.crispasr_session_result_segment_no_speech_prob(res, i) if has_nsp else -1.0
+                spk_b = (self._lib.crispasr_session_result_segment_speaker(res, i)
+                         if hasattr(self._lib, "crispasr_session_result_segment_speaker") else None)
+                spk = spk_b.decode("utf-8") if spk_b else ""
                 words: List[SessionWord] = []
                 for j in range(wn):
                     wt = self._lib.crispasr_session_result_word_text(res, i, j)
@@ -1518,7 +1575,7 @@ class Session:
                         end=self._lib.crispasr_session_result_word_t1(res, i, j) / 100.0,
                         confidence=1.0 if raw_p < 0 else raw_p,
                     ))
-                out.append(SessionSegment(text=text.strip(), start=t0, end=t1, words=words, no_speech_prob=nsp))
+                out.append(SessionSegment(text=text.strip(), start=t0, end=t1, words=words, no_speech_prob=nsp, speaker=spk))
             return out
         finally:
             self.set_return_logits(False)
@@ -1632,6 +1689,9 @@ class Session:
                 wn = self._lib.crispasr_session_result_n_words(res, i)
                 has_nsp = hasattr(self._lib, "crispasr_session_result_segment_no_speech_prob")
                 nsp = self._lib.crispasr_session_result_segment_no_speech_prob(res, i) if has_nsp else -1.0
+                spk_b = (self._lib.crispasr_session_result_segment_speaker(res, i)
+                         if hasattr(self._lib, "crispasr_session_result_segment_speaker") else None)
+                spk = spk_b.decode("utf-8") if spk_b else ""
                 words: List[SessionWord] = []
                 has_word_p = hasattr(self._lib, "crispasr_session_result_word_p")
                 for j in range(wn):
@@ -1645,7 +1705,7 @@ class Session:
                         # surface 1.0 so callers can render uniformly.
                         confidence=1.0 if raw_p < 0 else raw_p,
                     ))
-                out.append(SessionSegment(text=text.strip(), start=t0, end=t1, words=words, no_speech_prob=nsp))
+                out.append(SessionSegment(text=text.strip(), start=t0, end=t1, words=words, no_speech_prob=nsp, speaker=spk))
             return out
         finally:
             self._lib.crispasr_session_result_free(res)
@@ -1702,6 +1762,9 @@ class Session:
                 wn = self._lib.crispasr_session_result_n_words(res, i)
                 has_nsp = hasattr(self._lib, "crispasr_session_result_segment_no_speech_prob")
                 nsp = self._lib.crispasr_session_result_segment_no_speech_prob(res, i) if has_nsp else -1.0
+                spk_b = (self._lib.crispasr_session_result_segment_speaker(res, i)
+                         if hasattr(self._lib, "crispasr_session_result_segment_speaker") else None)
+                spk = spk_b.decode("utf-8") if spk_b else ""
                 words: List[SessionWord] = []
                 for j in range(wn):
                     wt = self._lib.crispasr_session_result_word_text(res, i, j)
@@ -1712,7 +1775,7 @@ class Session:
                         end=self._lib.crispasr_session_result_word_t1(res, i, j) / 100.0,
                         confidence=1.0 if raw_p < 0 else raw_p,
                     ))
-                segs.append(SessionSegment(text=text.strip(), start=t0, end=t1, words=words, no_speech_prob=nsp))
+                segs.append(SessionSegment(text=text.strip(), start=t0, end=t1, words=words, no_speech_prob=nsp, speaker=spk))
 
             # Lift out the CTC logits (if any) before the handle is freed.
             n_frames = self._lib.crispasr_session_result_n_logit_frames(res)
@@ -1894,6 +1957,24 @@ class Session:
                                f"set_instruct only applies to qwen3-tts VoiceDesign models")
         if rc != 0:
             raise RuntimeError(f"set_instruct failed (rc={rc}) for backend {self.backend!r}")
+
+    def set_tts_phonemes(self, phonemes: str) -> None:
+        """Synthesize these phonemes verbatim instead of phonemizing the text — the seam between text processing and the acoustic model. Use it to reproduce another implementation's pronunciation exactly, or to tell a G2P bug from a model bug (#316). Empty clears. Honoured by kokoro and piper; other backends soft no-op (rc=-2).
+
+        Args:
+            phonemes: IPA string in the backend's own alphabet, or "" to clear.
+        """
+        if not hasattr(self._lib, "crispasr_session_set_tts_phonemes"):
+            raise RuntimeError("set_tts_phonemes API not present in this libcrispasr build")
+        self._lib.crispasr_session_set_tts_phonemes.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        self._lib.crispasr_session_set_tts_phonemes.restype = ctypes.c_int
+        rc = self._lib.crispasr_session_set_tts_phonemes(self._session, phonemes.encode("utf-8"))
+        if rc == -2:
+            raise RuntimeError(
+                f"backend {self.backend!r} has no phonemes-in entry point (kokoro and piper do)"
+            )
+        if rc != 0:
+            raise RuntimeError(f"set_tts_phonemes failed (rc={rc})")
 
     def clear_phoneme_cache(self) -> None:
         """Drop the kokoro per-session phoneme cache.
@@ -2580,6 +2661,45 @@ class Session:
         ptr = self._lib.crispasr_session_synthesize(self._handle, text.encode("utf-8"), ctypes.byref(n))
         if not ptr or n.value <= 0:
             raise RuntimeError(f"synthesize returned no audio for backend {self.backend!r}")
+        try:
+            arr = np.ctypeslib.as_array(ptr, shape=(n.value,)).copy()
+        finally:
+            self._lib.crispasr_pcm_free(ptr)
+        return arr
+
+    def accept_marking_responsibility(self, attestation: str = "") -> None:
+        """Attest acceptance of AI-content marking/disclosure responsibility
+        (EU AI Act Art. 50). REQUIRED before :meth:`synthesize_raw` will return
+        unmarked audio; the default :meth:`synthesize` is watermarked and needs
+        no attestation. ``attestation`` is recorded for audit."""
+        if not hasattr(self._lib, "crispasr_session_accept_marking_responsibility"):
+            raise RuntimeError("marking-attestation API not present in this libcrispasr build")
+        self._lib.crispasr_session_accept_marking_responsibility.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p,
+        ]
+        self._lib.crispasr_session_accept_marking_responsibility.restype = ctypes.c_int
+        self._lib.crispasr_session_accept_marking_responsibility(self._handle, attestation.encode("utf-8"))
+
+    def synthesize_raw(self, text: str) -> "np.ndarray":
+        """UNMARKED synthesis (no watermark), for callers that post-process
+        before embedding the mark themselves. Hard-refused unless
+        :meth:`accept_marking_responsibility` was called first. Prefer
+        :meth:`synthesize` for the default watermarked output."""
+        if not hasattr(self._lib, "crispasr_session_synthesize_raw"):
+            raise RuntimeError("TTS raw API not present in this libcrispasr build")
+        self._lib.crispasr_session_synthesize_raw.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int),
+        ]
+        self._lib.crispasr_session_synthesize_raw.restype = ctypes.POINTER(ctypes.c_float)
+        self._lib.crispasr_pcm_free.argtypes = [ctypes.POINTER(ctypes.c_float)]
+        self._lib.crispasr_pcm_free.restype = None
+        n = ctypes.c_int(0)
+        ptr = self._lib.crispasr_session_synthesize_raw(self._handle, text.encode("utf-8"), ctypes.byref(n))
+        if not ptr or n.value <= 0:
+            raise RuntimeError(
+                "synthesize_raw returned no audio (attestation required? "
+                "call accept_marking_responsibility() first)"
+            )
         try:
             arr = np.ctypeslib.as_array(ptr, shape=(n.value,)).copy()
         finally:

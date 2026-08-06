@@ -312,6 +312,36 @@ the §232 campaign. Verified against current code, not carried from this doc.
 
 ### Highest-ceiling paths forward
 
+### dots.tts baseline and optimization queue (#319, 2026-07-28)
+
+The first local low-memory benchmark used an Apple M1, Metal, a mixed `Q4_K`
+core (about 2.2 GiB; DiT tensors intentionally left in F16) and a `Q8_0`
+vocoder (about 330 MiB). With an eight-patch cap, synthesis produced valid,
+recognizable audio and measured:
+
+| ODE steps | Total | Flow matching | Vocoder decode |
+|---:|---:|---:|---:|
+| 16 | 24.2 s | 13.7 s | 10.4 s |
+| 8 | 16.2 s | 5.8 s | 10.5 s |
+
+Model loading is excluded. The patch cap makes this a bounded smoke benchmark,
+not a real-time claim for full utterances. Eight steps is about 1.49x faster in
+this run, but the vocoder becomes the floor once DiT steps are reduced. The
+current Metal path already uses the persistent fused DiT graph by default;
+remaining high-value work is:
+
+1. Make vocoder decode reuse a fixed-shape graph and benchmark the batch-1
+   convolution occupancy fix against the existing HiFi-GAN measurements.
+2. Batch CFG conditional/unconditional work with a device-resident dequantized
+   weight copy, preserving the quantization safety rule established by
+   chatterbox.
+3. Add length-bucketed graph reuse for autoregressive patch counts, then measure
+   the existing approximate CFG-interval mode separately from exact decoding.
+
+Every dots.tts speed change must retain the audio roundtrip gate (TTS WAV → ASR)
+and compare decoded output, not only process exit status. Do not quantize the
+DiT tensors to F16 or increase the memory footprint as an optimization.
+
 1. **Lk-bucketed decode-step graph caching** generalized to the 30+ decoders
    that rebuild per step — templates: qwen3-tts (5 buckets), granite §210
    gallocr, mimo `step_t1_gf`. Cache the *decode-step* graph, not the encoder.

@@ -908,6 +908,97 @@ impl Session {
         Ok(out)
     }
 
+    /// Speech-to-speech: input PCM in → output PCM out via a single model
+    /// pass. Requires an S2S-capable backend (`lfm2-audio`, `mini-omni2`,
+    /// `sidon`, `voxcpm2-vae`). Input PCM must be at the backend's native
+    /// input rate (see [`Session::input_sample_rate`]).
+    ///
+    /// Returns the output PCM plus the optional intermediate transcript the
+    /// model produced on the way (`None` if the backend doesn't surface one).
+    /// Errors if the backend has no S2S capability or the pass fails.
+    pub fn speech_to_speech(&self, pcm: &[f32]) -> Result<(Vec<f32>, Option<String>), String> {
+        let mut n: c_int = 0;
+        let mut text_ptr: *mut c_char = std::ptr::null_mut();
+        let ptr = unsafe {
+            crispasr_sys::crispasr_session_speech_to_speech(
+                self.handle,
+                pcm.as_ptr(),
+                pcm.len() as c_int,
+                &mut text_ptr as *mut *mut c_char,
+                &mut n as *mut c_int,
+            )
+        };
+        if ptr.is_null() || n <= 0 {
+            if !text_ptr.is_null() {
+                unsafe { crispasr_sys::crispasr_session_translate_text_free(text_ptr) };
+            }
+            return Err(format!(
+                "speech_to_speech returned no audio for backend {:?} (S2S may be unsupported)",
+                self.backend()
+            ));
+        }
+        let out = unsafe { std::slice::from_raw_parts(ptr, n as usize).to_vec() };
+        unsafe { crispasr_sys::crispasr_pcm_free(ptr) };
+        let transcript = if text_ptr.is_null() {
+            None
+        } else {
+            let s = unsafe { CStr::from_ptr(text_ptr) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { crispasr_sys::crispasr_session_translate_text_free(text_ptr) };
+            Some(s)
+        };
+        Ok((out, transcript))
+    }
+
+    /// The sample rate (Hz) the backend expects for input PCM — `16000` for
+    /// Whisper-family backends, the model's native rate otherwise, `0` on
+    /// error. Feed [`Session::speech_to_speech`] (and TTS voice-clone input)
+    /// at this rate rather than resampling twice.
+    pub fn input_sample_rate(&self) -> i32 {
+        unsafe { crispasr_sys::crispasr_session_input_sample_rate(self.handle) as i32 }
+    }
+
+    /// Attest that the integrator accepts AI-content marking/disclosure
+    /// responsibility (EU AI Act Art. 50). **Required** before
+    /// [`Session::synthesize_raw`] will return unmarked audio; the default
+    /// [`Session::synthesize`] is watermarked and needs no attestation.
+    /// `attestation` is a free-text acknowledgement recorded for audit.
+    pub fn accept_marking_responsibility(&self, attestation: &str) -> Result<(), String> {
+        let c = CString::new(attestation).map_err(|e| e.to_string())?;
+        // The C side records the attestation; the return is informational
+        // (mirrors the Python/Dart bindings, which ignore it).
+        unsafe {
+            crispasr_sys::crispasr_session_accept_marking_responsibility(self.handle, c.as_ptr())
+        };
+        Ok(())
+    }
+
+    /// UNMARKED synthesis (no watermark / disclosure), for callers that embed
+    /// the mark themselves after post-processing. Hard-refused (returns `Err`)
+    /// unless [`Session::accept_marking_responsibility`] was called first.
+    /// Prefer [`Session::synthesize`] for the default watermarked output.
+    pub fn synthesize_raw(&self, text: &str) -> Result<Vec<f32>, String> {
+        let ctext = CString::new(text).map_err(|e| e.to_string())?;
+        let mut n: c_int = 0;
+        let ptr = unsafe {
+            crispasr_sys::crispasr_session_synthesize_raw(
+                self.handle,
+                ctext.as_ptr(),
+                &mut n as *mut c_int,
+            )
+        };
+        if ptr.is_null() || n <= 0 {
+            return Err(format!(
+                "synthesize_raw returned no audio for backend {:?} (call accept_marking_responsibility first?)",
+                self.backend()
+            ));
+        }
+        let out = unsafe { std::slice::from_raw_parts(ptr, n as usize).to_vec() };
+        unsafe { crispasr_sys::crispasr_pcm_free(ptr) };
+        Ok(out)
+    }
+
     /// Drop the kokoro per-session phoneme cache. No-op for non-kokoro
     /// backends. Useful for long-running daemons that resynthesize across
     /// many speakers and want bounded memory. (PLAN #56 #5)
@@ -1377,6 +1468,25 @@ impl Session {
         let rc = unsafe { crispasr_sys::crispasr_session_set_instruct(self.handle, c.as_ptr()) };
         if rc != 0 {
             return Err(format!("set_instruct failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Synthesize `phonemes` verbatim instead of phonemizing the text — the
+    /// seam between text processing and the acoustic model. Use it to reproduce
+    /// another implementation's pronunciation exactly, or to tell a G2P bug from
+    /// a model bug (#316). An empty string clears it.
+    ///
+    /// Honoured by `kokoro` and `piper`; other backends soft no-op (`rc = -2`).
+    pub fn set_tts_phonemes(&self, phonemes: &str) -> Result<(), String> {
+        let c = CString::new(phonemes).map_err(|e| e.to_string())?;
+        let rc =
+            unsafe { crispasr_sys::crispasr_session_set_tts_phonemes(self.handle, c.as_ptr()) };
+        if rc == -2 {
+            return Err("backend has no phonemes-in entry point (kokoro and piper do)".to_string());
+        }
+        if rc != 0 {
+            return Err(format!("set_tts_phonemes failed (rc={})", rc));
         }
         Ok(())
     }

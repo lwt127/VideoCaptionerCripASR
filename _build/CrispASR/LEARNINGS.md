@@ -10,6 +10,289 @@ If a lesson is still "live" (affects current work), it's linked from
 
 ---
 
+## The diff harness starts where its INPUT starts — check what it is fed before trusting parity (#316, 2026-07-28)
+
+Kokoro was dropping numbers and speaking with the wrong accent, and
+`crispasr-diff kokoro` could not have caught either: its reference dumper takes
+`KOKORO_PHONEMES` and embeds that string in the GGUF so both sides consume
+identical phonemes. Every dumped stage is downstream of the G2P. Perfect
+per-stage cosine there means "given the same phonemes we compute the same
+acoustics" — true the entire time the audio was wrong.
+
+So before answering "are we at parity?", **look at what the harness's first stage
+consumes.** If the first dumped tensor derives from an input the harness itself
+supplies, everything upstream of that input is outside the comparison and a green
+diff is not evidence about it. Here the cheap substitute beat the harness anyway:
+feed the reference implementation's phoneme string into our acoustic path and
+listen. Correct audio proved the acoustics in one run and pinned the fault to the
+front end.
+
+**A shared front end serves models that disagree.** Our G2P is "tuned to match
+espeak-ng output for piper compatibility"; Kokoro was trained on misaki's
+alphabet — different spellings of the same sounds (`tʃ` vs `ʧ`, `oʊ` vs `O`, and
+misaki has no length marks). Both spellings are IN Kokoro's vocabulary, so the
+mismatch could not fail loudly: no unknown token, no drop, no error, just tokens
+the model never saw in training and audio that drifts. When one component feeds
+several models, its output convention is part of the interface — make the dialect
+explicit (an enum, incumbent as the identity) instead of letting whichever
+consumer came first define the format for everyone.
+
+**Measure the front end against the reference, symbol by symbol.** "Do we cover
+every phoneme?" is answerable: run both G2Ps over a corpus and diff the symbol
+inventories. Two invariants are worth keeping forever — nothing we emit is
+outside the model's vocab (else it is silently dropped), and nothing we emit is
+outside what the reference emits (else it is out-of-distribution). Exact-match
+rate is the weaker, noisier number; the inventory invariants catch a whole class
+of silent breakage.
+
+## A guard job that runs ONE compiler family guards one compiler family (#314, 2026-07-27)
+
+`linux-amr-fetch` was written for exactly the failure it later missed: it builds
+the opt-in static opencore-amr path, links it, and decodes a real `.amr` file, so
+that "a regression fails CI at authoring time". It stayed green for months while
+that build was broken for every clang user on the planet, because it installs
+`g++` and nothing else — and the defect (`register`, removed in C++17) is an
+ERROR under clang and merely a WARNING under GCC.
+
+The general shape: **a compile-time defect can be error-vs-warning across
+compiler families, so single-compiler CI coverage of a compile-only path is a
+coin flip.** Vendored/legacy third-party sources are where this bites, because
+they are the code most likely to use constructs a newer standard removed, and
+they are usually behind an opt-in flag that only one job exercises. If a job
+exists solely to prove that some source still *compiles*, it needs a compiler
+matrix or it is proving it for one compiler.
+
+Corollary for the fix itself: probe the POSITIVE warning flag with
+`check_cxx_compiler_flag`, never the `-Wno-` form. GCC accepts unknown `-Wno-*`
+options silently and only errors later, when some unrelated diagnostic fires — so
+a `check_cxx_compiler_flag("-Wno-whatever")` returns success on a compiler that
+has never heard of it, and you ship a flag that does nothing (or breaks a build
+you never tested).
+
+## When instrumenting the suspect file produces NO output, you are editing the wrong file — look for a second copy (#308 audit, 2026-07-27)
+
+A capitalisation bug (`And` → `ANd`) reproduced perfectly, and the guard that
+prevents it was visibly present in `src/fireredpunc.cpp`. Adding a debug print to
+that file and rebuilding produced **nothing** — and that silence was the whole
+answer. `crisp_punc/src/fireredpunc.cpp` is a second copy of the same
+implementation, it is the one `src/CMakeLists.txt` prefers, and the fix had never
+been applied to it. The `src/` copy is a fallback for checkouts missing the
+sibling directory, so it compiles, links into nothing, and reads as authoritative.
+
+The durable habit: **a debug print that does not appear is evidence, not a build
+problem.** Before re-checking your build flags, ask whether the symbol you
+instrumented is the symbol being called — `strings` the shipped library for your
+marker, or check for a duplicate source file. Any repo with vendored/mirrored
+sibling libraries has this shape, and a fix in the wrong copy passes review,
+passes the build, and changes nothing.
+
+Two corollaries. **Duplication needs a test, not discipline.** The two files
+differed by exactly one hunk and nobody noticed for months; a file-comparison
+test costs nothing, fails loudly, and is the only thing that actually holds. Write
+it before the fix and watch it fail at the right line. **And a diagnostic flag can
+lie about the thing it seems to diagnose:** `--no-punctuation` strips punctuation
+*after* restoration, so it makes a natively-punctuating model look unpunctuated.
+Using it as the discriminator would have put `CAP_PUNCTUATION_NATIVE` on backends
+that genuinely need the punctuation pass, silently deleting their commas. Print
+what the stage actually receives instead of inferring it from a flag whose job is
+to change the output.
+
+## MOSS-TTS-Local 4B stop runaway was a PROMPT-TOKENIZATION bug — non-compositional BPE, not the forward (#249, 2026-07)
+
+The 4B's binary continue/stop head ran away (q6_k/q8_0 always, q4_k a per-text
+coin-flip). **Root cause: we built the whole generation prompt as one string and
+tokenized it in one `moss_tts_local_tokenize` call.** BPE is not compositional —
+`encode(A+B) ≠ encode(A)+encode(B)` at merge boundaries — so encoding the user text
+embedded in the `…- Text:\n{text}\n</user_inst>…` template merged the text boundary
+**~2 tokens differently** from the reference processor, which encodes each segment
+separately and splices special-token ids in directly. Fix: piece-wise assembly
+mirroring `processing_moss_tts.py` (`moss_tts_local.cpp` `mtl_generate_grid`: encode
+`"user\n"`, `"<user_inst>\n- Reference(s):\n"`, `"None"`, the fields block, the text
+ALONE, `"\n</user_inst>"`, `"\n"`, `"assistant\n"` each on their own, `im_start`/
+`im_end`/`audio_start` as literal ids). Result: channel-0 ids now == the reference
+`input_ids` exactly (62/62, 69/69), and **q4_k AND f16 both stop 4/4** at 11–39
+frames — the higher-precision quants are shippable.
+
+**Why it hid so well, and the diagnostic tarpit it created:**
+- The last prompt token is `<audio_start>` (a special), tokenized correctly either
+  way, so **last-position Q/K is byte-exact** — the check that "confirmed" the input.
+- The interior mis-tokenized text tokens are weighted ~0 by early-layer attention
+  but **amplified by the layer-10 attention-sink softmax**, so the backbone hidden
+  drifts (cos 0.99998 @ block 9 → 0.9996 @ block 10 → 0.991 @ 35) and the fragile
+  2-way stop gap stays high → runaway. That layer-10 blow-up looked exactly like a
+  forward/numerics bug.
+- Every forward check therefore passed: f16≡f32 GGUF (byte-identical divergence),
+  our `flash_attn_ext`≡numpy-eager (cos 1.0), `ggml_rope_ext`≡HF half-split rope
+  byte-exact, pre-RoPE Q/K byte-exact to `q_norm`/`k_norm`, V≈5e-6, the KV-cache
+  round-trip + manual GQA expand preserved K to 1e-7, positions `0..T-1`, and the
+  eager-F32 attention path (added, then reverted) was byte-identical to flash on CPU
+  (`GGML_PREC_F32` is a CPU no-op). **All true, all irrelevant** — the forward was
+  correct; the *input tokens* were wrong.
+
+**LESSON (the expensive one): when a forward diverges from a reference but every
+discrete op is machine-precision-correct, the bug is in the INPUT, not the forward.**
+I burned ~a dozen Kaggle builds and wrongly concluded "irreducible ggml-vs-torch f32
+accumulation / ship q4_k" before checking prompt-token parity. Two things would have
+caught it on day one: (1) diff the FULL input-token grid against the reference
+processor, not just the last position (specials tokenize fine; interior text drifts);
+(2) when a from-scratch port disagrees with the reference and the ops check out, diff
+against a *second* independent port — a working C++/ggml port (mudler/moss-tts.cpp)
+whose own code comments named this exact "big-string encode drifts ~2 tokens" bug,
+plus the OpenMOSS llama.cpp fork, pinned it in one systematic file-by-file pass
+(delegated to a fork agent). Corollary: a reference's own emphasis is a clue — the HF
+README said "the tokenized generation prompt matches the reference processor exactly …
+so the model stops where it should"; that sentence WAS the answer. Diagnostic envs
+live in `moss_tts_local.cpp`
+(`CRISPASR_MOSS_TTS_LOCAL_{DUMP_STOP,DUMP_HIDDEN,DUMP_LAYERS,DUMP_SUBLAYER,DUMP_PROMPT_IDS,FORCE_FRAMES,GREEDY_TEXT}`);
+the eager-F32 attention path stays available via `CRISPASR_CORE_ATTN_EAGER_F32=1`
+(helps GPU where `GGML_PREC_F32` is real, but is not the fix here).
+
+## Cross-lingual TTS needs the target language plumbed through /v1/audio/speech (#249/#304, 2026-07)
+
+subof: CosyVoice3 + MOSS-TTS clones reading a language ≠ the reference voice's
+sounded heavily accented. Both engines already convey the target language (MOSS
+via a `- Language:` prompt field; CV3 drops the reference transcript when the
+target differs) driven by the CLI `-l`/`-tl` → `params.language`. The gap was
+purely the server: `/v1/audio/speech` parsed `input`/`voice`/`instructions` but
+NOT `language`, so a SubtitleEdit-style client couldn't select it. Fix: forward a
+`language` (or `target_lang` alias) field to `rp.language`. LESSON: when a
+capability works on the CLI but users hit it through the server/SE, check the
+OpenAI-compat endpoint actually plumbs the field — the backend adapter consumes
+`params.language` either way.
+
+---
+
+## "The model emits it inline as text" is a claim to VERIFY, not to document — structured data you never parsed looks identical to a model limitation (#300 follow-up, 2026-07-27)
+
+vibevoice was written off in #300 as "speaker info is part of the transcript text,
+so the structured-label change is a no-op there" — and that sentence was then
+copied into three doc sites and the issue's closing comment. It was wrong in a
+specific, checkable way: the model answers with
+`[{"Start":..,"End":..,"Speaker":N,"Content":".."}]`, which is *more* structured
+than the field we said it lacked. The adapter simply assigned the whole blob to
+`seg.text`. One `grep` for what the prompt asks the model to produce
+(`src/vibevoice.cpp`: "please transcribe it with these keys: Start time, End time,
+Speaker ID, Content") would have settled it before the claim was written down.
+
+The tell to generalise: when a backend "can't do X" but its OUTPUT is a blob you
+pass through untouched, you have not established that it can't do X — you have
+established that nobody looked. Read what the prompt asks the model for; the
+answer's shape is usually right there.
+
+Three supporting lessons from the same fix:
+
+**Parse LLM output with a scanner, not a strict reader.** A decode that hits the
+token cap ends mid-array. `json.hpp` throws on that and you lose every complete
+utterance before the cut — precisely the long-audio case where the labels matter
+most. An object-at-a-time scanner loses only the unfinished tail. Unit-test the
+truncation case explicitly; it is the one a strict parser silently turns into
+"the model produced nothing."
+
+**A pass over already-formatted text corrupts it, and the corruption hides until
+you clean up the layer above.** With the blob passing through, FireRedPunc was
+capitalising *inside* the JSON — the printed keys were `"STart"`, `"ENd"`,
+`"SPeaker"`. So the pre-fix output wasn't even valid for the consumers who were
+parsing it, and nobody noticed because the text looked "roughly right". Once the
+parse landed, the same pass produced `ANd so … country..` on the clean text, which
+is #308's `CAP_PUNCTUATION_NATIVE` audit item — every LLM-decoder ASR backend
+emits punctuated, cased text and must declare that flag. Fixing a formatting layer
+often reveals a second formatting bug that the first one was masking.
+
+**A pinned expected_transcript that cannot match is worse than no pin.**
+vibevoice's regression entry held the bare Content since 2026-06-15 while the CLI
+printed the JSON blob — the entry could never have passed, and it sat there
+looking like coverage. When pinning a transcript, capture it from the binary under
+test and say where it came from; if the pin and the printed output can't be the
+same string, the entry is decoration.
+
+## A new REQUIRED request field is a breaking API change on a schedule you don't control — deny the sub-feature, don't refuse the request (#312, 2026-07-27)
+
+v0.8.22 made `"spoken_disclaimer": false` on a voice clone require a companion
+`marking_attestation` field, hard-refusing with `400` otherwise. Correct policy,
+wrong failure mode: the integrator (Subtitle Edit) shipped the field a day after
+its last release, so for a full release cycle *every* SE build in users' hands got
+zero TTS output — the feature was gone, not degraded, and the user-visible symptom
+("synthesis failed 400") pointed nowhere near provenance policy.
+
+The generalisable shape: when a request asks to **weaken** a default and doesn't
+qualify, you have two failure modes — refuse the whole request, or refuse the
+*opt-out* and serve the default. The second is strictly better here, because the
+policy being enforced is "never emit weaker-than-default output," and serving the
+default satisfies it completely. Refusing outright buys no extra safety; it only
+converts a client that is one field behind into a client that is entirely broken.
+Announce the denial so it isn't silent (response headers + an audit-log line with
+`DENIED` in it), and keep the hard refusal on surfaces where the operator can fix
+it in place — the CLI's `--no-spoken-disclaimer` still exits 12, because the error
+names the flag you'd add to the very command you just typed.
+
+Two supporting rules the same issue produced. **An operator-scope attestation must
+satisfy a request-scope gate.** A server launched with
+`--accept-marking-responsibility` has accepted the duty for *every* response it
+serves, which strictly subsumes the per-request field — checking only the body
+refused requests the operator had already covered. **A gate added without docs is
+a trap with a fuse.** `marking_attestation` never made it into `docs/server.md` or
+`docs/tts.md`, so both surfaces still told integrators to send
+`"spoken_disclaimer": false` on its own — the exact request the server had started
+rejecting. And the live test that asserted that request is accepted was left
+failing for four days without anyone noticing, because live tests need models and
+CI never runs them: a policy gate wants a test on a tier that actually runs.
+
+## When a clone/zero-shot path misbehaves but the BAKED/preset path is clean, diff the two paths' DATA byte-for-byte — the difference IS the bug (CosyVoice3 #310, 2026-07-26)
+
+CosyVoice3 zero-shot (`--voice ref.wav`) spoke the reference transcript before the
+requested text; the baked preset voices were clean. Both paths run the identical
+`cv3_synth_with_voice`, so the bug had to be in the DATA the zero-shot extractor
+produced vs what the baker stored. Dumping the baked voice's `prompt_text` out of
+the voices GGUF settled it in one shot: it is `"You are a helpful
+assistant.<|endofprompt|>" + <transcript>`, i.e. the required CosyVoice3 system
+prompt + `<|endofprompt|>` boundary — while the runtime clone stored the bare
+`--ref-text`. Without that prefix the Qwen-based speech LM is out-of-distribution
+and re-renders the reference text as speech (the "leak"); it is intelligible in the
+right voice, so it reads like extra content, not miscompute. Lessons: (1) a working
+sibling path is a free oracle — when preset works and clone doesn't, the delta is a
+short list of stored fields, so compare them before touching the graph; (2) an
+instruct/chat speech-LM needs its EXACT training-time system-prompt wrapper — a bare
+prompt string silently degrades to "read this text aloud." (Second, smaller cause:
+the LLM was fed the mel-cap-truncated prompt speech tokens while the text kept the
+full transcript — feed the LM the full tokens, let only the flow use the truncated,
+mel-aligned set.)
+
+F5-TTS produced no Chinese audio because its `convert_to_pinyin` was an ASCII-only
+passthrough (every Han char → unknown token → silence). We added a real g2p
+(jieba-min + pypinyin TONE3 + sandhi) and unit-tested it to **99.8% token parity**
+against the reference `convert_char_to_pinyin`. Chinese was still garbled. The g2p
+was correct; the bug was one function DOWNSTREAM: `f5_tts_synthesize` concatenated
+the g2p's token list into a flat string and **re-tokenized it per UTF-8 byte**. The
+F5 vocab stores whole pinyin syllables as single entries (`zhong1`, `guo2`, `a1`,
+`ang1`, …), so `zhong1` became `z,h,o,n,g,1` → six wrong ids → recognizably-Chinese
+-but-unintelligible audio. The parity test validated the g2p's OUTPUT and never saw
+f5's CONSUMPTION of it, so it stayed green through a shipped, broken build. Only the
+TTS→ASR roundtrip caught it (ZH ASR became an exact match; token count for the clip
+dropped 146→63 = one id per syllable). Lessons: (1) a list of vocab units must be
+mapped element-wise to ids (`list_str_to_idx`), NEVER concatenated and re-split —
+the re-split silently destroys every multi-char token; (2) HARD RULE #3b in force —
+a component's own metric is blind to the seam with the next stage, so the acceptance
+gate is always the DECODED OUTPUT, not the component score. Corollary: for cross-
+lingual TTS, use a same-language reference (an English ref speaking Chinese is
+degraded regardless), and a wrong/too-short `--ref-text` garbles output outright.
+
+## Reusing a cached scheduler graph across `sched_reset`/`alloc` cycles is CPU-safe but SIGSEGVs on GPU — the reused input tensor is bound to the prior cycle's freed buffer (moonshine #301, 2026-07-25)
+
+Sibling of the #215/#235 "cached graph shares a scheduler with a larger graph"
+trap, but distinct: here a SINGLE graph is cached and re-run. moonshine's §176s
+encoder cache reused the same `ggml_cgraph` across `ggml_backend_sched_reset` +
+`ggml_backend_sched_alloc_graph` every call. On CPU this is fine; on a GPU sched
+the reused `audio_input`/`enc_pos` leaves stay bound to the PREVIOUS cycle's freed
+buffer, so the very next `ggml_backend_tensor_set` memmoves into freed memory and
+the **2nd** transcribe SIGSEGVs (1st is fine). It reproduced at
+`CRISPASR_SERVER_WORKERS=1` too, so it's repeated-call, not concurrency; a `--server`
+made it look like a server bug. Bisect tell: the rebuild branch (different
+`n_samples`) never crashes, only the exact-reuse branch does. Fix: gate the cache to
+CPU (`ggml_backend_is_cpu(ctx->backend)`); on GPU rebuild the (tiny) graph each call
+and free it. Rule: cache-and-reuse a sched cgraph across reset/alloc is a CPU-only
+optimization — GPU wants rebuild-each-call (or a genuinely persistent gallocr graph
+whose inputs you re-set every eval).
+
 ## A hardcoded decode cap silently ignores --max-new-tokens — and forwarding it naively SHRINKS a backend (#292, 10 ASR backends, 2026-07-22)
 
 An autoregressive/LLM ASR backend caps its decode loop at some `const int max_new
@@ -13692,3 +13975,93 @@ same input-alignment applies to every later MBR stage (each RoFormer block also
 opens with RMSNorm). General rule for the harness: prefer feeding each stage the
 reference input over chaining your own outputs, whenever the stage's first op is
 scale-sensitive.
+
+
+## CI has no NVIDIA GPU — a CUDA-only graph path (mimo RVQ) is guarded by an on-Kaggle exact-parity smoke, not CI (#309)
+
+`perf(mimo-tokenizer): move RVQ to CUDA` (#309) runs MiMo's 8-stage Euclidean
+RVQ inside the encoder graph when the tokenizer weights are CUDA-resident:
+`scores = 2*(e·x) - ||e||^2` (mul_mat + scale + sub of precomputed codebook
+norms) -> `argmax` (== `argmin ||x-e||^2`) -> `get_rows` residual. The argmax
+output is contiguous, so it sidesteps the CUDA `get_rows` non-contiguous-index
+abort; `mul_mat_set_prec(F32)` keeps the dot products exact.
+
+The catch: the release CI matrix (linux-x86_64, linux-vulkan, macos, wasm, ios,
+android) has NO NVIDIA GPU, so the whole `#if defined(GGML_USE_CUDA)` RVQ branch
+COMPILES but never EXECUTES in CI. A green CI is necessary but NOT sufficient for
+this path. Its regression guard is the model smoke tool's exact CPU/CUDA compare,
+run on a CUDA box (Kaggle):
+
+```
+CRISPASR_MIMO_SMOKE_GPU=1 CRISPASR_MIMO_TOK_VERIFY_RVQ=1 \
+    ./mimo-tokenizer-smoke mimo-tokenizer-q4_k.gguf samples/jfk.wav
+# -> [ ok ] rvq_cpu_gpu_compare  codes=2208 mismatches=0
+```
+
+Validated on an RTX 2080 Ti: 2,208 codes, 0 mismatches, 5.65x faster than the CPU
+fallback. Any future edit to the RVQ or encoder graph must re-run this on real
+CUDA — do not trust CI alone. Rollback / diagnosis: `CRISPASR_MIMO_TOK_CPU_RVQ=1`
+forces the CPU argmin path. (General rule: whenever a perf change adds a
+`GGML_USE_CUDA`-gated compute path, name its Kaggle parity check in the PR, since
+CI cannot cover it — same lesson as the parakeet/nemotron ggml-decode A/Bs.)
+
+
+## "Backend miscomputes my pipeline" ≠ "op X is broken": arbitrate with test-backend-ops, and beware aggregate precision (#304 native-Vulkan post-mortem)
+
+CosyVoice3 produces noise on the Vulkan backend (the shipped fix CPU-routes it).
+Chasing "make it run natively on Vulkan," a chain of app-level symptoms kept
+pointing at a broken op — and kept being WRONG until ggml's own unit tests
+settled it. The sequence, and the lessons:
+
+1. **LM is fine, flow/HiFT are not.** With `CRISPASR_COSYVOICE3_GREEDY=1` (forces
+   argmax so two backends yield identical tokens iff their logits agree) the LM
+   matched CPU **512/512 tokens** on both MoltenVK and a real Tesla P100 — but the
+   flow mel diverged (cosine(cpu,vk)=**0.961**, max element diff 6.78). *Greedy is
+   the tool for cross-backend determinism*: sampling hides a miscompute behind a
+   "different but valid" sequence; argmax exposes it.
+
+2. **"Healthy stats ≠ correct" (again — cf. the F5/HARD-RULE token-parity lesson).**
+   The Vulkan flow mel had a perfectly healthy RANGE (min/max/rms like CPU, no
+   NaN), so an early read said "flow works, HiFT is the breaker." False: a
+   HiFT-on-CPU hybrid fed that mel still produced noise. A healthy-looking
+   intermediate can be wrong in CONTENT. Only an element-wise cos/max-diff vs a
+   reference (same input) is trustworthy — dump raw tensors, not summaries.
+
+3. **Isolate DISPATCH from OP.** Suspecting my own single-backend `gallocr`
+   dispatch (gallocr reuses input buffers as scratch — a real footgun for
+   multi-step graphs), I added `CRISPASR_COSYVOICE3_FORCE_GALLOCR=1` to run the
+   gallocr path on the CPU backend and diff it against the CPU scheduler: **cosine
+   1.000000, max diff 0 — bit-identical.** The dispatch was never the bug.
+
+4. **The arbiter: ggml's own `test-backend-ops` on the target backend.** Built it
+   with `GGML_VULKAN=ON` and ran it on a real P100 (Kaggle). EVERY op the flow +
+   HiFT touch PASSES vs the CPU reference — IM2COL 88/88, CONV_TRANSPOSE_1D,
+   MUL_MAT 892/892, NORM(LayerNorm) 10/10, RMS_NORM, SOFT_MAX 212/212, GELU/SILU,
+   ROPE 288/288, CONCAT/GET_ROWS/CPY/PAD, all `Backend Vulkan0: OK`. There is **no
+   broken op.** My successive "it's the conv" / "it's LayerNorm" hypotheses were
+   all disproven by the op the primitive's own unit test. LESSON: before claiming
+   "ggml op X miscomputes on backend Y," RUN test-backend-ops for X on Y — it is
+   cheap, authoritative, and app-independent. An app-level divergence is evidence
+   of a *problem*, never of a *specific op*.
+
+5. **Root cause = aggregate numerical sensitivity, not a bug.** All ops pass
+   *within tolerance*, but Vulkan is not bit-exact to CPU (fp16-class accumulation
+   vs fp32). Those in-tolerance per-op deltas ACCUMULATE across the deep flow (22
+   DiT layers × 6 CFM Euler steps) and are amplified by the CFM ODE integration +
+   the log-mel HiFT vocoder's sensitivity → audible noise. The LM survives because
+   it is shallow-per-token and robust. cosine 0.961 (distributed small error, not
+   a localized drop or NaN) is the signature of accumulation, not a broken kernel.
+   There is nothing to file upstream and no single op to fix; the all-CPU route
+   stays correct. (Corollary: a numerically-sensitive generative head — flow
+   matching / diffusion + a log-domain vocoder — may be un-portable to a
+   lower-accumulation backend even when every op is individually "correct.")
+
+6. **Process bug worth remembering: a global find-replace can eat a function's own
+   body.** Converting ~15 `ggml_backend_sched_*(ctx->sched, gf)` call sites to
+   thin `cv3_sched_*(ctx, gf)` shims via a blanket string replace ALSO rewrote the
+   `ggml_backend_sched_*` calls INSIDE the shim definitions → the shims called
+   themselves → infinite recursion → stack-overflow SIGSEGV on any non-gallocr
+   (CPU/Metal) path. It hid because the gallocr branch skipped the recursion, so
+   only the "other" backend crashed — and I first misattributed it to a stale
+   build. When a blanket replace targets a name, exclude the definitions of the
+   wrappers you're routing THROUGH.

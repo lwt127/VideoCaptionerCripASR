@@ -39,6 +39,7 @@
 #include "core/lstm.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "core/crispasr_env.h"
+#include "core/phoneme_dialect.h" // #316: one G2P, several phoneme conventions
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -3251,9 +3252,15 @@ bool phonemize_cached(kokoro_context* ctx, const std::string& lang, const std::s
         if (skip_builtin)
             return false;
         bool ok = false;
-        if (lang == "en" || lang == "en-us" || lang == "en-gb")
-            ok = crispasr::phonemize_builtin_en(lang, text, out);
-        else if (lang == "de")
+        if (lang == "en" || lang == "en-us" || lang == "en-gb") {
+            // #316: prefer misaki's own lexicon — Kokoro was trained on its
+            // output, and CMUdict disagrees with it on ~42% of words (stress
+            // and unstressed vowels, not spelling). Falls back automatically
+            // when the lexicon is not installed.
+            ok = crispasr::phonemize_misaki_en(lang, text, out);
+            if (!ok)
+                ok = crispasr::phonemize_builtin_en(lang, text, out);
+        } else if (lang == "de")
             ok = crispasr::phonemize_builtin_de(lang, text, out);
         else if (lang == "fr" || lang == "fr-fr")
             ok = crispasr::phonemize_builtin_fr(lang, text, out);
@@ -3290,6 +3297,21 @@ bool phonemize_cached(kokoro_context* ctx, const std::string& lang, const std::s
     if (ok && !out.empty()) {
         if (is_cmn_lang(lang))
             strip_cmn_tone_numbers(out);
+        // #316: our G2P (and espeak) speak textbook IPA — `tʃ`, `oʊ`, `ː`.
+        // Kokoro was trained on misaki's alphabet, which uses `ʧ`, `O` and no
+        // length marks. Every symbol is in the vocab either way, so nothing is
+        // dropped and nothing errors; the model just gets a token sequence it
+        // never saw in training and drifts ("sounds British"). Rewrite it.
+        // Kokoro-scoped on purpose: piper wants the espeak spelling.
+        // Default ON; CRISPASR_KOKORO_MISAKI_IPA=0 restores the raw G2P
+        // spelling for A/B (never delete the old path).
+        static const bool misaki_ipa = [] {
+            const char* v = crispasr_env::get("CRISPASR_KOKORO_MISAKI_IPA");
+            return !(v && *v && strcmp(v, "0") == 0);
+        }();
+        const bool is_en = lang.empty() || lang.rfind("en", 0) == 0;
+        if (is_en && misaki_ipa)
+            out = core_phoneme::convert(out, core_phoneme::Dialect::Misaki);
         ctx->phon_cache.insert(key, out);
         return true;
     }

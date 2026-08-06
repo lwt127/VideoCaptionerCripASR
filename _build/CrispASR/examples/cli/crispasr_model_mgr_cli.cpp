@@ -7,8 +7,11 @@
 #include "crispasr_cache.h"
 #include "crispasr_model_registry.h"
 
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <string>
+#include <sys/stat.h>
 
 #if defined(_WIN32)
 #include <io.h>
@@ -134,6 +137,33 @@ std::string crispasr_resolve_model_cli(const std::string& model_arg, const std::
     FILE* f = fopen(effective_model_arg.c_str(), "rb");
     if (f) {
         fclose(f);
+        return effective_model_arg;
+    }
+    const int open_errno = errno;
+
+    // fopen failed. Distinguish "no such entry" (maybe a registry model *name*
+    // to download — handled below) from "the entry exists but we can't open
+    // it" (a dangling/unreadable symlink, a permission problem, an unmounted
+    // volume). For the latter, do NOT silently substitute a downloadable
+    // default: that masks a real "your file is unreadable" error as "loaded
+    // some other model" (observed with a -m pointing at a symlink whose target
+    // was offline — the whisper default ggml-base.bin was loaded instead).
+    // Surface a clear error and return the path so the load layer fails on it.
+    bool entry_exists = false;
+#if !defined(_WIN32)
+    struct stat lst;
+    if (lstat(effective_model_arg.c_str(), &lst) == 0)
+        entry_exists = true; // the path names a real filesystem entry
+#endif
+    if (entry_exists || open_errno == EACCES || open_errno == EPERM) {
+        fprintf(stderr, "crispasr: cannot open model file '%s': %s\n", effective_model_arg.c_str(),
+                std::strerror(open_errno));
+#if !defined(_WIN32)
+        if (entry_exists && S_ISLNK(lst.st_mode))
+            fprintf(stderr, "  (it is a symlink — its target may be missing or on an unmounted/unreadable volume)\n");
+#endif
+        fprintf(stderr, "  Refusing to substitute a downloadable default for an explicit --model path.\n"
+                        "  Fix the file/permissions, or pass -m auto to download a model.\n");
         return effective_model_arg;
     }
 

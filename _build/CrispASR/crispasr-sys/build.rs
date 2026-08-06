@@ -109,12 +109,18 @@ fn has_built_lib(build_dir: &Path, lib_name: &str) -> bool {
         // Legacy `whisper` alias produced by the same target.
         build_dir.join("src").join("libwhisper.dylib"),
         build_dir.join("src").join("libwhisper.so"),
-        // MSVC multi-config: import lib lives under `src/Release/`.
+        // MSVC multi-config (Visual Studio generator, e.g. the release
+        // bundle): import lib lives under `src/Release/`.
         build_dir
             .join("src")
             .join("Release")
             .join(format!("{lib_name}.lib")),
         build_dir.join("src").join("Release").join("whisper.lib"),
+        // Single-config on Windows (Ninja / NMake, e.g. `build-windows.bat`):
+        // the import lib lands directly under `src/` with no `Release/` level,
+        // so a local source build is consumable via CRISPASR_SYS_LIB_DIR too.
+        build_dir.join("src").join(format!("{lib_name}.lib")),
+        build_dir.join("src").join("whisper.lib"),
         // Flat layouts (e.g., users who pointed CRISPASR_SYS_LIB_DIR at a
         // directory that already contains the libs without the `src/`
         // prefix).
@@ -291,6 +297,14 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CRISPASR_LIB_NAME");
     println!("cargo:rerun-if-env-changed=CRISPASR_FORCE_GGML_NATIVE");
 
+    // docs.rs has neither the CrispASR sources nor a prebuilt libcrispasr.
+    // Building a *library* crate never invokes the system linker, so we can
+    // compile the FFI rlib without emitting any link directives — this lets
+    // the docs.rs build (and any consumer that only type-checks) succeed.
+    if env::var_os("DOCS_RS").is_some() {
+        return;
+    }
+
     let lib_name = link_lib_name();
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -320,7 +334,23 @@ fn main() {
         return;
     }
 
-    // (4) Build it ourselves.
+    // (4) Build it ourselves — but only if the CrispASR C/C++ sources are
+    // actually present. When this crate is pulled from crates.io the parent
+    // directory is the registry cache (no CMakeLists.txt), so cmake would
+    // fail with a cryptic error. Emit an actionable one instead, pointing at
+    // the two supported ways to consume the crate from the registry.
+    if !src_root.join("CMakeLists.txt").exists() {
+        panic!(
+            "crispasr-sys: no prebuilt libcrispasr found and the CrispASR C/C++ \
+             sources are not present at {} (expected a CMakeLists.txt).\n\
+             When depending on this crate from crates.io, either:\n  \
+             • set CRISPASR_LIB_DIR to a directory holding a prebuilt \
+             libcrispasr, or\n  \
+             • depend on it via git so build.rs can build it from source:\n      \
+             crispasr = {{ git = \"https://github.com/CrispStrobe/CrispASR\" }}",
+            src_root.display()
+        );
+    }
     let build_dir = configure_and_build(src_root);
     add_build_dir_search(&build_dir);
     emit_runtime_rpath(&build_dir);

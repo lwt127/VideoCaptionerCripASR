@@ -3663,6 +3663,15 @@ static int start_decoder(vorb *f)
    {
       f->comment_list = (char**) setup_malloc(f, sizeof(char*) * (f->comment_list_length));
       if (f->comment_list == NULL)                  return error(f, VORBIS_outofmem);
+      // CrispASR patch: setup_malloc is a plain malloc, so these pointers start
+      // as garbage. The loop below can `return error(...)` partway through (short
+      // read or OOM) while comment_list_length keeps its full, ATTACKER-CONTROLLED
+      // value — and vorbis_deinit then frees every slot up to that length,
+      // including the ones never assigned. Found by the fuzz-smoke job:
+      // "SEGV in __asan::Allocator::Deallocate <- free <- setup_free <-
+      // vorbis_deinit <- stb_vorbis_open_memory" on a malformed Ogg reaching
+      // crispasr_audio_load. Zeroing makes the partial-init path free only NULLs.
+      memset(f->comment_list, 0, sizeof(char*) * (f->comment_list_length));
    }
 
    for(i=0; i < f->comment_list_length; ++i) {

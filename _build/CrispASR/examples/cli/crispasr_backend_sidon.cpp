@@ -37,7 +37,7 @@ public:
             ctx_ = nullptr;
         }
     }
-    ~SidonBackend() override { shutdown(); }
+    ~SidonBackend() override { SidonBackend::shutdown(); }
 
 private:
     sidon_context* ctx_ = nullptr;

@@ -8,6 +8,7 @@
 // library is linked in.
 std::unique_ptr<CrispasrBackend> crispasr_make_whisper_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_nemotron_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_gigaam_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_parakeet_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_canary_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_canary_qwen_backend();
@@ -102,8 +103,14 @@ std::unique_ptr<CrispasrBackend> crispasr_make_omnivoice_backend();
 // ---------------------------------------------------------------------------
 
 std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name) {
-    if (name == "whisper")
+    // "tiron" (#295) is a Whisper large-v3 checkpoint with inline <|speakerN|>
+    // markers — it runs on the whisper backend, which auto-detects the speaker
+    // vocab and enables the tiron constrained-decoding grammar. The alias only
+    // affects the model-registry lookup + CLI dispatch.
+    if (name == "whisper" || name == "tiron")
         return crispasr_make_whisper_backend();
+    if (name == "gigaam" || name == "gigaam-v3" || name == "gigaam3")
+        return crispasr_make_gigaam_backend();
     if (name == "nemotron" || name == "nemotron-streaming" || name == "nemotron-3.5" || name == "nemotron-asr" ||
         name == "nemotron-speech-streaming")
         return crispasr_make_nemotron_backend();
@@ -139,7 +146,7 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_fastconformer_ctc_backend();
     if (name == "wav2vec2" || name == "hubert" || name == "data2vec")
         return crispasr_make_wav2vec2_backend();
-    if (name == "vibevoice")
+    if (name == "vibevoice" || name == "vibevoice-bitnet" || name == "vibevoice-asr-bitnet")
         return crispasr_make_vibevoice_backend();
     if (name == "vibevoice-tts")
         return crispasr_make_vibevoice_tts_backend();
@@ -284,6 +291,7 @@ std::vector<std::string> crispasr_list_backends() {
     return {
         "whisper",
         "nemotron",
+        "gigaam",
         "parakeet",
         "reazonspeech",
         "canary",
@@ -307,6 +315,7 @@ std::vector<std::string> crispasr_list_backends() {
         "hubert",
         "data2vec",
         "vibevoice",
+        "vibevoice-bitnet",
         "kugelaudio",
         "qwen3-tts",
         "miotts",
@@ -743,6 +752,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "miotts";
     if (contains_ci("piano") && contains_ci("transcription"))
         return "piano-transcription";
+    if (contains_ci("gigaam"))
+        return "gigaam";
     if (contains_ci("ggml-") && contains_ci(".bin"))
         return "whisper";
 
@@ -767,6 +778,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "sidon";
             else if (a == "nemotron" || a == "nemotron-asr" || a == "nemotron-streaming")
                 result = "nemotron";
+            else if (a == "gigaam")
+                result = "gigaam";
             else if (a == "parakeet")
                 result = "parakeet";
             else if (a == "parakeet-tdt" || a == "parakeet-ja" || a == "parakeet_ja")
@@ -846,7 +859,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "granite-4.1-nar";
             else if (a == "wav2vec2" || a == "wav2vec2-ctc")
                 result = "wav2vec2";
-            else if (a == "vibevoice" || a == "vibevoice-asr" || a == "vibevoice_asr")
+            else if (a == "vibevoice" || a == "vibevoice-asr" || a == "vibevoice_asr" || a == "vibevoice-bitnet" ||
+                     a == "vibevoice-asr-bitnet" || a == "vibevoice_bitnet")
                 result = "vibevoice";
             else if (a == "kugelaudio" || a == "kugelaudio-tts" || a == "kugelaudio_tts")
                 result = "kugelaudio";

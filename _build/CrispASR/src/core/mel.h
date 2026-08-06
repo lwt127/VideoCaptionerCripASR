@@ -195,6 +195,14 @@ struct Params {
     // thread_local scratch (voxtral) — none use shared mutable state, so the
     // parallel path is correctness-safe; the remaining gate is per-arch perf.
     bool allow_parallel_stft = false;
+
+    // Thread budget for the parallel STFT. 0 (default) keeps the previous
+    // behaviour: the OpenMP path uses omp_get_max_threads() and the portable
+    // std::thread path uses min(hardware_concurrency, 8). A positive value caps
+    // both paths to that many threads WITHOUT mutating global OpenMP state —
+    // callers wanting a specific budget set this instead of omp_set_num_threads()
+    // (which races across concurrent callers of the shared OpenMP thread count).
+    int n_threads = 0;
 };
 
 // Compute log-mel spectrogram from raw PCM samples.

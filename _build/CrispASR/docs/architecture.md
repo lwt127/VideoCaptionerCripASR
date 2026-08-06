@@ -537,6 +537,31 @@ tok_emb shape (vocab_size + 3). Supports arbitrarily long audio input.
 σ-VAE ConvNeXt encoders + Qwen2.5-7B decoder. Dual-mode: ASR (with
 timestamps, diarization, hotwords) and TTS (DPM-Solver++ flow matching).
 
+**The ASR answer is JSON, and the adapter parses it.** The system prompt says
+"transcribes audio input into text output in JSON format" and the user turn asks
+for the keys `Start time, End time, Speaker ID, Content`, so the model replies
+with an array of utterances:
+
+```json
+[{"Start":0.0,"End":10.99,"Speaker":0,"Content":"…"},
+ {"Start":11.32,"End":15.65,"Speaker":1,"Content":"…"}]
+```
+
+`core_vibevoice::parse` (`src/core/vibevoice_transcript.h`) turns that into one
+`crispasr_segment` per utterance — timings from Start/End offset into the chunk,
+speaker as the structured `"(Speaker N) "` label — which is what makes the
+diarization reachable in file output, `--stream`, `--stream-json` and the
+bindings. Until v0.8.24 the whole blob was one segment's `text` (#300), so the
+labels were literal JSON and `seg.speaker` was never set.
+
+It is a deliberately tolerant scanner rather than a strict JSON reader: a decode
+that hits the token cap ends mid-array, and a strict parse would discard every
+complete utterance before the cut. Unparseable output falls back to the raw
+string, and `CRISPASR_VIBEVOICE_RAW_TRANSCRIPT=1` restores the pre-v0.8.24
+single-segment behaviour for callers that parse the blob themselves. Because the
+model punctuates and sentence-cases its own Content, the adapter declares
+`CAP_PUNCTUATION_NATIVE` so the CLI's FireRedPunc pass does not run over it.
+
 ### mimo-asr
 
 6L input_local_transformer (1024d) + 36L Qwen2 LM (4096d, 32Q/8KV);
@@ -694,6 +719,38 @@ native timestamps and speaker IDs.
 speaker-labelled transcription. Hotwords are injected into the system prompt
 via `热词提示：word1, word2`. The user turn wraps the audio pad sequence
 between `<|audio_start|>` and `<|audio_end|>`.
+
+### tiron ⚠️ *experimental* (#295)
+
+Multi-speaker meeting ASR (`Trelis/tiron`, Apache-2.0). A **drop-in
+`WhisperForConditionalGeneration`** — Whisper **large-v3** (128-mel, 32 enc +
+32 dec, 1280d) with an **extended vocab** (51904): `<|speaker1|>`..`<|speaker8|>`
+(ids 51866–51873, contiguous above the 1501-token timestamp block) + `<|nospeech|>`.
+It runs on the **whisper backend** (alias `tiron`); the loader auto-detects the
+speaker tokens (`whisper_has_speaker_tokens`) and switches the decode.
+
+**Decode.** Not plain greedy — a port of the harness's constrained-decoding
+grammar (`whisper_tiron_apply_grammar`, from `tiron/constraints.py`; plain greedy
+loses ~5 cpWER): step 0 forces `<|speaker1|>`/`<|nospeech|>`; a speaker tag forces
+an opening timestamp; text runs until a closing timestamp; a closing timestamp
+allows EOS, another opening ts (same speaker continues), or the **next** speaker
+slot (`speaker_blocks`); `no_repeat_ngram_size=15`. Per-speaker timelines are
+**non-monotonic** (a later speaker opens earlier in the window), so the stock
+whisper "timestamps must increase / don't go back in time" seek rules are
+disabled for a speaker vocab. Driven exactly as `engine.py`: a 0.75 s onset pad,
+**fixed non-overlapping 30 s windows** (the whisper adapter declares
+`CAP_INTERNAL_CHUNKING` so the CLI passes the whole clip), and an RMS silent-
+window gate. Validated byte-exact (f16 **and** q8_0 token stream) vs the Python
+reference (`tools/reference_backends/tiron.py`).
+
+**Speaker indices are window-LOCAL.** `crispasr_tiron_link_speakers`
+(`src/tiron_link.{h,cpp}`) promotes them to meeting-level `SPEAKER_NN` by
+clustering per-(window, local-speaker) group voiceprints (TitaNet/ECAPA +
+agglomerative cosine), with a within-window must-link "spine". Hoisted into the
+library (`crispasr_tiron_link_transcript`) so the CLI and server both apply it;
+opt-in via `--diarize` / `--diarize-embedder`. GGUFs at
+[`cstr/tiron-GGML`](https://huggingface.co/cstr/tiron-GGML) (f16 + q4_k, quantized
+with `crispasr-legacy-quantize` — the whisper-bin quantizer).
 
 ### qwen3-tts
 
@@ -989,6 +1046,159 @@ runtime. **Two separate checkpoints**: `en-x` for English-source
 translation, `x-en` for English-target. Pick whichever matches your
 direction (`-sl`/`-tl`) — the auto-download path picks `en-x` by
 default; load `x-en` explicitly with `-m <path>` for X→English.
+
+### foxnose-diarize
+
+Speaker diarization via `--diarize-method foxnose` (#324), an alternative to
+the pyannote path. Ported from the recipe in
+[FoxNoseTech/diarize](https://github.com/FoxNoseTech/diarize); the algorithms
+are standard published methods and the implementation is independent, so the
+tree stays MIT (see below).
+
+```
+speech regions (the caller's segments — no separate VAD)
+  -> sliding windows: skip < 0.4 s, embed whole if <= 1.8 s, else 1.2 s / 0.6 s hop
+  -> WeSpeaker ResNet34-LM  ->  256-d embedding per window
+  -> speaker count: cosine-p10 veto -> PCA(8) -> full-covariance GMM BIC sweep
+                    -> silhouette refinement (score = sil + 0.04*log k)
+  -> spectral clustering on (cos+1)/2 affinity -> spherical centroid refinement
+  -> temporal smoothing: Viterbi (0.18 switch penalty) -> restore sustained runs
+                         -> collapse A-B-A islands <= 1.2 s
+  -> merge adjacent same-speaker turns closer than 0.7 s
+```
+
+Components: `src/wespeaker.{h,cpp}` (embedder),
+`src/core/spectral_diarize.{h,cpp}` (counting + clustering),
+`src/core/diarize_smooth.{h,cpp}` (temporal), `src/core/foxnose_pipeline.{h,cpp}`
+(orchestration), `src/core/der.h` (the metric).
+
+The pipeline takes its embedder as a function pointer rather than linking one
+in, which keeps `core/` model-free and — more usefully — makes the whole
+orchestration testable with a synthetic embedder whose speakers are known by
+construction. A model-driven test cannot separate "the pipeline is wrong" from
+"the embedder is weak".
+
+**Licensing.** The WeSpeaker *weights* are CC-BY-4.0 (not Apache-2.0 as some
+downstream projects state), so redistributing the GGUF requires attribution —
+see `THIRD_PARTY_NOTICES.txt`. The upstream *code* is Apache-2.0 and none of it
+is incorporated: `clustering.py` is a sequence of scikit-learn calls rather
+than implementations, so there was nothing to translate, and what was taken is
+the recipe and its tuned constants — parameters and facts, not copyrightable
+expression.
+
+**Parity.** Bit-exact agreement with scikit-learn is unachievable: its
+k-means++ seeding, GMM initialisation and ARPACK eigensolver all ride its own
+RNG stream. The gates are therefore known-answer unit tests (375 assertions
+over 57 hermetic cases) plus DER, not label equality. Output IS deterministic
+across runs — everything is explicitly seeded.
+
+**Speaker counting uses the upstream GMM/BIC + silhouette sweep by default.**
+`CRISPASR_DIARIZE_COUNT=eigengap` selects an eigengap-of-the-Laplacian
+estimator instead (with row-wise affinity thresholding, without which the
+dense cosine affinity puts the largest gap at k=1 and it reports one speaker
+for everything). Eigengap is better on well-separated synthetic data and
+cheaper, but it UNDER-counts on real speech and scores materially worse:
+pooled DER over 8 VoxConverse dev files against human labels is 5.3% for
+`bic` and 11.4% for `eigengap`, against upstream Python's 3.1%.
+
+**Benchmarked accuracy.** Over 8 VoxConverse dev files against human labels
+(0.25 s collar, optimal 1:1 mapping), with Silero VAD supplying speech regions
+to both sides: **this port 3.18 % DER, upstream Python 3.07 %** — 0.11 points
+apart, with our speaker confusion actually lower (26.5 s vs 29.0 s). Feeding
+whole files with no VAD instead costs 2 points of pure false alarm (5.27 %),
+which is a property of the benchmark driver, not of the diarizer: the real CLI
+path takes the caller's ASR/VAD segments. With the speaker count pinned equal
+on both sides the two agree with ZERO speaker confusion.
+
+Speaker identity is consistent across slices: on the unified `crispasr_run`
+path FoxNose runs in ONE global pass after transcription
+(`crispasr_apply_foxnose_global`), taking the final segment list as its speech
+regions, and segments spanning several speakers are then split at word-aligned
+turn boundaries. Diarizing per slice cannot work — each slice clusters
+independently and restarts numbering at 0 — which is the same problem the
+pyannote path solves with a pre-computed posterior cache (#107).
+
+Env gates: `CRISPASR_DIARIZE_BIC_WINDOW=1` (restrict silhouette to a window
+around the BIC anchor instead of the full speaker range, which is the default),
+`CRISPASR_WESPEAKER_BENCH=1`, `CRISPASR_WESPEAKER_DEBUG=1`.
+
+### gigaam
+
+ai-sage/GigaAM-v3 — Russian ASR. A 16-layer **rotary** Conformer encoder
+(220 M params, `d_model=768`, 16 heads) with either a CTC or an RNN-T head.
+Four shipped revisions of one architecture:
+
+| revision | head | vocabulary | output |
+|---|---|---|---|
+| `ctc` | CTC | 33 Cyrillic chars | lowercase, unpunctuated |
+| `rnnt` | RNN-T | 33 Cyrillic chars | lowercase, unpunctuated |
+| `e2e_ctc` | CTC | SentencePiece 256 | punctuation + casing + ITN |
+| `e2e_rnnt` | RNN-T | SentencePiece 1024 | punctuation + casing + ITN (best WER) |
+
+One GGUF carries the head type and tokenizer kind, so a single runtime
+(`src/gigaam.cpp`) serves all four.
+
+```
+Audio → log-mel (64 bins, n_fft=win=320, hop=160, center=False, htk, power=2,
+                 ln(clamp(x, 1e-9)) — NO z-norm, NO pre-emphasis)
+      → conv1d striding subsample: 2 x [Conv1d(k=5, s=2, p=2) + ReLU]  (4x)
+      → 16 x Conformer block:
+            FFN1(x0.5) -> rotary MHA -> conv(dw k=5 + LayerNorm) -> FFN2(x0.5) -> LN
+      → CTC head (Conv1d k=1 + log_softmax + greedy collapse)
+        or RNN-T head (Embedding + 1-layer LSTM predictor, joint enc/pred
+        -> ReLU -> Linear, greedy with max 10 symbols per frame)
+```
+
+Three details are easy to get wrong and are worth stating explicitly — all
+three come from reading `modeling_gigaam.py`, not from Conformer convention:
+
+- **RoPE is applied to the block INPUT, before the Q/K/V projections.**
+  `RotaryPositionMultiHeadAttention.forward` receives `x, x, x`, rotates
+  `query`/`key` (which are still the raw hidden state, reshaped to
+  `(T, B, n_heads, head_dim)`), and only then calls `forward_qkv`. So
+  `Q = Wq·RoPE(x)`, `K = Wk·RoPE(x)`, and `V = Wv·x` — **V is projected
+  from the unrotated input.**
+- **The rotary base is 5000, not 10000.** `RotaryPositionalEmbedding` is
+  constructed as `(d_model // n_heads, pos_emb_max_len)` against
+  `PositionalEncoding.__init__(self, dim, base)`, so `pos_emb_max_len`
+  lands in the `base` slot. The converter writes it out as
+  `gigaam.rope_base` rather than letting the runtime re-derive it.
+- **`conv.batch_norm` is a LayerNorm.** `conv_norm_type='layer_norm'`
+  makes the conv module's `batch_norm` submodule an `nn.LayerNorm`, so
+  its weight/bias are LN affine parameters and there are no running
+  statistics to fold.
+
+`rtt_half` is the rotate-half (NEOX) pairing over `head_dim=48`, which maps
+onto `ggml_rope_ext(..., GGML_ROPE_TYPE_NEOX)` exactly. The FFN / conv /
+macaron halves are shape-identical to every other Conformer in the tree, so
+the weight container is `core_conformer::BlockWeights`; only the attention
+differs, which is why `gigaam.cpp` has its own block builder rather than
+calling the rel-pos `core_conformer::build_block`.
+
+Batch is always 1 in this runtime, and the blueprint only builds an
+attention mask when `batch > 1` — so full unmasked attention is correct and
+the conv module's `pad_mask` is a no-op.
+
+Preprocessing note: the Hann window and the mel filterbank are copied out of
+the checkpoint by `models/convert-gigaam-to-gguf.py` rather than rebuilt,
+which removes a whole class of window-convention and mel-normalization
+scale bugs. The mel is un-normalized log-mel in roughly `[-20.7, +5]`, so
+`encoder.pre.*` stays at F32 in every quant (the same reasoning as
+nemotron's pre-encode, #81), and the quantizer also keeps `joint.*`,
+`decoder.*` and `head.ctc.*` at source precision.
+
+The adapter declares `sole_language() == "ru"`, so `-l auto` resolves to
+Russian without downloading and running a whisper-tiny LID pass (#227), and
+`CAP_PUNCTUATION_NATIVE` for every revision — not only because the `e2e_*`
+ones already punctuate, but because the auto-enabled restorer (FireRedPunc)
+is a Chinese/English model that injects full-width CJK punctuation into
+Russian. An explicit `--punc-model` still applies.
+
+Env gates: `CRISPASR_GIGAAM_BENCH=1` (per-stage timings),
+`CRISPASR_GIGAAM_DEBUG=1`, `CRISPASR_GIGAAM_FLASH=1` (flash attention in
+the encoder — opt-in until it has its own A/B),
+`CRISPASR_GIGAAM_FORCE_SCALAR=1` (scalar LSTM/joint instead of cblas),
+`CRISPASR_GIGAAM_QUANT_ALL=1` (quantize the heads too).
 
 ### paraformer
 

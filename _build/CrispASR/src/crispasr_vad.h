@@ -135,9 +135,18 @@ inline std::vector<crispasr_audio_slice> crispasr_post_merge_vad_slices(const st
 // `vad_model_path` must be a concrete file path; auto-download /
 // cache resolution is the caller's responsibility (CLI handles it
 // via crispasr_cache; wrappers can ship the GGUF as an asset).
+//
+// An empty result is ambiguous — no speech vs. the model failing to load.
+// When `out_load_failed` is non-null it is set to `true` iff the model
+// could not be loaded (silero/marblenet/whisper-vad returned no context),
+// and `false` otherwise (including a successful run that found no speech).
+// This lets a caller (issue #311 --strict-pipeline) distinguish "VAD ran,
+// no speech" from "VAD model unloadable". webrtc (no model) and firered are
+// reported as loaded. Detection is best-effort — it never false-positives.
 std::vector<crispasr_audio_slice> crispasr_compute_vad_slices(const float* samples, int n_samples, int sample_rate,
                                                               const char* vad_model_path,
-                                                              const crispasr_vad_options& opts);
+                                                              const crispasr_vad_options& opts,
+                                                              bool* out_load_failed = nullptr);
 
 // Same shape as above but without VAD: returns fixed `chunk_seconds` windows
 // (one slice covering the whole buffer when it's shorter than a chunk).

@@ -29,6 +29,7 @@
 #include "core/crispasr_env.h"
 
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1141,14 +1142,19 @@ extern "C" char* m2m100_translate(struct m2m100_context* ctx, const char* text, 
     } else {
         int offset = prompt_len;
         for (int step = 0; step < max_new_tokens; step++) {
-            // Greedy: argmax
-            int best_id = 0;
-            float best_val = logits[0];
-            for (int i = 1; i < hp.vocab_size; i++) {
-                if (logits[i] > best_val) {
+            // Greedy: argmax — NaN-robust (see lfm2_audio note). Seed from -inf,
+            // skip non-finite, abort if the whole row is non-finite.
+            int best_id = -1;
+            float best_val = -std::numeric_limits<float>::infinity();
+            for (int i = 0; i < hp.vocab_size; i++) {
+                if (std::isfinite(logits[i]) && logits[i] > best_val) {
                     best_val = logits[i];
                     best_id = i;
                 }
+            }
+            if (best_id < 0) {
+                fprintf(stderr, "m2m100: non-finite logits — aborting decode\n");
+                break;
             }
 
             if (best_id == hp.eos_token_id)

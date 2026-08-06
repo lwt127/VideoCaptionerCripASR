@@ -18,6 +18,22 @@ The default and recommended path is **session-scoped clustering**. The named
 path exists, is **off by default**, and should only be used deliberately and
 with the obligations in the last section understood.
 
+> **Streaming?** Both columns above are **recorded-file (offline)** features.
+> For live transcription, a backend that emits a structured per-segment speaker
+> label (`moss-diarize`; `vibevoice` from v0.8.24; `granite` in speaker-aware
+> `--diarize` mode) surfaces its own per-utterance `(Speaker N)` labels under
+> `--stream` — but the cross-recording clustering and named-voiceprint paths
+> here do not run in real time. See [`streaming.md`](streaming.md#speaker-diarization-while-streaming).
+
+> **From a binding?** The same native label is on the session ABI from v0.8.24 —
+> `crispasr_session_result_segment_speaker(result, i)` in C, `.speaker` on
+> Python's `SessionSegment`, `.Speaker` on Go's `TranscribeSegment`, `.speaker`
+> on Dart's `SessionSegment`. It is `""` when the backend does not diarize
+> natively, and its ordinals are **chunk-local** — `Speaker 1` from one
+> `transcribe()` call is not necessarily the same voice as `Speaker 1` from the
+> next, because no cross-chunk clustering runs there. Use the `diarize_*`
+> helpers in section 1 when you need labels stable across a whole recording.
+
 ---
 
 ## 1. Session-scoped speaker clustering (recommended)
@@ -245,3 +261,107 @@ To stay clearly on the safe side, prefer **section 1** and rename manually.
   points; the pre-#266 ungated `_load`/`_enroll` symbols refuse at runtime.
 
 See [`cli.md`](cli.md#diarization) for the full diarization flag reference.
+
+## pyannote segmentation: chunked inference and the powerset layout (#326)
+
+Two changes landed together here, one a speed fix and one a correctness fix
+that was found while measuring the first.
+
+### Chunked parallel inference
+
+`pyannote_seg_run` used to push the entire file through as ONE sequence. The
+segmentation net is SincNet → 4 stacked bidirectional LSTMs → classifier, and
+an LSTM recurrence is inherently sequential, so the dominant stage ran on
+exactly two threads (one per direction) no matter what `-t` said. At
+16.875 ms per frame a 48-minute recording is 171k timesteps, ~70% of
+segmentation time, with every core past the second one idle.
+
+Audio is now cut into fixed 60 s chunks that are inferred concurrently, each
+with 5 s of real audio spliced on either side and then trimmed. That context
+absorbs the two edge effects — the k=5 convolutions' zero padding and the LSTM
+starting from a zero hidden state.
+
+Measured on a 2888 s file (M1, 8 cores), whole-file vs chunked:
+
+| `-t` | whole-file | chunked |
+|---|---|---|
+| 1 | ~50 s | 47.0 s |
+| 2 | ~50 s | 25.2 s |
+| 4 | ~50 s | 18.5 s |
+| 8 | 49.8–56.1 s | 18.1 s |
+
+Two properties worth relying on:
+
+* **Output does not depend on `-t`.** Chunking is decided by audio length
+  alone; the thread count only picks how many chunks are in flight. `-t 1`,
+  `2`, `4` and `8` produce byte-identical posteriors on a 2888 s file.
+* **Accuracy does not regress.** On the VoxConverse dev shard (8 files, DER vs
+  human labels) every chunked setting beat the single scan:
+  whole-file 33.37%, 60/ctx2 32.88%, **60/ctx5 30.67%**, 60/ctx10 31.87%,
+  120/ctx5 31.08%, 120/ctx10 29.88%.
+
+  ⚠ Read those as a RELATIVE A/B of the segmenter only, never as pipeline
+  quality. They score the raw powerset posteriors with the local speaker
+  tracks taken as global identity — no embedder, no clustering. The shard
+  averages 4.5 speakers per file and the segmentation head models at most 3
+  LOCALLY, so ~30% is that harness's floor, not the product's. Scored end to
+  end on the same files and the same scorer, what actually ships is:
+
+  | path | mean DER |
+  |---|---|
+  | raw posteriors, no clustering (the A/B harness above) | 33.37% |
+  | `--diarize-method pyannote --diarize-embedder auto` | **15.74%** |
+  | `--diarize-method foxnose` (#324) | **7.32%** |
+
+  foxnose is the one to reach for. The pyannote+TitaNet path over-clusters: it
+  hit the `--diarize-max-speakers 8` cap on 4 of the 8 files (esrit 8 vs 5 real,
+  mesob 8 vs 4, nnqfq 8 vs 5), which is where most of its remaining DER lives.
+  (The 7.32% here is foxnose labelling whisper-tiny's ASR segments; #324's
+  3.18% scored foxnose's own turns directly, without ASR segmentation as a
+  ceiling. Different measurement, not a regression.)
+
+This also moves toward pyannote's own design rather than away from it:
+upstream infers on a sliding 10 s window, and one continuous 48-minute scan
+was the outlier.
+
+Tunable with `CRISPASR_PYANNOTE_CHUNK_S` (0 restores the single scan) and
+`CRISPASR_PYANNOTE_CHUNK_CONTEXT_S`.
+
+Because each chunk numbers its local speakers arbitrarily, chunks are stitched
+by choosing, per seam, the relabelling of {spk0, spk1, spk2} that best matches
+the previous chunk on the frames they both cover. That pass is sequential but
+pure arithmetic over a few seconds of frames, so it costs nothing next to the
+forward passes.
+
+### The powerset class layout was wrong
+
+The segmentation head emits one probability per *subset* of the ≤3 locally
+active speakers, enumerated by increasing subset size:
+
+```
+0 = {}        1 = {spk0}      2 = {spk1}      3 = {spk2}
+              4 = {spk0,spk1} 5 = {spk0,spk2} 6 = {spk1,spk2}
+```
+
+`SPK_MASK` had **3 and 4 swapped** — it read class 3 as "spk0+spk1" and class 4
+as "spk2 alone". Every frame in which the third local speaker was talking
+alone was therefore credited to the first two speakers as if they were talking
+over each other, and real overlap was credited to a speaker who was silent.
+
+The ground truth gives the layout away, because the implied overlap fraction
+is only plausible under one reading of the table:
+
+| file | GT overlap | as `{4,5,6}` (correct) | as `{3,5,6}` (old) |
+|---|---|---|---|
+| fsaal | 0.42% | 0.17% | 62.65% |
+| jyirt | 0.09% | 0.00% | 28.32% |
+| mesob | 28.84% | 34.05% | 0.00% |
+| nnqfq | 14.40% | 10.14% | 48.40% |
+
+Fixing it moved mean DER on that shard from **48.21% to 33.37%**.
+
+The bug survived because every existing test used at most two speakers, where
+the wrong table and the right one agree. The layout now lives in one place —
+`src/core/powerset.h` — with `tests/test-powerset.cpp` guarding the
+singleton/pair split, bijectivity, and permutation closure. Nothing downstream
+should hard-code a class number; derive it.

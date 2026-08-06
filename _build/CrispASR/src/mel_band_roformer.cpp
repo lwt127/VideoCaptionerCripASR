@@ -21,11 +21,30 @@
 #include "core/gguf_loader.h" // core_gguf::{open_metadata,kv_u32,load_weights}
 #include "core/istft.h"       // core_istft::istft (torch center=True match)
 
+// BLAS for the linear() SGEMM. #296: the forward is ~264 GFLOP of matmul; without
+// a BLAS backend linear() falls back to a scalar loop that took ~24 min on an 11s
+// clip (Linux/Windows), while macOS was fast via Accelerate. Use the portable
+// cblas the same way cohere/crispasr-core do: Accelerate on Apple, <cblas.h>
+// (OpenBLAS/MKL) elsewhere when the build found one (HAVE_BLAS).
 #if defined(__APPLE__)
-#include <Accelerate/Accelerate.h> // cblas_sgemm for the diff-probe forward
+#include <Accelerate/Accelerate.h> // cblas + vDSP, no external deps
+#elif defined(HAVE_BLAS)
+#include <cblas.h>
+#endif
+
+// #296: run_time/run_freq parallelise the band/time loops with OpenMP and each
+// block calls BLAS — a threaded BLAS would nest and oversubscribe cores. Pin BLAS
+// to one thread. Gated on CRISPASR_MBR_OPENBLAS (set by CMake ONLY when OpenBLAS
+// is the linked BLAS), so the symbol is guaranteed present — no __attribute__(
+// (weak)), which MSVC rejects. Reference cblas / MKL / Accelerate skip this
+// (single-threaded or self-managed).
+#if defined(CRISPASR_MBR_OPENBLAS)
+extern "C" void openblas_set_num_threads(int);
 #endif
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -422,9 +441,11 @@ bool band_split_cpu(core_gguf::WeightLoad& mw, const std::vector<float>& gathere
 void linear(const std::vector<float>& x, int T, int din, const std::vector<float>& W, const std::vector<float>* bias,
             int dout, std::vector<float>& y) {
     y.assign((size_t)T * dout, 0.0f);
-#if defined(__APPLE__)
-    // y = x @ W^T (x is T x din row-major, W is dout x din row-major). Accelerate
-    // sgemm makes the naive 264-GFLOP scalar forward practical for the diff.
+#if defined(HAVE_BLAS)
+    // y = x @ W^T (x is T x din row-major, W is dout x din row-major). This SGEMM
+    // is ~264 GFLOP for a full clip and is the entire reason --separate was fast
+    // on macOS (Accelerate) but "hung" for ~24 min elsewhere (#296) — route it
+    // through cblas on every platform that has a BLAS.
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, dout, din, 1.0f, x.data(), din, W.data(), din, 0.0f,
                 y.data(), dout);
     if (bias)
@@ -432,15 +453,17 @@ void linear(const std::vector<float>& x, int T, int din, const std::vector<float
             for (int o = 0; o < dout; o++)
                 y[(size_t)t * dout + o] += (*bias)[o];
 #else
+    // No-BLAS fallback: float (not double) accumulation — the torch reference is
+    // float32, so this matches it and vectorizes; still far slower than a BLAS.
     for (int t = 0; t < T; t++) {
         const float* xr = x.data() + (size_t)t * din;
         float* yr = y.data() + (size_t)t * dout;
         for (int o = 0; o < dout; o++) {
-            double acc = bias ? (*bias)[o] : 0.0;
+            float acc = bias ? (*bias)[o] : 0.0f;
             const float* wr = W.data() + (size_t)o * din;
             for (int i = 0; i < din; i++)
-                acc += (double)wr[i] * xr[i];
-            yr[o] = (float)acc;
+                acc += wr[i] * xr[i];
+            yr[o] = acc;
         }
     }
 #endif
@@ -479,17 +502,33 @@ void rope_head(float* qh, int T, int dim_head) {
 // One RoFormer block (attention + FFN, both pre-RMSNorm, residual) over a
 // [T, dim] sequence for a SINGLE band/batch element. Layer 0 only (is_first:
 // no value-residual input). `pre` = e.g. "layers.0.0.layers.0.". Modifies x.
-bool roformer_block(core_gguf::WeightLoad& mw, const std::string& pre, std::vector<float>& x, int T, int dim, int heads,
-                    int dim_head) {
-    const int inner = heads * dim_head;
+// #296: a block's weights, read (and F16->F32 dequantized) ONCE per layer instead
+// of on every one of the num_bands / T roformer_block calls — the redundant reads
+// were a large O(T) cost in run_freq.
+struct RoformerBlockW {
     std::vector<float> nrm_g, qkv_w, gate_w, gate_b, out_w;
     std::vector<float> ff_g, ff1_w, ff1_b, ff4_w, ff4_b;
-    if (!read_f32(mw, pre + "0.norm.gamma", nrm_g) || !read_f32(mw, pre + "0.to_qkv.weight", qkv_w) ||
-        !read_f32(mw, pre + "0.to_gates.weight", gate_w) || !read_f32(mw, pre + "0.to_gates.bias", gate_b) ||
-        !read_f32(mw, pre + "0.to_out.0.weight", out_w) || !read_f32(mw, pre + "1.net.0.gamma", ff_g) ||
-        !read_f32(mw, pre + "1.net.1.weight", ff1_w) || !read_f32(mw, pre + "1.net.1.bias", ff1_b) ||
-        !read_f32(mw, pre + "1.net.4.weight", ff4_w) || !read_f32(mw, pre + "1.net.4.bias", ff4_b))
-        return false;
+};
+bool read_block_weights(core_gguf::WeightLoad& mw, const std::string& pre, RoformerBlockW& w) {
+    return read_f32(mw, pre + "0.norm.gamma", w.nrm_g) && read_f32(mw, pre + "0.to_qkv.weight", w.qkv_w) &&
+           read_f32(mw, pre + "0.to_gates.weight", w.gate_w) && read_f32(mw, pre + "0.to_gates.bias", w.gate_b) &&
+           read_f32(mw, pre + "0.to_out.0.weight", w.out_w) && read_f32(mw, pre + "1.net.0.gamma", w.ff_g) &&
+           read_f32(mw, pre + "1.net.1.weight", w.ff1_w) && read_f32(mw, pre + "1.net.1.bias", w.ff1_b) &&
+           read_f32(mw, pre + "1.net.4.weight", w.ff4_w) && read_f32(mw, pre + "1.net.4.bias", w.ff4_b);
+}
+
+bool roformer_block(const RoformerBlockW& w, std::vector<float>& x, int T, int dim, int heads, int dim_head) {
+    const int inner = heads * dim_head;
+    const auto& nrm_g = w.nrm_g;
+    const auto& qkv_w = w.qkv_w;
+    const auto& gate_w = w.gate_w;
+    const auto& gate_b = w.gate_b;
+    const auto& out_w = w.out_w;
+    const auto& ff_g = w.ff_g;
+    const auto& ff1_w = w.ff1_w;
+    const auto& ff1_b = w.ff1_b;
+    const auto& ff4_w = w.ff4_w;
+    const auto& ff4_b = w.ff4_b;
 
     // --- attention ---
     std::vector<float> xn = x;
@@ -510,38 +549,70 @@ bool roformer_block(core_gguf::WeightLoad& mw, const std::string& pre, std::vect
         rope_head(q.data() + (size_t)h * T * dim_head, T, dim_head);
         rope_head(k.data() + (size_t)h * T * dim_head, T, dim_head);
     }
-    // attention per head, scale = dim_head^-0.5, full (no mask)
-    const double scale = 1.0 / std::sqrt((double)dim_head);
+    // attention per head, scale = dim_head^-0.5, full (no mask).
+    const float scale = 1.0f / std::sqrt((float)dim_head);
     std::vector<float> attn(inner * T, 0.0f); // [h][T][dh] like q
-    std::vector<double> scores(T);
+#if defined(HAVE_BLAS)
+    // #296: per head, S = scale * Q_h @ K_h^T (T x T) -> softmax rows -> O_h =
+    // S @ V_h (T x dim_head). Two SGEMMs replace the scalar O(T^2*dim_head) triple
+    // loop that dominated run_time; softmax stays in float (matches the reference).
+    std::vector<float> S((size_t)T * T);
+    for (int h = 0; h < heads; h++) {
+        const float* qh = q.data() + (size_t)h * T * dim_head;
+        const float* kh = k.data() + (size_t)h * T * dim_head;
+        const float* vh = v.data() + (size_t)h * T * dim_head;
+        float* oh = attn.data() + (size_t)h * T * dim_head;
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, T, T, dim_head, scale, qh, dim_head, kh, dim_head, 0.0f,
+                    S.data(), T);
+        for (int m = 0; m < T; m++) {
+            float* sr = S.data() + (size_t)m * T;
+            float mx = -1e30f;
+            for (int n = 0; n < T; n++)
+                if (sr[n] > mx)
+                    mx = sr[n];
+            float sum = 0.0f;
+            for (int n = 0; n < T; n++) {
+                sr[n] = std::exp(sr[n] - mx);
+                sum += sr[n];
+            }
+            const float inv = 1.0f / sum;
+            for (int n = 0; n < T; n++)
+                sr[n] *= inv;
+        }
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, T, dim_head, T, 1.0f, S.data(), T, vh, dim_head, 0.0f,
+                    oh, dim_head);
+    }
+#else
+    std::vector<float> scores(T);
     for (int h = 0; h < heads; h++) {
         const float* qh = q.data() + (size_t)h * T * dim_head;
         const float* kh = k.data() + (size_t)h * T * dim_head;
         const float* vh = v.data() + (size_t)h * T * dim_head;
         float* oh = attn.data() + (size_t)h * T * dim_head;
         for (int m = 0; m < T; m++) {
-            double mx = -1e30;
+            float mx = -1e30f;
             for (int n = 0; n < T; n++) {
-                double dot = 0;
+                float dot = 0.0f;
                 for (int d = 0; d < dim_head; d++)
-                    dot += (double)qh[(size_t)m * dim_head + d] * kh[(size_t)n * dim_head + d];
+                    dot += qh[(size_t)m * dim_head + d] * kh[(size_t)n * dim_head + d];
                 scores[n] = dot * scale;
                 if (scores[n] > mx)
                     mx = scores[n];
             }
-            double sum = 0;
+            float sum = 0.0f;
             for (int n = 0; n < T; n++) {
                 scores[n] = std::exp(scores[n] - mx);
                 sum += scores[n];
             }
             for (int d = 0; d < dim_head; d++) {
-                double acc = 0;
+                float acc = 0.0f;
                 for (int n = 0; n < T; n++)
                     acc += scores[n] * vh[(size_t)n * dim_head + d];
-                oh[(size_t)m * dim_head + d] = (float)(acc / sum);
+                oh[(size_t)m * dim_head + d] = acc / sum;
             }
         }
     }
+#endif
     // per-head gating: out[t,h,:] *= sigmoid(gates[t,h]); gates = xn @ gate_w.T + b
     std::vector<float> gates;
     linear(xn, T, dim, gate_w, &gate_b, heads, gates); // (T, heads)
@@ -583,19 +654,33 @@ bool run_time(core_gguf::WeightLoad& mw, int L, std::vector<float>& x, int T, in
     std::vector<float> fg;
     if (!read_f32(mw, pre + "norm.gamma", fg))
         return false;
-    std::vector<float> seq((size_t)T * dim);
+    RoformerBlockW bw; // read the block weights ONCE, reuse across all bands (#296)
+    if (!read_block_weights(mw, pre + "layers.0.", bw))
+        return false;
+    // Each band is an independent Transformer over the T-axis: distinct bands
+    // write disjoint b-strides of x, and roformer_block reads only the shared
+    // (const) bw, so the band loop is embarrassingly parallel. seq is thread-local.
+    std::atomic<bool> ok{true};
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
     for (int b = 0; b < nb; b++) {
+        if (!ok.load(std::memory_order_relaxed))
+            continue;
+        std::vector<float> seq((size_t)T * dim);
         for (int t = 0; t < T; t++)
             for (int d = 0; d < dim; d++)
                 seq[(size_t)t * dim + d] = x[((size_t)t * nb + b) * dim + d];
-        if (!roformer_block(mw, pre + "layers.0.", seq, T, dim, heads, dim_head))
-            return false;
+        if (!roformer_block(bw, seq, T, dim, heads, dim_head)) {
+            ok.store(false, std::memory_order_relaxed);
+            continue;
+        }
         rms_rows(seq, T, dim, fg);
         for (int t = 0; t < T; t++)
             for (int d = 0; d < dim; d++)
                 x[((size_t)t * nb + b) * dim + d] = seq[(size_t)t * dim + d];
     }
-    return true;
+    return ok.load();
 }
 
 // Run a Transformer over the FREQ (band) axis: x is (T, nb, dim); each time
@@ -606,15 +691,28 @@ bool run_freq(core_gguf::WeightLoad& mw, int L, std::vector<float>& x, int T, in
     std::vector<float> fg;
     if (!read_f32(mw, pre + "norm.gamma", fg))
         return false;
-    std::vector<float> seq((size_t)nb * dim);
+    RoformerBlockW bw; // read the block weights ONCE, reuse across all T steps (#296)
+    if (!read_block_weights(mw, pre + "layers.0.", bw))
+        return false;
+    // Each time step is an independent Transformer over the band-axis: distinct
+    // t write disjoint nb*dim slabs of x. Parallel over T (see run_time note).
+    std::atomic<bool> ok{true};
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
     for (int t = 0; t < T; t++) {
+        if (!ok.load(std::memory_order_relaxed))
+            continue;
+        std::vector<float> seq((size_t)nb * dim);
         std::memcpy(seq.data(), x.data() + (size_t)t * nb * dim, (size_t)nb * dim * sizeof(float));
-        if (!roformer_block(mw, pre + "layers.0.", seq, nb, dim, heads, dim_head))
-            return false;
+        if (!roformer_block(bw, seq, nb, dim, heads, dim_head)) {
+            ok.store(false, std::memory_order_relaxed);
+            continue;
+        }
         rms_rows(seq, nb, dim, fg);
         std::memcpy(x.data() + (size_t)t * nb * dim, seq.data(), (size_t)nb * dim * sizeof(float));
     }
-    return true;
+    return ok.load();
 }
 
 // Mask estimator (stem 0): per band, MLP (Linear->Tanh->Linear->Tanh->Linear to
@@ -663,6 +761,51 @@ bool mask_estimator(core_gguf::WeightLoad& mw, const std::vector<float>& x, int 
     return true;
 }
 
+// FFT-based inverse STFT for a power-of-2 n_fft. Numerically equivalent to
+// core_istft::istft(..., TRIM_CENTER) — same Hann overlap-add, COLA window-sum
+// normalization and center trim — but O(n_fft log n_fft) per frame instead of the
+// shared header's naive O(n_fft^2) irfft. #296: at n_fft=2048 that DFT was ~1/3 of
+// the whole separation time. Inverse via the forward FFT:
+//   ifft(X) = conj(fft(conj(X)))/N,  and X is Hermitian ⇒ the output is real, so
+//   x[n] = Re(fft(conj(Xfull)))[n] / N.
+std::vector<float> istft_fft(const float* mag, const float* phase, int n_fft, int hop, int T_frames,
+                             const float* window) {
+    const int n_freq = n_fft / 2 + 1;
+    const int ola_len = (T_frames - 1) * hop + n_fft;
+    std::vector<float> output((size_t)ola_len, 0.0f), win_sum((size_t)ola_len, 0.0f);
+    std::vector<float> re((size_t)n_fft), im((size_t)n_fft);
+    const float invN = 1.0f / (float)n_fft;
+    for (int t = 0; t < T_frames; t++) {
+        const float* m = mag + (size_t)t * n_freq;
+        const float* p = phase + (size_t)t * n_freq;
+        // conj of the half spectrum (bins 0..N/2)
+        for (int f = 0; f < n_freq; f++) {
+            re[(size_t)f] = m[f] * std::cos(p[f]);
+            im[(size_t)f] = -(m[f] * std::sin(p[f]));
+        }
+        // Hermitian mirror of the conjugated spectrum (bins 1..N/2-1 -> N-f)
+        for (int f = 1; f < n_freq - 1; f++) {
+            re[(size_t)(n_fft - f)] = re[(size_t)f];
+            im[(size_t)(n_fft - f)] = -im[(size_t)f];
+        }
+        core_fft::fft_radix2_inplace(re.data(), im.data(), n_fft);
+        const int offset = t * hop;
+        for (int i = 0; i < n_fft && (offset + i) < ola_len; i++) {
+            const float w = window[i];
+            output[(size_t)offset + i] += re[(size_t)i] * invN * w;
+            win_sum[(size_t)offset + i] += w * w;
+        }
+    }
+    for (int i = 0; i < ola_len; i++)
+        if (win_sum[(size_t)i] > 1e-8f)
+            output[(size_t)i] /= win_sum[(size_t)i];
+    const int pad = n_fft / 2; // TRIM_CENTER
+    const int final_len = ola_len - 2 * pad;
+    if (final_len <= 0)
+        return {};
+    return std::vector<float>(output.begin() + pad, output.begin() + pad + final_len);
+}
+
 // Apply the estimated mask to the packed STFT and iSTFT back to `channels`
 // waveforms of `T_samp` samples each. `packed` is (rows=n_freqs*channels, T, 2);
 // `mask_raw` is (T, 2N) complex per gather-index. Shared by separate() and the
@@ -702,8 +845,10 @@ void synthesize(mel_band_roformer_context* ctx, const std::vector<float>& packed
                 mag[(size_t)t * n_freqs + f] = std::sqrt(re * re + im * im);
                 phase[(size_t)t * n_freqs + f] = std::atan2(im, re);
             }
-        std::vector<float> wav = core_istft::istft(mag.data(), phase.data(), ctx->hp.n_fft, ctx->hp.hop, T, win.data(),
-                                                   core_istft::TRIM_CENTER);
+        const bool pow2 = ctx->hp.n_fft > 0 && (ctx->hp.n_fft & (ctx->hp.n_fft - 1)) == 0;
+        std::vector<float> wav = pow2 ? istft_fft(mag.data(), phase.data(), ctx->hp.n_fft, ctx->hp.hop, T, win.data())
+                                      : core_istft::istft(mag.data(), phase.data(), ctx->hp.n_fft, ctx->hp.hop, T,
+                                                          win.data(), core_istft::TRIM_CENTER);
         for (int i = 0; i < T_samp && i < (int)wav.size(); i++)
             out[(size_t)s * T_samp + i] = wav[i];
     }
@@ -718,6 +863,26 @@ bool run_forward(mel_band_roformer_context* ctx, const std::vector<std::vector<f
     const int n_freqs = ctx->n_freqs();
     const int T = stft_n_frames(T_samp, hp.hop);
 
+#if defined(CRISPASR_MBR_OPENBLAS)
+    // Coarse OpenMP parallelism (band/time loops) does the threading; keep each
+    // per-block OpenBLAS call serial so they don't oversubscribe cores.
+    openblas_set_num_threads(1);
+#endif
+
+    // #296: per-stage profiling (CRISPASR_MBR_PROFILE=1) to localise where the
+    // forward spends time — the separation was silently slow and the bottleneck
+    // was not where it looked.
+    const bool prof = std::getenv("CRISPASR_MBR_PROFILE") != nullptr;
+    using clk = std::chrono::steady_clock;
+    auto tick = clk::now();
+    auto lap = [&](const char* what) {
+        if (prof) {
+            auto n = clk::now();
+            fprintf(stderr, "  [mbr-prof] %-14s %7lld ms\n", what,
+                    (long long)std::chrono::duration_cast<std::chrono::milliseconds>(n - tick).count());
+            tick = n;
+        }
+    };
     std::vector<float> window;
     hann_periodic(hp.win, window);
     std::vector<std::vector<float>> chan_spec(channels);
@@ -725,21 +890,39 @@ bool run_forward(mel_band_roformer_context* ctx, const std::vector<std::vector<f
         stft_one_channel(chan[s].data(), T_samp, hp.n_fft, hp.hop, window, T, n_freqs, chan_spec[s]);
     std::vector<float> packed;
     pack_stft(chan_spec, n_freqs, T, channels, packed);
+    lap("stft+pack");
     std::vector<float> gathered;
     band_gather(packed, ctx->freq_indices, T, gathered);
     std::vector<float> x;
     if (!band_split_cpu(ctx->weights, gathered, ctx->band_width, T, dim, x))
         return false;
-    for (int L = 0; L < hp.depth; L++)
-        if (!run_time(ctx->weights, L, x, T, nb, dim, hp.heads, hp.dim_head) ||
-            !run_freq(ctx->weights, L, x, T, nb, dim, hp.heads, hp.dim_head))
+    lap("band_split");
+    // Compute-heavy Transformer stack; emit per-layer progress so it never looks
+    // hung, and (under profiling) split run_time vs run_freq time.
+    fprintf(stderr, "mel_band_roformer: separating (T=%d frames, %d layers, %d bands)...\n", T, hp.depth, nb);
+    double t_time = 0, t_freq = 0;
+    for (int L = 0; L < hp.depth; L++) {
+        fprintf(stderr, "mel_band_roformer: layer %d/%d\n", L + 1, hp.depth);
+        auto a = clk::now();
+        if (!run_time(ctx->weights, L, x, T, nb, dim, hp.heads, hp.dim_head))
             return false;
+        auto b = clk::now();
+        if (!run_freq(ctx->weights, L, x, T, nb, dim, hp.heads, hp.dim_head))
+            return false;
+        auto c = clk::now();
+        t_time += std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
+        t_freq += std::chrono::duration_cast<std::chrono::milliseconds>(c - b).count();
+    }
+    if (prof)
+        fprintf(stderr, "  [mbr-prof] run_time(all)  %7.0f ms\n  [mbr-prof] run_freq(all)  %7.0f ms\n", t_time, t_freq);
+    tick = clk::now();
     std::vector<float> mask_raw;
     if (!mask_estimator(ctx->weights, x, T, nb, dim, ctx->band_width, mask_raw))
         return false;
-
+    lap("mask_est");
     std::vector<float> out_planar; // channels * T_samp
     synthesize(ctx, packed, mask_raw, T, T_samp, out_planar);
+    lap("synthesize");
     // interleave
     vocals_interleaved.assign((size_t)T_samp * channels, 0.0f);
     for (int i = 0; i < T_samp; i++)
@@ -935,7 +1118,9 @@ int mel_band_roformer_diff(const char* model_gguf, const char* ref_gguf, const c
                 for (int d = 0; d < hp.dim; d++)
                     x0[(size_t)t * hp.dim + d] = ref_bso[((size_t)t * nb + 0) * hp.dim + d];
             std::vector<float> final_g;
-            if (roformer_block(ctx->weights, "layers.0.0.layers.0.", x0, T, hp.dim, hp.heads, hp.dim_head) &&
+            RoformerBlockW tbw;
+            if (read_block_weights(ctx->weights, "layers.0.0.layers.0.", tbw) &&
+                roformer_block(tbw, x0, T, hp.dim, hp.heads, hp.dim_head) &&
                 read_f32(ctx->weights, "layers.0.0.norm.gamma", final_g)) {
                 rms_rows(x0, T, hp.dim, final_g); // Transformer final norm
                 report("layer0_time", x0, ref_lt);
@@ -960,13 +1145,14 @@ int mel_band_roformer_diff(const char* model_gguf, const char* ref_gguf, const c
             const int nb = hp.num_bands, dim = hp.dim;
             // freq input at t=0: run the time block on each band, take t=0.
             std::vector<float> freq_in((size_t)nb * dim, 0.0f);
-            bool ok = true;
+            RoformerBlockW tbw;
+            bool ok = read_block_weights(ctx->weights, "layers.0.0.layers.0.", tbw);
             for (int b = 0; b < nb && ok; b++) {
                 std::vector<float> xb((size_t)T * dim);
                 for (int t = 0; t < T; t++)
                     for (int d = 0; d < dim; d++)
                         xb[(size_t)t * dim + d] = ref_bso[((size_t)t * nb + b) * dim + d];
-                ok = roformer_block(ctx->weights, "layers.0.0.layers.0.", xb, T, dim, hp.heads, hp.dim_head);
+                ok = roformer_block(tbw, xb, T, dim, hp.heads, hp.dim_head);
                 if (!ok)
                     break;
                 rms_rows(xb, T, dim, tfinal_g);
@@ -974,7 +1160,9 @@ int mel_band_roformer_diff(const char* model_gguf, const char* ref_gguf, const c
                     freq_in[(size_t)b * dim + d] = xb[(size_t)0 * dim + d]; // t=0
             }
             std::vector<float> ffinal_g;
-            if (ok && roformer_block(ctx->weights, "layers.0.1.layers.0.", freq_in, nb, dim, hp.heads, hp.dim_head) &&
+            RoformerBlockW fbw;
+            if (ok && read_block_weights(ctx->weights, "layers.0.1.layers.0.", fbw) &&
+                roformer_block(fbw, freq_in, nb, dim, hp.heads, hp.dim_head) &&
                 read_f32(ctx->weights, "layers.0.1.norm.gamma", ffinal_g)) {
                 rms_rows(freq_in, nb, dim, ffinal_g);
                 report("layer0_freq(chain)", freq_in, ref_lf);

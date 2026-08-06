@@ -297,6 +297,27 @@ bool crispasr_detect_language(const float* samples, int n_samples, const Crispas
     return false;
 }
 
+std::vector<float> crispasr_lid_speech_prefix(const std::vector<float>& pcm,
+                                              const std::vector<crispasr_audio_slice>& slices) {
+    constexpr size_t kMaxSamples = 16000u * 15u;
+    constexpr size_t kGapSamples = 1600u;
+    std::vector<float> out;
+    out.reserve(std::min(kMaxSamples, pcm.size()));
+
+    for (const auto& slice : slices) {
+        const int start = std::max(0, slice.start);
+        const int end = std::min((int)pcm.size(), slice.end);
+        if (end <= start || out.size() >= kMaxSamples)
+            continue;
+        if (!out.empty())
+            out.insert(out.end(), std::min(kGapSamples, kMaxSamples - out.size()), 0.0f);
+        const size_t remaining = kMaxSamples - out.size();
+        const size_t count = std::min(remaining, (size_t)(end - start));
+        out.insert(out.end(), pcm.begin() + start, pcm.begin() + start + count);
+    }
+    return out;
+}
+
 void crispasr_lid_free_cache() {
     WhisperLidCache& c = whisper_lid_cache();
     if (c.ctx) {

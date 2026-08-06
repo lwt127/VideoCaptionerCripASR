@@ -365,15 +365,17 @@ fn session_omni_ctc_vocab() {
 
     // Accessor contract: a non-empty vocab of raw SentencePiece pieces.
     let vocab = sess.ctc_vocab().expect("CTC backend should expose a vocab");
-    assert!(vocab.len() > 1000, "unexpectedly small vocab: {}", vocab.len());
+    assert!(
+        vocab.len() > 1000,
+        "unexpectedly small vocab: {}",
+        vocab.len()
+    );
     // Real pieces carry a word-boundary marker. The v2 Omni CTC vocab is built
     // verbatim from vocab.json and uses a literal ASCII space; v1 (SentencePiece)
     // uses U+2581 (▁). Accept either so the accessor test isn't tied to one
     // tokenizer flavour.
     assert!(
-        vocab
-            .iter()
-            .any(|p| p.contains('\u{2581}') || p == " "),
+        vocab.iter().any(|p| p.contains('\u{2581}') || p == " "),
         "no word-boundary token (U+2581 piece or literal space) — not a real vocab"
     );
 
@@ -501,7 +503,11 @@ fn assert_ctc_vocab_contract(sess: &crispasr::Session, pcm: &[f32]) {
     let vocab = sess
         .ctc_vocab()
         .expect("CTC backend should expose Some(vocab)");
-    assert!(vocab.len() > 1, "unexpectedly small CTC vocab: {}", vocab.len());
+    assert!(
+        vocab.len() > 1,
+        "unexpectedly small CTC vocab: {}",
+        vocab.len()
+    );
     // token_text must always yield a valid (possibly empty) string, never panic
     // — including an out-of-range id, which the accessor guards to "".
     assert!(
@@ -582,7 +588,10 @@ fn session_ctc_backend_no_speech_sentinel() {
     // Fallback path: never a whisper acoustic code here; a non-empty string
     // (source hint or "unknown"), never a panic.
     let lang = sess.detected_language();
-    assert!(!lang.is_empty(), "detected_language fallback must be non-empty");
+    assert!(
+        !lang.is_empty(),
+        "detected_language fallback must be non-empty"
+    );
 }
 
 // ---- Registry + cache ----

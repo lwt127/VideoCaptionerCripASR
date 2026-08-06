@@ -160,16 +160,21 @@ static inline ggml_tensor* convt1d_decomp(ggml_context* ctx, ggml_tensor* x, ggm
     // mul_mat contracts IC → col: [K*OC, T_in]
     ggml_tensor* col = ggml_mul_mat(ctx, w_perm, x);
 
-    // col2im: [K*OC, T_in] → [T_raw, OC]  (GATHER)
-    // p0 = crop_left tells col2im to start the output at offset crop_left
-    // in the uncropped signal, effectively skipping crop_left samples.
-    ggml_tensor* y = ggml_col2im_1d(ctx, col, stride, OC, crop_left);
+    // col2im: [K*OC, T_in] → [T_full, OC]  (GATHER, overlap-add)
+    //
+    // p0 = 0 asks for the FULL uncropped signal, T_full = (T_in-1)*stride + K.
+    // upstream's ggml_col2im_1d crops p0 from BOTH sides
+    // (T_out = (T_in-1)*s0 + K - 2*p0) while the kernel treats p0 as a left
+    // offset (t_abs = t_out + p0). We need ASYMMETRIC cropping — causal decoders
+    // want crop_left=0, crop_right=K-stride — which that symmetric formula cannot
+    // express. Taking the whole signal and cropping once in a view is both exact
+    // and cheaper than the old two-step (op-side left offset + tail view).
+    ggml_tensor* y = ggml_col2im_1d(ctx, col, stride, OC, /*p0=*/0);
 
-    // col2im output length: T_raw = (T_in-1)*stride + K - crop_left
-    // We want T_out = T_raw - crop_right, so trim the tail if needed.
-    if (crop_right > 0) {
-        const int64_t T_keep = y->ne[0] - crop_right;
-        y = ggml_view_2d(ctx, y, T_keep, y->ne[1], y->nb[1], 0);
+    if (crop_left > 0 || crop_right > 0) {
+        const int64_t T_keep = y->ne[0] - crop_left - crop_right;
+        GGML_ASSERT(T_keep > 0);
+        y = ggml_view_2d(ctx, y, T_keep, y->ne[1], y->nb[1], (size_t)crop_left * y->nb[0]);
         y = ggml_cont(ctx, y);
     }
 

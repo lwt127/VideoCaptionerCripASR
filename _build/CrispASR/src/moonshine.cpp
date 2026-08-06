@@ -17,6 +17,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -593,15 +594,26 @@ static int moonshine_run_encoder(struct moonshine_context* ctx, const float* aud
     const auto& hp = ctx->model.hparams;
 
     // §176s: reuse cached encoder graph when n_samples matches.
+    // #301: reusing the cached cgraph across ggml_backend_sched_reset/alloc
+    // cycles is only safe on CPU. On a GPU sched (Metal/CUDA/Vulkan) the reused
+    // input tensors stay bound to the previous cycle's freed buffer, so the
+    // ggml_backend_tensor_set below memmoves into freed memory and SIGSEGVs on
+    // the 2nd transcribe (reproduced on Metal via crispasr --server). Gate the
+    // reuse to CPU; on GPU rebuild the (tiny) encoder graph each call and free
+    // it after compute. moonshine's GPU encoder is marginal anyway (§232), so
+    // the per-call rebuild costs nothing measurable.
+    const bool cache_ok = ggml_backend_is_cpu(ctx->backend);
     struct ggml_cgraph* graph;
     struct ggml_context* ctx0 = nullptr;
-    if (ctx->cached_enc_gf && ctx->cached_enc_n_samples == n_samples) {
+    struct ggml_context* transient_ctx = nullptr; // freed after compute when not cached (GPU)
+    if (cache_ok && ctx->cached_enc_gf && ctx->cached_enc_n_samples == n_samples) {
         graph = ctx->cached_enc_gf;
     } else {
         if (ctx->cached_enc_ctx) {
             ggml_free(ctx->cached_enc_ctx);
             ctx->cached_enc_ctx = nullptr;
             ctx->cached_enc_gf = nullptr;
+            ctx->cached_enc_n_samples = 0;
         }
         const size_t n_tensors = hp.enc_n_layers * 25 + 100;
         const size_t mem_size = ggml_tensor_overhead() * n_tensors + ggml_graph_overhead();
@@ -641,15 +653,22 @@ static int moonshine_run_encoder(struct moonshine_context* ctx, const float* aud
         graph = ggml_new_graph(ctx0);
         ggml_build_forward_expand(graph, output);
 
-        ctx->cached_enc_ctx = ctx0;
-        ctx->cached_enc_gf = graph;
-        ctx->cached_enc_n_samples = n_samples;
-        ctx0 = nullptr; // owned by cache now
+        if (cache_ok) {
+            ctx->cached_enc_ctx = ctx0;
+            ctx->cached_enc_gf = graph;
+            ctx->cached_enc_n_samples = n_samples;
+            ctx0 = nullptr; // owned by cache now
+        } else {
+            transient_ctx = ctx0; // GPU: own it here, free after compute
+            ctx0 = nullptr;
+        }
     }
 
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, graph)) {
         fprintf(stderr, "%s: failed to alloc graph\n", __func__);
+        if (transient_ctx)
+            ggml_free(transient_ctx);
         return -1;
     }
 
@@ -666,6 +685,8 @@ static int moonshine_run_encoder(struct moonshine_context* ctx, const float* aud
 
     if (ggml_backend_sched_graph_compute(ctx->sched, graph) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "%s: graph compute failed\n", __func__);
+        if (transient_ctx)
+            ggml_free(transient_ctx);
         return -1;
     }
 
@@ -678,6 +699,8 @@ static int moonshine_run_encoder(struct moonshine_context* ctx, const float* aud
     ctx->enc_len = out_seq;
     ggml_backend_tensor_get(enc_output, ctx->encoder_out.data(), 0, out_bytes);
 
+    if (transient_ctx)
+        ggml_free(transient_ctx);
     return 0;
 }
 
@@ -1255,22 +1278,30 @@ static int moonshine_transcribe_impl(struct moonshine_context* ctx, const float*
             const int V = (int)hp.vocab_size;
 
             if (!sample) {
-                // Greedy argmax (with probs requested)
-                int32_t best = 0;
-                float best_val = logits[0];
-                for (int i = 1; i < V; i++) {
-                    if (logits[i] > best_val) {
+                // Greedy argmax — NaN-robust (see canary_qwen note): seed -inf,
+                // skip non-finite. If the whole row is non-finite, route through
+                // the EOS path below to terminate cleanly instead of spewing 0.
+                int32_t best = -1;
+                float best_val = -std::numeric_limits<float>::infinity();
+                for (int i = 0; i < V; i++) {
+                    if (std::isfinite(logits[i]) && logits[i] > best_val) {
                         best_val = logits[i];
                         best = i;
                     }
                 }
-                picked = best;
-                if (out_token_probs) {
-                    float mx = best_val;
-                    float s = 0.f;
-                    for (int i = 0; i < V; i++)
-                        s += expf(logits[i] - mx);
-                    picked_prob = 1.0f / s;
+                if (best < 0) {
+                    fprintf(stderr, "moonshine: non-finite logits — stopping decode\n");
+                    picked = (int32_t)hp.eos_token_id;
+                } else {
+                    picked = best;
+                    if (out_token_probs) {
+                        float mx = best_val;
+                        float s = 0.f;
+                        for (int i = 0; i < V; i++)
+                            if (std::isfinite(logits[i]))
+                                s += expf(logits[i] - mx);
+                        picked_prob = 1.0f / s;
+                    }
                 }
             } else {
                 // Multinomial sample from softmax(logits / T).

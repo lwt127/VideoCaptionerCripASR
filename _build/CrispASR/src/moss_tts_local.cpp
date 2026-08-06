@@ -327,9 +327,39 @@ static ggml_cgraph* mtl_build_graph_llm_kv(moss_tts_local_context* ctx, int n_pa
         32.0f, 1.0f, attn_scale, eps,        core_attn::GQA_MANUAL_CONT,
     };
 
+    // #249 per-layer diff: on the prompt prefill, expose each block's output so
+    // mtl_run_backbone can dump it and compare to the reference per layer.
+    const bool dump_layers = (n_past == 0) && (getenv("CRISPASR_MOSS_TTS_LOCAL_DUMP_LAYERS") != nullptr);
+    // #249 option 2 — pin the layer-10 op: for one target layer, expose the
+    // attention output and the SwiGLU-MLP output (both pre-residual, last
+    // position) so the per-sublayer diff can tell whether attention or the MLP is
+    // where the block first diverges from the reference (block input matches).
+    int dump_sub = -1;
+    if (n_past == 0) {
+        if (const char* s = getenv("CRISPASR_MOSS_TTS_LOCAL_DUMP_SUBLAYER"))
+            dump_sub = atoi(s);
+    }
+    // #249 gold-standard test: inject the REFERENCE's exact block-(L-1) output as
+    // the input to block L, so block L computes from a byte-identical input. If
+    // block L's output then matches the reference, layer L is correct and the
+    // divergence is pure amplification of accumulated drift; if it still diverges,
+    // there is a real per-layer op bug. inject_in is filled in mtl_run_backbone.
+    int inject_layer = -1;
+    if (n_past == 0) {
+        if (const char* s = getenv("CRISPASR_MOSS_TTS_LOCAL_INJECT_LAYER"))
+            inject_layer = atoi(s);
+    }
+    ggml_tensor* inject_in = nullptr;
+    if (inject_layer >= 0) {
+        inject_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d, T);
+        ggml_set_name(inject_in, "inject_in");
+        ggml_set_input(inject_in);
+    }
     ggml_tensor* cur = embeds;
     for (uint32_t il = 0; il < hp.llm_layers; il++) {
         const auto& b = m.blocks[il];
+        if ((int)il == inject_layer && inject_in)
+            cur = inject_in; // block L reads the reference's exact input
         ggml_tensor* residual = cur;
         ggml_tensor* x = ggml_mul(ctx0, ggml_rms_norm(ctx0, cur, eps), b.attn_norm_w);
         ggml_tensor* attn = core_attn::kv_self_attn(
@@ -338,7 +368,26 @@ static ggml_cgraph* mtl_build_graph_llm_kv(moss_tts_local_context* ctx, int n_pa
         cur = ggml_add(ctx0, residual, attn);
         residual = cur;
         x = ggml_mul(ctx0, ggml_rms_norm(ctx0, cur, eps), b.ffn_norm_w);
-        cur = ggml_add(ctx0, residual, core_ffn::swiglu(ctx0, x, b.ffn_gate_w, b.ffn_up_w, b.ffn_down_w));
+        ggml_tensor* mlp = core_ffn::swiglu(ctx0, x, b.ffn_gate_w, b.ffn_up_w, b.ffn_down_w);
+        cur = ggml_add(ctx0, residual, mlp);
+        if (dump_sub == (int)il) {
+            char nm[24];
+            snprintf(nm, sizeof(nm), "sub_attn_%u", il);
+            ggml_set_name(attn, nm);
+            ggml_set_output(attn);
+            ggml_build_forward_expand(gf, attn);
+            snprintf(nm, sizeof(nm), "sub_mlp_%u", il);
+            ggml_set_name(mlp, nm);
+            ggml_set_output(mlp);
+            ggml_build_forward_expand(gf, mlp);
+        }
+        if (dump_layers) {
+            char nm[24];
+            snprintf(nm, sizeof(nm), "blk_%u", il);
+            ggml_set_name(cur, nm);
+            ggml_set_output(cur);
+            ggml_build_forward_expand(gf, cur);
+        }
     }
     cur = ggml_mul(ctx0, ggml_rms_norm(ctx0, cur, eps), m.output_norm_w);
     if (T > 1)
@@ -368,7 +417,12 @@ static bool mtl_kv_init(moss_tts_local_context* ctx, int max_ctx) {
     const int hd = (int)hp.llm_head_dim;
     const int n_kv = (int)hp.llm_n_kv_heads;
     const int nl = (int)hp.llm_layers;
-    const ggml_type kv_type = core_attn::kv_dtype_from_env("moss_tts_local");
+    // #249: the 4B's marginal binary stop head is sensitive to KV precision —
+    // an f16 KV cache measurably delays/breaks the wind-down (an f32 KV moves
+    // the "Hello world" stop earlier, toward the reference). Default to F32 KV;
+    // CRISPASR_KV_QUANT still overrides for users who want the smaller cache.
+    const ggml_type kv_type = core_attn::kv_dtype_parse(std::getenv("CRISPASR_KV_QUANT"), "moss_tts_local",
+                                                        "CRISPASR_KV_QUANT", GGML_TYPE_F32);
     ggml_init_params ip = {ggml_tensor_overhead() * 4, nullptr, true};
     ctx->kv_ctx = ggml_init(ip);
     if (!ctx->kv_ctx)
@@ -412,11 +466,96 @@ static float* mtl_run_backbone(moss_tts_local_context* ctx, const float* inputs_
     if (n_tokens > 1)
         ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "causal_mask"), mask.data(), 0,
                                 mask.size() * sizeof(ggml_fp16_t));
+    // #249 gold-standard test: load the reference block-(L-1) output (all positions,
+    // layout [pos][dim] == our (d, T) ggml order) into the injection tensor.
+    if (n_past == 0) {
+        if (ggml_tensor* it = ggml_graph_get_tensor(gf, "inject_in")) {
+            const char* ip = getenv("CRISPASR_MOSS_TTS_LOCAL_INJECT_PATH");
+            if (ip) {
+                std::vector<float> buf((size_t)d * n_tokens);
+                if (FILE* f = fopen(ip, "rb")) {
+                    const size_t got = fread(buf.data(), sizeof(float), buf.size(), f);
+                    fclose(f);
+                    if (got == buf.size())
+                        ggml_backend_tensor_set(it, buf.data(), 0, buf.size() * sizeof(float));
+                    else
+                        fprintf(stderr, "moss_tts_local[inject] short read %zu/%zu\n", got, buf.size());
+                }
+            }
+        }
+    }
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS)
         return nullptr;
     ggml_tensor* h_t = ggml_graph_get_tensor(gf, "hidden_last");
     float* out = (float*)malloc((size_t)d * sizeof(float));
     ggml_backend_tensor_get(h_t, out, 0, (size_t)d * sizeof(float));
+    // #249: dump each block's last-position hidden on the prompt prefill.
+    if (n_past == 0) {
+        if (const char* lp = getenv("CRISPASR_MOSS_TTS_LOCAL_DUMP_LAYERS")) {
+            if (FILE* lf = fopen(lp, "w")) {
+                std::vector<float> buf(d);
+                for (uint32_t il = 0; il < ctx->model.hparams.llm_layers; il++) {
+                    char nm[24];
+                    snprintf(nm, sizeof(nm), "blk_%u", il);
+                    ggml_tensor* t = ggml_graph_get_tensor(gf, nm);
+                    if (!t)
+                        continue;
+                    ggml_backend_tensor_get(t, buf.data(), (size_t)(n_tokens - 1) * d * sizeof(float),
+                                            (size_t)d * sizeof(float));
+                    fprintf(lf, "blk_%u", il);
+                    for (int i = 0; i < d; i++)
+                        fprintf(lf, " %.6f", buf[i]);
+                    fprintf(lf, "\n");
+                }
+                fclose(lf);
+            }
+        }
+        // #249 option 2: dump one target layer's attention + MLP outputs.
+        if (const char* sl = getenv("CRISPASR_MOSS_TTS_LOCAL_DUMP_SUBLAYER")) {
+            if (const char* sp = getenv("CRISPASR_MOSS_TTS_LOCAL_DUMP_SUBLAYER_PATH")) {
+                const int il = atoi(sl);
+                if (FILE* sf = fopen(sp, "w")) {
+                    std::vector<float> buf(d);
+                    for (const char* which : {"sub_attn", "sub_mlp"}) {
+                        char nm[24];
+                        snprintf(nm, sizeof(nm), "%s_%d", which, il);
+                        ggml_tensor* t = ggml_graph_get_tensor(gf, nm);
+                        if (!t)
+                            continue;
+                        ggml_backend_tensor_get(t, buf.data(), (size_t)(n_tokens - 1) * d * sizeof(float),
+                                                (size_t)d * sizeof(float));
+                        fprintf(sf, "%s", nm);
+                        for (int i = 0; i < d; i++)
+                            fprintf(sf, " %.6f", buf[i]);
+                        fprintf(sf, "\n");
+                    }
+                    fclose(sf);
+                }
+            }
+        }
+        // #249 option 2: dump the shared-attention debug tensors (named by the
+        // core_attn CRISPASR_CORE_ATTN_DUMP_FA_LAYER hook) so a numpy flash-vs-eager
+        // self-check and the Q/K/V-vs-reference diff can localize the attention op.
+        if (const char* fp = getenv("CRISPASR_MOSS_TTS_LOCAL_DUMP_FA_PATH")) {
+            if (FILE* ff = fopen(fp, "w")) {
+                for (const char* nm : {"DBG_Q_prerope", "DBG_K_prerope", "DBG_V_new", "DBG_Q_post_rope", "DBG_Kfull",
+                                       "DBG_Vfull", "DBG_fa_out", "DBG_fa_reshaped"}) {
+                    ggml_tensor* t = ggml_graph_get_tensor(gf, nm);
+                    if (!t)
+                        continue;
+                    const int64_t n = ggml_nelements(t);
+                    std::vector<float> buf((size_t)n);
+                    ggml_backend_tensor_get(t, buf.data(), 0, (size_t)n * sizeof(float));
+                    fprintf(ff, "%s %lld %lld %lld %lld", nm, (long long)t->ne[0], (long long)t->ne[1],
+                            (long long)t->ne[2], (long long)t->ne[3]);
+                    for (int64_t i = 0; i < n; i++)
+                        fprintf(ff, " %.6f", buf[(size_t)i]);
+                    fprintf(ff, "\n");
+                }
+                fclose(ff);
+            }
+        }
+    }
     return out;
 }
 
@@ -929,36 +1068,6 @@ extern "C" const char* moss_tts_local_token_text(moss_tts_local_context* ctx, in
     return ctx->vocab.id_to_token[id].c_str();
 }
 
-static std::string mtl_tok_str(const moss_tts_local_context* ctx, uint32_t id) {
-    if (id < ctx->vocab.id_to_token.size())
-        return ctx->vocab.id_to_token[id];
-    return "";
-}
-
-// Prompt (same template as the 8B; token ids from hparams). No voice cloning yet
-// (needs the v2 codec encoder — Phase 3).
-static std::string mtl_build_prompt(const moss_tts_local_context* ctx, const char* text,
-                                    const moss_tts_local_synth_params& sp) {
-    const auto& hp = ctx->model.hparams;
-    const std::string im_start = mtl_tok_str(ctx, hp.tok_im_start);
-    const std::string im_end = mtl_tok_str(ctx, hp.tok_im_end);
-    const std::string audio_start = mtl_tok_str(ctx, hp.tok_audio_start);
-    const std::string instruction = sp.instruction ? std::string(sp.instruction) : "None";
-    const std::string language = sp.language ? std::string(sp.language) : "None";
-    std::string body;
-    body += "<user_inst>\n";
-    body += "- Reference(s):\nNone\n";
-    body += "- Instruction:\n" + instruction + "\n";
-    body += "- Tokens:\nNone\n";
-    body += "- Quality:\nNone\n";
-    body += "- Sound Event:\nNone\n";
-    body += "- Ambient Sound:\nNone\n";
-    body += "- Language:\n" + language + "\n";
-    body += "- Text:\n" + std::string(text ? text : "") + "\n";
-    body += "</user_inst>";
-    return im_start + "user\n" + body + im_end + "\n" + im_start + "assistant\n" + audio_start;
-}
-
 // ===========================================================================
 // Generate: depth-first RVQ code grid
 // ===========================================================================
@@ -969,29 +1078,100 @@ static bool mtl_generate_grid(moss_tts_local_context* ctx, const char* text, con
     const int n_vq = (int)hp.n_vq;
     const int d = (int)hp.llm_hidden;
     const int aud_v = (int)hp.audio_vocab_size;
-    const int max_frames = sp.max_new_frames > 0 ? sp.max_new_frames : 4096;
+    int max_frames = sp.max_new_frames > 0 ? sp.max_new_frames : 4096;
+    if (const char* mf = getenv("CRISPASR_MOSS_TTS_LOCAL_MAX_FRAMES")) // #249 diag: bound runaways for A/B tests
+        max_frames = atoi(mf) > 0 ? atoi(mf) : max_frames;
     const int stride = 1 + n_vq;
     Rng rng(sp.seed ? sp.seed : ctx->seed);
-    const bool text_greedy = sp.text_temperature <= 0.f;
+    // CRISPASR_MOSS_TTS_LOCAL_GREEDY_TEXT=1 forces the binary stop head greedy
+    // (argmax) — used by the #249 trajectory diff so the stop decision is
+    // deterministic and directly comparable to the HF reference run greedy.
+    const bool text_greedy = (sp.text_temperature <= 0.f) || (getenv("CRISPASR_MOSS_TTS_LOCAL_GREEDY_TEXT") != nullptr);
     // CRISPASR_MOSS_TTS_LOCAL_GREEDY_AUDIO=1 forces greedy audio codebooks (A/B the
     // stop-runaway hypothesis: sampled audio feeds back and may prevent the binary
     // stop head from firing). CRISPASR_MOSS_TTS_LOCAL_DEBUG=1 traces stop logits.
     const bool audio_greedy =
         (sp.audio_temperature <= 0.f) || (getenv("CRISPASR_MOSS_TTS_LOCAL_GREEDY_AUDIO") != nullptr);
     const bool dbg = getenv("CRISPASR_MOSS_TTS_LOCAL_DEBUG") != nullptr;
+    // CRISPASR_MOSS_TTS_LOCAL_DUMP_STOP=1 emits the RAW (pre-softmax) stop-head
+    // logits every frame, parseable, for the reference-vs-port trajectory diff.
+    const bool dump_stop = getenv("CRISPASR_MOSS_TTS_LOCAL_DUMP_STOP") != nullptr;
 
-    std::string prompt = mtl_build_prompt(ctx, text, sp);
-    int n_ids = 0;
-    int32_t* ids = moss_tts_local_tokenize(ctx, prompt.c_str(), &n_ids);
-    if (!ids || n_ids <= 0) {
-        free(ids);
-        return false;
+    // CRISPASR_MOSS_TTS_LOCAL_FORCE_FRAMES=<path>: teacher-forcing for the #249
+    // trajectory diff. The file is whitespace-separated audio codes, n_vq per
+    // frame; we feed those exact frames back (skipping audio sampling) and dump
+    // our stop logit per frame — directly comparable to the reference run on the
+    // SAME frames, isolating forward-correctness from the sampled-code choices.
+    std::vector<std::vector<int32_t>> forced;
+    if (const char* fp = getenv("CRISPASR_MOSS_TTS_LOCAL_FORCE_FRAMES")) {
+        if (FILE* ff = fopen(fp, "r")) {
+            std::vector<int32_t> row;
+            int v;
+            while (fscanf(ff, "%d", &v) == 1) {
+                row.push_back(v);
+                if ((int)row.size() == n_vq) {
+                    forced.push_back(row);
+                    row.clear();
+                }
+            }
+            fclose(ff);
+        }
+        if (dump_stop)
+            fprintf(stderr, "DUMPSTOP force_frames=%zu\n", forced.size());
     }
-    const int prompt_len = n_ids;
+
+    // #249: PIECE-WISE prompt assembly. BPE is NOT compositional — encode(A+B) !=
+    // encode(A)+encode(B) at merge boundaries — so tokenizing the whole prompt as
+    // one string drifted ~2 tokens near the text segment. Those interior tokens are
+    // weighted ~0 by early-layer attention but amplified by the layer-10 attention
+    // sink, drifting the backbone hidden enough to break the 4B binary stop head
+    // (runaway). Encode each text segment SEPARATELY and splice the special-token
+    // ids in directly, mirroring the reference processor
+    // (processing_moss_tts.py `_build_generation_or_voice_clone_codes`).
+    std::vector<int32_t> id_vec;
+    auto enc = [&](const std::string& s) {
+        int n = 0;
+        int32_t* p = moss_tts_local_tokenize(ctx, s.c_str(), &n);
+        if (p) {
+            id_vec.insert(id_vec.end(), p, p + n);
+            free(p);
+        }
+    };
+    {
+        const std::string instruction = sp.instruction ? std::string(sp.instruction) : "None";
+        const std::string language = sp.language ? std::string(sp.language) : "None";
+        const std::string after_ref = "\n- Instruction:\n" + instruction +
+                                      "\n- Tokens:\nNone\n- Quality:\nNone\n- Sound Event:\nNone"
+                                      "\n- Ambient Sound:\nNone\n- Language:\n" +
+                                      language + "\n- Text:\n";
+        id_vec.push_back((int32_t)hp.tok_im_start);
+        enc("user\n");
+        enc("<user_inst>\n- Reference(s):\n");
+        enc("None"); // text-only reference value, encoded alone
+        enc(after_ref);
+        enc(text ? text : ""); // the user's text, encoded ALONE (this is the boundary that drifted)
+        enc("\n</user_inst>");
+        id_vec.push_back((int32_t)hp.tok_im_end);
+        enc("\n");
+        id_vec.push_back((int32_t)hp.tok_im_start);
+        enc("assistant\n");
+        id_vec.push_back((int32_t)hp.tok_audio_start);
+    }
+    const int prompt_len = (int)id_vec.size();
+    if (prompt_len <= 0)
+        return false;
+    // #249 confirm: dump the channel-0 prompt ids to diff against the reference
+    // processor's input_ids[:,0] (proves piece-wise parity).
+    if (const char* pp = getenv("CRISPASR_MOSS_TTS_LOCAL_DUMP_PROMPT_IDS")) {
+        if (FILE* pf = fopen(pp, "w")) {
+            for (int32_t t : id_vec)
+                fprintf(pf, "%d ", t);
+            fclose(pf);
+        }
+    }
     std::vector<int32_t> grid((size_t)prompt_len * stride, (int32_t)hp.audio_pad_code);
     for (int r = 0; r < prompt_len; r++)
-        grid[(size_t)r * stride] = ids[r];
-    free(ids);
+        grid[(size_t)r * stride] = id_vec[r];
 
     if (!mtl_kv_init(ctx, prompt_len + max_frames + 8))
         return false;
@@ -1010,6 +1190,8 @@ static bool mtl_generate_grid(moss_tts_local_context* ctx, const char* text, con
     std::vector<std::vector<int32_t>> history_per_cb(n_vq);
 
     for (int f = 0; f < max_frames; f++) {
+        if (!forced.empty() && f >= (int)forced.size())
+            break; // teacher-forcing: dumped our stop logit for every reference frame
         // Local sequence starts with the backbone hidden (position 0).
         std::vector<float> local_seq(global_hidden, global_hidden + d);
         float* lh = mtl_local_forward(ctx, local_seq.data(), 1);
@@ -1017,15 +1199,39 @@ static bool mtl_generate_grid(moss_tts_local_context* ctx, const char* text, con
             free(global_hidden);
             return false;
         }
+        // CRISPASR_MOSS_TTS_LOCAL_DUMP_HIDDEN=<path>: dump frame-0 backbone hidden
+        // (global) + local-transformer output (local) for the #249 per-component
+        // diff vs the HF reference — localizes whether the backbone or the depth
+        // transformer diverges.
+        if (f == 0) {
+            if (const char* dhp = getenv("CRISPASR_MOSS_TTS_LOCAL_DUMP_HIDDEN")) {
+                if (FILE* hf = fopen(dhp, "w")) {
+                    fprintf(hf, "GLOBAL");
+                    for (int i = 0; i < d; i++)
+                        fprintf(hf, " %.6f", global_hidden[i]);
+                    fprintf(hf, "\nLOCAL");
+                    for (int i = 0; i < d; i++)
+                        fprintf(hf, " %.6f", lh[i]);
+                    fprintf(hf, "\n");
+                    fclose(hf);
+                }
+            }
+        }
         // Binary continue/stop head: index 0 = assistant_slot (continue), 1 = audio_end.
         float* tl = mtl_apply_head(ctx, ctx->model.local_text_head_w, lh, d, 2);
+        // Capture the RAW logits before sample_one softmaxes them in place.
+        const float raw_cont = tl ? tl[0] : 0.f;
+        const float raw_stop = tl ? tl[1] : 0.f;
         const int stop_idx =
             tl ? sample_one(tl, 2, sp.text_temperature, sp.text_top_p, sp.text_top_k, !text_greedy, rng) : 1;
-        if (dbg && tl && (f < 8 || f % 64 == 0))
+        if (dump_stop)
+            fprintf(stderr, "DUMPSTOP frame=%d cont=%.6f stop=%.6f gap=%.6f\n", f, raw_cont, raw_stop,
+                    raw_cont - raw_stop);
+        else if (dbg && tl && (f < 8 || f % 64 == 0))
             fprintf(stderr, "moss_tts_local[dbg] frame %d: stop_head continue=%.4f stop=%.4f -> %s\n", f, tl[0], tl[1],
                     stop_idx == 1 ? "STOP" : "cont");
         free(tl);
-        if (stop_idx == 1) { // audio_end -> stop
+        if (stop_idx == 1 && forced.empty()) { // audio_end -> stop (ignored under teacher-forcing)
             free(lh);
             if (dbg)
                 fprintf(stderr, "moss_tts_local[dbg] stop head fired at frame %d\n", f);
@@ -1042,8 +1248,9 @@ static bool mtl_generate_grid(moss_tts_local_context* ctx, const char* text, con
             }
             if (sp.audio_repetition_penalty != 1.0f)
                 apply_repetition_penalty(al, aud_v, history_per_cb[k], sp.audio_repetition_penalty);
-            const int32_t code =
-                sample_one(al, aud_v, sp.audio_temperature, sp.audio_top_p, sp.audio_top_k, !audio_greedy, rng);
+            const int32_t code = forced.empty() ? sample_one(al, aud_v, sp.audio_temperature, sp.audio_top_p,
+                                                             sp.audio_top_k, !audio_greedy, rng)
+                                                : forced[f][k]; // teacher-forced: feed the reference's own code
             free(al);
             frame[k] = code;
             history_per_cb[k].push_back(code);

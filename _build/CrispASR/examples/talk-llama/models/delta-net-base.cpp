@@ -383,7 +383,12 @@ std::pair<ggml_tensor*, ggml_tensor*> llm_build_delta_net_base::build_delta_net_
     GGML_ASSERT(b->ne[0] == 1 && b->ne[1] == H_v && b->ne[2] == n_tokens && b->ne[3] == n_seqs);
     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v && s->ne[3] == n_seqs);
 
-    ggml_tensor* result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s);
+    // ggml v0.17 added a trailing K: the output packs the attention scores
+    // followed by K state snapshots, most-recent first. K=1 keeps only the final
+    // state, which is exactly the pre-v0.17 layout — and exactly what the two
+    // views below assume (scores at offset 0, one state block after them). Do not
+    // raise it without also reworking new_state's offset.
+    ggml_tensor* result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K =*/1);
     if (n_tokens == 1) {
         cb(result, LLAMA_TENSOR_NAME_FGDN_AR, il);
     } else {

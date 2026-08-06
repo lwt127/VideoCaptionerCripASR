@@ -904,6 +904,31 @@ static bool qwen3_tts_codec_decode_uses_cuda(const qwen3_tts_context* c) {
            crispasr_env::get("CRISPASR_QWEN3_TTS_CODEC_GPU") != nullptr || qwen3_tts_codec_use_gpu_by_default(c);
 }
 
+// #304: the qwen3-tts talker LM (and code_predictor) miscompute on the Vulkan
+// backend — on a Tesla P100 the AR decode runs away into a ~324 s clip of
+// clipping noise (peak 1.0) with empty ASR, vs a correct ~7 s render on CPU.
+// The codec is already CPU-pinned (see qwen3_tts_codec_use_gpu_by_default); this
+// routes the talker to CPU too when the GPU backend is Vulkan — the same
+// ggml-vulkan graph-corruption class already gated to CPU in cosyvoice3 (#304),
+// tada-codec (#192), moss (#215). SubtitleEdit ships the Vulkan Windows build to
+// every Windows user. Metal + CUDA keep the native GPU talker. Override with
+// CRISPASR_QWEN3_TTS_VULKAN_NATIVE=1.
+static void qwen3_tts_route_off_vulkan(qwen3_tts_context* c, int verbosity) {
+    if (c->backend == c->backend_cpu || !std::strstr(ggml_backend_name(c->backend), "Vulkan")) {
+        return;
+    }
+    const char* keep = crispasr_env::get("CRISPASR_QWEN3_TTS_VULKAN_NATIVE");
+    if (keep && keep[0] == '1') {
+        return;
+    }
+    if (verbosity >= 1) {
+        fprintf(stderr, "qwen3_tts: Vulkan backend detected — running talker on CPU (#304 Vulkan "
+                        "miscompute; set CRISPASR_QWEN3_TTS_VULKAN_NATIVE=1 to override)\n");
+    }
+    ggml_backend_free(c->backend);
+    c->backend = c->backend_cpu;
+}
+
 // ---------------------------------------------------------------------------
 // Loader helpers
 // ---------------------------------------------------------------------------
@@ -5835,6 +5860,7 @@ extern "C" struct qwen3_tts_context* qwen3_tts_init_codec_only(const char* codec
     if (!c->backend) {
         c->backend = c->backend_cpu;
     }
+    qwen3_tts_route_off_vulkan(c, params.verbosity);
 
     if (!load_codec(c, codec_path)) {
         fprintf(stderr, "qwen3_tts: codec-only init: failed to load codec\n");
@@ -5973,6 +5999,7 @@ extern "C" struct qwen3_tts_context* qwen3_tts_init_from_file(const char* path_m
     if (!c->backend) {
         c->backend = c->backend_cpu;
     }
+    qwen3_tts_route_off_vulkan(c, params.verbosity);
 
     core_gguf::WeightLoad wl;
     if (!core_gguf::load_weights(path_model, c->backend, "qwen3_tts", wl)) {

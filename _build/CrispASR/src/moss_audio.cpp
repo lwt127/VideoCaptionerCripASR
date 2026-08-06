@@ -21,6 +21,7 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -2025,19 +2026,28 @@ static char* moss_audio_process_impl(struct moss_audio_context* ctx, const float
     } else {
         // Greedy decode
         for (int step = 0; step < max_new; step++) {
-            int best_id = 0;
-            float best_val = logits[0];
-            for (int i = 1; i < vocab; i++) {
-                if (logits[i] > best_val) {
+            // NaN-robust argmax (see canary_qwen note): seed -inf, skip non-finite,
+            // abort if the whole row is non-finite.
+            int best_id = -1;
+            float best_val = -std::numeric_limits<float>::infinity();
+            for (int i = 0; i < vocab; i++) {
+                if (std::isfinite(logits[i]) && logits[i] > best_val) {
                     best_val = logits[i];
                     best_id = i;
                 }
+            }
+            if (best_id < 0) {
+                free(logits);
+                logits = nullptr;
+                fprintf(stderr, "moss_audio: non-finite logits at step %d — aborting decode\n", step);
+                break;
             }
             float tok_prob = 0.0f;
             if (on_tok && best_id != (int)hp.eos_token_id) {
                 float s = 0.0f;
                 for (int i = 0; i < vocab; i++)
-                    s += expf(logits[i] - best_val);
+                    if (std::isfinite(logits[i]))
+                        s += expf(logits[i] - best_val);
                 tok_prob = (s > 0.0f) ? (1.0f / s) : 0.0f;
             }
             free(logits);

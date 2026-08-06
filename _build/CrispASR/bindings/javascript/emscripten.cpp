@@ -43,9 +43,20 @@ int crispasr_session_set_speaker_name(CrispasrSession* s, const char* name);
 int crispasr_session_n_speakers(CrispasrSession* s);
 const char* crispasr_session_get_speaker_name(CrispasrSession* s, int i);
 int crispasr_session_set_instruct(CrispasrSession* s, const char* instruct);
+// #316: synthesize these phonemes verbatim, skipping the G2P. Empty clears. kokoro and piper only (rc=-2).
+int crispasr_session_set_tts_phonemes(struct crispasr_session* s, const char* phonemes);
 int crispasr_session_is_custom_voice(CrispasrSession* s);
 int crispasr_session_is_voice_design(CrispasrSession* s);
 float* crispasr_session_synthesize(CrispasrSession* s, const char* text, int* out_n_samples);
+// #321 parity: UNMARKED synthesis (hard-refused unless accept_marking_responsibility was called first),
+// the marking attestation gate, speech-to-speech, the input-rate probe, and two setters.
+float* crispasr_session_synthesize_raw(CrispasrSession* s, const char* text, int* out_n_samples);
+int crispasr_session_accept_marking_responsibility(CrispasrSession* s, const char* attestation);
+float* crispasr_session_speech_to_speech(CrispasrSession* s, const float* in_samples, int n_in_samples, char** out_text,
+                                         int* out_n_samples);
+int crispasr_session_input_sample_rate(CrispasrSession* s);
+int crispasr_session_set_g2p_dict(CrispasrSession* s, const char* source);
+int crispasr_session_set_speaker_id(CrispasrSession* s, int id);
 void crispasr_pcm_free(float* pcm);
 unsigned char* crispasr_c2pa_sign(const unsigned char* data, size_t len, const char* format, const char* cert_path,
                                   const char* key_path, size_t* out_len);
@@ -148,6 +159,9 @@ long long crispasr_session_result_word_t0(struct crispasr_session_result* r, int
 long long crispasr_session_result_word_t1(struct crispasr_session_result* r, int i_seg, int i_word);
 float crispasr_session_result_word_p(struct crispasr_session_result* r, int i_seg, int i_word);
 float crispasr_session_result_segment_no_speech_prob(struct crispasr_session_result* r, int i_seg);
+// #300: native per-segment speaker label ("(Speaker N) "), "" when the backend
+// does not diarize natively. Never NULL.
+const char* crispasr_session_result_segment_speaker(struct crispasr_session_result* r, int i);
 int crispasr_session_result_word_n_alts(struct crispasr_session_result* r, int i_seg, int i_word);
 const char* crispasr_session_result_word_alt_text(struct crispasr_session_result* r, int i_seg, int i_word, int i_alt);
 float crispasr_session_result_word_alt_p(struct crispasr_session_result* r, int i_seg, int i_word, int i_alt);
@@ -603,6 +617,14 @@ EMSCRIPTEN_BINDINGS(whisper) {
                              return crispasr_session_set_instruct(g_tts_session, instruct.c_str());
                          }));
 
+    // #316: drive the acoustic model with phonemes, skipping the G2P.
+    // kokoro and piper; -2 from any other backend.
+    emscripten::function("ttsSetPhonemes", emscripten::optional_override([](const std::string& phonemes) {
+                             if (!g_tts_session)
+                                 return -1;
+                             return crispasr_session_set_tts_phonemes(g_tts_session, phonemes.c_str());
+                         }));
+
     // qwen3-tts variant detection (returns false also when the active
     // backend isn't qwen3-tts).
     emscripten::function("ttsIsCustomVoice", emscripten::optional_override([]() -> bool {
@@ -680,6 +702,80 @@ EMSCRIPTEN_BINDINGS(whisper) {
             });
         }));
 #endif
+
+    // #321 parity: attest AI-content marking/disclosure responsibility (EU AI Act
+    // Art. 50). REQUIRED before ttsSynthesizeRaw() will return unmarked audio.
+    // `attestation` is recorded for audit. Returns 0 on success, -1 otherwise.
+    emscripten::function(
+        "ttsAcceptMarkingResponsibility", emscripten::optional_override([](const std::string& attestation) {
+            return g_tts_session ? crispasr_session_accept_marking_responsibility(g_tts_session, attestation.c_str())
+                                 : -1;
+        }));
+
+    // #321 parity: UNMARKED synthesis (no watermark). Mirrors ttsSynthesize but
+    // hard-refused (returns an empty Float32Array) unless
+    // ttsAcceptMarkingResponsibility() was called first. Prefer ttsSynthesize
+    // for the default watermarked output.
+    emscripten::function("ttsSynthesizeRaw",
+                         emscripten::optional_override([](const std::string& text) -> emscripten::val {
+                             if (!g_tts_session)
+                                 return emscripten::val::array();
+                             int n = 0;
+                             float* pcm = crispasr_session_synthesize_raw(g_tts_session, text.c_str(), &n);
+                             if (!pcm || n <= 0) {
+                                 if (pcm)
+                                     crispasr_pcm_free(pcm);
+                                 return emscripten::val::array();
+                             }
+                             emscripten::val out = emscripten::val::global("Float32Array").new_(n);
+                             emscripten::val memoryView = emscripten::val(emscripten::typed_memory_view(n, pcm));
+                             out.call<void>("set", memoryView);
+                             crispasr_pcm_free(pcm);
+                             return out;
+                         }));
+
+    // #321 parity: speech-to-speech (audio in → audio out via a single model
+    // pass; lfm2-audio, mini-omni2, sidon, voxcpm2-vae). `audio` is a mono
+    // Float32Array at the backend's input rate (see sessionInputSampleRate).
+    // Returns { pcm: Float32Array (watermarked, backend-native rate), transcript:
+    // string } — an empty pcm + "" transcript on failure or when the backend
+    // has no S2S arm. Same owned-then-freed idiom as ttsSynthesize; the optional
+    // intermediate transcript is freed with crispasr_session_translate_text_free.
+    emscripten::function(
+        "ttsSpeechToSpeech", emscripten::optional_override([](const emscripten::val& audio) -> emscripten::val {
+            emscripten::val result = emscripten::val::object();
+            result.set("pcm", emscripten::val::array());
+            result.set("transcript", std::string());
+            if (!g_tts_session)
+                return result;
+            const int n = audio["length"].as<int>();
+            if (n <= 0)
+                return result;
+            std::vector<float> in(n);
+            emscripten::val heap = emscripten::val::module_property("HEAPU8");
+            emscripten::val memory = heap["buffer"];
+            emscripten::val view = audio["constructor"].new_(memory, reinterpret_cast<uintptr_t>(in.data()), n);
+            view.call<void>("set", audio);
+
+            char* out_text = nullptr;
+            int out_n = 0;
+            float* pcm = crispasr_session_speech_to_speech(g_tts_session, in.data(), n, &out_text, &out_n);
+            if (out_text) {
+                result.set("transcript", std::string(out_text));
+                crispasr_session_translate_text_free(out_text);
+            }
+            if (!pcm || out_n <= 0) {
+                if (pcm)
+                    crispasr_pcm_free(pcm);
+                return result;
+            }
+            emscripten::val outPcm = emscripten::val::global("Float32Array").new_(out_n);
+            emscripten::val memoryView = emscripten::val(emscripten::typed_memory_view(out_n, pcm));
+            outPcm.call<void>("set", memoryView);
+            crispasr_pcm_free(pcm);
+            result.set("pcm", outPcm);
+            return result;
+        }));
 
     // Mirrors python crispasr.kokoro_resolve_for_lang() — returns
     // {modelPath, voicePath, voiceName, backboneSwapped}.
@@ -782,6 +878,19 @@ EMSCRIPTEN_BINDINGS(whisper) {
     emscripten::function("sessionSetLengthScale", emscripten::optional_override([](float s) {
                              return g_tts_session ? crispasr_session_set_length_scale(g_tts_session, s) : -1;
                          }));
+    // #321 parity: G2P dict source — "olaph" (MIT), "open-dict" (CC-BY-SA), or a file path.
+    emscripten::function("sessionSetG2pDict", emscripten::optional_override([](const std::string& source) {
+                             return g_tts_session ? crispasr_session_set_g2p_dict(g_tts_session, source.c_str()) : -1;
+                         }));
+    // #321 parity: select a preset speaker by integer id (backends with an id-indexed roster).
+    emscripten::function("sessionSetSpeakerId", emscripten::optional_override([](int id) {
+                             return g_tts_session ? crispasr_session_set_speaker_id(g_tts_session, id) : -1;
+                         }));
+    // #321 parity: sample rate the backend expects for input PCM (16000 for
+    // Whisper-family; feed it to S2S/transcribe input). 0 when no session is open.
+    emscripten::function("sessionInputSampleRate", emscripten::optional_override([]() {
+                             return g_tts_session ? crispasr_session_input_sample_rate(g_tts_session) : 0;
+                         }));
     emscripten::function("sessionSetBestOf", emscripten::optional_override([](int n) {
                              return g_tts_session ? crispasr_session_set_best_of(g_tts_session, n) : -1;
                          }));
@@ -849,6 +958,10 @@ EMSCRIPTEN_BINDINGS(whisper) {
                 seg.set("t0", crispasr_session_result_segment_t0(res, i) / 100.0);
                 seg.set("t1", crispasr_session_result_segment_t1(res, i) / 100.0);
                 seg.set("noSpeechProb", (double)crispasr_session_result_segment_no_speech_prob(res, i));
+                {
+                    const char* spk = crispasr_session_result_segment_speaker(res, i);
+                    seg.set("speaker", std::string(spk ? spk : ""));
+                }
                 int nw = crispasr_session_result_n_words(res, i);
                 emscripten::val words = emscripten::val::array();
                 for (int j = 0; j < nw; j++) {
@@ -908,6 +1021,10 @@ EMSCRIPTEN_BINDINGS(whisper) {
                 seg.set("t0", crispasr_session_result_segment_t0(res, i) / 100.0);
                 seg.set("t1", crispasr_session_result_segment_t1(res, i) / 100.0);
                 seg.set("noSpeechProb", (double)crispasr_session_result_segment_no_speech_prob(res, i));
+                {
+                    const char* spk = crispasr_session_result_segment_speaker(res, i);
+                    seg.set("speaker", std::string(spk ? spk : ""));
+                }
                 int nw = crispasr_session_result_n_words(res, i);
                 emscripten::val words = emscripten::val::array();
                 for (int j = 0; j < nw; j++) {

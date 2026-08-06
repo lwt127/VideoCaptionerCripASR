@@ -199,6 +199,26 @@ struct whisper_params {
     // README). `--no-auto-aligner` reverts to the pre-default native
     // DTW path (no second forward pass, no ~442 MB download).
     bool no_auto_aligner = false;
+    // Issue #311: machine-reliable strict failure semantics for explicitly
+    // requested auxiliary pipeline stages. By default CrispASR degrades
+    // gracefully (a VAD/aligner/punc model that fails to load is skipped with
+    // a stderr warning and a 0 exit code). Integrations that treat these stages
+    // as *required task properties* need a zero exit to actually mean "every
+    // requested stage succeeded". These opt-in flags make a failed-to-load /
+    // failed-to-produce required stage return a NON-ZERO exit instead.
+    //
+    //  * `strict_pipeline` (--strict-pipeline): require every stage that was
+    //    explicitly requested on this command line (VAD if --vad/-vm, word
+    //    timestamps if -am/--force-aligner, punctuation if --punc-model).
+    //  * the per-stage flags force one specific requirement regardless.
+    //
+    // A stage that RAN successfully but legitimately produced nothing (VAD ran
+    // and detected no speech) is NOT a failure. Direct local model paths are
+    // used as-is and never fall back to auto-download.
+    bool strict_pipeline = false;
+    bool require_vad = false;
+    bool require_word_timestamps = false;
+    bool require_punctuation = false;
     int32_t max_new_tokens = 512;
     // Whether the user passed --max-new-tokens. Backends whose sensible default
     // differs from 512 (e.g. moss-diarize wants 1024) forward the CLI value only
@@ -278,6 +298,32 @@ struct whisper_params {
     std::string diarize_embedder;           // model path or "auto"
     float diarize_cluster_threshold = 0.5f; // cosine merge threshold
     int diarize_max_speakers = 8;           // upper bound for cluster count
+    int diarize_num_speakers = 0;           // >0 pins the count (foxnose)
+    // Set when the user passed --diarize-max-speakers explicitly, so a
+    // per-method default never SHRINKS or GROWS a value they chose. Same
+    // contract as max_new_tokens_explicit (#292).
+    bool diarize_max_speakers_explicit = false;
+    // Set when the user passed --diarize-cluster-threshold explicitly. The
+    // embedder path otherwise estimates the speaker count with spectral
+    // clustering (#326) and the cosine threshold is not consulted at all;
+    // honouring it only when asked for keeps that knob working for anyone who
+    // tuned it, without letting its default decide the answer.
+    bool diarize_cluster_threshold_explicit = false;
+
+    // Set by the unified runner: foxnose diarization happens in one global
+    // pass after transcription, so the per-slice path must stand down.
+    bool diarize_foxnose_global = false;
+
+    // #324: `--diarize-method foxnose` consumes --diarize-embedder itself, as
+    // the WeSpeaker model for its own spectral clustering. The generic
+    // TitaNet remap must therefore NOT also try to load that path — it is a
+    // different architecture and fails with a confusing
+    // "block_repeats/kernels array size mismatch". There are three call sites
+    // (cli.cpp, crispasr_run.cpp, crispasr_server.cpp); they all ask here so a
+    // fourth cannot silently drift.
+    bool diarize_embedder_is_foxnose() const {
+        return diarize_method == "foxnose" || diarize_method == "foxnose-diarize";
+    }
     bool stream = false;
     bool mic = false;
     bool stream_continuous = false;
@@ -286,6 +332,13 @@ struct whisper_params {
     std::string server_host = "127.0.0.1";
     int32_t server_port = 8080;
     std::string server_api_keys;
+    // --server-workers N (>1): load N independent backend instances so
+    // "pure-ASR" requests (explicit language, no aligner, no punctuation/
+    // truecaser) run concurrently instead of serializing on one model. Costs
+    // N× model memory. 1 = single shared instance (default, unchanged). The
+    // CRISPASR_SERVER_WORKERS env var, when set, overrides this. See
+    // docs/concurrency.md.
+    int32_t server_workers = 1;
     // --ws-port: real-time WebSocket ASR streaming on a second port.
     //   -1 = disabled (default), 0 = server_port + 1, N = port N.
     int32_t server_ws_port = -1;
@@ -375,6 +428,16 @@ struct whisper_params {
     std::string tts_ref_text;
     std::string tts_ref_asr;  // ASR backend for auto-transcribing ref audio (default: whisper)
     std::string tts_instruct; // VoiceDesign: natural-language voice description
+
+    // #316: bypass the G2P and feed these phonemes to the TTS backend verbatim.
+    // The phoneme string is the boundary between text processing and the
+    // acoustic model, so being able to drive it directly is what lets you tell a
+    // G2P bug from a model bug — and it is how you reproduce another
+    // implementation's pronunciation exactly. Honoured by kokoro; backends
+    // without a phonemes-in entry point report it rather than silently
+    // synthesizing the text.
+    // CLI: --tts-phonemes "<IPA>"
+    std::string tts_phonemes;
     bool tts_trim_silence = false;
 
     // --make-ref: create a TADA voice reference GGUF from --voice <audio.wav>
@@ -436,6 +499,24 @@ struct whisper_params {
     // On by default — see docs/issue-260/PLAN.md for the regulatory background.
     // CLI: --no-watermark
     bool tts_no_watermark = false;
+
+    // Explicit attestation that the operator accepts AI-content marking/disclosure
+    // responsibility. REQUIRED to honor ANY provenance opt-out (--no-watermark or
+    // --no-spoken-disclaimer); without it those opt-outs are hard-refused. Mirrors
+    // the voice-clone --i-have-rights consent gate.
+    // CLI: --accept-marking-responsibility
+    // Server: request field "marking_attestation": "<text>" (per-request spoken
+    //   disclaimer opt-out), or the launch flag for a server-level --no-watermark.
+    bool tts_marking_responsibility_accepted = false;
+    std::string tts_marking_attestation;
+
+    // Disable C2PA Content Credentials signing on synthesized output. A provenance
+    // opt-out like --no-watermark: REQUIRES tts_marking_responsibility_accepted,
+    // else refused. On the CLI the watertight rule still forces the audio watermark
+    // on when C2PA is off, so output is never fully unmarked; on the server the
+    // operator takes on the marking duty for every response.
+    // CLI/server launch: --no-c2pa
+    bool tts_no_c2pa = false;
 
     // Server mode: directory containing voice profiles for /v1/audio/speech.
     // Each profile is a sibling pair: <name>.wav + <name>.txt (the WAV is

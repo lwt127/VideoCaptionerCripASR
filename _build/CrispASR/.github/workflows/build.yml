@@ -254,7 +254,10 @@ jobs:
         run: |
           cmake . -DWHISPER_SDL2=ON -DCMAKE_BUILD_TYPE=${{ matrix.build }}
           make
-          ctest -L gh --output-on-failure
+          # -L "gh|unit": this job already BUILDS all 192 test targets, so running the
+          # unit tier costs seconds. CI used to execute 1 of 162 unit tests (found
+          # while checking whether the test added for #322 actually ran; it did not).
+          ctest -L "gh|unit" -E live --output-on-failure --timeout 300
 
   ubuntu-22-gcc-arm64:
     if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' ||
@@ -281,7 +284,10 @@ jobs:
         run: |
           cmake . -DWHISPER_SDL2=ON -DCMAKE_BUILD_TYPE=${{ matrix.build }} -DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8-a
           make
-          ctest -L gh --output-on-failure
+          # -L "gh|unit": this job already BUILDS all 192 test targets, so running the
+          # unit tier costs seconds. CI used to execute 1 of 162 unit tests (found
+          # while checking whether the test added for #322 actually ran; it did not).
+          ctest -L "gh|unit" -E live --output-on-failure --timeout 300
 
   ubuntu-22-clang:
     if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' ||
@@ -291,11 +297,20 @@ jobs:
       fail-fast: false
       matrix:
         build: [Debug, Release]
+        # `arch` MUST be a real matrix dimension. It used to be two bare `include:`
+        # entries with no key shared with `build:`, which GitHub merges into every
+        # combination — so the LAST one won and every "ubuntu-22-clang" job silently
+        # ran on ubuntu-22.04-arm. clang-on-x86 was therefore never tested, and the
+        # arm64 runs were mislabelled, which is what sent the core_adaln
+        # investigation chasing "clang" and then AVX-512 on x86 for three rounds
+        # (the real cause was aarch64 SVE). `include:` here now only MAPS arch ->
+        # runner, which is what it is for.
+        arch: [amd64, arm64]
         include:
-          - runner: ubuntu-22.04
-            arch: amd64
-          - runner: ubuntu-22.04-arm
-            arch: arm64
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
 
     runs-on: ${{ matrix.runner }}
 
@@ -314,7 +329,10 @@ jobs:
         run: |
           cmake . -DWHISPER_SDL2=ON -DCMAKE_BUILD_TYPE=${{ matrix.build }} -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang
           make
-          ctest -L gh --output-on-failure
+          # -L "gh|unit": this job already BUILDS all 192 test targets, so running the
+          # unit tier costs seconds. CI used to execute 1 of 162 unit tests (found
+          # while checking whether the test added for #322 actually ran; it did not).
+          ctest -L "gh|unit" -E live --output-on-failure --timeout 300
 
   ubuntu-22-gcc-sanitized:
     if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' ||
@@ -346,12 +364,19 @@ jobs:
             sed -i "s|archive.ubuntu.com|azure.archive.ubuntu.com|g" /etc/apt/sources.list
             sed -i "s|security.ubuntu.com|azure.archive.ubuntu.com|g" /etc/apt/sources.list
             for i in 1 2 3 4 5; do apt update && break || sleep 10; done
-            apt install -y build-essential cmake git curl
+            # python3: test-release-workflow is a python test and this container
+            # (unlike the runner) had none, so it failed with "/usr/bin/env:
+            # 'python3': No such file or directory" the moment the unit tier
+            # started running here.
+            apt install -y build-essential cmake git curl python3
             cmake . -DCMAKE_BUILD_TYPE=Debug \
               -DWHISPER_SANITIZE_${{ matrix.sanitizer }}=ON \
               -DGGML_OPENMP=OFF
             make
-            ctest -L gh --output-on-failure'
+            # -L "gh|unit": this job already BUILDS all 192 test targets, so running the
+            # unit tier costs seconds. CI used to execute 1 of 162 unit tests (found
+            # while checking whether the test added for #322 actually ran; it did not).
+            ctest -L "gh|unit" -E live --output-on-failure --timeout 300'
 
   windows-msys2:
     if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' ||
@@ -902,7 +927,7 @@ jobs:
         with:
           tag_name: ${{ needs.determine-tag.outputs.tag_name }}
           files: crispasr-${{ needs.determine-tag.outputs.tag_name }}-xcframework.zip
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
   android:
     if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' ||

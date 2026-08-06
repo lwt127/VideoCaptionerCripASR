@@ -291,10 +291,18 @@ endif()
   docstring. Dart uses `DynamicLibrary.lookupFunction` with symbol-presence
   checks, so new C-ABI functions are discovered automatically.
 
-### Bindings — adding a new *session setter* (`crispasr_session_set_*`)
-A new setter is **not** auto-discovered; every wrapper exposes it explicitly
-and they are kept at full parity. Add the new method to **all seven** wrappers
-(mirror the nearest existing setter in each — argtypes/restype, error-on-rc≠0):
+### Bindings — adding a new *session setter* (`crispasr_session_set_*`) or *method*
+This applies to any explicit session entry point — the `crispasr_session_set_*`
+setters **and** the data-returning session methods such as
+`crispasr_session_synthesize`, `crispasr_session_synthesize_raw`, and
+`crispasr_session_speech_to_speech`. None of these are auto-discovered (only a new
+*backend* is — see the section above); every wrapper exposes them explicitly and
+they are kept at **full parity**. When you add one, add it to **all seven** wrappers
+(plus the WASM/JS binding and the server, listed below — mirror the nearest existing
+setter/method in each: argtypes/restype, error-on-rc≠0,
+and for PCM-returning methods copy `synthesize`: return the malloc'd `float*` as an
+owned buffer then free via `crispasr_pcm_free`; free any `out_text` via
+`crispasr_session_translate_text_free`):
 - `python/crispasr/_binding.py` — ctypes method on `Session`.
 - `bindings/go/crispasr_session.go` — the cgo-preamble `int crispasr_session_set_X(...)`
   declaration **and** the `Set X` method.
@@ -466,6 +474,48 @@ CMakeLists.txt sets `SKIP_RETURN_CODE 4` so ctest reports them as
 "Skipped" rather than "Failed".
 
 ## Common pitfalls
+
+### Does your model already punctuate? Declare it (`CAP_PUNCTUATION_NATIVE`)
+
+CrispASR auto-enables FireRedPunc for any backend that advertises neither
+`CAP_PUNCTUATION_NATIVE` nor `CAP_PUNCTUATION_TOGGLE`
+(`crispasr_punctuation_policy.h`). Run that pass over text a model already
+punctuated and you get `your country..` — and, before the fix below,
+`ANd so` as well. Every LLM-decoder ASR backend emits punctuated, sentence-cased
+text, so **it must declare `CAP_PUNCTUATION_NATIVE`**; CTC and other
+unpunctuated backends must NOT (they need the pass).
+
+**Do not decide this by reading the model card, and do not use
+`--no-punctuation` to check.** That flag *strips* punctuation after the fact
+(`crispasr_run.cpp`), so a model that punctuates itself looks unpunctuated
+under it — which is exactly how a whole audit can reach the wrong conclusion.
+Print the real thing instead:
+
+```bash
+FIREREDPUNC_DEBUG=1 crispasr -m <model> -f samples/jfk.wav --backend <name> 2>&1 | grep PUNCDBG
+# [PUNCDBG] in=<And so, my fellow Americans, … your country.>   ← the model's OWN output
+# [PUNCDBG] out=<And so, my fellow Americans, … your country..> ← the pass double-punctuating
+```
+
+If `in=` already carries commas/stops and sentence case, add the cap. The
+2026-07-27 audit found `moonshine-streaming` and `mimo-asr` needed it, while
+`canary-qwen` (cased but unpunctuated) and `firered-asr` (ALL CAPS,
+unpunctuated) correctly rely on the pass — so this is per-backend evidence, not
+a blanket flag.
+
+### The modular libraries have TWO copies — patch both
+
+`crisp_punc/`, `crisp_lid/` and `crisp_truecase/` each exist twice: the sibling
+directory (preferred, and what normally links) and a fallback copy under `src/`
+that `src/CMakeLists.txt` builds only when the sibling directory is missing from
+a checkout. A fix applied to one copy silently does nothing in the normal build.
+
+This is not hypothetical: #308's capitalisation fix landed in
+`src/fireredpunc.cpp` while `crisp_punc/src/fireredpunc.cpp` — the copy that
+actually links — kept the bug for months. Every symptom pointed at the file that
+was already correct, and instrumenting that file produced no output at all,
+which is the tell. `tests/test-punc-copies-in-sync.cpp` now fails when the two
+diverge; keep it green rather than deleting the assertion.
 
 ### Mel spectrogram
 

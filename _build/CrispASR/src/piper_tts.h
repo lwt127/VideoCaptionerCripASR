@@ -31,6 +31,11 @@ struct piper_tts_params {
     float length_scale; // duration stretch factor (>1 = slower, <1 = faster)
     float noise_w;      // variance of the stochastic duration predictor noise
     int speaker_id;     // multi-speaker models: speaker index (0-based)
+    // RNG seed for the two stochastic stages (SDP noise + latent sampling).
+    // 0 = non-deterministic (seeded from std::random_device), matching the
+    // historical behaviour. Set it for reproducible audio — the WER regression
+    // gate needs this, since piper's output otherwise varies every run.
+    uint32_t seed;
 };
 
 struct piper_tts_params piper_tts_default_params(void);

@@ -54,6 +54,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -679,6 +680,8 @@ def run_validate() -> list[dict]:
         name = entry["name"]
         print(f"\n========== validate :: {name} ==========")
         t0 = time.time()
+        gguf_local = None  # reset per iteration: the finally-block eviction below
+                           # must never see a stale path from the previous backend
         try:
             from huggingface_hub import hf_hub_download
             gguf_local = Path(hf_hub_download(
@@ -686,11 +689,18 @@ def run_validate() -> list[dict]:
                 filename=entry["gguf"]["file"],
                 revision=entry["gguf"]["revision"],
             ))
-            ref_local = Path(hf_hub_download(
-                repo_id=MANIFEST["fixtures"]["repo"],
-                filename=entry["fixture_ref_path"],
-                revision=MANIFEST["fixtures"]["revision"],
-            ))
+            # `skip_diff: true` entries are transcript-only and carry no
+            # reference dump — 38 of 45 backends. Downloading a fixture for them
+            # raised KeyError: 'fixture_ref_path' and failed the backend before it
+            # ever ran. run_one.py already treats skip_diff this way.
+            skip_diff = bool(entry.get("skip_diff", False))
+            ref_local = None
+            if not skip_diff:
+                ref_local = Path(hf_hub_download(
+                    repo_id=MANIFEST["fixtures"]["repo"],
+                    filename=entry["fixture_ref_path"],
+                    revision=MANIFEST["fixtures"]["revision"],
+                ))
             if "fixture_sample_path" in entry:
                 sample = Path(hf_hub_download(
                     repo_id=MANIFEST["fixtures"]["repo"],
@@ -705,11 +715,15 @@ def run_validate() -> list[dict]:
 
             actual = run_one.run_transcript(crispasr_bin, gguf_local, sample)
             transcript_ok = (actual == entry["expected_transcript"])
-            stages = run_one.run_diff(
-                diff_bin, entry["backend_id"], gguf_local, ref_local, sample)
-            passes, fails, missing, extras = run_one.evaluate_stage_thresholds(
-                stages, entry["diff_thresholds"])
-            ok = transcript_ok and not fails and not missing
+            if skip_diff:
+                stages, passes, fails, missing, extras = {}, [], [], [], {}
+                ok = transcript_ok
+            else:
+                stages = run_one.run_diff(
+                    diff_bin, entry["backend_id"], gguf_local, ref_local, sample)
+                passes, fails, missing, extras = run_one.evaluate_stage_thresholds(
+                    stages, entry["diff_thresholds"])
+                ok = transcript_ok and not fails and not missing
             results.append({
                 "backend": name,
                 "mode": "validate",
@@ -717,7 +731,7 @@ def run_validate() -> list[dict]:
                 "elapsed_s": round(time.time() - t0, 2),
                 "transcript_match": transcript_ok,
                 "transcript_actual": actual if not transcript_ok else None,
-                "stages": {s: stages.get(s) for s in entry["diff_thresholds"]},
+                "stages": {s: stages.get(s) for s in entry.get("diff_thresholds", {})},
                 "extras": dict(extras),
                 "missing": missing,
             })
@@ -732,6 +746,29 @@ def run_validate() -> list[dict]:
                 "error": f"{type(exc).__name__}: {exc}",
             })
             print(f"  -> ERROR  {type(exc).__name__}: {exc}")
+        finally:
+            # Free the model before the next backend. The 45-backend sweep pulls
+            # far more than /kaggle/working holds — the previous run died partway
+            # through with "No space left on device (os error 28)" and every
+            # remaining backend then failed on disk rather than on merit.
+            # Keeping one model at a time is what makes a full sweep possible;
+            # the ASR ground-truth model and fixtures are small and are re-used,
+            # so only the backend under test is evicted.
+            try:
+                import shutil as _sh
+                for _p in (locals().get("gguf_local"),):
+                    if _p is None:
+                        continue
+                    # hf_hub_download returns .../snapshots/<rev>/<file>; drop the
+                    # whole models--* tree so blobs go too, not just the symlink.
+                    _root = Path(_p)
+                    while _root.parent != _root and not _root.name.startswith("models--"):
+                        _root = _root.parent
+                    if _root.name.startswith("models--") and _root.is_dir():
+                        _sh.rmtree(_root, ignore_errors=True)
+                        print(f"  freed {_root.name}", flush=True)
+            except Exception as _e:
+                print(f"  cleanup skipped: {_e}", flush=True)
 
     return results
 
@@ -863,11 +900,87 @@ def run_rebake() -> list[dict]:
     return results
 
 
+# ─────────────────────────── cell 6b (code) ──────────────────────────
+step("cell_6b_begin")
+# ── VALIDATE mode: TTS -> ASR roundtrips ─────────────────────────────────
+#
+# The manifest has carried a `tts_backends` section for a while, but this suite
+# only ever iterated `backends` — so the 21 WER-gated TTS roundtrips were in the
+# manifest and never run by the thing called "the full regression suite".
+# run_one.tts_roundtrip_for already implements one (synthesise the phrase,
+# transcribe it with the pinned ASR backend, assert WER <= wer_max) and returns a
+# failure count, handling `advisory: true` entries internally by reporting and
+# returning 0. Driving it here is what makes the sweep actually full.
+def run_validate_tts() -> list[dict]:
+    sys.path.insert(0, str(REPO / "tests" / "regression"))
+    import run_one  # noqa: E402
+
+    entries = [e for e in MANIFEST.get("tts_backends", [])
+               if not want or e["name"] in want]
+    if not entries:
+        return []
+
+    print(f"\nProcessing {len(entries)} TTS backend(s):")
+    for e in entries:
+        print(f"  - {e['name']:30s} (gguf ~{e['gguf'].get('approx_size_mb','?')} MB)")
+
+    crispasr_bin = BUILD / "bin" / "crispasr"
+    out = []
+    for entry in entries:
+        name = entry["name"]
+        print(f"\n========== tts-roundtrip :: {name} ==========")
+        t0 = time.time()
+        work = Path(tempfile.mkdtemp(prefix=f"tts-{name}-"))
+        try:
+            failures = run_one.tts_roundtrip_for(name, MANIFEST, work, crispasr_bin)
+            out.append({
+                "backend": name,
+                "mode": "validate-tts",
+                "ok": failures == 0,
+                "advisory": bool(entry.get("advisory", False)),
+                "elapsed_s": round(time.time() - t0, 2),
+            })
+            print(f"  -> ok={failures == 0}")
+        # SystemExit too: run_one.die() raises it, and one bad entry must not
+        # abort the remaining backends the way a bare `except Exception` would.
+        except (Exception, SystemExit) as exc:
+            out.append({
+                "backend": name,
+                "mode": "validate-tts",
+                "ok": False,
+                "advisory": bool(entry.get("advisory", False)),
+                "elapsed_s": round(time.time() - t0, 2),
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+            print(f"  -> ERROR  {type(exc).__name__}: {exc}")
+        finally:
+            # Same eviction discipline as the ASR pass: TTS GGUFs are large
+            # (tada 2.2 GB, f5 953 MB) and /kaggle/working does not hold them all.
+            #
+            # Evict THIS entry's repos only. HF_HOME is shared (set in cell 2), so
+            # the per-job work dir holds nothing and a blanket models--* wipe would
+            # also evict the pinned ASR ground-truth model — re-downloading
+            # parakeet for all 21 entries instead of once.
+            shutil.rmtree(work, ignore_errors=True)
+            repos = {entry["gguf"]["repo"]}
+            for key in ("voice", "codec"):
+                if isinstance(entry.get(key), dict) and "repo" in entry[key]:
+                    repos.add(entry[key]["repo"])
+            hub = Path(os.environ["HF_HOME"]) / "hub"
+            for repo in repos:
+                d = hub / ("models--" + repo.replace("/", "--"))
+                if d.is_dir():
+                    shutil.rmtree(d, ignore_errors=True)
+                    print(f"  freed {d.name}", flush=True)
+    return out
+
+
 # ─────────────────────────── cell 7 (code) ───────────────────────────
 step("cell_7_begin")
 # ── Dispatch + upload ─────────────────────────────────────────────────────
 if MODE == "validate":
     RESULTS_DATA = run_validate()
+    RESULTS_DATA += run_validate_tts()
 elif MODE == "rebake":
     RESULTS_DATA = run_rebake()
 else:
@@ -882,8 +995,12 @@ print(f"\nResults: {results_jsonl}")
 
 # Summary line for stdout (so a Kaggle screenshot is self-contained).
 n_ok = sum(1 for r in RESULTS_DATA if r.get("ok"))
-n_fail = sum(1 for r in RESULTS_DATA if not r.get("ok"))
-print(f"\nSUMMARY  mode={MODE}  ok={n_ok}/{len(RESULTS_DATA)}  fail={n_fail}")
+# `advisory: true` entries report but never gate (weak / high-variance models).
+n_fail = sum(1 for r in RESULTS_DATA
+             if not r.get("ok") and not r.get("advisory"))
+n_advisory = sum(1 for r in RESULTS_DATA
+                 if not r.get("ok") and r.get("advisory"))
+print(f"\nSUMMARY  mode={MODE}  ok={n_ok}/{len(RESULTS_DATA)}  fail={n_fail}  advisory={n_advisory}")
 for r in RESULTS_DATA:
     flag = "✓" if r.get("ok") else "✗"
     print(f"  {flag} {r['backend']:30s} {r['elapsed_s']:6.1f}s  {r.get('error', '')}")

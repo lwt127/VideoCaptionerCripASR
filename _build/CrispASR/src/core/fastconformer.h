@@ -506,6 +506,7 @@ static inline int fuse_qkv(std::vector<BlockWeights*>& layers, ggml_backend_t ba
         j.w = ggml_new_tensor_2d(out.ctx, e->attn_q_w->type, e->attn_q_w->ne[0], 3 * e->attn_q_w->ne[1]);
         if (e->attn_q_b)
             j.b = ggml_new_tensor_1d(out.ctx, GGML_TYPE_F32, 3 * e->attn_q_b->ne[0]);
+        // cppcheck-suppress uninitvar
         jobs.push_back(j);
     }
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(out.ctx, backend);

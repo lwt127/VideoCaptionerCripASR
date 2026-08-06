@@ -7,8 +7,9 @@
 //
 // pyannote-seg-3.0 class layout:
 //   0 = silence
-//   1 = spk0,        2 = spk1,        3 = spk0 + spk1,
-//   4 = spk2,        5 = spk0 + spk2, 6 = spk1 + spk2.
+//   1 = spk0,        2 = spk1,        3 = spk2,
+//   4 = spk0 + spk1, 5 = spk0 + spk2, 6 = spk1 + spk2.
+// (Powerset ordered by subset size: all singletons, then all pairs.)
 
 #include "../src/crispasr_diarize.h"
 #include "../src/crispasr_diarize_internal.h"
@@ -86,7 +87,7 @@ TEST_CASE("apply_pyannote: pure-spk2 frames assign segment to spk 2", "[unit][di
     std::vector<float> probs;
     const int T = 100;
     for (int f = 0; f < T; f++)
-        push_frame(probs, 4); // spk2
+        push_frame(probs, 3); // spk2
 
     std::vector<CrispasrDiarizeSegment> segs = {{0, frames_to_cs(T), -1}};
     assign_speakers_from_log_posteriors(probs.data(), T, kFrameDurS, 0, segs);
@@ -115,7 +116,7 @@ TEST_CASE("apply_pyannote: minority-speaker turn within a segment can still surf
 
 TEST_CASE("apply_pyannote: overlap class spk0+spk1 with extra spk1 frames tips to spk1 (regression vs. old LUT)",
           "[unit][diarize][pyannote]") {
-    // Old behavior: class_to_speaker[]={...,0,1,0,...} maps class 3
+    // Old behavior: class_to_speaker[]={...,0,1,0,...} maps class 4
     // (spk0+spk1) to spk0 ONLY, ignoring spk1's coexistence. So 30
     // frames of overlap + 25 frames of pure spk1 would tally as
     // spk0=30, spk1=25 → spk0 wins. New behavior: overlap class
@@ -125,7 +126,7 @@ TEST_CASE("apply_pyannote: overlap class spk0+spk1 with extra spk1 frames tips t
     std::vector<float> probs;
     const int T_overlap = 30, T_spk1_only = 25;
     for (int f = 0; f < T_overlap; f++)
-        push_frame(probs, 3); // spk0 + spk1
+        push_frame(probs, 4); // spk0 + spk1
     for (int f = 0; f < T_spk1_only; f++)
         push_frame(probs, 2); // spk1
     const int T = T_overlap + T_spk1_only;
@@ -145,7 +146,7 @@ TEST_CASE("apply_pyannote: multiple ASR segments get independent labels by frame
     for (int f = 0; f < 50; f++)
         push_frame(probs, 2); // spk1
     for (int f = 0; f < 50; f++)
-        push_frame(probs, 4); // spk2
+        push_frame(probs, 3); // spk2
     const int T = 150;
 
     std::vector<CrispasrDiarizeSegment> segs = {
@@ -240,7 +241,7 @@ TEST_CASE("score_speaker_for_range: picks the dominant speaker within an arbitra
     for (int f = 0; f < 50; f++)
         push_frame(probs, 2);
     for (int f = 0; f < 50; f++)
-        push_frame(probs, 4);
+        push_frame(probs, 3);
     const int T = 150;
 
     REQUIRE(score_speaker_for_range(probs.data(), T, kFrameDurS, 0, frames_to_cs(50)) == 0);

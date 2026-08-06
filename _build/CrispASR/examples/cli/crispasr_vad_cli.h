@@ -49,5 +49,12 @@ bool crispasr_vad_is_webrtc(const whisper_params& p);
 // `crispasr_fixed_chunk_slices(chunk_seconds)`.
 //
 // Returns an empty vector if VAD was requested but detected no speech.
+//
+// When `out_vad_load_failed` is non-null it receives `true` iff a VAD model
+// was requested but could not be loaded (vs. loaded-and-found-no-speech, which
+// reports `false`). Issue #311 --strict-pipeline uses this to fail rather than
+// silently fall through to fixed/energy chunking. It stays `false` when no VAD
+// was requested.
 std::vector<crispasr_audio_slice> crispasr_compute_audio_slices(const float* samples, int n_samples, int sample_rate,
-                                                                int chunk_seconds, const whisper_params& params);
+                                                                int chunk_seconds, const whisper_params& params,
+                                                                bool* out_vad_load_failed = nullptr);

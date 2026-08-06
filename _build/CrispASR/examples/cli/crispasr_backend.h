@@ -258,6 +258,15 @@ public:
     // the VAD path when the user didn't pass an explicit --chunk-seconds.
     virtual int vad_slice_cap_seconds() const { return 0; }
 
+    // ISO-639-1 code of the ONLY language this backend can produce, or nullptr
+    // if it is multilingual / language-agnostic (the default). A monolingual
+    // backend (e.g. moonshine, English-only) returns its code so the CLI can
+    // skip external language-ID on `-l auto` — running a whisper-tiny LID pass
+    // (and downloading `ggml-tiny.bin`) to "detect" the language of a backend
+    // that can only ever emit one is pointless (#227). Must NOT be set by a
+    // multilingual backend — that would wrongly force its output language.
+    virtual const char* sole_language() const { return nullptr; }
+
     // Streaming transcription callback type.
     // Called with partial text (empty string counts as keep-alive)
     // and is_final flag. When is_final is true, partial_text is the

@@ -80768,7 +80768,11 @@ MA_PRIVATE ma_uint64 ma_dr_wav__read_bext_to_metadata_obj(ma_dr_wav__metadata_pa
             ma_dr_wav_buffer_reader_read_u16(&reader, &pMetadata->data.bext.maxMomentaryLoudness);
             ma_dr_wav_buffer_reader_read_u16(&reader, &pMetadata->data.bext.maxShortTermLoudness);
             MA_DR_WAV_ASSERT((ma_dr_wav_offset_ptr(ma_dr_wav_buffer_reader_ptr(&reader), MA_DR_WAV_BEXT_RESERVED_BYTES)) == (bextData + MA_DR_WAV_BEXT_BYTES));
-            extraBytes = (size_t)(chunkSize - MA_DR_WAV_BEXT_BYTES);
+            /* CrispASR #304-fuzz: a malformed bext chunk with chunkSize < 602 (MA_DR_WAV_BEXT_BYTES)
+               underflows this unsigned subtraction to ~2^64, driving a bogus multi-exabyte coding-history
+               allocation (ASan: "requested allocation size ... exceeds maximum supported size"). Clamp so a
+               truncated bext yields no coding history instead of a huge alloc. */
+            extraBytes = chunkSize > MA_DR_WAV_BEXT_BYTES ? (size_t)(chunkSize - MA_DR_WAV_BEXT_BYTES) : 0;
             if (extraBytes > 0) {
                 pMetadata->data.bext.pCodingHistory = (char*)ma_dr_wav__metadata_get_memory(pParser, extraBytes + 1, 1);
                 MA_DR_WAV_ASSERT(pMetadata->data.bext.pCodingHistory != NULL);

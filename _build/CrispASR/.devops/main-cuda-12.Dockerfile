@@ -37,7 +37,7 @@ RUN jobs="${CRISPASR_BUILD_JOBS:-$(nproc)}" && \
     cmake -S . -B build -G Ninja -DCRISPASR_BUILD_TESTS=OFF -DGGML_CUDA=1 \
         -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
     -DGGML_BMI2=ON -DGGML_SSE42=ON -DGGML_AVX=ON -DGGML_AVX512=OFF \
-        -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-real;90-virtual" \
+        -DCMAKE_CUDA_ARCHITECTURES="60-real;61-real;70-real;75-real;80-real;86-real;89-real;90-real;90-virtual" \
         -DCMAKE_EXE_LINKER_FLAGS="-Wl,--allow-shlib-undefined" && \
     cmake --build build -j"${jobs}" --target crispasr-cli
 # --allow-shlib-undefined: see main-cuda.Dockerfile for rationale —
@@ -73,7 +73,7 @@ LABEL org.opencontainers.image.source="https://github.com/CrispStrobe/CrispASR"
 LABEL org.opencontainers.image.revision="${GIT_SHA}"
 LABEL org.opencontainers.image.ref.name="${GIT_REF}"
 LABEL org.opencontainers.image.created="${BUILD_DATE}"
-LABEL org.opencontainers.image.description="crispasr unified ASR — CUDA 12.4 build (driver R510+; sm_75-90)"
+LABEL org.opencontainers.image.description="crispasr unified ASR — CUDA 12.4 build (driver R510+; sm_60-90)"
 
 COPY --from=build /app /app
 RUN printf 'image=main-cuda-12\ncuda_version=12.4\ngit_sha=%s\ngit_ref=%s\nbuild_date=%s\n' \

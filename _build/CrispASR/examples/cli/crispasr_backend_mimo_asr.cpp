@@ -58,6 +58,10 @@ public:
 
     const char* name() const override { return "mimo-asr"; }
     uint32_t capabilities() const override {
+        // #300/#308 audit: the model emits punctuated, sentence-cased text (verified
+        // on jfk: "And so, my fellow Americans, ... for you. Ask what ..."), so the
+        // CLI's automatic FireRedPunc pass must not run over it — it doubled every
+        // sentence-final stop ("for you..", "country..").
         // Verified against src/mimo_asr.cpp as of 2026-05-04:
         //   CAP_AUTO_DOWNLOAD     registry entry exists
         //   CAP_TIMESTAMPS_CTC    framework -am post-step works on segments
@@ -67,7 +71,7 @@ public:
         //                         into cp.temperature → decode cfg
         //   CAP_DIARIZE           framework post-step on segment list
         return CAP_AUTO_DOWNLOAD | CAP_TOKEN_CONFIDENCE | CAP_TIMESTAMPS_CTC | CAP_FLASH_ATTN | CAP_TEMPERATURE |
-               CAP_DIARIZE | CAP_BEAM_SEARCH;
+               CAP_DIARIZE | CAP_BEAM_SEARCH | CAP_PUNCTUATION_NATIVE;
     }
 
     bool init(const whisper_params& params) override {

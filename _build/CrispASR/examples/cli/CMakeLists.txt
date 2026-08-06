@@ -16,6 +16,7 @@ add_executable(${TARGET}
     crispasr_backend.cpp
     crispasr_backend_crispasr.cpp
     crispasr_backend_nemotron.cpp
+    crispasr_backend_gigaam.cpp
     crispasr_backend_parakeet.cpp
     crispasr_backend_canary.cpp
     crispasr_backend_canary_qwen.cpp
@@ -208,6 +209,8 @@ target_link_libraries(crispasr-diff PRIVATE
     common
     crispasr-lib
     parakeet
+    wespeaker
+    gigaam
     canary
     cohere
     granite_speech
@@ -324,6 +327,8 @@ target_link_libraries(${TARGET} PRIVATE
     common
     crispasr-lib
     parakeet
+    wespeaker
+    gigaam
     canary
     cohere
     granite_speech

@@ -1,5 +1,5 @@
 {
-  "id": "chr1s4/crispasr-mtl-codec-upload",
+  "id": "chr1str/crispasr-mtl-codec-upload",
   "title": "CrispASR mtl codec upload",
   "code_file": "crispasr-moss-tts-local-codec-upload.py",
   "language": "python",
@@ -7,7 +7,9 @@
   "is_private": "true",
   "enable_gpu": "false",
   "enable_internet": "true",
-  "dataset_sources": ["chr1s4/crispasr-hf-token"],
+  "dataset_sources": [
+    "chr1str/crispasr-hf-token"
+  ],
   "competition_sources": [],
   "kernel_sources": [],
   "model_sources": []

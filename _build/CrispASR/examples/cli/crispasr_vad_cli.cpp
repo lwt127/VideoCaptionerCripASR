@@ -78,7 +78,10 @@ bool crispasr_vad_is_webrtc(const whisper_params& p) {
 }
 
 std::vector<crispasr_audio_slice> crispasr_compute_audio_slices(const float* samples, int n_samples, int sample_rate,
-                                                                int chunk_seconds, const whisper_params& params) {
+                                                                int chunk_seconds, const whisper_params& params,
+                                                                bool* out_vad_load_failed) {
+    if (out_vad_load_failed)
+        *out_vad_load_failed = false;
     const std::string vad_path = crispasr_resolve_vad_model(params);
 
     if (!vad_path.empty()) {
@@ -90,7 +93,11 @@ std::vector<crispasr_audio_slice> crispasr_compute_audio_slices(const float* sam
         opts.speech_pad_ms = params.vad_speech_pad_ms;
         opts.chunk_seconds = chunk_seconds;
         opts.n_threads = params.n_threads;
-        auto slices = crispasr_compute_vad_slices(samples, n_samples, sample_rate, vad_path.c_str(), opts);
+        bool load_failed = false;
+        auto slices =
+            crispasr_compute_vad_slices(samples, n_samples, sample_rate, vad_path.c_str(), opts, &load_failed);
+        if (out_vad_load_failed)
+            *out_vad_load_failed = load_failed;
         if (!slices.empty())
             return slices;
         // Issue #213: when the VAD model loaded successfully but detected

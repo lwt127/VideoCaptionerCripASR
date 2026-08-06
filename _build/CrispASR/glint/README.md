@@ -69,4 +69,4 @@ and rewrites *only* the marker line below — the prose above is
 maintained here by hand and does not auto-update, so a codec added
 upstream will not be described until this file is edited.
 
-Synced at upstream commit: `efe1a461f78b47cdac2dd3174c630dac40fdba22` (fix: mp3Decode robust to malformed input (resync, never throw); v0.6.1).
+Synced at upstream commit: `5227708db602fb9dba723ae412d20f0f5d5765c3` (chore(dart_pure): glint_audio_pure 0.6.2 — description within pub.dev's limit).

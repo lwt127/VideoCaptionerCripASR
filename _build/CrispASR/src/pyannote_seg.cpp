@@ -7,6 +7,7 @@
 #include "pyannote_seg.h"
 #include "core/gguf_loader.h"
 #include "core/crispasr_env.h"
+#include "core/powerset.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -15,6 +16,7 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -226,7 +228,7 @@ struct pyannote_graph_run {
 
 // SincNet front-end: conv(1→80,k=251,s=10) → |·| → IN+LeakyReLU → pool3 →
 // [conv(k=5,p=2) → IN+LeakyReLU → pool3] ×2. Returns row-major (T_out, 60).
-static bool pyannote_sincnet_ggml(pyannote_seg_context* ctx, const float* samples, int n_samples,
+static bool pyannote_sincnet_ggml(pyannote_seg_context* ctx, ggml_backend_t be, const float* samples, int n_samples,
                                   std::vector<float>& out, int& T_out) {
     pyannote_seg_bench_stage _bs("sincnet_ggml");
     const auto& m = ctx->model;
@@ -265,10 +267,10 @@ static bool pyannote_sincnet_ggml(pyannote_seg_context* ctx, const float* sample
     x = ggml_pool_1d(c, x, GGML_OP_POOL_MAX, 3, 3, 0); // (T3, 60)
 
     ggml_tensor* res = ggml_cont(c, ggml_transpose(c, x)); // (60, T3) → row-major (T3, 60)
-    if (!run.compute(ctx->model.backend, res))
+    if (!run.compute(be, res))
         return false;
     ggml_backend_tensor_set(audio, samples, 0, (size_t)n_samples * sizeof(float));
-    if (ggml_backend_graph_compute(ctx->model.backend, run.gf) != GGML_STATUS_SUCCESS)
+    if (ggml_backend_graph_compute(be, run.gf) != GGML_STATUS_SUCCESS)
         return false;
 
     T_out = (int)res->ne[1];
@@ -280,7 +282,7 @@ static bool pyannote_sincnet_ggml(pyannote_seg_context* ctx, const float* sample
 // One bidirectional LSTM layer. Input/output row-major (T, C_in) / (T, 2H).
 // Input projections batched as one mul_mat per direction; recurrence in
 // plain contiguous loops, one thread per direction.
-static bool bilstm_forward_ggml(pyannote_seg_context* ctx, const float* input, int T, int C_in,
+static bool bilstm_forward_ggml(pyannote_seg_context* ctx, ggml_backend_t be, const float* input, int T, int C_in,
                                 const pyannote_lstm& lstm, float* output) {
     const int H = lstm.hidden_size;
 
@@ -306,11 +308,11 @@ static bool bilstm_forward_ggml(pyannote_seg_context* ctx, const float* input, i
             ggml_set_output(outs[dir]);
             ggml_build_forward_expand(run.gf, outs[dir]);
         }
-        run.ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->model.backend));
+        run.ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
         if (!ggml_gallocr_alloc_graph(run.ga, run.gf))
             return false;
         ggml_backend_tensor_set(X, input, 0, (size_t)T * C_in * sizeof(float));
-        if (ggml_backend_graph_compute(ctx->model.backend, run.gf) != GGML_STATUS_SUCCESS)
+        if (ggml_backend_graph_compute(be, run.gf) != GGML_STATUS_SUCCESS)
             return false;
         for (int dir = 0; dir < 2; dir++) {
             xw[dir].resize((size_t)T * 4 * H);
@@ -319,6 +321,17 @@ static bool bilstm_forward_ggml(pyannote_seg_context* ctx, const float* input, i
     }
 
     // Sequential recurrence — contiguous dots over H (autovectorized).
+    //
+    // This is the hot loop of the whole model: a 4H x H matvec per timestep,
+    // per direction, per layer.
+    //
+    // ⚠ An F16 copy of R was tried here and LOST: 173.6 s of LSTM CPU time
+    // against 146-162 s for F32, interleaved on a 2888 s file. The reasoning
+    // that motivated it — "512x128 F32 restreamed 171k x 4 layers x 2
+    // directions is ~350 GB, so halve it" — ignores that all of R is only 2 MB
+    // and therefore L2-resident, so there was no DRAM bandwidth to win back,
+    // while the per-element widening costs real cycles in the inner loop.
+    // Don't re-try without a new argument.
     auto run_dir = [&](int dir) {
         const float* R_dir = (const float*)lstm.R->data + (size_t)dir * 4 * H * H;
         std::vector<float> h(H, 0.f), cc(H, 0.f), gates(4 * H);
@@ -355,7 +368,8 @@ static bool bilstm_forward_ggml(pyannote_seg_context* ctx, const float* input, i
 
 // 3× Linear (+LeakyReLU) + LogSoftmax over the 7 classes.
 // Input row-major (T, 256); output row-major (T, 7).
-static bool pyannote_classifier_ggml(pyannote_seg_context* ctx, const float* input, int T, std::vector<float>& out) {
+static bool pyannote_classifier_ggml(pyannote_seg_context* ctx, ggml_backend_t be, const float* input, int T,
+                                     std::vector<float>& out) {
     pyannote_seg_bench_stage _bs("classifier_ggml");
     const auto& m = ctx->model;
 
@@ -379,10 +393,10 @@ static bool pyannote_classifier_ggml(pyannote_seg_context* ctx, const float* inp
     x = lin(x, m.matmul2_w, m.linear2_b, false); // (7, T)
     x = ggml_log(c, ggml_soft_max(c, x));        // LogSoftmax over ne[0]=7
 
-    if (!run.compute(ctx->model.backend, x))
+    if (!run.compute(be, x))
         return false;
     ggml_backend_tensor_set(X, input, 0, (size_t)T * 256 * sizeof(float));
-    if (ggml_backend_graph_compute(ctx->model.backend, run.gf) != GGML_STATUS_SUCCESS)
+    if (ggml_backend_graph_compute(be, run.gf) != GGML_STATUS_SUCCESS)
         return false;
 
     out.resize((size_t)T * 7);
@@ -390,13 +404,32 @@ static bool pyannote_classifier_ggml(pyannote_seg_context* ctx, const float* inp
     return true;
 }
 
-static float* pyannote_seg_run_ggml(pyannote_seg_context* ctx, const float* samples, int n_samples, int* out_T) {
+// SincNet's downsampling: conv(stride 10) then three max-pools of stride 3.
+// Output frame f is a function of input samples [270f, 270f + 511) — the 251
+// -sample sinc receptive field plus the span the pools reach across. Both
+// constants matter for chunking: kFrameStride makes chunk-local frames line up
+// with whole-file frames exactly, and kFrameSpan says how much audio past the
+// last wanted frame a chunk still has to be handed.
+constexpr int kFrameStride = 270;
+constexpr int kFrameSpan = 511;
+
+static int pyannote_frames_for_samples(int n_samples) {
+    if (n_samples < kFrameSpan)
+        return 0;
+    int t = (n_samples - 251) / 10 + 1; // conv0, stride 10, no padding
+    return t / 3 / 3 / 3;               // three max-pools, stride 3
+}
+
+// Run the full net over one contiguous span of audio. `be` is the backend this
+// call may use — chunk workers each get their own so they can run at once.
+static bool pyannote_forward_span(pyannote_seg_context* ctx, ggml_backend_t be, const float* samples, int n_samples,
+                                  std::vector<float>& logp, int& T) {
     const auto& m = ctx->model;
 
     std::vector<float> feats;
-    int T = 0;
-    if (!pyannote_sincnet_ggml(ctx, samples, n_samples, feats, T) || T <= 0)
-        return nullptr;
+    T = 0;
+    if (!pyannote_sincnet_ggml(ctx, be, samples, n_samples, feats, T) || T <= 0)
+        return false;
 
     std::vector<float> lstm_out((size_t)T * 256);
     {
@@ -404,22 +437,259 @@ static float* pyannote_seg_run_ggml(pyannote_seg_context* ctx, const float* samp
         std::vector<float> lstm_in = std::move(feats);
         for (int li = 0; li < 4; li++) {
             int C_in = (li == 0) ? 60 : 256;
-            if (!bilstm_forward_ggml(ctx, lstm_in.data(), T, C_in, m.lstm[li], lstm_out.data()))
-                return nullptr;
+            if (!bilstm_forward_ggml(ctx, be, lstm_in.data(), T, C_in, m.lstm[li], lstm_out.data()))
+                return false;
             lstm_in = lstm_out;
         }
     }
+    return pyannote_classifier_ggml(ctx, be, lstm_out.data(), T, logp);
+}
 
-    std::vector<float> logp;
-    if (!pyannote_classifier_ggml(ctx, lstm_out.data(), T, logp))
+// ── Chunked parallel inference (#326) ──────────────────────────────────────
+//
+// The whole-file path fed every sample through as ONE sequence. That made the
+// 4 stacked BiLSTMs a single scan of n_samples/270 timesteps, and since the
+// recurrence is inherently sequential it ran on exactly two threads (one per
+// direction) no matter what -t said. On a 48-minute file that is 171k steps
+// and ~70% of segmentation time, with every core past the second one idle.
+//
+// So cut the audio into fixed-length chunks and run whole chunks concurrently,
+// each on its own backend. Two things make this safe rather than merely fast:
+//
+//  * Chunk length is FIXED, never derived from the thread count, so the output
+//    does not change when -t does. Thread count picks how many chunks are in
+//    flight, nothing else.
+//  * Each chunk is computed with kContextSeconds of real audio spliced on
+//    either side and then trimmed away. That context absorbs the two edge
+//    effects — the k=5 convolutions' zero padding, and the LSTM starting from
+//    a zero hidden state — so interior frames land where the whole-file scan
+//    put them.
+//
+// It also moves us TOWARD pyannote's own design rather than away from it:
+// segmentation-3.0's 7 classes are a powerset over the speakers active in a
+// *local* window, and upstream infers on a sliding 10 s window. One continuous
+// 48-minute scan was the outlier.
+struct pyannote_chunking {
+    int chunk_frames = 0;   // frames emitted per chunk
+    int context_frames = 0; // frames of real audio added each side, then dropped
+    int n_workers = 1;
+};
+
+static bool pyannote_chunking_for(const pyannote_seg_context* ctx, int total_frames, pyannote_chunking& out) {
+    // CRISPASR_PYANNOTE_CHUNK_S=0 restores the old single-scan behaviour.
+    //
+    // 60 s / 5 s picked on the VoxConverse dev shard (8 files, DER vs human
+    // labels, no embedder re-clustering so the absolute numbers are the weak
+    // raw-pyannote path):
+    //
+    //   whole-file 33.37% | 60/ctx2 32.88% | 60/ctx5 30.67% | 60/ctx10 31.87%
+    //                     | 120/ctx5 31.08% | 120/ctx10 29.88%
+    //
+    // Every chunked setting beats the single scan, so this is not a speed-for-
+    // accuracy trade. The spread among chunked settings is smaller than the
+    // file-to-file spread on 8 files, so 120/ctx10 is not meaningfully better
+    // than 60/ctx5 — and 60 s chunks parallelise on short and medium files
+    // where 120 s would yield two chunks and half the cores idle. Context
+    // costs (60+2*5)/60 = 17% redundant compute either way.
+    double chunk_s = 60.0, context_s = 5.0;
+    if (const char* e = crispasr_env::get("CRISPASR_PYANNOTE_CHUNK_S"))
+        chunk_s = atof(e);
+    if (const char* e = crispasr_env::get("CRISPASR_PYANNOTE_CHUNK_CONTEXT_S"))
+        context_s = atof(e);
+    if (chunk_s <= 0.0)
+        return false;
+
+    const double frames_per_s = 16000.0 / kFrameStride;
+    out.chunk_frames = (int)(chunk_s * frames_per_s);
+    out.context_frames = (int)(context_s * frames_per_s);
+    if (out.chunk_frames <= 0)
+        return false;
+    // One chunk plus its context is the whole file — nothing to win, and the
+    // single-scan path is then bit-identical to what shipped before.
+    if (total_frames <= out.chunk_frames)
+        return false;
+
+    // Whether to chunk depends ONLY on how long the audio is — never on the
+    // thread count. Deciding it on worker count would mean `-t 1` silently
+    // took the single-scan path and produced different posteriors from `-t 2`
+    // on the same file. Thread count picks how many chunks are in flight, and
+    // nothing else: -t 2/4/8 are byte-identical, verified on a 2888 s file.
+    const int n_chunks = (total_frames + out.chunk_frames - 1) / out.chunk_frames;
+    out.n_workers = std::max(1, std::min(ctx->n_threads, n_chunks));
+    return true;
+}
+
+static float* pyannote_seg_run_ggml(pyannote_seg_context* ctx, const float* samples, int n_samples, int* out_T) {
+    const int total_frames = pyannote_frames_for_samples(n_samples);
+    if (total_frames <= 0)
         return nullptr;
 
+    pyannote_chunking ch;
+    if (!pyannote_chunking_for(ctx, total_frames, ch)) {
+        // Single scan over everything — the pre-#326 path, unchanged.
+        std::vector<float> logp;
+        int T = 0;
+        if (!pyannote_forward_span(ctx, ctx->model.backend, samples, n_samples, logp, T) || T <= 0)
+            return nullptr;
+        if (out_T)
+            *out_T = T;
+        float* result = (float*)malloc((size_t)T * 7 * sizeof(float));
+        if (result)
+            memcpy(result, logp.data(), (size_t)T * 7 * sizeof(float));
+        pyannote_seg_dump(result, T);
+        return result;
+    }
+
+    const int n_chunks = (total_frames + ch.chunk_frames - 1) / ch.chunk_frames;
+    if (pyannote_seg_bench_enabled())
+        fprintf(stderr, "  pyannote_seg_bench: chunked %d frames -> %d chunks x %d frames, %d workers\n", total_frames,
+                n_chunks, ch.chunk_frames, ch.n_workers);
+
+    std::vector<float> result_buf((size_t)total_frames * 7);
+    struct chunk_result {
+        std::vector<float> logp; // (T, 7), starting at global frame g0 - pad_lo
+        int pad_lo = 0;
+        int T = 0;
+    };
+    std::vector<chunk_result> chunks((size_t)n_chunks);
+    std::atomic<int> next_chunk{0};
+    std::atomic<bool> failed{false};
+
+    auto worker = [&](ggml_backend_t be) {
+        for (;;) {
+            const int ci = next_chunk.fetch_add(1);
+            if (ci >= n_chunks || failed.load())
+                return;
+
+            const int g0 = ci * ch.chunk_frames;
+            const int g1 = std::min(total_frames, g0 + ch.chunk_frames);
+
+            // Widen by context on both sides, clipped to the real audio, and
+            // snapped to frame boundaries so chunk-local frame j is exactly
+            // global frame (s_start / kFrameStride) + j.
+            const int pad_lo = std::min(ch.context_frames, g0);
+            const int s_start = (g0 - pad_lo) * kFrameStride;
+            const int want_end = (g1 + ch.context_frames) * kFrameStride + kFrameSpan;
+            const int s_end = std::min(n_samples, want_end);
+            if (s_end - s_start < kFrameSpan) {
+                failed.store(true);
+                return;
+            }
+
+            chunk_result cr;
+            cr.pad_lo = pad_lo;
+            if (!pyannote_forward_span(ctx, be, samples + s_start, s_end - s_start, cr.logp, cr.T)) {
+                failed.store(true);
+                return;
+            }
+            chunks[(size_t)ci] = std::move(cr);
+        }
+    };
+
+    {
+        pyannote_seg_bench_stage _bs("chunked_total");
+        std::vector<ggml_backend_t> backends;
+        for (int i = 0; i < ch.n_workers; i++) {
+            // Each worker needs its own backend: ggml_backend_graph_compute is
+            // not re-entrant on one instance. The model weights are read-only
+            // and shared, so only the scratch buffers are duplicated.
+            ggml_backend_t be = ggml_backend_cpu_init();
+            if (!be) {
+                failed.store(true);
+                break;
+            }
+            // Hand each worker the cores that inter-chunk parallelism cannot
+            // use. With more chunks than threads this is 1 and everything is
+            // busy anyway; with FEWER chunks than threads — any short file —
+            // pinning workers to 1 thread would leave most of the machine idle
+            // (a 2-chunk file on 8 cores used 2). ggml partitions matmul and
+            // conv by output row, so no output element is split across
+            // threads and the result does not depend on this number; the
+            // byte-identity of the posteriors across -t is asserted below by
+            // measurement, not assumed.
+            ggml_backend_cpu_set_n_threads(be, std::max(1, ctx->n_threads / ch.n_workers));
+            backends.push_back(be);
+        }
+        if (!failed.load()) {
+            std::vector<std::thread> pool;
+            for (size_t i = 1; i < backends.size(); i++)
+                pool.emplace_back(worker, backends[i]);
+            if (!backends.empty())
+                worker(backends[0]);
+            for (auto& t : pool)
+                t.join();
+        }
+        for (ggml_backend_t be : backends)
+            ggml_backend_free(be);
+    }
+
+    if (failed.load())
+        return nullptr;
+
+    // ── Stitch, aligning each chunk's local speaker numbering to the last ──
+    //
+    // The 7 classes are a powerset over *local* speakers, and which physical
+    // voice ends up as local spk0 vs spk1 is arbitrary per forward pass. Left
+    // alone, every seam permutes the labels and the output is unusable
+    // downstream. Each chunk was computed with `pad_lo` frames of context that
+    // the PREVIOUS chunk already owns, so those frames are the same audio
+    // scored twice — pick the relabelling of {spk0, spk1, spk2} that makes the
+    // two agree best on them, then apply it to the frames this chunk owns.
+    //
+    // Alignment is sequential (chunk i aligns to the already-aligned i-1) but
+    // it is pure arithmetic over a couple of seconds of frames, so it costs
+    // nothing next to the forward passes, which all ran in parallel above.
+    // class_map[p][c] = class c relabelled by permutation p (core/powerset.h).
+    int class_map[6][core_powerset::kClasses];
+    for (int pi = 0; pi < 6; pi++)
+        for (int c = 0; c < core_powerset::kClasses; c++)
+            class_map[pi][c] = core_powerset::permute_class(c, core_powerset::kPerms[pi]);
+
+    for (int ci = 0; ci < n_chunks; ci++) {
+        const chunk_result& cr = chunks[(size_t)ci];
+        const int g0 = ci * ch.chunk_frames;
+        const int g1 = std::min(total_frames, g0 + ch.chunk_frames);
+
+        int best = 0; // identity
+        if (ci > 0 && cr.pad_lo > 0) {
+            double best_score = -1.0;
+            for (int pi = 0; pi < 6; pi++) {
+                double score = 0.0;
+                for (int f = 0; f < cr.pad_lo; f++) {
+                    const float* cur = &cr.logp[(size_t)f * 7];
+                    const float* prev = &result_buf[(size_t)(g0 - cr.pad_lo + f) * 7];
+                    for (int c = 0; c < 7; c++)
+                        score += (double)expf(prev[class_map[pi][c]]) * expf(cur[c]);
+                }
+                if (score > best_score) {
+                    best_score = score;
+                    best = pi;
+                }
+            }
+        }
+
+        const int avail = cr.T - cr.pad_lo;
+        const int keep = std::min(g1 - g0, std::max(0, avail));
+        for (int f = 0; f < keep; f++) {
+            const float* src = &cr.logp[(size_t)(cr.pad_lo + f) * 7];
+            float* dst = &result_buf[(size_t)(g0 + f) * 7];
+            for (int c = 0; c < 7; c++)
+                dst[class_map[best][c]] = src[c];
+        }
+        // A short tail chunk can come up a frame or two shy once the trailing
+        // context is clipped; repeat the last good frame rather than leaving
+        // zeros, which would read as a confident silence.
+        for (int f = keep; f < g1 - g0; f++)
+            memcpy(&result_buf[(size_t)(g0 + f) * 7], keep > 0 ? &result_buf[(size_t)(g0 + keep - 1) * 7] : &cr.logp[0],
+                   7 * sizeof(float));
+    }
+
     if (out_T)
-        *out_T = T;
-    float* result = (float*)malloc((size_t)T * 7 * sizeof(float));
+        *out_T = total_frames;
+    float* result = (float*)malloc(result_buf.size() * sizeof(float));
     if (result)
-        memcpy(result, logp.data(), (size_t)T * 7 * sizeof(float));
-    pyannote_seg_dump(result, T);
+        memcpy(result, result_buf.data(), result_buf.size() * sizeof(float));
+    pyannote_seg_dump(result, total_frames);
     return result;
 }
 

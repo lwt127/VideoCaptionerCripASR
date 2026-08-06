@@ -29,6 +29,7 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1160,13 +1161,19 @@ extern "C" char* t5_translate(struct t5_translate_context* ctx, const char* text
     } else {
         int offset = prompt_len;
         for (int step = 0; step < max_new_tokens; step++) {
-            int best_id = 0;
-            float best_val = logits[0];
-            for (int i = 1; i < hp.vocab_size; i++) {
-                if (logits[i] > best_val) {
+            // NaN-robust argmax (see lfm2_audio note): seed -inf, skip non-finite,
+            // abort if the whole row is non-finite (else best_id=-1 gets pushed).
+            int best_id = -1;
+            float best_val = -std::numeric_limits<float>::infinity();
+            for (int i = 0; i < hp.vocab_size; i++) {
+                if (std::isfinite(logits[i]) && logits[i] > best_val) {
                     best_val = logits[i];
                     best_id = i;
                 }
+            }
+            if (best_id < 0) {
+                fprintf(stderr, "t5_translate: non-finite logits — aborting decode\n");
+                break;
             }
             if (best_id == hp.eos_token_id)
                 break;

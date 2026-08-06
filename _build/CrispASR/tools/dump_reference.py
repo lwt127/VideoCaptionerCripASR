@@ -119,7 +119,22 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # autoregresses with a KV cache that doesn't have a clean "per-step
     # logits" entry point the way the speech-LLMs do.
     "cohere":     "reference_backends.cohere",
+    # Tiron (#295): Whisper large-v3 + inline <|speakerN|> markers. Dumps mel +
+    # encoder_output (structural parity) and the CONSTRAINED-GRAMMAR decoded
+    # transcript (the acceptance target — see reference_backends/tiron.py). The
+    # audio arg is a real multi-speaker clip.
+    "tiron":      "reference_backends.tiron",
     "parakeet":   "reference_backends.parakeet",
+    # WeSpeaker ResNet34-LM speaker embedder (#324). model_dir is a snapshot of
+    # Wespeaker/wespeaker-voxceleb-resnet34-LM (containing `avg_model`), or the
+    # checkpoint path itself. Needs the upstream package importable — either
+    # pip-installed or via WESPEAKER_REPO=<checkout>.
+    "wespeaker":  "reference_backends.wespeaker",
+    # GigaAM-v3 (ai-sage/GigaAM-v3): rotary Conformer + CTC or RNN-T head.
+    # model_dir is a LOCAL snapshot of one revision (ctc / rnnt / e2e_ctc /
+    # e2e_rnnt), or the repo id plus GIGAAM_REVISION=<rev>. Loaded with
+    # trust_remote_code — modeling_gigaam.py is the driving inference code.
+    "gigaam":     "reference_backends.gigaam",
     # Parakeet-TDT MAES beam decoding. Same model as "parakeet" but captures
     # transducer component intermediates (prediction net, joint net) plus
     # full MAES decode output. Config via MAES_BEAM_SIZE / MAES_NUM_STEPS /

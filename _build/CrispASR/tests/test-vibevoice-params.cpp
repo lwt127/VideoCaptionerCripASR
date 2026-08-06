@@ -22,10 +22,19 @@ TEST_CASE("vibevoice_params: value knobs match the shipped/upstream contract", "
 
     REQUIRE(p.tts_steps == 20);                  // DPM-Solver++ inference steps (header: default 20, min 4)
     REQUIRE(p.cfg_scale == Catch::Approx(0.0f)); // sentinel: 0 → model default (1.3 base) resolved downstream
-    REQUIRE(p.max_new_tokens == 512);            // AR decode upper bound
+    REQUIRE(p.max_new_tokens == 0);              // 0 = duration-scaled ASR budget
     REQUIRE(p.seed == 0u);                       // 0 = env/default noise seed
     REQUIRE(p.use_gpu == true);
     REQUIRE(p.flash_attn == true); // PLAN #89 plumbing — must stay on
+}
+
+TEST_CASE("vibevoice_params: ASR token budget scales with audio duration", "[unit][vibevoice]") {
+    REQUIRE(vibevoice_resolve_max_new_tokens(0, 30 * 24000) == 512);
+    REQUIRE(vibevoice_resolve_max_new_tokens(0, 142 * 24000 + 1) == 1144);
+}
+
+TEST_CASE("vibevoice_params: explicit ASR token budget overrides duration scaling", "[unit][vibevoice]") {
+    REQUIRE(vibevoice_resolve_max_new_tokens(768, 300 * 24000) == 768);
 }
 
 TEST_CASE("vibevoice_init_from_file: null path returns nullptr", "[unit][vibevoice]") {

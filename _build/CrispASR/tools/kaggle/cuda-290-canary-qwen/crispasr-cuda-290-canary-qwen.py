@@ -224,15 +224,15 @@ def word_count(t):
 # independent #292 backend beyond moss-diarize; equal counts would be the bug.
 for device in ["cpu", "cuda"]:
     with kh.build_heartbeat(f"292.canary_qwen.{device}"):
-        ok_lo, lo_txt, _, _ = transcribe(M["canary_qwen"], "canary-qwen", MED, device,
-                                         extra=["--chunk-seconds", "0", "--max-new-tokens", "64"])
-        ok_hi, hi_txt, _, _ = transcribe(M["canary_qwen"], "canary-qwen", MED, device,
+        ok_lo, lo_txt, _, _ = transcribe(M["canary_qwen"], "canary-qwen", JFK, device,
+                                         extra=["--chunk-seconds", "0", "--max-new-tokens", "8"])
+        ok_hi, hi_txt, _, _ = transcribe(M["canary_qwen"], "canary-qwen", JFK, device,
                                          extra=["--chunk-seconds", "0", "--max-new-tokens", "4096"])
     n_lo, n_hi = word_count(lo_txt), word_count(hi_txt)
-    passed = ok_lo and ok_hi and n_hi >= n_lo * 1.2 and n_hi >= n_lo + 30
+    passed = ok_lo and ok_hi and n_hi >= n_lo * 1.5 and n_hi >= n_lo + 20
     record(f"292:canary-qwen:{device}:max_new_tokens_honored", passed,
-           words_cap64=n_lo, words_cap4096=n_hi, ratio=round(n_hi / max(n_lo, 1), 2),
-           note="cap 64 truncates, cap 4096 does not; EQUAL = flag ignored (bug)")
+           words_cap8=n_lo, words_cap4096=n_hi, ratio=round(n_hi / max(n_lo, 1), 2),
+           note="11s single-pass jfk: cap 8 MUST truncate vs 4096; EQUAL = flag ignored on a single decode (real bug)")
 
 # ── cell 6: #290 — canary-qwen long audio stays bounded (the real target) ───
 # The #290 regression: canary-qwen declared CAP_INTERNAL_CHUNKING with no chunker,

@@ -15,9 +15,9 @@ logger = setup_logger("crisp_asr")
 # CrispASR 二进制目录（随应用打包在 resource/bin/CrispASR 下）
 CRISP_ASR_BIN = Path(BIN_PATH) / "CrispASR" / "crispasr.exe"
 
-# 期望的最低引擎版本；低于该版本的本地引擎会被自动升级（下载 v0.8.21）。
+# 期望的最低引擎版本；低于该版本的本地引擎会被自动升级（下载 v0.8.25）。
 # 与 crisp_asr_download_thread.CRISP_ASR_PINNED_TAG 保持一致。
-CRISP_ASR_MIN_VERSION = (0, 8, 21)
+CRISP_ASR_MIN_VERSION = (0, 8, 25)
 
 # CrispASR 引擎内部把解码后的采样点数量强转为 32 位有符号 int
 # （examples/cli/crispasr_run.cpp: `(int)samples.size()`）。解码后统一为
@@ -183,7 +183,7 @@ class CrispASR(BaseASR):
         want_cuda = self.use_gpu and cuda_available()
 
         # 已存在引擎时：
-        #   1) 版本低于最低要求 → 升级到目标版本（v0.8.21）；
+        #   1) 版本低于最低要求 → 升级到目标版本（v0.8.25）；
         #   2) 需要 CUDA 但当前为 CPU-only → 升级为 CUDA 构建。
         if self.crisp_asr_path.exists():
             ver = engine_version(self.crisp_asr_path)
@@ -411,8 +411,8 @@ class CrispASR(BaseASR):
             if self.vad_method and self.vad_method != "silero":
                 params.extend(["--vad-model", self.vad_method])
 
-        # 语种自动检测：对没有原生 LID 能力的后端（cohere/canary/granite/voxtral/
-        # voxtral4b），CrispASR 靠额外的 audio-LID 预处理模型实现 "-l auto"，
+        # 语种自动检测：对没有原生 LID capability 的后端，CrispASR 靠额外的
+        # audio-LID 预处理模型实现 "-l auto"，
         # 通过 --lid-backend 指定该预处理模型（默认 FireRed，见 crisp_asr_catalog）。
         # 对有原生 LID 能力的后端，"-l auto" 本身已足够，不需要也不应传该参数。
         if self.language == "auto" and self.lid_method:

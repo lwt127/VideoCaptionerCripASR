@@ -215,8 +215,11 @@ static std::vector<crispasr_audio_slice> compute_firered_vad_slices(const float*
 
 std::vector<crispasr_audio_slice> crispasr_compute_vad_slices(const float* samples, int n_samples, int sample_rate,
                                                               const char* vad_model_path,
-                                                              const crispasr_vad_options& opts) {
+                                                              const crispasr_vad_options& opts, bool* out_load_failed) {
     std::vector<crispasr_audio_slice> slices;
+    // Assume the model loads; a branch below sets this true if it can't.
+    if (out_load_failed)
+        *out_load_failed = false;
     if (!vad_model_path || !*vad_model_path || n_samples <= 0)
         return slices;
 
@@ -247,6 +250,8 @@ std::vector<crispasr_audio_slice> crispasr_compute_vad_slices(const float* sampl
             if (segs)
                 free(segs);
             // Do NOT free vctx — it's cached.
+        } else if (out_load_failed) {
+            *out_load_failed = true; // marblenet model failed to load
         }
     }
 #endif
@@ -289,6 +294,8 @@ std::vector<crispasr_audio_slice> crispasr_compute_vad_slices(const float* sampl
             if (segs)
                 free(segs);
             // Do NOT free vctx — it's cached.
+        } else if (out_load_failed) {
+            *out_load_failed = true; // whisper-vad-encdec model failed to load
         }
     }
 #endif
@@ -329,6 +336,8 @@ std::vector<crispasr_audio_slice> crispasr_compute_vad_slices(const float* sampl
         whisper_vad_context* vctx = silero_vad_get_cached_locked(vad_model_path, opts.n_threads);
         if (!vctx) {
             fprintf(stderr, "crispasr: warning: failed to load VAD model '%s'\n", vad_model_path);
+            if (out_load_failed)
+                *out_load_failed = true;
             return slices;
         }
 

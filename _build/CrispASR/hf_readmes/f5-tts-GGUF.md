@@ -38,7 +38,10 @@ experimentation, but F16 is the only recommended format.
 ## Architecture
 
 - **DiT backbone**: 22-layer Diffusion Transformer with AdaLN-Zero (330M params)
-- **Text encoder**: Character-level ConvNeXtV2 (4 blocks, 512-d)
+- **Text encoder**: Character-level ConvNeXtV2 (4 blocks, 512-d). English is
+  tokenized per character; **Chinese** is converted to pinyin syllables (TONE3,
+  with tone-sandhi) by CrispASR's built-in g2p — a Chinese reference clip + an
+  accurate Chinese `--ref-text` give the best results.
 - **Vocoder**: Vocos (8× ConvNeXt + ISTFTHead, 13M params)
 - **ODE solver**: 32-step Euler with CFG (strength=2.0, sway=-1.0)
 - **Output**: 24 kHz mono PCM

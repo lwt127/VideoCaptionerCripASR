@@ -444,8 +444,10 @@ std::vector<CrispasrAlignedSegment> crispasr_group_aligned_segments(const std::v
 
 std::vector<CrispasrAlignedWord> crispasr_align_words(const std::string& aligner_model, const std::string& transcript,
                                                       const float* samples, int n_samples, int64_t t_offset_cs,
-                                                      int n_threads) {
+                                                      int n_threads, bool* out_load_failed) {
     std::vector<CrispasrAlignedWord> out;
+    if (out_load_failed)
+        *out_load_failed = false;
     if (aligner_model.empty() || transcript.empty() || !samples || n_samples <= 0)
         return out;
 
@@ -487,6 +489,8 @@ std::vector<CrispasrAlignedWord> crispasr_align_words(const std::string& aligner
         actx = canary_ctc_init_from_file(aligner_model.c_str(), acp);
         if (!actx) {
             fprintf(stderr, "crispasr[aligner]: failed to load '%s'\n", aligner_model.c_str());
+            if (out_load_failed)
+                *out_load_failed = true;
             return out;
         }
         g_aligner_cache_ctx = actx;

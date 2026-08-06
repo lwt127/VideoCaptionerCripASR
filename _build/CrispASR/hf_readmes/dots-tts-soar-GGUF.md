@@ -79,9 +79,9 @@ automatically with `-m auto --backend dots-tts`.
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `CRISPASR_DOTS_MAX_PATCHES`   | 200 | Hard cap on generated audio patches |
+| `CRISPASR_DOTS_MAX_PATCHES`   | 256 | Hard cap on generated audio patches |
 | `CRISPASR_DOTS_ODE_STEPS`     | 16  | Flow-matching Euler steps (quality vs speed) |
-| `CRISPASR_DOTS_EOS_THRESHOLD` | 0.5 | End-of-speech probability threshold |
+| `CRISPASR_DOTS_EOS_THRESHOLD` | 0.8 | End-of-speech probability threshold |
 
 ## Architecture
 

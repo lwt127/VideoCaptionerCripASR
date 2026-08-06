@@ -24,6 +24,7 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1447,13 +1448,21 @@ static char* moss_diarize_impl(struct moss_diarize_context* ctx, const float* sa
             generated.pop_back();
     } else {
         for (int step = 0; step < max_new; step++) {
-            int best_id = 0;
-            float best_val = logits[0];
-            for (int i = 1; i < vocab; i++)
-                if (logits[i] > best_val) {
+            // NaN-robust argmax (see canary_qwen note): seed -inf, skip non-finite,
+            // abort if the whole row is non-finite.
+            int best_id = -1;
+            float best_val = -std::numeric_limits<float>::infinity();
+            for (int i = 0; i < vocab; i++)
+                if (std::isfinite(logits[i]) && logits[i] > best_val) {
                     best_val = logits[i];
                     best_id = i;
                 }
+            if (best_id < 0) {
+                free(logits);
+                logits = nullptr;
+                fprintf(stderr, "moss_diarize: non-finite logits at step %d — aborting decode\n", step);
+                break;
+            }
             free(logits);
             logits = nullptr;
             if (ctx->params.verbosity >= 2 && step < 10)
@@ -1482,7 +1491,11 @@ static char* moss_diarize_impl(struct moss_diarize_context* ctx, const float* sa
             result += core_bpe::token_bytes_to_utf8(t);
     }
     if (ctx->params.verbosity >= 1)
-        fprintf(stderr, "moss_diarize: %zu tokens: \"%s\"\n", generated.size(), result.substr(0, 200).c_str());
+        // #318: print the FULL tagged transcript, not the first 200 chars — this
+        // `[t][Sxx] …[t]` line (speaker tags + per-phrase timings) is the only
+        // place the rich structure surfaces during streaming (the partial JSONs
+        // carry text only), and users rely on it. One line, printed once per call.
+        fprintf(stderr, "moss_diarize: %zu tokens: \"%s\"\n", generated.size(), result.c_str());
 
     // n-gram loop fix
     {

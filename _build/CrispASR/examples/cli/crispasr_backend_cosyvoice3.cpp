@@ -65,7 +65,12 @@ public:
     const char* name() const override { return "cosyvoice3-tts"; }
 
     uint32_t capabilities() const override {
-        return CAP_TTS | CAP_VOICE_CLONING | CAP_AUTO_DOWNLOAD | CAP_TEMPERATURE | CAP_FLASH_ATTN;
+        // #304: CAP_SRC_TGT_LANGUAGE signals cross-lingual synthesis — pass a
+        // target language (-l/--language, or -tl) that differs from the voice's
+        // own language and CV3 drops the reference transcript to avoid the
+        // cross-lingual accent (SubtitleEdit surfaces this as a language menu).
+        return CAP_TTS | CAP_VOICE_CLONING | CAP_AUTO_DOWNLOAD | CAP_TEMPERATURE | CAP_FLASH_ATTN |
+               CAP_SRC_TGT_LANGUAGE;
     }
 
     int tts_sample_rate() const override { return 24000; }
@@ -195,6 +200,15 @@ public:
             return {};
         cosyvoice3_tts_set_temperature(ctx_, params.temperature > 0.0f ? params.temperature : 0.8f);
         cosyvoice3_tts_set_seed(ctx_, (uint64_t)params.seed);
+
+        // #304 cross-lingual: the requested synthesis language — prefer -tl,
+        // else -l (mirrors OmniVoice's language knob that SE already surfaces).
+        // When it differs from the reference voice's language, synth drops the
+        // reference transcript to avoid the cross-lingual accent (#304).
+        std::string tgt_lang = !params.target_lang.empty()
+                                   ? params.target_lang
+                                   : (params.language != "auto" ? params.language : std::string());
+        cosyvoice3_tts_set_target_language(ctx_, tgt_lang.c_str());
 
         int n = 0;
         float* pcm = nullptr;

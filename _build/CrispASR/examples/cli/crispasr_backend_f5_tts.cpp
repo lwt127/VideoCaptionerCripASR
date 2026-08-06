@@ -189,8 +189,14 @@ public:
             return false;
         }
 
-        // Load reference audio for voice cloning
-        if (!p.tts_voice.empty()) {
+        // Load reference audio for voice cloning.
+        //
+        // "default" / "auto" mean "use the built-in reference", the same sentinel
+        // cosyvoice3, tada and omnivoice already honour. f5-tts alone treated them
+        // as a filename and died with "failed to load reference audio 'default'",
+        // which is what broke `--voice default` in the TTS regression manifest.
+        const bool voice_is_sentinel = p.tts_voice == "default" || p.tts_voice == "auto";
+        if (!p.tts_voice.empty() && !voice_is_sentinel) {
             int wav_sr = 0;
             auto ref_pcm = read_wav_mono(p.tts_voice, &wav_sr);
             if (ref_pcm.empty() || wav_sr <= 0) {

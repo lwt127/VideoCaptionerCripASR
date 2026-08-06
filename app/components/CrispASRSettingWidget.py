@@ -108,8 +108,8 @@ def _enum_members_for_codes(codes, include_auto: bool = False):
     return result
 
 
-# “自动检测”在需要额外 LID 预处理步骤的后端（cohere/canary/granite/voxtral/
-# voxtral4b）上显示的专用文案，用于和原生自动识别的“自动检测”区分开。
+# “自动检测”在需要额外 LID 预处理步骤的后端上显示的专用文案，用于和原生自动
+# 识别的“自动检测”区分开。具体能力由 CrispASR v0.8.25 runtime matrix 判定。
 _AUTO_LID_PRE_STEP_LABEL = "自动检测 (LID 预处理)"
 
 
@@ -361,7 +361,7 @@ class CrispASRSettingWidget(QWidget):
         """根据后端标签 + 模型标签，解析出应展示的 TranscribeLanguageEnum 子集。
 
         若该后端/模型具备原生语种自动识别（native audio-LID）能力，或需要额外 LID
-        预处理步骤才能实现自动检测（cohere/canary/granite/voxtral/voxtral4b），
+        预处理步骤才能实现自动检测，
         在列表最前面加入“自动检测”选项（对应 CrispASR 的 -l auto）。
         """
         codes = get_language_codes(backend_label, model_label or None)

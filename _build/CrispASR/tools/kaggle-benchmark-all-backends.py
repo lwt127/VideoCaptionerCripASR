@@ -23,7 +23,14 @@ from datetime import datetime
 from pathlib import Path
 
 WORK = "/kaggle/working"
-BUILD_DIR = f"{WORK}/CrispASR/build"
+# Clone and build under /kaggle/temp, NOT /kaggle/working. `kaggle kernels output`
+# is page-capped at 500 files and does not auto-continue, so a repo checkout in
+# the working dir buries everything that sorts after it — including the kernel
+# log, which is the only place a failing backend's stderr appears. That is why
+# kugelaudio's failure could not be read back after a 6-hour sweep. /kaggle/working
+# should hold only artifacts worth retrieving.
+SCRATCH = "/kaggle/temp" if os.path.isdir("/kaggle/temp") else "/tmp"
+BUILD_DIR = f"{SCRATCH}/CrispASR/build"
 CRISPASR = f"{BUILD_DIR}/bin/crispasr"
 QUANTIZE = f"{BUILD_DIR}/bin/crispasr-quantize"
 RESULTS_DIR = f"{WORK}/results"
@@ -141,7 +148,7 @@ print("✓ Dependencies installed")
 
 # ─────────────────────────── cell 3 (code) ───────────────────────────
 # ── Clone and build CrispASR ───────────────────────────────────────────────
-CRISPASR_DIR = f"{WORK}/CrispASR"
+CRISPASR_DIR = f"{SCRATCH}/CrispASR"
 
 def run(cmd, timeout=600, stream_stderr=False):
     """Run shell command, return (success, stdout, stderr, elapsed).
@@ -187,13 +194,19 @@ def run(cmd, timeout=600, stream_stderr=False):
 
 if os.path.isdir(CRISPASR_DIR):
     # Pull latest to pick up fixes pushed since initial clone
-    subprocess.run(f"cd {CRISPASR_DIR} && git fetch --depth 1 origin main && git reset --hard origin/main",
+    subprocess.run(f"cd {CRISPASR_DIR} && git fetch --depth 1 origin main "
+                   f"&& git reset --hard origin/main "
+                   f"&& git submodule update --init --recursive --depth 1",
                    shell=True, check=True, capture_output=True)
-    print("✓ CrispASR updated to latest")
+    print("✓ CrispASR updated to latest (submodules synced)")
 else:
-    subprocess.run(f"git clone --depth 1 https://github.com/CrispStrobe/CrispASR.git {CRISPASR_DIR}",
+    # --recurse-submodules is not optional: ggml is a submodule, and without it
+    # cmake stops at CMakeLists.txt:256 with "The bundled 'ggml' submodule is not
+    # initialized" (#298) before a single backend runs.
+    subprocess.run(f"git clone --depth 1 --recurse-submodules --shallow-submodules "
+                   f"https://github.com/CrispStrobe/CrispASR.git {CRISPASR_DIR}",
                    shell=True, check=True)
-    print("✓ CrispASR cloned")
+    print("✓ CrispASR cloned (with submodules)")
 
 # Shared Kaggle harness (lives in the cloned repo) — build streaming,
 # heartbeat+RSS, ccache/mold, CUDA arch auto-detect, 3-tier HF auth.
@@ -216,7 +229,11 @@ import io as _io
 # progress to), under a sweep-specific prefix so it doesn't collide with the
 # harness's runs/*.jsonl.
 SWEEP_REPO = os.environ.get("CRISPASR_SWEEP_REPO", "cstr/crispasr-kaggle-progress")
-RUN_TAG = os.environ.get("CRISPASR_SWEEP_RUN", "latest")
+# Bump this per campaign — results are keyed by tag and a matching tag makes the
+# kernel SKIP backends that already have a result file. "latest" currently holds
+# 60 finished backends from an earlier pin, so reusing it would skip nearly the
+# whole sweep and say nothing about the tree under test.
+RUN_TAG = os.environ.get("CRISPASR_SWEEP_RUN", "ggml-v0.17b")
 SWEEP_PREFIX = f"full-backend-sweep/{RUN_TAG}"
 # Optional subset filter: CRISPASR_SWEEP_ONLY="f5-tts,chatterbox,..." runs ONLY
 # those backends (skips all others) — for targeted re-tests of a fixed subset.
@@ -562,6 +579,8 @@ def benchmark_backend(backend, display_name, timeout, notes):
 
     if not ok:
         result["status"] = "TIMEOUT" if "TIMEOUT" in stderr else "CRASH"
+        if stderr:
+            result["stderr_tail"] = stderr[-1500:]
         print(f"  ✗ {result['status']} after {elapsed:.1f}s  (wall)")
         # Show useful stderr lines (skip download progress bars)
         if stderr:
@@ -713,6 +732,12 @@ if BENCHMARK_TTS == "1":
             status = "PASS" if ok else "FAIL"
             tts_r = {"backend": backend, "name": name, "wall_s": round(wall, 1),
                      "status": status, "wav_bytes": sz}
+            # Carry the failure reason IN the streamed record. The kernel log is
+            # the only other place it exists, and that is page-capped and easily
+            # unreachable — kugelaudio failed a 6-hour sweep with nothing but
+            # "wav_bytes: 0" to show for it.
+            if not ok and proc.stderr:
+                tts_r["stderr_tail"] = proc.stderr[-1500:]
             print(f"  {status} — {wall:.1f}s, {sz} bytes")
             if not ok and proc.stderr:
                 print(f"  stderr: {proc.stderr[-300:]}")

@@ -381,11 +381,29 @@ struct zonos_tts_context* zonos_tts_init_from_file(const char* path_model, struc
     }
     ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
-    if (ggml_backend_is_cpu(ctx->backend)) {
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
-    }
     if (!ctx->backend) {
         ctx->backend = ctx->backend_cpu;
+    }
+    // #304: Zonos hangs on the Vulkan backend — the AR transformer + DAC (44 kHz)
+    // vocoder graph never completes (>300 s on a 3 s clip vs ~8 s on CPU on a
+    // Tesla P100), the same ggml-vulkan graph-corruption class already routed to
+    // CPU in cosyvoice3 (#304), tada-codec (#192), moss (#215). SubtitleEdit
+    // ships the Vulkan Windows build to every Windows user. Metal + CUDA render
+    // correctly. Run on CPU when the GPU backend is Vulkan; override with
+    // CRISPASR_ZONOS_VULKAN_NATIVE=1.
+    if (ctx->backend != ctx->backend_cpu && std::strstr(ggml_backend_name(ctx->backend), "Vulkan")) {
+        const char* keep = crispasr_env::get("CRISPASR_ZONOS_VULKAN_NATIVE");
+        if (!(keep && keep[0] == '1')) {
+            if (params.verbosity >= 1) {
+                fprintf(stderr, "zonos_tts: Vulkan backend detected — running on CPU (#304 Vulkan "
+                                "hang; set CRISPASR_ZONOS_VULKAN_NATIVE=1 to override)\n");
+            }
+            ggml_backend_free(ctx->backend);
+            ctx->backend = ctx->backend_cpu;
+        }
+    }
+    if (ggml_backend_is_cpu(ctx->backend)) {
+        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
     }
 
     // Pass 2: load weights via core_gguf helper

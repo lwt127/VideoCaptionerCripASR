@@ -511,6 +511,12 @@ extern "C" {
     // qwen3-tts VoiceDesign: natural-language voice description.
     pub fn crispasr_session_set_instruct(s: *mut CrispasrSession, instruct: *const c_char)
         -> c_int;
+    // #316: synthesize these phonemes verbatim, skipping the G2P. Empty clears.
+    // -2 = the active backend has no phonemes-in call (kokoro and piper do).
+    pub fn crispasr_session_set_tts_phonemes(
+        s: *mut CrispasrSession,
+        phonemes: *const c_char,
+    ) -> c_int;
     // qwen3-tts variant detection (returns 0/1; 0 also covers "not qwen3-tts").
     pub fn crispasr_session_is_custom_voice(s: *mut CrispasrSession) -> c_int;
     pub fn crispasr_session_is_voice_design(s: *mut CrispasrSession) -> c_int;
@@ -519,6 +525,36 @@ extern "C" {
         text: *const c_char,
         out_n_samples: *mut c_int,
     ) -> *mut f32;
+    // Speech-to-Speech — audio in -> audio out via a single model pass. Supported
+    // on S2S-capable backends (lfm2-audio, mini-omni2, sidon, voxcpm2-vae). Returns
+    // malloc'd f32 PCM (free with `crispasr_pcm_free`); `out_text`, if non-null,
+    // receives the malloc'd intermediate transcript (free with
+    // `crispasr_session_translate_text_free`). Returns null on failure / unsupported.
+    pub fn crispasr_session_speech_to_speech(
+        s: *mut CrispasrSession,
+        in_samples: *const f32,
+        n_in_samples: c_int,
+        out_text: *mut *mut c_char,
+        out_n_samples: *mut c_int,
+    ) -> *mut f32;
+    // UNMARKED synthesis (no watermark/disclosure). Hard-refused unless
+    // `crispasr_session_accept_marking_responsibility` was called first. Returns
+    // malloc'd f32 PCM (free with `crispasr_pcm_free`); null on refusal/failure.
+    pub fn crispasr_session_synthesize_raw(
+        s: *mut CrispasrSession,
+        text: *const c_char,
+        out_n_samples: *mut c_int,
+    ) -> *mut f32;
+    // Attest that the integrator accepts AI-content marking/disclosure
+    // responsibility (EU AI Act Art. 50). REQUIRED before `synthesize_raw`.
+    pub fn crispasr_session_accept_marking_responsibility(
+        s: *mut CrispasrSession,
+        attestation: *const c_char,
+    ) -> c_int;
+    // Sample rate the backend expects for input PCM (16000 for Whisper-family,
+    // the model's native rate otherwise; 0 on error). Pair with s2s/synthesize to
+    // feed input at the right rate.
+    pub fn crispasr_session_input_sample_rate(s: *mut CrispasrSession) -> c_int;
     pub fn crispasr_pcm_free(pcm: *mut f32);
     // Drop the kokoro per-session phoneme cache. No-op for non-kokoro
     // backends. Returns 0 on success, -1 if `s` is null. (PLAN #56 #5)

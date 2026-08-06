@@ -44,6 +44,11 @@ public:
         pp.noise_scale = -1.0f; // use model defaults
         pp.length_scale = -1.0f;
         pp.noise_w = -1.0f;
+        // Piper is a stochastic VITS (SDP noise + latent sampling). Forward the
+        // seed so --seed makes synthesis reproducible; 0 keeps the historical
+        // std::random_device behaviour. Without this the WER regression gate
+        // resamples every run and flaps around its threshold.
+        pp.seed = (uint32_t)p.seed;
 
         ctx_ = piper_tts_init_from_file(model_path.c_str(), pp);
         if (!ctx_) {
@@ -82,6 +87,21 @@ public:
 
         float* pcm = nullptr;
         int sr = 0;
+
+        // #316: --tts-phonemes drives the acoustic model directly. piper's
+        // runtime always had this call; the adapter previously reached it only
+        // by accident, as a fallback when phonemization failed and the text
+        // happened to be non-ASCII.
+        if (!p.tts_phonemes.empty()) {
+            int np = piper_tts_synthesize_phonemes(ctx_, p.tts_phonemes.c_str(), &pcm, &sr);
+            if (np <= 0 || !pcm) {
+                fprintf(stderr, "piper: phoneme synthesis failed for '%s'\n", p.tts_phonemes.c_str());
+                return {};
+            }
+            std::vector<float> out(pcm, pcm + np);
+            free(pcm);
+            return out;
+        }
 
         // Try full text→phoneme→synth (espeak-ng or built-in G2P).
         int n = piper_tts_synthesize(ctx_, text.c_str(), &pcm, &sr);

@@ -36,8 +36,8 @@ CRISP_ASR_LID_METHODS = [
 ]
 
 
-# 表示“不限制下拉列表”的哨兵值：该后端/模型支持自动检测 + 大规模/完整语言集，
-# 语言下拉应展示完整枚举，不做筛选。
+# 表示“不限制下拉列表”的哨兵值：该后端/模型支持大规模/完整语言集，语言下拉
+# 应展示完整枚举，不做筛选。是否可自动检测由 native-LID capability 另行判断。
 _MULTI_50 = None
 
 
@@ -345,14 +345,11 @@ def get_language_codes(backend_label: str, model_label: "str | None" = None) -> 
     return b.get("languages")
 
 
-# 没有原生语种识别（audio-LID）能力的后端：CrispASR 文档明确指出这些后端要靠
-# `-l auto` 触发的额外 LID 预处理步骤（whisper-tiny 等）才能"检测"语言，而不是
-# 模型自身原生支持多语言自动识别。见 docs/cli.md「Audio LID」一节：
-# "Backends without native lang-detect (cohere, canary, granite, voxtral,
-# voxtral4b) get it via the LID pre-step"。
-# 因此即使这些后端的某个模型不限制语言（languages=None），也不应展示“自动检测”
-# 选项——避免与真正原生支持自动检测的后端混淆。
-_NO_NATIVE_LID_BACKENDS = {"cohere", "canary", "granite", "voxtral", "voxtral4b"}
+# CrispASR v0.8.25 的 --list-backends-json 运行时 capability matrix 中，只有
+# Whisper 与 SenseVoice 声明 language-detect。其余 ASR 后端的 `-l auto` 都会走
+# 外部 audio-LID 预处理步骤，默认会使用 whisper-tiny；本应用允许用户改选 ECAPA、
+# FireRed 等 LID 模型。不要以 README 的语言覆盖表推断原生 LID。
+_NATIVE_LID_BACKENDS = {"whisper", "sensevoice"}
 
 
 def _resolve_effective_backend(backend_label: str, model_label: "str | None" = None) -> "str | None":
@@ -373,25 +370,24 @@ def supports_auto_lid(backend_label: str, model_label: "str | None" = None) -> b
     """判断给定后端（可选模型）是否具备原生语种自动识别（native audio-LID）能力。
 
     条件：该组合的语言集不受限（get_language_codes 返回 None，即支持多语言/大语种
-    集），且实际生效的 --backend 值不在 _NO_NATIVE_LID_BACKENDS 名单中（这些后端
-    的“自动检测”是靠额外 LID 预处理步骤实现，非模型原生能力）。
+    集），且实际生效的 --backend 值在 _NATIVE_LID_BACKENDS 名单中。
     """
     if get_language_codes(backend_label, model_label) is not None:
         return False
     effective_backend = _resolve_effective_backend(backend_label, model_label)
     if effective_backend is None:
         return False
-    return effective_backend not in _NO_NATIVE_LID_BACKENDS
+    return effective_backend in _NATIVE_LID_BACKENDS
 
 
 def needs_lid_pre_step(backend_label: str, model_label: "str | None" = None) -> bool:
     """判断给定后端（可选模型）是否需要靠额外 LID 预处理步骤才能提供“自动检测”。
 
-    条件：实际生效的 --backend 值在 _NO_NATIVE_LID_BACKENDS 名单中，且该组合支持
+    条件：实际生效的 --backend 值不在 _NATIVE_LID_BACKENDS 名单中，且该组合支持
     2 种及以上语言（只支持 1 种语言时谈不上“检测”，不需要也不应展示自动检测项）。
     """
     effective_backend = _resolve_effective_backend(backend_label, model_label)
-    if effective_backend is None or effective_backend not in _NO_NATIVE_LID_BACKENDS:
+    if effective_backend is None or effective_backend in _NATIVE_LID_BACKENDS:
         return False
     codes = get_language_codes(backend_label, model_label)
     return codes is None or len(codes) >= 2

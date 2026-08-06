@@ -311,6 +311,15 @@ CRISPASR_SESSION_API int crispasr_session_result_n_segments(crispasr_session_res
 CRISPASR_SESSION_API const char* crispasr_session_result_segment_text(crispasr_session_result* r, int i);
 CRISPASR_SESSION_API int64_t crispasr_session_result_segment_t0(crispasr_session_result* r, int i);
 CRISPASR_SESSION_API int64_t crispasr_session_result_segment_t1(crispasr_session_result* r, int i);
+// #300: native per-segment speaker label from a backend that diarizes on its
+// own — the "(Speaker N) " form (with the trailing space, as the CLI prefixes
+// it), or "" when the backend produced none. Never NULL, so a caller can print
+// it unconditionally. Populated today by vibevoice, whose model answers with a
+// Start/End/Speaker/Content array; other backends leave it empty. The ordinals
+// are CHUNK-LOCAL: "Speaker 1" in one transcribe call is not guaranteed to be
+// the same voice as "Speaker 1" in the next, since no cross-chunk clustering
+// runs here (use crispasr_diarize_* for that).
+CRISPASR_SESSION_API const char* crispasr_session_result_segment_speaker(crispasr_session_result* r, int i);
 CRISPASR_SESSION_API int crispasr_session_result_n_words(crispasr_session_result* r, int i_seg);
 CRISPASR_SESSION_API const char* crispasr_session_result_word_text(crispasr_session_result* r, int i_seg, int i_word);
 CRISPASR_SESSION_API int64_t crispasr_session_result_word_t0(crispasr_session_result* r, int i_seg, int i_word);
@@ -364,10 +373,19 @@ CRISPASR_SESSION_API int crispasr_session_set_speaker_id(crispasr_session* s, in
 CRISPASR_SESSION_API int crispasr_session_n_speakers(crispasr_session* s);
 CRISPASR_SESSION_API const char* crispasr_session_get_speaker_name(crispasr_session* s, int i);
 CRISPASR_SESSION_API int crispasr_session_set_instruct(crispasr_session* s, const char* instruct);
+// #316: synthesize `phonemes` verbatim instead of phonemizing the text — the
+// seam between text processing and the acoustic model. Use it to reproduce
+// another implementation's pronunciation exactly, or to separate "the G2P is
+// wrong" from "the model is wrong". Empty clears. Returns -2 (soft no-op) when
+// the active backend exposes no phonemes-in call; kokoro and piper do.
+CRISPASR_SESSION_API int crispasr_session_set_tts_phonemes(crispasr_session* s, const char* phonemes);
 CRISPASR_SESSION_API int crispasr_session_is_custom_voice(crispasr_session* s);
 CRISPASR_SESSION_API int crispasr_session_is_voice_design(crispasr_session* s);
+// UNMARKED synthesis — hard-refused unless crispasr_session_accept_marking_responsibility() was called first.
 CRISPASR_SESSION_API float* crispasr_session_synthesize_raw(crispasr_session* s, const char* text, int* out_n_samples);
 CRISPASR_SESSION_API float* crispasr_session_synthesize(crispasr_session* s, const char* text, int* out_n_samples);
+// Attest acceptance of AI-content marking/disclosure duty (required for _raw); recorded for audit.
+CRISPASR_SESSION_API int crispasr_session_accept_marking_responsibility(crispasr_session* s, const char* attestation);
 
 // Streaming synthesis: fires `cb` once per sentence chunk with that chunk's
 // watermarked PCM (backend-native sample rate, same as synthesize) as it is

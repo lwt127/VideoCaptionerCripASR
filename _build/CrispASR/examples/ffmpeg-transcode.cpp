@@ -11,6 +11,12 @@
 #include <vector>
 #include <string>
 
+// C++ header — MUST stay outside the extern "C" block below. crispasr_env.h
+// pulls in <mutex>/<string> (→ <chrono>/<ratio>), whose templates are illegal
+// under C linkage; GCC 15 / libstdc++ 15 rejects it with "template with C
+// linkage" (#297). The FFmpeg headers below are C and do need extern "C".
+#include "core/crispasr_env.h"
+
 // C
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,7 +34,6 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libswresample/swresample.h>
-#include "core/crispasr_env.h"
 }
 
 typedef uint64_t u64;

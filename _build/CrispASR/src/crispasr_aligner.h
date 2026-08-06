@@ -78,9 +78,17 @@ std::vector<CrispasrAlignedSegment> crispasr_group_aligned_segments(const std::v
 /// cost is dominated by the ASR pass upstream, not the aligner load.
 ///
 /// Returns an empty vector on any failure (error printed to stderr).
+///
+/// When `out_load_failed` is non-null it is set to `true` iff the aligner
+/// MODEL could not be loaded (as opposed to loading fine but yielding no words),
+/// so issue #311 --strict-pipeline can fail even when the backend's native word
+/// timestamps would otherwise mask an explicitly-requested aligner that never
+/// ran. Best-effort: covers the canary-CTC path (and any unrecognized/corrupt
+/// GGUF, which routes there); it stays `false` otherwise and never
+/// false-positives.
 std::vector<CrispasrAlignedWord> crispasr_align_words(const std::string& aligner_model, const std::string& transcript,
                                                       const float* samples, int n_samples, int64_t t_offset_cs,
-                                                      int n_threads);
+                                                      int n_threads, bool* out_load_failed = nullptr);
 
 /// Free the cached aligner model context (§176e). Call at shutdown.
 void crispasr_aligner_free_cache();

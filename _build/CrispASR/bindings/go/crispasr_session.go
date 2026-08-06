@@ -71,9 +71,12 @@ int              crispasr_session_set_speaker_id(CrispasrSession* s, int id);
 int              crispasr_session_n_speakers(CrispasrSession* s);
 const char*      crispasr_session_get_speaker_name(CrispasrSession* s, int i);
 int              crispasr_session_set_instruct(CrispasrSession* s, const char* instruct);
+int              crispasr_session_set_tts_phonemes(CrispasrSession* s, const char* phonemes);
 int              crispasr_session_is_custom_voice(CrispasrSession* s);
 int              crispasr_session_is_voice_design(CrispasrSession* s);
 float*           crispasr_session_synthesize(CrispasrSession* s, const char* text, int* out_n_samples);
+float*           crispasr_session_synthesize_raw(CrispasrSession* s, const char* text, int* out_n_samples);
+int              crispasr_session_accept_marking_responsibility(CrispasrSession* s, const char* attestation);
 float*           crispasr_session_speech_to_speech(CrispasrSession* s, const float* in_samples, int n_in_samples,
                                                     char** out_text, int* out_n_samples);
 void             crispasr_session_translate_text_free(char* text);
@@ -107,6 +110,7 @@ long long    crispasr_session_result_word_t0(crispasr_session_result* r, int i_s
 long long    crispasr_session_result_word_t1(crispasr_session_result* r, int i_seg, int i_word);
 float        crispasr_session_result_word_p(crispasr_session_result* r, int i_seg, int i_word);
 float        crispasr_session_result_segment_no_speech_prob(crispasr_session_result* r, int i_seg);
+const char*  crispasr_session_result_segment_speaker(crispasr_session_result* r, int i);
 // Per-frame CTC logits (opted in via crispasr_session_set_return_logits) for
 // backends that produce a dense CTC grid (Omni CTC, wav2vec2/hubert/data2vec,
 // canary-ctc). Frame-major: logits[t * n_logit_vocab + v]. Raw pre-softmax for
@@ -157,6 +161,15 @@ struct crispasr_diarize_opts_abi {
     int         n_threads;
     long long   slice_t0_cs;
     const char* pyannote_model_path;
+    // #324 foxnose (method 4). This layout is hand-maintained and MUST match
+    // struct crispasr_diarize_opts_abi in src/crispasr_c_api.cpp exactly —
+    // Go allocates the struct, so a missing field here means the C side reads
+    // past the end of it.
+    const char* foxnose_embedder_path;
+    int         min_speakers;
+    int         max_speakers;
+    int         num_speakers;
+    int         _pad2;
 };
 int crispasr_diarize_segments_abi(const float* left_pcm, const float* right_pcm, int n_samples,
                                   int is_stereo, struct crispasr_diarize_seg_abi* segs, int n_segs,
@@ -961,6 +974,25 @@ func (s *CrispasrSession) SetInstruct(instruct string) error {
 	}
 }
 
+// SetTTSPhonemes synthesizes the given phonemes verbatim instead of
+// phonemizing the text — the seam between text processing and the acoustic
+// model. Use it to reproduce another implementation's pronunciation exactly, or
+// to tell a G2P bug from a model bug (#316). Empty clears.
+// Honoured by kokoro and piper; other backends return a soft no-op error.
+func (s *CrispasrSession) SetTTSPhonemes(phonemes string) error {
+	cps := C.CString(phonemes)
+	defer C.free(unsafe.Pointer(cps))
+	rc := C.crispasr_session_set_tts_phonemes(s.handle, cps)
+	switch rc {
+	case 0:
+		return nil
+	case -2:
+		return errors.New("backend has no phonemes-in entry point; SetTTSPhonemes applies to kokoro and piper")
+	default:
+		return fmt.Errorf("SetTTSPhonemes failed (rc=%d)", int(rc))
+	}
+}
+
 // IsCustomVoice reports whether the loaded model is a qwen3-tts
 // CustomVoice variant (use SetSpeakerName for it).
 func (s *CrispasrSession) IsCustomVoice() bool {
@@ -996,6 +1028,38 @@ func (s *CrispasrSession) Synthesize(text string) ([]float32, error) {
 	ptr := C.crispasr_session_synthesize(s.handle, ctext, &n)
 	if ptr == nil || n <= 0 {
 		return nil, errors.New("crispasr_session_synthesize: no audio produced")
+	}
+	defer C.crispasr_pcm_free(ptr)
+	samples := make([]float32, int(n))
+	src := unsafe.Slice((*float32)(unsafe.Pointer(ptr)), int(n))
+	copy(samples, src)
+	return samples, nil
+}
+
+// AcceptMarkingResponsibility attests that the caller accepts AI-content
+// marking/disclosure responsibility (EU AI Act Art. 50). It is REQUIRED before
+// SynthesizeRaw will return UNMARKED audio; the default Synthesize (watermarked)
+// is unaffected. `attestation` is a human-readable affirmation recorded for audit.
+func (s *CrispasrSession) AcceptMarkingResponsibility(attestation string) error {
+	ca := C.CString(attestation)
+	defer C.free(unsafe.Pointer(ca))
+	if C.crispasr_session_accept_marking_responsibility(s.handle, ca) != 0 {
+		return errors.New("crispasr_session_accept_marking_responsibility failed")
+	}
+	return nil
+}
+
+// SynthesizeRaw converts `text` to UNMARKED 24 kHz mono PCM (no watermark), for
+// callers that must post-process (speed/mix/concat) before embedding the mark
+// themselves. It is hard-refused unless AcceptMarkingResponsibility was called
+// first. Most callers should use Synthesize, which watermarks by default.
+func (s *CrispasrSession) SynthesizeRaw(text string) ([]float32, error) {
+	ctext := C.CString(text)
+	defer C.free(unsafe.Pointer(ctext))
+	var n C.int
+	ptr := C.crispasr_session_synthesize_raw(s.handle, ctext, &n)
+	if ptr == nil || n <= 0 {
+		return nil, errors.New("crispasr_session_synthesize_raw: no audio (attestation required? call AcceptMarkingResponsibility first)")
 	}
 	defer C.crispasr_pcm_free(ptr)
 	samples := make([]float32, int(n))
@@ -1068,6 +1132,13 @@ type TranscribeSegment struct {
 	// <|nospeech|> posterior) in [0, 1]. Whisper-only; other backends leave
 	// the -1.0 "no data" sentinel.
 	NoSpeechProb float32
+	// Speaker is a native per-segment speaker label from a backend that
+	// diarizes on its own, in the "(Speaker N) " form the CLI prefixes into
+	// text/srt/vtt output, or "" when the backend produced none. Populated
+	// today by vibevoice, whose model answers with a Start/End/Speaker/Content
+	// array. The ordinals are CHUNK-LOCAL: "Speaker 1" in one transcribe call
+	// is not necessarily the same voice as "Speaker 1" in the next.
+	Speaker string
 }
 
 // TranscribeWord is one word with timing and confidence.
@@ -1207,6 +1278,7 @@ func extractResult(r *C.crispasr_session_result) *TranscribeResult {
 		seg.T0 = int64(C.crispasr_session_result_segment_t0(r, C.int(i)))
 		seg.T1 = int64(C.crispasr_session_result_segment_t1(r, C.int(i)))
 		seg.NoSpeechProb = float32(C.crispasr_session_result_segment_no_speech_prob(r, C.int(i)))
+		seg.Speaker = C.GoString(C.crispasr_session_result_segment_speaker(r, C.int(i)))
 		nWords := int(C.crispasr_session_result_n_words(r, C.int(i)))
 		seg.Words = make([]TranscribeWord, nWords)
 		for j := 0; j < nWords; j++ {
@@ -1373,6 +1445,9 @@ const (
 	DiarizeXCorr    DiarizeMethod = 1 // stereo-only, cross-correlation
 	DiarizeVADTurns DiarizeMethod = 2 // mono-friendly, gap-based
 	DiarizePyannote DiarizeMethod = 3 // pyannote v3 segmentation model
+	// DiarizeMethodFoxNose: WeSpeaker embeddings + spectral clustering (#324).
+	// Requires FoxNoseOpts.EmbedderPath.
+	DiarizeMethodFoxNose DiarizeMethod = 4
 )
 
 // DiarizeSeg is one input/output segment for diarization.
@@ -1385,8 +1460,29 @@ type DiarizeSeg struct {
 // DiarizeSegments assigns speaker labels to pre-segmented audio.
 // leftPCM is the mono or left-channel audio; rightPCM is the right channel
 // (nil for mono). segs are modified in-place with Speaker fields filled.
+// FoxNoseOpts configures DiarizeMethodFoxNose (#324). Nil for other methods.
+type FoxNoseOpts struct {
+	EmbedderPath string // WeSpeaker GGUF; required
+	MinSpeakers  int    // 0 -> 1
+	MaxSpeakers  int    // 0 -> 8
+	NumSpeakers  int    // >0 pins the count and skips estimation
+}
+
+// DiarizeSegments keeps its original signature for source compatibility;
+// DiarizeSegmentsFoxNose adds the #324 options.
 func DiarizeSegments(leftPCM, rightPCM []float32, isStereo bool, segs []DiarizeSeg,
 	method DiarizeMethod, nThreads int, pyannoteModel string) error {
+	return diarizeSegments(leftPCM, rightPCM, isStereo, segs, method, nThreads, pyannoteModel, nil)
+}
+
+// DiarizeSegmentsFoxNose runs the WeSpeaker + spectral-clustering diarizer.
+func DiarizeSegmentsFoxNose(leftPCM, rightPCM []float32, isStereo bool, segs []DiarizeSeg,
+	nThreads int, fox *FoxNoseOpts) error {
+	return diarizeSegments(leftPCM, rightPCM, isStereo, segs, DiarizeMethodFoxNose, nThreads, "", fox)
+}
+
+func diarizeSegments(leftPCM, rightPCM []float32, isStereo bool, segs []DiarizeSeg,
+	method DiarizeMethod, nThreads int, pyannoteModel string, fox *FoxNoseOpts) error {
 	if len(segs) == 0 {
 		return nil
 	}
@@ -1412,6 +1508,18 @@ func DiarizeSegments(leftPCM, rightPCM []float32, isStereo bool, segs []DiarizeS
 		n_threads:           C.int(nThreads),
 		slice_t0_cs:         0,
 		pyannote_model_path: cPyannote,
+	}
+	if fox != nil {
+		// DiarizeMethodFoxNose (#324) consumes the embedder path and speaker
+		// bounds; every other method ignores them.
+		if fox.EmbedderPath != "" {
+			cEmb := C.CString(fox.EmbedderPath)
+			defer C.free(unsafe.Pointer(cEmb))
+			opts.foxnose_embedder_path = cEmb
+		}
+		opts.min_speakers = C.int(fox.MinSpeakers)
+		opts.max_speakers = C.int(fox.MaxSpeakers)
+		opts.num_speakers = C.int(fox.NumSpeakers)
 	}
 	stereo := C.int(0)
 	if isStereo {

@@ -9,6 +9,15 @@ on:
         description: 'Tag to build + release (e.g. v0.4.5)'
         required: true
         type: string
+      only:
+        description: >-
+          Rebuild ONLY this job and re-upload just its asset
+          (e.g. build-libs-macos-arm64). Empty = the whole release.
+          The publish step attaches whatever was produced, so the other
+          assets on the release are left untouched.
+        required: false
+        default: ''
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -63,6 +72,7 @@ jobs:
           esac
 
   build-linux:
+    if: ${{ !inputs.only || inputs.only == 'build-linux' }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v6
@@ -99,10 +109,11 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/crispasr-linux-x86_64.tar.gz
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
   # ── WebAssembly build (browser: ASR + TTS, all backends) ─────────────────────
   build-wasm:
+    if: ${{ !inputs.only || inputs.only == 'build-wasm' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -136,7 +147,7 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/crispasr-wasm.tar.gz
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
   # ── Linux x86_64 CLI — AVX-512 + VNNI variant ────────────────────────────────
   # Default build-linux ships AVX-2 only. On CPUs with AVX-512 + VPDPBUSD
@@ -149,6 +160,7 @@ jobs:
   # CPU; users on Skylake-X / Ice Lake / Tiger Lake / Sapphire Rapids
   # / Zen 4 can opt into the faster build.
   build-linux-x86_64-avx512:
+    if: ${{ !inputs.only || inputs.only == 'build-linux-x86_64-avx512' }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v6
@@ -187,15 +199,19 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/crispasr-linux-x86_64-avx512.tar.gz
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
   # ── Linux x86_64 CLI — CUDA 12 variant ──────────────────────────────────────
   # Static CLI binary linked with CUDA 12.8. Useful for Kaggle / Colab /
   # any Linux box with an NVIDIA GPU: download, chmod +x, run — no build step.
-  # Targets sm_75 (T4), sm_86 (A100/3090), sm_89 (L4/4090), sm_120 (Blackwell)
+  # Targets sm_60 (Tesla P100) + sm_61 (P5000/P4000/GTX 10xx) Pascal, sm_70
+  # (Volta: V100/Titan V), sm_75 (T4), sm_86 (A100/3090), sm_89 (L4/4090),
+  # sm_120 (Blackwell). CUDA 12.x still emits Pascal/Volta SASS — CUDA 13
+  # dropped them, so the cuda13 variant below floors at sm_75.
   # plus sm_120 virtual for future compat. Ships as a self-contained tarball
   # alongside crispasr-quantize so users can convert + run in one download.
   build-linux-x86_64-cuda:
+    if: ${{ !inputs.only || inputs.only == 'build-linux-x86_64-cuda' }}
     runs-on: ubuntu-22.04
     env:
       CUDA_VERSION: "12.8.0"
@@ -224,7 +240,7 @@ jobs:
             -DGGML_CUDA=ON \
             -DGGML_OPENBLAS=ON \
             -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
-            -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120-real;120-virtual" \
+            -DCMAKE_CUDA_ARCHITECTURES="60-real;61-real;70-real;75-real;86-real;89-real;120-real;120-virtual" \
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=ON \
             -DCRISPASR_BUILD_SERVER=OFF \
@@ -250,15 +266,18 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/crispasr-linux-x86_64-cuda.tar.gz
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
   # ── Linux x86_64 CLI — CUDA 13 variant (#152) ────────────────────────────────
   # Same as build-linux-x86_64-cuda but compiled against CUDA 13.0.
   # CUDA 13 ships a new libcudart.so.13 (not ABI-compatible with .so.12),
   # so users with CUDA 13 drivers/toolkit need a separate binary.
-  # Targets sm_75 (T4), sm_86 (A100/3090), sm_89 (L4/4090), sm_120 (Blackwell)
-  # plus sm_120 virtual for future compat.
+  # Floors at sm_75: CUDA 13 REMOVED offline codegen for Maxwell/Pascal/Volta
+  # (sm_50-70), so nvcc 13 fatals on compute_60/61/70 — Pascal (P100/P5000) +
+  # Volta (V100) users must take the cuda12 tarball above. Targets sm_75 (T4),
+  # sm_86 (A100/3090), sm_89 (L4/4090), sm_120 (Blackwell) plus sm_120 virtual.
   build-linux-x86_64-cuda13:
+    if: ${{ !inputs.only || inputs.only == 'build-linux-x86_64-cuda13' }}
     runs-on: ubuntu-22.04
     env:
       CUDA_VERSION: "13.0.0"
@@ -313,7 +332,7 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/crispasr-linux-x86_64-cuda13.tar.gz
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
   # ── Linux x86_64 CLI — HIP/ROCm variant ─────────────────────────────────────
   # Native AMD GPU path via HIP (ROCm). Covers RDNA2 (gfx1030/1035),
@@ -322,6 +341,7 @@ jobs:
   # (gfx1201 support was added in ROCm 6.3). Prefer this over Vulkan on Linux
   # AMD: HIP has full flash-attention, tinyBLAS INT8 VNNI, and MFMA paths.
   build-linux-x86_64-hip:
+    if: ${{ !inputs.only || inputs.only == 'build-linux-x86_64-hip' }}
     runs-on: ubuntu-22.04
     container:
       image: rocm/dev-ubuntu-22.04:6.3
@@ -376,13 +396,14 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/crispasr-linux-x86_64-hip.tar.gz
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
   # ── Linux x86_64 shared libs — HIP/ROCm variant ──────────────────────────────
   # Mirrors build-linux-x86_64-hip as a shared-lib tarball for downstream
   # FFI consumers (Rust crispasr-sys, Dart, Python ctypes) that need AMD GPU
   # acceleration without rebuilding from source.
   build-libs-linux-x86_64-hip:
+    if: ${{ !inputs.only || inputs.only == 'build-libs-linux-x86_64-hip' }}
     runs-on: ubuntu-22.04
     container:
       image: rocm/dev-ubuntu-22.04:6.3
@@ -460,7 +481,7 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/libcrispasr-linux-x86_64-hip.tar.gz
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
   # ── Linux x86_64 CLI — Vulkan variant ──────────────────────────────────────
   # GPU-accelerated CLI for systems without NVIDIA CUDA (AMD, Intel Arc,
@@ -468,6 +489,7 @@ jobs:
   # where the CUDA release binary is incompatible. Ships libvulkan
   # dynamically linked — the host must have a Vulkan-capable driver.
   build-linux-x86_64-vulkan:
+    if: ${{ !inputs.only || inputs.only == 'build-linux-x86_64-vulkan' }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v6
@@ -521,7 +543,7 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/crispasr-linux-x86_64-vulkan.tar.gz
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
   # ── Linux ARM64 CLI binaries ─────────────────────────────────────────────────
   # Mirror of build-linux on GitHub's ubuntu-22.04-arm runner. NEON is the
@@ -529,6 +551,7 @@ jobs:
   # as x86_64) for consistent CPU code paths and easy A/B comparison;
   # `libopenblas-dev` has aarch64 binaries in Ubuntu's apt repo.
   build-linux-arm64:
+    if: ${{ !inputs.only || inputs.only == 'build-linux-arm64' }}
     runs-on: ubuntu-22.04-arm
     steps:
       - uses: actions/checkout@v6
@@ -563,9 +586,10 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/crispasr-linux-arm64.tar.gz
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
   build-python-linux:
+    if: ${{ !inputs.only || inputs.only == 'build-python-linux' }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v6
@@ -637,13 +661,14 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/crispasr-python-linux-x86_64.tar.gz
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
   # ── Python binding (Linux ARM64) ─────────────────────────────────────────────
   # Mirror of build-python-linux on aarch64 — bundles libwhisper.so +
   # ggml backend libs + libcrispasr_helpers.so + $ORIGIN RPATH so the
   # tarball is self-contained.
   build-python-linux-arm64:
+    if: ${{ !inputs.only || inputs.only == 'build-python-linux-arm64' }}
     runs-on: ubuntu-22.04-arm
     steps:
       - uses: actions/checkout@v6
@@ -708,9 +733,10 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/crispasr-python-linux-arm64.tar.gz
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
   build-macos:
+    if: ${{ !inputs.only || inputs.only == 'build-macos' }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
@@ -742,7 +768,7 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/crispasr-macos.tar.gz
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
   # ── Apple xcframework (iOS + simulator + macOS + tvOS/visionOS) ───────────────
   #
@@ -757,6 +783,7 @@ jobs:
   # has no dylib and none of the @rpath problems the desktop lib bundles had — the
   # archive drops straight into an Xcode/Flutter project.
   build-xcframework:
+    if: ${{ !inputs.only || inputs.only == 'build-xcframework' }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
@@ -813,6 +840,7 @@ jobs:
   # `<bundle>/ggml/src/libggml*`), so consumers point CRISPASR_SYS_LIB_DIR
   # at the extracted dir and the cmake-build fallback is bypassed.
   build-libs-macos-arm64:
+    if: ${{ !inputs.only || inputs.only == 'build-libs-macos-arm64' }}
     runs-on: macos-latest # arm64 since macos-13 was retired
     steps:
       - uses: actions/checkout@v6
@@ -826,8 +854,19 @@ jobs:
         # Mirrors CrispEmbed's macos-arm64 posture; meaningful speedup on
         # the larger ASR encoder bodies (Voxtral 4B, Qwen3-ASR).
         run: |
+          # CMAKE_OSX_DEPLOYMENT_TARGET is load-bearing. Without it clang targets
+          # whatever macOS the runner happens to be on, and STRONG-links APIs
+          # newer than the oldest macOS we claim to support — so the bundle only
+          # loads on that macOS or newer. v0.8.24 shipped exactly that: built on
+          # macos-latest, it failed to dlopen on macos-14 with
+          #   Symbol not found: _OBJC_CLASS_$_MTLResidencySetDescriptor
+          # (a macOS 15 Metal API), which broke the macOS wheel and would break
+          # anyone on an older macOS using the bundle directly. 11.0 matches the
+          # macosx_11_0_arm64 tag the wheel declares; ggml's @available guards
+          # then take effect at runtime instead of at link time.
           cmake -S . -B build-libs \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
             -DBUILD_SHARED_LIBS=ON \
             -DGGML_METAL=ON \
             -DGGML_METAL_EMBED_LIBRARY=ON \
@@ -895,7 +934,7 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/libcrispasr-macos-arm64.tar.gz
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
   # ── Linux x86_64 shared libs + headers (CPU baseline) ────────────────────────
   # Mirror of build-libs-macos-arm64 for Linux: ship libcrispasr.so + ggml
@@ -904,6 +943,7 @@ jobs:
   # at the extract dir instead of cmake-building from source. CPU + OpenBLAS
   # only — GPU-aware variants (CUDA/Vulkan) are a separate matrix slot.
   build-libs-linux-x86_64:
+    if: ${{ !inputs.only || inputs.only == 'build-libs-linux-x86_64' }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v6
@@ -971,13 +1011,14 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/libcrispasr-linux-x86_64.tar.gz
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
   # ── Linux x86_64 shared libs — AVX-512 + VNNI variant ────────────────────────
   # Companion to build-linux-x86_64-avx512 but for the shared-lib tarball
   # downstream consumers (crispasr-sys / Dart / wrapper bindings) pull
   # from. See that job's comment for the per-CPU rationale.
   build-libs-linux-x86_64-avx512:
+    if: ${{ !inputs.only || inputs.only == 'build-libs-linux-x86_64-avx512' }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v6
@@ -1040,13 +1081,14 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/libcrispasr-linux-x86_64-avx512.tar.gz
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
   # ── Linux ARM64 shared libs + headers (CPU baseline) ─────────────────────────
   # Mirror of build-libs-linux-x86_64 on the ubuntu-24.04-arm runner.
   # GPU variants for arm64 (CUDA-Jetson, Vulkan-mobile) are out of scope
   # for this round — add separate jobs when there's user demand.
   build-libs-linux-arm64:
+    if: ${{ !inputs.only || inputs.only == 'build-libs-linux-arm64' }}
     runs-on: ubuntu-22.04-arm
     steps:
       - uses: actions/checkout@v6
@@ -1113,7 +1155,7 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/libcrispasr-linux-arm64.tar.gz
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
   # ── Windows x86_64 shared libs + headers (CPU baseline) ──────────────────────
   # Windows tarball includes BOTH the runtime DLLs (under bin/) and the MSVC
@@ -1122,6 +1164,7 @@ jobs:
   # extract the tarball, set CRISPASR_SYS_LIB_DIR, and link against the .lib
   # at build time while loading the .dll at runtime.
   build-libs-windows-x86_64:
+    if: ${{ !inputs.only || inputs.only == 'build-libs-windows-x86_64' }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -1180,7 +1223,7 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/libcrispasr-windows-x86_64.tar.gz
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
   # ── Windows x86_64 shared libs + headers (Vulkan) ────────────────────────────
   # Same layout as build-libs-windows-x86_64 but with GGML_VULKAN=ON so the
@@ -1188,6 +1231,7 @@ jobs:
   # need GPU-accelerated FFI on Windows (Flutter desktop, Rust crispasr-sys
   # with --features=vulkan, etc.) point CRISPASR_SYS_LIB_DIR here.
   build-libs-windows-x86_64-vulkan:
+    if: ${{ !inputs.only || inputs.only == 'build-libs-windows-x86_64-vulkan' }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -1275,16 +1319,17 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/libcrispasr-windows-x86_64-vulkan.tar.gz
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
   # ── Linux x86_64 shared libs + headers (CUDA) ────────────────────────────────
-  # CUDA 12.8 toolkit (sm_75…sm_120 incl. RTX 50xx Blackwell). Bundles
+  # CUDA 12.8 toolkit (sm_60 Pascal/P100 … sm_120 incl. RTX 50xx Blackwell). Bundles
   # libggml-cuda.so alongside the standard libs/headers. Consumers must
   # have a matching CUDA driver + runtime installed on the host
   # (cudart / cublas) — we don't bundle those, since dev hosts that
   # link against a libcrispasr-cuda tarball typically have CUDA
   # already.
   build-libs-linux-x86_64-cuda:
+    if: ${{ !inputs.only || inputs.only == 'build-libs-linux-x86_64-cuda' }}
     runs-on: ubuntu-22.04
     env:
       CUDA_VERSION: "12.8.0"
@@ -1319,7 +1364,7 @@ jobs:
             -DBUILD_SHARED_LIBS=ON \
             -DGGML_CUDA=ON \
             -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
-            -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120-real;120-virtual" \
+            -DCMAKE_CUDA_ARCHITECTURES="60-real;61-real;70-real;75-real;86-real;89-real;120-real;120-virtual" \
             -DCRISPASR_BUILD_TESTS=OFF \
             -DCRISPASR_BUILD_EXAMPLES=OFF \
             -DCRISPASR_BUILD_SERVER=OFF \
@@ -1364,7 +1409,7 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/libcrispasr-linux-x86_64-cuda.tar.gz
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
   # ── Windows x86_64 shared libs + headers (CUDA) ──────────────────────────────
   # CUDA 12.8 toolkit (Blackwell-aware). Unlike the Linux CUDA tarball,
@@ -1372,6 +1417,7 @@ jobs:
   # tarball is self-contained for downstream Windows consumers — matches
   # the existing build-windows-cuda EXE bundle's pattern.
   build-libs-windows-x86_64-cuda:
+    if: ${{ !inputs.only || inputs.only == 'build-libs-windows-x86_64-cuda' }}
     # Pin to windows-2022 — CUDA 12.8 doesn't support VS 2026 (MSVC 14.51).
     runs-on: windows-2022
     env:
@@ -1401,7 +1447,7 @@ jobs:
             -DCRISPASR_BUILD_EXAMPLES=OFF ^
             -DCRISPASR_BUILD_SERVER=OFF ^
             -DGGML_CUDA=ON ^
-            -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120-real;120-virtual" ^
+            -DCMAKE_CUDA_ARCHITECTURES="60-real;61-real;70-real;75-real;86-real;89-real;120-real;120-virtual" ^
             -DGGML_NATIVE=OFF ^
             -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
             -DCRISPASR_OPUS_FETCH=ON
@@ -1460,7 +1506,7 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/libcrispasr-windows-x86_64-cuda.tar.gz
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
   # ── Windows x86_64 shared libs + headers (CPU legacy SSE4.2) ─────────────────
   # For dev hosts on pre-Haswell CPUs (Sandy/Ivy Bridge i5/i7-3xxx, AMD
@@ -1469,6 +1515,7 @@ jobs:
   # using the wrong build on a legacy host: silent instant exit
   # (STATUS_ILLEGAL_INSTRUCTION) with no error message.
   build-libs-windows-x86_64-cpu-legacy:
+    if: ${{ !inputs.only || inputs.only == 'build-libs-windows-x86_64-cpu-legacy' }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -1522,16 +1569,24 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/libcrispasr-windows-x86_64-cpu-legacy.tar.gz
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
   # ── Windows CPU (AVX2 — Haswell/2013+ baseline) ──────────────────────────────
   build-windows-cpu:
+    if: ${{ !inputs.only || inputs.only == 'build-windows-cpu' }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
+
+      # #296: OpenBLAS makes mel-band-roformer --separate ~26x faster (SGEMM).
+      # Non-fatal: if this fails, the CMake below silently falls back to the
+      # (slow but correct) scalar path — the build never breaks over BLAS.
+      - name: Install OpenBLAS (vcpkg)
+        continue-on-error: true
+        run: vcpkg install openblas:x64-windows
 
       - name: Build
         run: |
@@ -1540,7 +1595,8 @@ jobs:
             -DBUILD_SHARED_LIBS=OFF `
             -DGGML_NATIVE=OFF `
             -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON `
-            -DCRISPASR_OPUS_FETCH=ON
+            -DCRISPASR_OPUS_FETCH=ON `
+            -DCMAKE_PREFIX_PATH="$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows"
           cmake --build build --config Release --target crispasr-cli crispasr-quantize -j $env:NUMBER_OF_PROCESSORS
 
       - name: Package
@@ -1548,6 +1604,10 @@ jobs:
           New-Item -ItemType Directory -Force release\crispasr-windows-x86_64-cpu
           Copy-Item build\bin\Release\crispasr.exe release\crispasr-windows-x86_64-cpu\
           Copy-Item build\bin\Release\crispasr-quantize.exe release\crispasr-windows-x86_64-cpu\
+          # #296: bundle the OpenBLAS runtime DLLs (and any transitive deps vcpkg
+          # installed) next to the exe so the fast SGEMM path loads on any machine.
+          Get-ChildItem "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin\*.dll" -ErrorAction SilentlyContinue |
+            Copy-Item -Destination release\crispasr-windows-x86_64-cpu\
           Copy-Item LICENSE release\crispasr-windows-x86_64-cpu\
           Copy-Item THIRD_PARTY_NOTICES.txt release\crispasr-windows-x86_64-cpu\
           Compress-Archive -Path release\crispasr-windows-x86_64-cpu -DestinationPath release\crispasr-windows-x86_64-cpu.zip -CompressionLevel Optimal
@@ -1562,13 +1622,14 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/crispasr-windows-x86_64-cpu.zip
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
   # ── Windows CPU legacy (SSE4.2 — Sandy Bridge/2011+, no AVX2/FMA/F16C) ───────
   # For CPUs that predate Haswell: Ivy Bridge (i5-3xxx, i7-3xxx), Sandy Bridge,
   # AMD pre-Excavator. Symptoms of using the wrong build: silent instant exit
   # (STATUS_ILLEGAL_INSTRUCTION) with no error message.
   build-windows-cpu-legacy:
+    if: ${{ !inputs.only || inputs.only == 'build-windows-cpu-legacy' }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -1606,10 +1667,11 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/crispasr-windows-x86_64-cpu-legacy.zip
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
   # ── Windows CUDA (dynamic, requires NVIDIA driver on target machine) ─────────
   build-windows-cuda:
+    if: ${{ !inputs.only || inputs.only == 'build-windows-cuda' }}
     # Pin to windows-2022 — CUDA 12.8 doesn't support VS 2026 (MSVC 14.51).
     runs-on: windows-2022
     env:
@@ -1624,6 +1686,13 @@ jobs:
       # consumer GPUs (RTX 50xx). Earlier toolkits (12.4 etc.) only know
       # up to sm_90, so RTX 5060/5070/5080/5090 fail at runtime with
       # 'no kernel image is available'.
+      # Ships Pascal (sm_61) + Volta (sm_70) + P100 (sm_60) alongside sm_75..sm_120,
+      # same as Linux CUDA-12 (#302/#307). The v0.8.23 crispasr-windows-x86_64-cuda
+      # miss was NOT the arch: a bare MSVC `/bigobj` was leaking into the nvcc
+      # command (nvcc counted it as a 2nd input -> `nvcc fatal: A single input file
+      # is required for a non-link phase`); guarding /bigobj to C/CXX only (root
+      # CMakeLists) removed it, and the Windows CUDA Smoke workflow confirmed the
+      # full arch compiles. Kept in lockstep with build-libs-windows-x86_64-cuda.
       - name: Install CUDA Toolkit 12.8.0
         # v0.2.19 only knows up to CUDA 12.4; v0.2.35 added 12.8 + 12.9
         # support. Required for sm_120 (RTX 50xx, Blackwell consumer) builds.
@@ -1641,7 +1710,7 @@ jobs:
           cmake -S . -B build -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DGGML_CUDA=ON ^
-            -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120-real;120-virtual" ^
+            -DCMAKE_CUDA_ARCHITECTURES="60-real;61-real;70-real;75-real;86-real;89-real;120-real;120-virtual" ^
             -DGGML_NATIVE=OFF ^
             -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
             -DCRISPASR_OPUS_FETCH=ON
@@ -1672,10 +1741,11 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/crispasr-windows-x86_64-cuda.zip
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
   # ── Windows Vulkan (dynamic, works on NVIDIA/AMD/Intel with a Vulkan driver) ─
   build-windows-vulkan:
+    if: ${{ !inputs.only || inputs.only == 'build-windows-vulkan' }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -1730,14 +1800,14 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/crispasr-windows-x86_64-vulkan.zip
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
   # `if: always() && !cancelled()` together with no-skipped-needs lets
   # publish run when SOME builds failed but the rest produced artifacts —
   # better than blocking the whole release on (e.g.) a transient
   # windows-cuda toolchain hiccup. The download-artifact step gracefully
   # ignores missing names, the action-gh-release files: glob is `**/...`
-  # and `fail_on_unmatched_files: false` so any subset that landed gets
+  # and `fail_on_unmatched_files: true` so any subset that landed gets
   # uploaded. The next round of builds (or a manual `gh release upload`)
   # can fill in late-arriving / re-run artifacts incrementally —
   # softprops/action-gh-release also defaults to NOT clobbering existing
@@ -1756,6 +1826,7 @@ jobs:
   # Qwen3-ASR) haven't been verified on 32-bit ARM and would need separate
   # validation before shipping armeabi-v7a.
   build-android-arm64:
+    if: ${{ !inputs.only || inputs.only == 'build-android-arm64' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -1815,7 +1886,7 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/crispasr-android-arm64-v8a.tar.gz
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
   # ── Publish (safety net) ──────────────────────────────────────────────────────
   # Each build job now uploads its artifact directly to the release via
@@ -1850,7 +1921,7 @@ jobs:
           tag_name: ${{ inputs.tag || github.ref_name }}
           # Glob ** picks up whatever build jobs actually produced. If a
           # job failed and didn't upload its artifact, that file is just
-          # absent from the upload set — fail_on_unmatched_files: false
+          # absent from the upload set — fail_on_unmatched_files: true
           # makes the action tolerant.
           files: |
             artifacts/**/*.tar.gz

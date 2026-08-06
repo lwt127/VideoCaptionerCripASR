@@ -43,6 +43,17 @@ int interleaved_hop(const Codec* c);
 int num_channels(const Codec* c);  // 2
 int sampling_rate(const Codec* c); // 48000
 
+// True iff the codec GGUF carried encoder tensors, i.e. voice cloning is
+// available. Decode-only GGUFs (everything published before the encoder export)
+// load fine and simply report false here.
+bool encoder_ready(const Codec* c);
+
+// Encode a channel-INTERLEAVED f32 signal (same layout decode() emits) into
+// (n_vq, t_audio) row-major int32 codes — the analysis inverse of decode().
+// Input is zero-padded up to a whole number of code frames. Returns empty if the
+// encoder isn't available or the input is unusable. (Voice cloning.)
+std::vector<int32_t> encode(Codec* c, const float* interleaved, int64_t n_samples, int& n_vq_out, int& t_audio_out);
+
 // Decode (n_vq, t_audio) row-major int32 codes -> mono channel-INTERLEAVED f32
 // signal of length t_audio * interleaved_hop() (= [L0,R0,L1,R1,...] for stereo).
 // Returns empty on error / t_audio <= 0.

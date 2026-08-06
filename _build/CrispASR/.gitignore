@@ -145,6 +145,7 @@ a.out.wasm
 /failed_logs.txt
 *.latents
 /*.gguf
+/models/*.gguf
 /ggml-*.bin
 /probe_mime*
 /.codex-scratch/

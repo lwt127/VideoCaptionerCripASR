@@ -30,8 +30,12 @@ curl http://localhost:8080/backends
 
 The server loads the model once at startup and keeps it in memory.
 Subsequent `/inference` requests reuse the loaded model with no reload
-overhead. Requests are mutex-serialized. Use `--host 0.0.0.0` to
-accept remote connections.
+overhead. Requests are mutex-serialized by default (the HTTP layer accepts
+connections concurrently, but inference runs one-at-a-time through the single
+loaded model). To run transcriptions concurrently, or to scale out with
+replicas / bulk process fan-out, see
+**[Concurrency, parallelism & scaling](concurrency.md)** (`--server-workers N`).
+Use `--host 0.0.0.0` to accept remote connections.
 
 ## API keys
 
@@ -137,8 +141,38 @@ curl http://localhost:8080/v1/audio/transcriptions \
 | `max_len` | Maximum segment length in characters |
 | `chunk_seconds` | Maximum chunk duration for long audio (default: 30) |
 | `chunk_overlap` | Overlap context (seconds) around chunk boundaries |
+| `strict_pipeline` | `true`/`false` — #311: fail the request (HTTP 400) if an explicitly-requested aux stage (VAD, forced aligner, punctuation) could not load or produce its output, instead of degrading silently (default: `false`) |
+| `require_vad` | `true`/`false` — force the VAD-load-success requirement (needs `vad`/`vad_model`) |
+| `require_word_timestamps` | `true`/`false` — fail unless every non-empty segment carries word timestamps (native or aligned) |
+| `require_punctuation` | `true`/`false` — fail unless a punctuation model is loaded (start the server with `--punc-model`) |
 
 The `/inference` endpoint accepts the same CrispASR extension fields.
+
+### Strict pipeline — fail on a required stage's failure (#311)
+
+By default the server, like the CLI, **degrades gracefully**: a VAD, forced
+aligner, or punctuation model that fails to load is skipped and the request
+still returns `200`. Integrations that treat those stages as required task
+properties can opt into strict semantics with the fields above — a required
+stage that fails to load or produce its output then returns **HTTP 400** with
+an `{"error": {...}}` body instead of a degraded `200`. A stage that ran and
+legitimately produced nothing (VAD detected no speech) stays a success. This
+mirrors the CLI's `--strict-pipeline` family (see
+[`cli.md`](cli.md#strict-pipeline--require-aux-stages-to-succeed-strict-pipeline-311));
+the strict decision is shared code (`crispasr_strict.h`), so the two front-ends
+cannot drift.
+
+```bash
+# rc-style contract over HTTP: 200 ⟺ every required stage succeeded.
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  http://localhost:8080/v1/audio/transcriptions \
+  -F file=@meeting.wav -F model=whisper \
+  -F vad=true -F strict_pipeline=true    # 400 if VAD couldn't load; 200 otherwise
+```
+
+`require_punctuation` needs the server to have been started with `--punc-model`
+(punctuation is a resident startup post-processor, not per-request) — otherwise
+the request fails fast with a clear error.
 
 ### Reusing VAD boundaries across backends (#227)
 
@@ -319,7 +353,8 @@ curl http://localhost:8080/v1/audio/speech \
 | `response_format` | `"wav"` | `wav` (16-bit PCM RIFF, 24 kHz mono — default), `pcm` (OpenAI spec: 24 kHz signed 16-bit LE raw, no header), `f32` (crispasr-specific raw float32 for downstream DSP), or the compressed containers `mp3` / `aac` / `opus` — all encoded in-tree by [glint](https://github.com/CrispStrobe/glint), no build deps. `opus` returns a standard **Ogg Opus** file (`audio/ogg`); set `CRISPASR_OPUS_ENCODER=libopus` (build with libopus) to fall back to the legacy raw-packet framing (`audio/opus`) instead. |
 | `consent_attestation` | empty | Required when `voice` ends in `.wav` (voice cloning). A free-text statement attesting speaker consent, e.g. `"I have the speaker's consent"`. Logged for audit. |
 | `ref_text` | empty | Transcript of the `.wav` clone reference, used by TADA on-the-fly cloning (#201). A companion `<name>.txt` in `--voice-dir` is used when omitted. Ignored by backends that clone from audio alone. |
-| `spoken_disclaimer` | `true` | Set to `false` to skip the audible AI-disclosure prefix on voice-cloned output. Machine-readable provenance (watermark + C2PA) is always applied. When `false`, the caller assumes responsibility for providing appropriate AI-disclosure to end users. |
+| `spoken_disclaimer` | `true` | Set to `false` to skip the audible AI-disclosure prefix on voice-cloned output. Machine-readable provenance (watermark + C2PA) is always applied. When `false`, the caller assumes responsibility for providing appropriate AI-disclosure to end users — which is why the opt-out is only honoured when attested (see `marking_attestation`). |
+| `marking_attestation` | empty | Required (since v0.8.22) to **honour** `"spoken_disclaimer": false` on a voice clone — a free-text affirmation that you accept the AI-content disclosure duty, e.g. `"I will disclose this is AI-generated"`. Logged for audit. A server launched with `--accept-marking-responsibility` has already accepted that duty for every response it serves and satisfies this per-request field. **Without it the opt-out is denied, not the request** (since v0.8.24): the response is still `200`, but it carries the spoken disclaimer and the headers below say so. Earlier v0.8.22/v0.8.23 servers returned `400 marking_attestation_required` instead. |
 
 > **Watermarking.** Every response is watermarked by default. There is **no
 > per-request watermark toggle** — the mark is disabled only at the process
@@ -682,7 +717,7 @@ You can override the loaded model and startup flags through `.env`:
 | `CRISPASR_CACHE_DIR` | Where auto-downloaded models live (defaults to `/cache`) |
 | `CRISPASR_API_KEYS` | Comma-separated API keys (see [API keys](#api-keys)) |
 | `CRISPASR_EXTRA_ARGS` | Forwarded verbatim to the server CLI (e.g. `--no-punctuation`) |
-| `CRISPASR_SERVER_WORKERS` | `N>1` loads N independent ASR backend instances so **pure-ASR** requests (explicit `language`, no aligner, no punctuation/truecaser) run concurrently instead of serializing on the single model. Costs N× model memory. Only a throughput win where a single request under-utilises the box (spare cores, a GPU not saturated by one stream, smaller models); a *net loss* on a saturated memory-bandwidth-bound CPU model, where the instances contend. Requests using shared LID/aligner/post-processing stay serialized. `/load` is disabled while a pool is active (restart to change models). Default `1` = single instance. |
+| `CRISPASR_SERVER_WORKERS` | `N>1` loads N independent ASR backend instances so **pure-ASR** requests (explicit `language`, no aligner, no punctuation/truecaser) run concurrently instead of serializing on the single model. Costs N× model memory. Only a throughput win where a single request under-utilises the box (spare cores, a GPU not saturated by one stream, smaller models); a *net loss* on a saturated memory-bandwidth-bound CPU model, where the instances contend. Requests using shared LID/aligner/post-processing stay serialized. `/load` is disabled while a pool is active (restart to change models). Default `1` = single instance. Equivalent to the `--server-workers N` CLI flag (this env var overrides the flag when both are set). Full guidance: **[docs/concurrency.md](concurrency.md)**. |
 
 The service is configured to avoid serving as root by default:
 - `user: "${CRISPASR_UID:-1000}:${CRISPASR_GID:-1000}"`

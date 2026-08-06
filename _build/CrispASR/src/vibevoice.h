@@ -39,6 +39,11 @@ struct vibevoice_context* vibevoice_init_from_file(const char* path_model, struc
 
 void vibevoice_free(struct vibevoice_context* ctx);
 
+// Set an exact ASR generation cap. n <= 0 restores the duration-scaled
+// default (at least 512 tokens, or 8 tokens per second of input audio).
+void vibevoice_set_max_new_tokens(struct vibevoice_context* ctx, int n);
+int vibevoice_resolve_max_new_tokens(int configured, int n_samples);
+
 // Runtime setter for the DPM-Solver++ inference step count
 // (default 20). Read on every vibevoice_synthesize call (line ~3422
 // in vibevoice.cpp), so post-init mutation is safe. Clamps to

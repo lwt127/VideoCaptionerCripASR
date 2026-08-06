@@ -162,8 +162,13 @@ public:
             voice_loaded_ = true;
         }
 
+        // #316: --tts-phonemes drives the acoustic model directly, skipping the
+        // G2P. This is the seam a pronunciation bug lives on — feeding another
+        // implementation's phoneme string through our model separates "our G2P
+        // is wrong" from "our model is wrong" in one run.
         int n = 0;
-        float* pcm = kokoro_synthesize(ctx_, text.c_str(), &n);
+        float* pcm = params.tts_phonemes.empty() ? kokoro_synthesize(ctx_, text.c_str(), &n)
+                                                 : kokoro_synthesize_phonemes(ctx_, params.tts_phonemes.c_str(), &n);
         if (!pcm || n <= 0)
             return {};
         std::vector<float> out(pcm, pcm + n);

@@ -38,7 +38,22 @@ bool phonemize_espeak_popen(const std::string& lang, const std::string& text, st
 // or CRISPASR_CMUDICT_PATH env var) + optional neural G2P (GRU seq2seq).
 // Produces IPA directly via ARPAbet→IPA conversion table.
 // For non-English, returns false and falls through.
+// Emits the ESPEAK-IPA dialect (`tʃ`, `oʊ`, `ɜː`, length marks) — see
+// core/phoneme_dialect.h. That is what piper expects and what g2p_en's ARPAbet
+// table is tuned for. A backend trained on a different spelling (Kokoro was
+// trained on misaki's) converts the result with core_phoneme::convert() rather
+// than changing what this function emits, which would regress the others.
 bool phonemize_builtin_en(const std::string& lang, const std::string& text, std::string& out);
+
+// #316: same, but Tier 0 is misaki's own lexicon (Kokoro's G2P, Apache-2.0)
+// instead of CMUdict — ~94% phoneme agreement with misaki on ordinary prose vs
+// ~58% for the CMUdict path. Output is still in the espeak dialect for words
+// that miss the lexicon, so the caller applies core_phoneme::convert() exactly
+// as it does for phonemize_builtin_en (the conversion is idempotent on
+// lexicon hits: misaki never emits ɚ/ɝ/r/ː). Returns false when the lexicon is
+// not installed — callers must fall back rather than ship worse pronunciation.
+bool phonemize_misaki_en(const std::string& lang, const std::string& text, std::string& out);
+bool misaki_lexicon_available();
 
 // Built-in German G2P: LTS rules (always available) + optional IPA
 // dictionary (787K words, auto-loaded from ~/.cache/crispasr/ipa_dict_de.txt

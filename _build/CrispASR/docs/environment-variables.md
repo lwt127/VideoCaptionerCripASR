@@ -137,6 +137,7 @@ These are not tied to a single backend.
 | `CRISPASR_G2P_DICT_SOURCE` / `_G2P_MODEL_PATH` | G2P dictionary source / neural G2P model path. |
 | `CRISPASR_ESPEAK_DATA_PATH` | eSpeak-NG data directory. |
 | `CRISPASR_KOKORO_G2P` | Kokoro G2P backend selection. |
+| `CRISPASR_KOKORO_MISAKI_IPA` | `0` disables the espeak-IPA → misaki-alphabet conversion Kokoro needs (#316), restoring the raw G2P spelling for A/B. On by default. |
 
 ### Watermark / provenance
 
@@ -201,7 +202,8 @@ scheme:
 
 - **`crisp_audio/`** — audio tower: `CRISP_AUDIO_DUMP_STAGES`, `CRISP_AUDIO_KEEP_PAD_FRAMES`, `CRISP_AUDIO_WINDOWED_ATTN`.
 - **`glint/`** — clean-room MP3/AAC codec: `GLINT_*`, `AACDBG`.
-- **`crisp_lid/` · `crisp_punc/` · `crisp_truecase/`** — standalone LID / punctuation / truecasing libraries (mirrored, not built by the main target); their runtime copies in `src/` follow each library's own naming (`LID_*`, `FIREREDPUNC_*`, `PCS_*`, `TRUECASER_*`).
+- **`crisp_lid/` · `crisp_punc/` · `crisp_truecase/`** — standalone LID / punctuation / truecasing libraries; they and their `src/` counterparts follow each library's own naming (`LID_*`, `FIREREDPUNC_*`, `PCS_*`, `TRUECASER_*`). `FIREREDPUNC_DEBUG=1` prints each restore pass as `[PUNCDBG] in=<…>` / `out=<…>`, which is the quickest way to see a backend's *true* model output — `--no-punctuation` is not, because it strips punctuation after the fact and so hides text the model punctuated itself.
+  > ⚠ **These libraries are built by the main target, and each has a second copy under `src/`.** `src/CMakeLists.txt` prefers `crisp_punc/` (etc.) and falls back to the `src/` copy only when the sibling directory is missing from a checkout — so the `crisp_punc/` copy is what normally links, and **a change must be applied to both**. #308's capitalisation fix went into `src/fireredpunc.cpp` alone and was dead code for months while the shipping copy kept the bug. `tests/test-punc-copies-in-sync.cpp` now fails if they diverge.
 
 ## Test fixtures
 
@@ -437,7 +439,10 @@ suffixes.
 - `CRISPASR_F5_BATCH_CFG`
 - `CRISPASR_F5_BENCH`
 - `CRISPASR_F5_CFG_INTERVAL`
+- `CRISPASR_F5_DURATION_CLAMP` — clamp the per-char speech rate into a sane English band so a reference whose audio/transcript lengths are mismatched can't truncate (or balloon) the output (#294). Default on; set `0` to restore the exact upstream `ref_T / ref_text_len * gen_text_len / speed` estimate.
 - `CRISPASR_F5_FORCE_SCALAR`
+- `CRISPASR_F5_REF_MAX_SEC` — clip the reference audio to this many seconds before it drives the duration estimate (upstream parity: 12 s). Default `12`; set `0` to disable the clip.
+- `CRISPASR_F5_REF_TRIM_SILENCE` — strip leading/trailing silence and collapse internal silences >~1 s in the reference audio (upstream parity). Default on; set `0` to disable.
 
 ### FastConformer (shared encoder)
 
@@ -712,6 +717,46 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 
 - `CRISPASR_MP3_ENCODER`
 
+### Diarization — foxnose (#324)
+
+- `CRISPASR_DIARIZE_COUNT` — speaker-count estimator: `bic` (default, the
+  upstream GMM/BIC + silhouette sweep) or `eigengap`. Eigengap is better on
+  well-separated synthetic data and cheaper, but under-counts on real speech
+  (11.4 % vs 5.3 % DER on VoxConverse) — see `docs/foxnose-diarize/PLAN.md`
+- `CRISPASR_DIARIZE_BIC_WINDOW` — score silhouette only in a `[k-2, k+3]` window
+  around the BIC anchor instead of the full `[min, max]` range. The full range is
+  the default: the BIC anchor is unreliable in both directions (measured errors
+  of +5 / -3 / -3 on 4/5/6 well-separated blobs) and when it over-counts the
+  window is stranded above the truth and cannot climb back to it
+- `CRISPASR_WESPEAKER_BENCH` — per-stage embedder timings (fbank / resnet /
+  resnet_windows). Counting invocations of these is also how you check WHICH
+  embedding path actually ran
+- `CRISPASR_WESPEAKER_DEBUG` — embedder diagnostics
+- `CRISPASR_DIARIZE_DEBUG` — chosen speaker count, the reason it was chosen,
+  and the per-k silhouette curve behind it. Worth reading before trusting a
+  count: on a borderline file the decision can rest on a <1 % score gap
+- `CRISPASR_DIARIZE_EMBED_WORKERS` — windows embedded concurrently (default:
+  `-t`). Each worker gets its own context sharing one copy of the weights
+- `CRISPASR_SPEAKER_EMBED_THREADS` — ggml threads per embedder context
+  (default: `-t`). Honoured by the pluggable embedders and by wespeaker
+- `CRISPASR_DIARIZE_SPAN_EMBED=1` — run ONE network pass per span of windows
+  instead of one per window. 1.78x less diarization CPU for +0.30 mean DER on
+  the VoxConverse dev shard; off by default because accuracy is the better
+  default for a diarizer. See `docs/cli.md#diarization`
+- `CRISPASR_DIARIZE_SPAN_WINDOWS` — windows per span (default 32). Measured NOT
+  to affect the accuracy cost — identical from N=2 to N=32 — so there is
+  nothing to tune here; larger is simply faster
+
+### GigaAM-v3
+
+- `CRISPASR_GIGAAM_BENCH` — per-stage timings (mel / encoder / decode)
+- `CRISPASR_GIGAAM_DEBUG` — encoder output min/max/mean
+- `CRISPASR_GIGAAM_FLASH` — `ggml_flash_attn_ext` in the encoder (opt-in; the
+  manual QK^T path is what the per-stage diff was validated on)
+- `CRISPASR_GIGAAM_FORCE_SCALAR` — scalar LSTM/joint loops instead of cblas
+- `CRISPASR_GIGAAM_QUANT_ALL` — let `crispasr-quantize` quantize the heads and
+  the pre-encode convs too (default keeps them at source precision)
+
 ### Nemotron
 
 - `CRISPASR_NEMOTRON_BENCH`
@@ -855,6 +900,13 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 - `CRISPASR_PYANNOTE_LEGACY`
 - `CRISPASR_PYANNOTE_SEG_BENCH`
 - `CRISPASR_PYANNOTE_SEG_DUMP`
+- `CRISPASR_PYANNOTE_CHUNK_S` — audio per chunk of parallel inference, in
+  seconds (default 60; `0` restores the pre-#326 single scan over the whole
+  file). Chunking is decided by audio LENGTH and never by thread count, so
+  posteriors do not change with `-t`
+- `CRISPASR_PYANNOTE_CHUNK_CONTEXT_S` — real audio spliced either side of a
+  chunk and then trimmed (default 5), which absorbs the convolutions' zero
+  padding and the LSTM's zero initial state
 
 ### Qwen3-ASR
 

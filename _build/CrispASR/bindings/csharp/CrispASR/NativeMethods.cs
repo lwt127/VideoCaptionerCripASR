@@ -74,6 +74,11 @@ namespace CrispASR
         internal static extern int crispasr_session_set_instruct(
             IntPtr s, [MarshalAs(UnmanagedType.LPUTF8Str)] string instruct);
 
+        // #316: synthesize these phonemes verbatim, skipping the G2P. Empty clears. kokoro and piper only (rc=-2).
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_set_tts_phonemes(
+            IntPtr s, [MarshalAs(UnmanagedType.LPUTF8Str)] string phonemes);
+
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int crispasr_session_is_custom_voice(IntPtr s);
 
@@ -197,8 +202,34 @@ namespace CrispASR
             IntPtr s, [MarshalAs(UnmanagedType.LPUTF8Str)] string text,
             out int outNSamples);
 
+        // UNMARKED synthesis — hard-refused unless accept_marking_responsibility was called first.
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr crispasr_session_synthesize_raw(
+            IntPtr s, [MarshalAs(UnmanagedType.LPUTF8Str)] string text,
+            out int outNSamples);
+
+        // Attest acceptance of AI-content marking/disclosure duty (EU AI Act Art. 50).
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_accept_marking_responsibility(
+            IntPtr s, [MarshalAs(UnmanagedType.LPUTF8Str)] string attestation);
+
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void crispasr_pcm_free(IntPtr pcm);
+
+        // Speech-to-speech — audio in → audio out via a single model pass
+        // (lfm2-audio, mini-omni2, sidon, voxcpm2-vae). Returns malloc'd float32
+        // PCM (free via crispasr_pcm_free); outText, when non-null, receives the
+        // intermediate transcript (malloc'd, free via
+        // crispasr_session_translate_text_free).
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr crispasr_session_speech_to_speech(
+            IntPtr s, float[] inSamples, int nInSamples,
+            out IntPtr outText, out int outNSamples);
+
+        // Sample rate the backend expects for input PCM (16000 for
+        // Whisper-family backends, 0 on error).
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_input_sample_rate(IntPtr s);
 
         // ---- ASR transcription ----
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
@@ -208,6 +239,19 @@ namespace CrispASR
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern IntPtr crispasr_session_transcribe_lang(
             IntPtr s, float[] pcm, int nSamples,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string? language);
+
+        // Chunked-encode transcribe (issue #208): forces the Parakeet backend
+        // through its bounded overlapping-window long-form path. chunkSeconds<=0
+        // keeps the per-model default window; overlapSeconds<0 keeps the default
+        // overlap. Inert (== transcribe[_lang]) on non-Parakeet backends.
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr crispasr_session_transcribe_chunked(
+            IntPtr s, float[] pcm, int nSamples, int chunkSeconds, int overlapSeconds);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr crispasr_session_transcribe_chunked_lang(
+            IntPtr s, float[] pcm, int nSamples, int chunkSeconds, int overlapSeconds,
             [MarshalAs(UnmanagedType.LPUTF8Str)] string? language);
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
@@ -255,6 +299,13 @@ namespace CrispASR
         // ("no data") for other backends and out-of-range indices.
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern float crispasr_session_result_segment_no_speech_prob(IntPtr result, int iSeg);
+
+        // #300: native per-segment speaker label ("(Speaker N) "), or "" when the
+        // backend does not diarize natively. Never NULL. Returned as IntPtr and
+        // marshalled via PtrToUtf8 like the other const char* getters — a
+        // [return: MarshalAs(LPUTF8Str)] would make the CLR try to free it.
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr crispasr_session_result_segment_speaker(IntPtr result, int i);
 
         // Per-frame CTC logits (opted in via crispasr_session_set_return_logits)
         // for backends with a dense CTC grid (Omni CTC, wav2vec2/hubert/data2vec,

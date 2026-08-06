@@ -538,10 +538,19 @@ def tts_roundtrip_for(name: str, manifest: dict, work_dir: Path,
     out_wav = work_dir / f"tts_{name}.wav"
     print(f"\n[tts-roundtrip] {name}")
     print(f"  synth     {asr_name} -> {tts_phrase!r}")
+    # Pin the RNG. Several TTS backends are stochastic — melotts is a VITS with
+    # noise_scale/noise_w and seeds from std::random_device() when no seed is
+    # given, so its output (and therefore its WER) differs run to run. Gating a
+    # non-deterministic backend on WER makes the check flap, and worse, makes an
+    # unrelated change look like a regression: a ggml-sync A/B read melotts as
+    # 0.0 -> 0.1111 purely because "lazy dog" resampled to "lazy duck".
+    # An entry can still override via tts_extra_args (appended after this).
+    tts_seed = str(entry.get("tts_seed", 1234))
     syn_cmd = [
         str(crispasr_bin), "-m", str(gguf_local),
         "--tts", tts_phrase,
         "--tts-output", str(out_wav),
+        "--seed", tts_seed,
         "--no-prints",
     ]
     # `--voice` takes either a path (voice GGUF) or a name (baked

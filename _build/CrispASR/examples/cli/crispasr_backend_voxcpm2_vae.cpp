@@ -48,7 +48,7 @@ public:
             ctx_ = nullptr;
         }
     }
-    ~VoxCPM2VAEBackend() override { shutdown(); }
+    ~VoxCPM2VAEBackend() override { VoxCPM2VAEBackend::shutdown(); }
 
 private:
     voxcpm2_vae_context* ctx_ = nullptr;

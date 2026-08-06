@@ -59,6 +59,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1167,21 +1168,37 @@ static canary_qwen_result* canary_qwen_transcribe_impl(canary_qwen_context* ctx,
     {
         cq_bench_stage bs("decode");
         for (int step = 0; step < max_new_tokens; step++) {
-            // Argmax
-            int32_t best_id = 0;
-            float best_val = logits[0];
-            for (int v2 = 1; v2 < vocab; v2++) {
-                if (logits[v2] > best_val) {
+            // Argmax — NaN-robust. Seeding best_val from logits[0] pins best_id at
+            // 0 forever when logits[0] is non-finite: `x > NaN` is false for every
+            // x, so the scan never moves off 0 and the decode silently spews token
+            // 0 (== "!") for the whole budget. That is exactly what a corrupt q4_k
+            // LLM projection produced (q8_0 fine, q4_k → all "!"). Seed from -inf,
+            // skip non-finite logits, and if the entire row is non-finite treat it
+            // as a numerics failure and stop rather than emit garbage.
+            int32_t best_id = -1;
+            float best_val = -std::numeric_limits<float>::infinity();
+            for (int v2 = 0; v2 < vocab; v2++) {
+                if (std::isfinite(logits[v2]) && logits[v2] > best_val) {
                     best_val = logits[v2];
                     best_id = v2;
                 }
             }
+            if (best_id < 0) {
+                fprintf(stderr,
+                        "canary_qwen: non-finite logits at step %d — aborting decode "
+                        "(corrupt/over-quantized weights? this quant is unusable)\n",
+                        step);
+                break;
+            }
 
-            // Compute softmax probability for the chosen token
+            // Compute softmax probability for the chosen token. Skip non-finite
+            // logits so a stray Inf/NaN elsewhere in the row can't poison the
+            // reported confidence of an otherwise-valid argmax.
             float max_logit = best_val;
             float sum_exp = 0.0f;
             for (int v2 = 0; v2 < vocab; v2++)
-                sum_exp += expf(logits[v2] - max_logit);
+                if (std::isfinite(logits[v2]))
+                    sum_exp += expf(logits[v2] - max_logit);
             float prob = 1.0f / sum_exp;
 
             if (best_id == eos_id || best_id == endoftext_id)

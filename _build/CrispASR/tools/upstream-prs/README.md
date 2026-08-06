@@ -29,6 +29,12 @@ literal `git am` payloads — line numbers are relative to our vendored
 ggml master snapshot (fetched 2026-05-05) and may drift before you
 open the PR.
 
+`UPSTREAM-SYNC.md` is the INBOUND counterpart: what we should take FROM
+upstream. It exists because nobody was watching that direction — `core_adaln`
+failed on ARM for weeks because our vendored ggml predated two upstream SVE
+fixes (`6aab1bcb`, `f69bdbb3`, both cherry-picked 2026-07-29). It also records
+that upstream now has its own `col2im_1d`, which supersedes draft 20.
+
 `MASTER-AUDIT.md` records the cross-check against `ggml-org/ggml`
 master (fetched 2026-05-05): all four still apply in shape; none
 have been fixed upstream. Note: `im2col` gained a second target

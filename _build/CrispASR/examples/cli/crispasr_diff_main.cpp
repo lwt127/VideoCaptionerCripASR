@@ -55,6 +55,8 @@
 #include "granite_speech.h"
 #include "granite_nle.h"
 #include "parakeet.h"
+#include "wespeaker.h"
+#include "gigaam.h"
 #include "canary.h"
 #include "canary_qwen.h"
 #include "cohere.h"
@@ -1052,6 +1054,99 @@ static std::string dirname_of(const std::string& path) {
     return path.substr(0, pos);
 }
 
+// ── Tiron (#295): decoded-output acceptance diff (HARD RULE #3). ─────────────
+// Whisper's forward is already proven and the token stream is validated
+// byte-exact elsewhere; the harness-visible stage that MATTERS is the decoded
+// transcript. We run whisper_full with the tiron grammar and compare the word
+// content against the reference's `generated_text` metadata (present-in overlap,
+// which tolerates the CLI's timestamp-as-segment rendering vs the reference's
+// inline <|t.tt|>). mel/encoder are F32/whisper-internal (no public getter) so
+// they aren't diffed here.
+#include "crispasr.h"
+#include <cctype>
+#include <regex>
+#include <set>
+static std::vector<std::string> tiron_words(const std::string& s) {
+    static const std::regex ctrl(R"(<\|[^|]*\|>)");
+    std::string t = std::regex_replace(s, ctrl, " ");
+    std::vector<std::string> w;
+    std::string cur;
+    for (unsigned char c : t) {
+        if (std::isalnum(c)) {
+            cur += (char)std::tolower(c);
+        } else if (!cur.empty()) {
+            w.push_back(cur);
+            cur.clear();
+        }
+    }
+    if (!cur.empty())
+        w.push_back(cur);
+    return w;
+}
+static int tiron_diff(const std::string& model, const std::string& ref_path, const std::string& /*audio*/) {
+    crispasr_diff::Ref ref;
+    if (!ref.load(ref_path)) {
+        fprintf(stderr, "tiron-diff: failed to load reference '%s'\n", ref_path.c_str());
+        return 1;
+    }
+    const std::string ref_text = ref.meta("generated_text");
+    if (ref_text.empty()) {
+        fprintf(stderr, "tiron-diff: reference has no generated_text metadata\n");
+        return 1;
+    }
+    // Reuse the reference's raw_audio, minus its 0.75 s onset pad (whisper_full
+    // re-applies the pad for a speaker vocab), so both sides see the same signal.
+    auto ra = ref.get_f32("raw_audio");
+    if (!ra.first || ra.second == 0) {
+        fprintf(stderr, "tiron-diff: reference has no raw_audio\n");
+        return 1;
+    }
+    const int pad = (int)(0.75f * 16000);
+    const int off = (int)ra.second > pad ? pad : 0;
+    std::vector<float> audio(ra.first + off, ra.first + ra.second);
+
+    whisper_context* ctx = whisper_init_from_file_with_params(model.c_str(), whisper_context_default_params());
+    if (!ctx) {
+        fprintf(stderr, "tiron-diff: failed to load model '%s'\n", model.c_str());
+        return 1;
+    }
+    whisper_full_params p = whisper_full_default_params(CRISPASR_SAMPLING_GREEDY);
+    p.print_special = true;
+    p.print_progress = false;
+    p.print_realtime = false;
+    p.no_timestamps = false;
+    p.language = "en";
+    p.n_threads = 4;
+    if (whisper_full(ctx, p, audio.data(), (int)audio.size()) != 0) {
+        fprintf(stderr, "tiron-diff: whisper_full failed\n");
+        whisper_free(ctx);
+        return 1;
+    }
+    std::string got;
+    for (int i = 0; i < whisper_full_n_segments(ctx); i++) {
+        got += whisper_full_get_segment_text(ctx, i);
+        got += ' ';
+    }
+    whisper_free(ctx);
+
+    const auto rw = tiron_words(ref_text);
+    const auto gw = tiron_words(got);
+    std::set<std::string> gset(gw.begin(), gw.end());
+    size_t hit = 0;
+    for (const auto& w : rw)
+        if (gset.count(w))
+            hit++;
+    const double overlap = rw.empty() ? 0.0 : (double)hit / rw.size();
+    printf("tiron-diff: reference words=%zu, runtime words=%zu, present-in overlap=%.3f\n", rw.size(), gw.size(),
+           overlap);
+    printf("  ref: %.160s\n", ref_text.c_str());
+    printf("  got: %.160s\n", got.c_str());
+    const bool pass = overlap >= 0.90;
+    printf("%s decoded-output acceptance (overlap %.3f %s 0.90)\n", pass ? "[PASS]" : "[FAIL]", overlap,
+           pass ? ">=" : "<");
+    return pass ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
     if (argc < 5) {
         fprintf(stderr,
@@ -1060,7 +1155,7 @@ int main(int argc, char** argv) {
                 "  backend       one of: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, omnivoice, tada-tts, "
                 "tada-encoder, kokoro, granite, "
                 "granite-4.1, "
-                "granite-nle, parakeet, chatterbox, voxcpm2-tts, "
+                "granite-nle, parakeet, gigaam, wespeaker, chatterbox, voxcpm2-tts, "
                 "canary, cohere, gemma4, mimo-tokenizer, mimo-asr, orpheus, moonshine, moonshine-streaming, "
                 "kyutai-stt, parler-tts, moss-audio\n"
                 "  model.gguf    crispasr-compatible model weights\n"
@@ -1073,6 +1168,11 @@ int main(int argc, char** argv) {
     const std::string model_path = argv[2];
     const std::string ref_path = argv[3];
     const std::string audio_path = argv[4];
+
+    // tiron (#295): decoded-output acceptance vs the reference transcript.
+    if (backend_name == "tiron") {
+        return tiron_diff(model_path, ref_path, audio_path);
+    }
 
     // dots-tts: self-contained per-stage parity checks (no audio needed). The
     // reference is the isolated component dump from
@@ -3588,6 +3688,293 @@ int main(int argc, char** argv) {
             n_fail++;
         }
         granite_nle_free(ctx);
+    } else if (backend_name == "gigaam") {
+        // GigaAM-v3: rotary Conformer + CTC or RNN-T head.
+        // Reference: tools/reference_backends/gigaam.py (the HF blueprint).
+        auto cp = gigaam_context_default_params();
+        cp.n_threads = 4;
+        cp.verbosity = 0;
+        gigaam_context* ctx = gigaam_init_from_file(model_path.c_str(), cp);
+        if (!ctx) {
+            fprintf(stderr, "failed to load gigaam model\n");
+            return 4;
+        }
+
+        // ---- mel ----
+        // Our mel is row-major (n_mels, T_mel), so the GGUF ne is
+        // [T_mel, n_mels] — ne[0] is the fast axis.
+        {
+            int n_mels = 0, T_mel = 0;
+            float* mel = gigaam_compute_mel(ctx, samples.data(), (int)samples.size(), &n_mels, &T_mel);
+            if (mel) {
+                auto rep = ref.compare("mel_spectrogram", mel, (size_t)n_mels * T_mel);
+                print_row("mel_spectrogram", rep, COS_THRESHOLD);
+                record(rep);
+                free(mel);
+            } else {
+                printf("[ERR ] mel_spectrogram         gigaam_compute_mel returned null\n");
+                n_fail++;
+            }
+        }
+
+        // ---- encoder, from OUR mel (end-to-end) ----
+        {
+            int n_mels = 0, T_mel = 0;
+            float* mel = gigaam_compute_mel(ctx, samples.data(), (int)samples.size(), &n_mels, &T_mel);
+            if (mel) {
+                int T_enc = 0, d_model = 0;
+                float* enc = gigaam_run_encoder(ctx, mel, n_mels, T_mel, &T_enc, &d_model);
+                free(mel);
+                if (enc) {
+                    auto rep = ref.compare("encoder_output", enc, (size_t)T_enc * d_model);
+                    print_row("encoder_output", rep, COS_THRESHOLD);
+                    record(rep);
+                    free(enc);
+                } else {
+                    printf("[ERR ] encoder_output          gigaam_run_encoder returned null\n");
+                    n_fail++;
+                }
+            }
+        }
+
+        // ---- per-stage encoder diff, driven by the REFERENCE mel ----
+        // Separates encoder-internal divergence from mel bleed-through:
+        // the first stage that drops is the bug (HARD RULE #2).
+        std::vector<float> ref_enc; // reference encoder output, (T_enc, d_model)
+        int ref_T_enc = 0, ref_d = 0;
+        {
+            auto enc_pair = ref.get_f32("encoder_output");
+            auto enc_shp = ref.shape("encoder_output");
+            if (enc_pair.first && enc_shp.size() >= 2) {
+                ref_d = (int)enc_shp[0];
+                ref_T_enc = (int)enc_shp[1];
+                ref_enc.assign(enc_pair.first, enc_pair.first + (size_t)ref_T_enc * ref_d);
+            }
+        }
+        {
+            auto mel_pair = ref.get_f32("mel_spectrogram");
+            auto mel_shp = ref.shape("mel_spectrogram");
+            if (mel_pair.first && mel_shp.size() >= 2) {
+                const int T_mel = (int)mel_shp[0];
+                const int n_mels = (int)mel_shp[1];
+                const int n_layers = gigaam_n_layers(ctx);
+                const int d_model = gigaam_d_model(ctx);
+                const int T_enc_max = T_mel / 4 + 8;
+                std::vector<std::vector<float>> bufs((size_t)n_layers + 1,
+                                                     std::vector<float>((size_t)d_model * T_enc_max));
+                std::vector<float*> ptrs((size_t)n_layers + 1);
+                for (int i = 0; i <= n_layers; i++)
+                    ptrs[(size_t)i] = bufs[(size_t)i].data();
+                int T_enc = 0, d_out = 0;
+                int rc = gigaam_run_encoder_dump(ctx, mel_pair.first, n_mels, T_mel, ptrs.data(), (int)ptrs.size(),
+                                                 &T_enc, &d_out);
+                if (rc == 0 && T_enc > 0) {
+                    auto rep0 = ref.compare("pre_encode_output", ptrs[0], (size_t)T_enc * d_out);
+                    print_row("pre_encode_output", rep0, COS_THRESHOLD);
+                    record(rep0);
+                    for (int il = 0; il < n_layers; il++) {
+                        char nm[64];
+                        snprintf(nm, sizeof(nm), "encoder_layer_%d", il);
+                        auto rep = ref.compare(nm, ptrs[(size_t)il + 1], (size_t)T_enc * d_out);
+                        print_row(nm, rep, COS_THRESHOLD);
+                    }
+                } else {
+                    printf("[SKIP] encoder_layer_*         gigaam_run_encoder_dump rc=%d\n", rc);
+                }
+            } else {
+                printf("[SKIP] encoder_layer_*         reference mel_spectrogram not in archive\n");
+            }
+        }
+
+        // ---- head, driven by the REFERENCE encoder output ----
+        if (!ref_enc.empty()) {
+            if (!gigaam_is_rnnt(ctx)) {
+                int C = 0;
+                float* lp = gigaam_ctc_log_probs(ctx, ref_enc.data(), ref_T_enc, ref_d, &C);
+                if (lp) {
+                    auto rep = ref.compare("ctc_log_probs", lp, (size_t)ref_T_enc * C);
+                    print_row("ctc_log_probs", rep, COS_THRESHOLD);
+                    record(rep);
+                    auto rep2 = ref.compare_argmax("ctc_log_probs", lp, (size_t)ref_T_enc * C);
+                    print_row("ctc_log_probs_top1", rep2, COS_THRESHOLD);
+                    free(lp);
+                } else {
+                    printf("[ERR ] ctc_log_probs           gigaam_ctc_log_probs returned null\n");
+                    n_fail++;
+                }
+            } else {
+                int jh = 0;
+                float* proj = gigaam_joint_project_encoder(ctx, ref_enc.data(), ref_T_enc, ref_d, &jh);
+                if (proj) {
+                    auto rep = ref.compare("joint_enc_proj", proj, (size_t)ref_T_enc * jh);
+                    print_row("joint_enc_proj", rep, COS_THRESHOLD);
+                    record(rep);
+                } else {
+                    printf("[ERR ] joint_enc_proj          gigaam_joint_project_encoder returned null\n");
+                    n_fail++;
+                }
+                int ph = 0;
+                float* pred = gigaam_predictor_initial(ctx, &ph);
+                if (pred) {
+                    auto rep = ref.compare("pred_initial", pred, (size_t)ph);
+                    print_row("pred_initial", rep, COS_THRESHOLD);
+                    record(rep);
+                } else {
+                    printf("[ERR ] pred_initial            gigaam_predictor_initial returned null\n");
+                    n_fail++;
+                }
+                if (proj && pred) {
+                    int C = 0;
+                    float* lg = gigaam_joint_step(ctx, proj, pred, &C);
+                    if (lg) {
+                        auto rep = ref.compare("joint_logits_t0", lg, (size_t)C);
+                        print_row("joint_logits_t0", rep, COS_THRESHOLD);
+                        record(rep);
+                        free(lg);
+                    } else {
+                        printf("[ERR ] joint_logits_t0         gigaam_joint_step returned null\n");
+                        n_fail++;
+                    }
+                }
+                free(proj);
+                free(pred);
+            }
+        }
+
+        // ---- decoded transcript (HARD RULE #3: the acceptance gate) ----
+        {
+            const std::string ref_text = ref.meta("generated_text");
+            char* my_text = gigaam_transcribe(ctx, samples.data(), (int)samples.size());
+            if (my_text) {
+                if (ref_text.empty()) {
+                    printf("[INFO] transcribe              %s (no ref)\n", my_text);
+                } else if (ref_text == std::string(my_text)) {
+                    printf("[PASS] transcribe              %s\n", my_text);
+                } else {
+                    printf("[FAIL] transcribe              cpp: %s\n", my_text);
+                    printf("                               ref: %s\n", ref_text.c_str());
+                    n_fail++;
+                }
+                free(my_text);
+            } else {
+                printf("[ERR ] transcribe              gigaam_transcribe returned null\n");
+                n_fail++;
+            }
+        }
+
+        gigaam_free(ctx);
+    } else if (backend_name == "wespeaker") {
+        // WeSpeaker ResNet34-LM speaker embedder (#324).
+        // Reference: tools/reference_backends/wespeaker.py, which runs the
+        // upstream model as an oracle (never a second implementation of ours).
+        auto cp = wespeaker_context_default_params();
+        cp.n_threads = 4;
+        cp.verbosity = 0;
+        wespeaker_context* ctx = wespeaker_init_from_file(model_path.c_str(), cp);
+        if (!ctx) {
+            fprintf(stderr, "failed to load wespeaker model\n");
+            return 4;
+        }
+
+        // ---- fbank (post-CMN, i.e. the actual network input) ----
+        {
+            int T = 0, F = 0;
+            float* fb = wespeaker_compute_fbank(ctx, samples.data(), (int)samples.size(), &T, &F);
+            if (fb) {
+                auto rep = ref.compare("fbank", fb, (size_t)T * F);
+                print_row("fbank", rep, COS_THRESHOLD);
+                record(rep);
+                free(fb);
+            } else {
+                printf("[ERR ] fbank                  wespeaker_compute_fbank returned null\n");
+                n_fail++;
+            }
+        }
+
+        // ---- every residual stage + stats + embedding, in one forward ----
+        {
+            struct Cap {
+                std::map<std::string, std::vector<float>> st;
+            } cap;
+            auto cb = [](const char* name, const float* data, int ne0, int ne1, int ne2, void* ud) {
+                auto* c = static_cast<Cap*>(ud);
+                c->st[name].assign(data, data + (size_t)ne0 * ne1 * ne2);
+            };
+            std::vector<float> emb((size_t)wespeaker_embed_dim(ctx));
+            int rc = wespeaker_embed_staged(ctx, samples.data(), (int)samples.size(), cb, &cap, emb.data());
+            if (rc != 0) {
+                printf("[ERR ] embedding               wespeaker_embed_staged rc=%d\n", rc);
+                n_fail++;
+            } else {
+                for (const char* nm : {"stem_out", "layer1_out", "layer2_out", "layer3_out", "layer4_out", "stats"}) {
+                    auto it = cap.st.find(nm);
+                    if (it == cap.st.end()) {
+                        printf("[SKIP] %-22s not captured\n", nm);
+                        continue;
+                    }
+                    auto rep = ref.compare(nm, it->second.data(), it->second.size());
+                    print_row(nm, rep, COS_THRESHOLD);
+                    record(rep);
+
+                    // These maps are post-ReLU and VERY sparse (36% of
+                    // stem_out's rows are entirely dead), which makes cos_min a
+                    // brittle statistic here. crispasr_diff skips any row whose
+                    // denominator is 0, so dead rows — one-sided or not — are
+                    // not what drives it; what does is sparse rows where the
+                    // handful of surviving positive values land at different
+                    // positions in the two implementations, giving a
+                    // near-orthogonal row. layer1_out reads cos_min=0.000000
+                    // that way while cos_mean is 0.999966 over 87,840 rows.
+                    // Judge this backend on cos_mean and on `embedding`, which
+                    // is the only thing downstream clustering consumes; the
+                    // counts below are printed so the sparsity is visible
+                    // rather than inferred.
+                    auto rp = ref.get_f32(nm);
+                    auto shp = ref.shape(nm);
+                    if (rp.first && !shp.empty()) {
+                        const size_t row_w = (size_t)shp.back(); // harness's row width
+                        if (row_w > 0 && it->second.size() % row_w == 0) {
+                            size_t one_sided = 0, both_zero = 0;
+                            for (size_t i = 0; i + row_w <= it->second.size(); i += row_w) {
+                                double na = 0, nb = 0;
+                                for (size_t k = 0; k < row_w; k++) {
+                                    na += (double)it->second[i + k] * it->second[i + k];
+                                    nb += (double)rp.first[i + k] * rp.first[i + k];
+                                }
+                                const bool za = na <= 0.0, zb = nb <= 0.0;
+                                if (za && zb)
+                                    both_zero++;
+                                else if (za != zb)
+                                    one_sided++;
+                            }
+                            if (one_sided || both_zero)
+                                printf("       %-22s dead rows: %zu one-sided, %zu both (of %zu)\n", "", one_sided,
+                                       both_zero, it->second.size() / row_w);
+                        }
+                    }
+                }
+                auto rep = ref.compare("embedding", emb.data(), emb.size());
+                print_row("embedding", rep, COS_THRESHOLD);
+                record(rep);
+
+                // The embedding is consumed as a direction (cosine affinity),
+                // so report that explicitly rather than inferring it from the
+                // elementwise cosine the harness already prints.
+                auto rp = ref.get_f32("embedding");
+                if (rp.first) {
+                    double dot = 0, na = 0, nb = 0;
+                    for (size_t i = 0; i < emb.size(); i++) {
+                        dot += (double)emb[i] * rp.first[i];
+                        na += (double)emb[i] * emb[i];
+                        nb += (double)rp.first[i] * rp.first[i];
+                    }
+                    printf("       cosine(emb, ref)       %.8f   |mine|=%.4f |ref|=%.4f\n",
+                           dot / (std::sqrt(na) * std::sqrt(nb) + 1e-12), std::sqrt(na), std::sqrt(nb));
+                }
+            }
+        }
+
+        wespeaker_free(ctx);
     } else if (backend_name == "parakeet") {
         auto cp = parakeet_context_default_params();
         cp.n_threads = 4;

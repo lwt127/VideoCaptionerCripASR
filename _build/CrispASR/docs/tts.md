@@ -19,7 +19,7 @@ trade-off:
 | **`orpheus`** | Llama-3.2-3B talker + SNAC 24 kHz codec. 8 baked English speakers; expressive output. Greedy loops — pass `--temperature 0.6`. | Preset names via `--voice tara/leah/...` | ~3.5 GB via `-m auto` (talker Q8 + 26 MB SNAC) |
 | **`chatterbox`** | T3 AR + S3Gen flow-matching + HiFTGenerator. Built-in voice baked into the T3 GGUF; clones via a baked voice GGUF (see workflow below). EN/AR/DE variants share runtime. | Yes (`--voice <voice.gguf>`, baked from a WAV with `models/bake-chatterbox-voice-from-wav.py`) | ~880 MB via `-m auto` (T3 Q8 + S3Gen Q8) |
 | **`outetts`** | OuteTTS-0.3-1B: OLMo-1B LLM + WavTokenizer single-codebook VQ-GAN. Lightweight (1B params), CC BY 4.0 license. 24 kHz output. | Yes (`--voice <speaker.json>`, created with `tools/reference_backends/outetts_create_speaker.py`) | ~2.5 GB via `-m auto` (talker F16 + WavTokenizer decoder) |
-| **`f5-tts`** | F5-TTS v1 Base: 22-layer DiT flow-matching TTS + Vocos iSTFT vocoder. MIT license. High-quality zero-shot voice cloning from 3-15s reference audio. 24 kHz output, character-level tokenization. | Yes (`--voice <ref.wav> --ref-text "transcript"`) | ~953 MB via `-m auto` (single F16 GGUF, DiT + Vocos) |
+| **`f5-tts`** | F5-TTS v1 Base: 22-layer DiT flow-matching TTS + Vocos iSTFT vocoder. MIT license. High-quality zero-shot voice cloning from 3-15s reference audio. 24 kHz output. English + Chinese (built-in pinyin g2p, #294). | Yes (`--voice <ref.wav> --ref-text "transcript"`) | ~953 MB via `-m auto` (single F16 GGUF, DiT + Vocos) |
 | **`irodori-tts`** | Irodori-TTS: RF-DiT flow-matching TTS with LowRankAdaLN + JointAttention + half-RoPE + SwiGLU. 48 kHz via Semantic-DACVAE-Japanese-32dim codec. MIT license. Japanese-focused (llm-jp-3 tokenizer). Zero-shot voice cloning from any reference WAV (DAC-VAE encoder + speaker CFG); emoji emotion control; duration predictor for output length. **VoiceDesign** (600M-v3): adds caption encoder for style/emotion control via text descriptions (`--instruct "calm adult male, deep voice"`); independent text/speaker/caption CFG. | Yes (`--voice <ref.wav> --i-have-rights`) | ~526 MB Q4_K (VoiceDesign) / ~852 MB Q4_K (base) + DAC-VAE codec |
 | **`indextts`** | IndexTTS-1.5: GPT-2 AR (24L/1280d) mel-code generator + BigVGAN vocoder. Designed for Chinese+English. Zero-shot voice cloning from any reference WAV. | Yes (`--voice <ref.wav>`) | ~2.4 GB via `-m auto` (GPT F16 + BigVGAN F16) |
 | **`cosyvoice3-tts`** | Fun-CosyVoice3-0.5B-2512: Qwen2-0.5B AR speech-token LM + DiT-CFM (10-step Euler) + HiFT (NSF + iSTFT) @ 24 kHz. 9 languages + 18 Chinese dialects. Ships an 8-voice baked bank (`zero_shot` + `fleurs-{en,de,zh,ja,fr,es,ko}`). | Yes — baked-bank name via `--voice <name>`, **or** native arbitrary-WAV cloning via `--voice <ref.wav> --ref-text "..."` (ports speech_tokenizer_v3 + CAMPPlus + matcha mel to ggml; speech tokens byte-exact vs ONNX). | ~1.2 GB via `-m auto` (Q4_K LLM + Q8_0 flow + HiFT + s3tok + campplus + voices) |
@@ -37,11 +37,50 @@ trade-off:
 | **`tada-1b`** | HumeAI TADA 1B: Llama-3.2-1B backbone + per-token flow-matching diffusion head + TADA codec → 24 kHz. **English-only.** `-m auto` downloads model + default `tada-ref.gguf`. | Yes (`--voice <tada-ref.gguf>`, English voice refs only) | ~1.7 GB Q4_K + ~1 GB codec |
 | **`tada` / `tada-3b-ml`** | HumeAI TADA 3B Multilingual: same architecture, 3B params. Supports **ar, ch, de, es, fr, it, ja, pl, pt** in addition to English. `-l <lang>` auto-downloads `tada-ref-<lang>.gguf`. | Yes (`--voice <tada-ref.gguf>`) | ~4 GB Q4_K + ~1 GB codec |
 | **`lfm2-audio`** | LiquidAI LFM2.5-Audio 1.5B: FastConformer encoder + LFM2 hybrid conv+attention backbone + 6L depthformer (8-codebook Mimi) + ISTFT detokenizer → 24 kHz. Interleaved text+audio generation. Also does ASR and speech-to-speech. LFM Open License v1.0 ($10M revenue cap). | No | ~1.5 GB Q4_K (JP) / ~1.6 GB Q5_K (EN) + ~157 MB detokenizer companion |
-| **`dots-tts`** | rednote-hilab dots.tts-soar: Qwen2.5-1.5B LLM + 24L VAESemanticEncoder + 18L DiT flow-matching head (16-step Euler CFG) + BigVGAN vocoder → 48 kHz. Continuous-latent AR (patch-by-patch). Apache-2.0. **The CFG flow-match needs F16 — a full-q8 core derails; use the F16 core or a mixed-quant (`crispasr-quantize` keeps the DiT at F16, quantizes the LLM+PatchEncoder to Q8_0 → ~3.1 GB).** | TODO (CAM++ speaker; text-only today) | ~4.6 GB F16 / ~3.1 GB mixed-Q8 core + 345 MB vocoder companion |
+| **`dots-tts`** | rednote-hilab dots.tts-soar: Qwen2.5-1.5B LLM + 24L VAESemanticEncoder + 18L DiT flow-matching head (16-step Euler CFG) + BigVGAN vocoder → 48 kHz. Continuous-latent AR (patch-by-patch). Apache-2.0. **The CFG flow-match needs an F16 DiT — a full-q8 core derails; use the mixed quant (`crispasr-quantize` keeps the DiT at F16, quantizes the LLM+PatchEncoder to Q8_0 or Q4_K).** CAM++ reference-WAV voice cloning is supported when the speaker companion is present. | Yes (`--voice ref.wav --i-have-rights`) | ~3.1 GB mixed-Q8 / ~2.2 GB mixed-Q4_K core + 330–345 MB vocoder companion |
 | **`mini-omni2`** | gpt-omni/mini-omni2: Whisper-small encoder + Qwen2-0.5B LLM with 8-stream architecture + SNAC 24 kHz decoder → 24 kHz. Also does ASR and speech-to-speech. MIT license. Requires `--codec-model snac-24khz.gguf` companion. | No | ~1.0 GB Q4_K + ~80 MB SNAC companion |
 | **`voxtral-tts`** | Mistral Voxtral-4B-TTS-2603: Ministral-3B AR backbone (26L GQA, NORMAL/adjacent-pair RoPE) + 3L bidirectional flow-matching acoustic transformer (8-step Euler ODE + CFG α=1.2, no positional encoding) + Voxtral codec decoder (ALiBi sliding-window attention + reflect-causal conv + ConvTranspose upsampling) → 24 kHz. 20 preset voices across 9 languages (en/fr/de/es/it/pt/nl/ar/hi); strong on French technical text. CC-BY-NC-4.0. | No (20 preset voices via `--voice <name>`, e.g. `fr_female`) | ~2.4 GB Q4_K / ~4.3 GB Q8_0 / ~8.2 GB F16 via `-m auto` |
 
 All backends write mono WAV via `--tts-output` (22 kHz for piper/fastpitch/bananamind-tts, 16 kHz for speecht5, 24 kHz for most others, 44.1 kHz for melotts/dia/parler-tts/zonos-tts, 48 kHz for voxcpm2-tts).
+
+## dots.tts — voice cloning and performance
+
+`dots-tts` supports zero-shot voice cloning from a reference WAV. Place the
+CAM++ speaker companion (`dots-tts-soar-spk-f16.gguf`) beside the core model,
+then pass the reference recording with the consent attestation:
+
+```bash
+crispasr --backend dots-tts \
+  -m dots-tts-soar-q4_k.gguf \
+  --codec-model dots-tts-soar-vocoder-q8_0.gguf \
+  --voice reference.wav --i-have-rights \
+  --tts "Hello from CrispASR." --tts-output cloned.wav
+```
+
+The speaker companion is loaded only when `--voice` is supplied. Without it,
+the same backend produces text-conditioned speech using its default model
+conditioning. If the speaker companion is missing, the CLI warns and ignores
+the voice prompt; it does not silently claim that cloning succeeded.
+
+The practical low-memory choice is the mixed Q4_K core: the LLM and
+PatchEncoder are quantized, while the DiT, projections, embeddings, and
+conditioning statistics remain at the precision required by the flow-matching
+loop. The Q8 core is the safer quality/size default; do not quantize the DiT.
+
+The dominant cost is the DiT flow-match, not tokenization or the recurrent
+LLM step. A local Apple M1 measurement using the Q4_K core, Q8 vocoder, Metal,
+and an eight-patch cap took 24.2 s at 16 Euler steps: about 13.7 s in
+flow-match, 10.4 s in the BigVGAN vocoder, and under 0.5 s in the LLM and
+PatchEncoder. With the same seed and cap, `CRISPASR_DOTS_ODE_STEPS=8` took
+16.2 s (1.49x faster); this is a speed/quality trade-off, not a parity-preserving
+optimization. Full utterances add patch-by-patch AR cost, so benchmark with a
+known patch/audio cap and inspect the generated WAV.
+
+For further experiments, `CRISPASR_DOTS_FUSED_STEP=0` restores the legacy DiT
+path for A/B testing; the persistent fused graph is the default on CPU/Metal.
+`CRISPASR_DOTS_CFG_INTERVAL=2` skips some unconditional CFG evaluations but is
+approximate and should remain opt-in until the decoded output is checked.
+`CRISPASR_DOTS_TTS_BENCH=1` prints the stage timings used above.
 
 ## TADA — multilingual and voice cloning
 
@@ -312,6 +351,100 @@ ships pre-generated IPA pronunciation dictionaries for 4 languages —
 Dictionaries are auto-downloaded from
 [cstr/g2p-dicts](https://huggingface.co/datasets/cstr/g2p-dicts)
 on first use and cached at `~/.cache/crispasr/`.
+
+### Numbers are spelled out first
+
+Digits appear in no pronunciation dictionary and no letter-to-sound rule, so
+before v0.8.24 a numeric token produced **no phonemes at all** and vanished from
+the audio — "a model with 82 million parameters" was spoken as "…with million
+parameters" (#316). Numbers are now expanded to words ahead of phonemization,
+following misaki's reading:
+
+| input | spoken | | input | spoken |
+|---|---|---|---|---|
+| `82` | eighty two | | `1234` | twelve thirty four |
+| `101` | one hundred one | | `1005` | one thousand five |
+| `1984` | nineteen eighty four | | `1100` | eleven hundred |
+| `2026` | twenty twenty six | | `1000` | one thousand |
+| `3.14` | three point one four | | `1st` | first |
+| `50%` | fifty percent | | `$20` | twenty dollars |
+
+A four-digit number reads as a **year** (two halves) unless it ends in `00` or
+its last two digits are below ten — `1234` is "twelve thirty four" but `1005` is
+"one thousand five". A digit inside a word (`mp3`, `x64`) is left alone.
+
+> **English only.** The expansion lives in the English G2P, so it also fixes
+> piper's EN voices. German, French and Spanish have their own G2P front ends
+> and still drop numeric tokens — `82` phonemizes to nothing there. Each needs
+> its own number grammar (German compounds "zweiundachtzig" rather than reading
+> the digits in order), so this is not a shared routine.
+
+### Phoneme dialects — one G2P, several models
+
+The G2P emits **espeak-style IPA** (`tʃ`, `oʊ`, `ɜː`, length marks), which is
+what piper expects. Kokoro was trained on [misaki](https://github.com/hexgrad/misaki),
+its own G2P, whose alphabet differs: `ʧ`, `O`, `ɜɹ`, and **no length marks at
+all**. Both spellings exist in Kokoro's vocabulary, so feeding it the espeak
+forms neither errors nor drops anything — the model just receives tokens it was
+never trained on and drifts, which is the "sounds British / old English" of #316
+(`ː` is the RP length mark).
+
+CrispASR converts per backend (`src/core/phoneme_dialect.h`):
+
+| Dialect | Spelling | Used by |
+|---|---|---|
+| `EspeakIpa` | `tʃ`, `oʊ`, `ɜː`, `ɾ`, `ɚ`, length marks | piper — and the G2P's own output |
+| `Misaki` | `ʧ`, `O`, `ɜɹ`, `T`, `əɹ`, no length marks | kokoro |
+
+`CRISPASR_KOKORO_MISAKI_IPA=0` restores the raw espeak spelling for A/B.
+
+### Phoneme parity with misaki
+
+Alphabet alone is not enough: CrispASR's CMUdict-based G2P and misaki disagree
+about stress and unstressed vowels, so kokoro was fed pronunciations it was not
+trained on even after the spelling was fixed. Five further pieces close that gap,
+each measured against misaki 0.9.4:
+
+| stage | 10k frequency list | 400-sentence prose corpus |
+|---|---|---|
+| CMUdict + alphabet conversion | — | 81.6% |
+| **+ misaki's own lexicon** (Tier 0) | — | 88.5%\* |
+| **+ morphological fallback** (`-s`/`-ed`/`-ing` from the stem) | — | 98.1%\* |
+| **+ contextual function words** (`the`/`to`/`a`) | — | 90.8% |
+| **+ Unicode punctuation** in the tokenizer | — | 93.0% |
+| **+ capitalisation stress + phrase-final variants** | **99.30%** | **99.12%** |
+
+\* measured on a harder obscure-word corpus at that stage.
+
+Three of those deserve a note because they are not obvious:
+
+- **Capitalisation, not grammar, drives stress.** misaki derives it from the
+  token's case (`lowercase` → the lexicon form, `Titlecase` → insert secondary
+  stress, `ALLCAPS` → primary): `and` / `And` / `AND` → `ænd` / `ˌænd` / `ˈænd`.
+  No part-of-speech tagger is involved.
+- **`the`/`to`/`a` depend on the FOLLOWING word.** `the apple` is `ði`, `the box`
+  is `ðə`; `to open` is `tʊ`, `to walk` is `tə`. Reading the citation form
+  everywhere is the "old English" diction of #316.
+- **misaki's `'None'` lexicon key is not a POS tag** — it is the phrase-final
+  reading, chosen when nothing follows (`…is she?` → `ʃˌi`). 32 entries.
+
+What is left needs a POS tagger and is deliberately not guessed: `that` wants
+`ðˈæt` as a determiner but `ðæt` as a conjunction, and `DEFAULT` is measurably
+the better single choice (68% vs 31%). Same for `used`, `read`, `desert`.
+
+### Driving the phonemes directly (`--tts-phonemes`)
+
+```bash
+crispasr --tts "unused" --tts-phonemes "həlˈO wˈɜɹld" --backend kokoro \
+         -m kokoro-82m-q8_0.gguf --voice kokoro-voice-af_heart.gguf -o out.wav
+```
+
+Synthesizes the phoneme string verbatim, skipping the G2P. This is the seam
+between text processing and the acoustic model: feeding another
+implementation's phonemes through our model separates "our G2P is wrong" from
+"our model is wrong" in a single run — which is exactly how #316 was diagnosed.
+kokoro only; other backends refuse rather than silently synthesizing the text,
+so an A/B cannot be misread.
 
 The `--g2p-dict` flag selects the dictionary source:
 
@@ -956,11 +1089,56 @@ ConvNeXtV2 text encoder → 22-layer Diffusion Transformer with AdaLN-Zero
 
 The `--ref-text` flag provides the transcript of the reference audio.
 This is required for F5-TTS (unlike indextts which conditions on audio
-only). The model uses character-level tokenization (2545 vocab, pinyin
-for Chinese). Output is 24 kHz mono PCM.
+only). Output is 24 kHz mono PCM.
+
+**Tokenization — English and Chinese (#294).** The model uses a 2545-entry
+character/pinyin vocab. English (and other Latin text) tokenizes per character.
+Chinese text is converted to pinyin the same way the upstream model expects
+(`convert_char_to_pinyin`): a built-in g2p (`src/core/pinyin_g2p.*`) does
+phrase-based segmentation → `pypinyin`-style TONE3 syllables (e.g. `zhong1`) with
+tone-sandhi (不/一/third-tone), embedded from `pypinyin` via
+`tools/gen_pinyin_data.py`. Token parity vs the reference is ~99.7% on the
+`tests/test-pinyin-g2p` corpus; the residual is segmentation-boundary polyphones
+that need full jieba (not embedded). Before #294 Chinese produced no audio (every
+Han char hit the unknown token). Mixed English+Chinese in one sentence works.
+
+**Output length (#294).** F5 estimates the number of mel frames from the
+reference's speech rate (`ref_frames / ref_text_len`) × the generated text
+length. A slow or expressive reference must not be truncated: the rate guard is
+asymmetric (a generous upper bound, matching upstream which has none — an
+over-estimate is just trailing silence that gets trimmed), so long sentences are
+no longer cut off. `CRISPASR_F5_DURATION_CLAMP=0` restores the exact upstream
+formula. Give an accurate `--ref-text`; a wrong/short reference transcript
+distorts the rate.
 
 **Model file:**
 [`cstr/f5-tts-GGUF`](https://huggingface.co/cstr/f5-tts-GGUF)
+
+### Performance (issue #294)
+
+The whole cost is the ODE denoising loop — 32 steps × 2 (CFG) = **64 full 22-layer
+DiT passes** over the ref+gen sequence. The vocoder and text encoder are <1%.
+**Quantization is not an option** — flow matching accumulates per-op error 1408×
+per synthesis, so anything below F16 is unintelligible (F16 is the only viable
+format; see the model README). All speed comes from *fewer / smaller passes*:
+
+| Lever | Speedup | How | Quality |
+|-------|---------|-----|---------|
+| **`--tts-steps 7`** | **~4.7×** | EPSS non-uniform step schedule (built in for n=5/6/7/10/12/16) | verified intact; drop to 10/12 (~3×) if a voice sounds rough |
+| `--tts-steps 16` | ~2.0× | fewer uniform-ish steps | intact |
+| `CRISPASR_F5_CFG_INTERVAL=2` | ~1.3× | reuse the unconditional CFG velocity between steps | intact at ≥16 steps |
+| shorter reference clip (3–5 s) | scales with T | the DiT denoises ref+gen jointly, so a long ref inflates *every* pass (attention is O(T²)) | intact |
+| `CRISPASR_F5_BATCH_CFG=1` | GPU-dependent | one 2×-batch CFG forward (matches upstream) instead of two; try on CUDA | intact |
+| `CRISPASR_F5_EMBED_GPU=1` | ~1.3× (more on slow-CPU) | run the InputEmbedding (input_proj + conv-pos) on the GPU instead of the CPU; removes the per-step CPU stall | intact (byte-identical gate-off; roundtrip-identical gate-on). GPU builds only |
+| `CRISPASR_F5_DIT_SKIP=2` | ~1.9× | DiTReducio temporal skip — reuse the cached step velocity every other step | intact at 32 steps; ≈ using `--tts-steps 16`, so use one or the other |
+
+Stacking: `~4 s ref` + `--tts-steps 7` (+ `CRISPASR_F5_EMBED_GPU=1` on a GPU) compound.
+**Do not** combine a low step count with `CFG_INTERVAL` or `DIT_SKIP` — too few
+non-uniform steps + a stale/reused velocity degrades to noise (the runtime warns
+below 16 steps). `EMBED_GPU` is orthogonal and stacks with any step setting.
+
+`CRISPASR_F5_BENCH=1` prints the per-stage split (host_embed / dit_graph / vocos).
+`-nfa` has no effect on F5 — the DiT always uses flash attention.
 
 ## IndexTTS — Chinese/English voice cloning
 
@@ -1412,13 +1590,38 @@ generated by artificial intelligence" using a neutral default voice
 The spoken disclaimer can be disabled per-request while keeping all
 machine-readable provenance (watermark + C2PA) intact:
 
-- **CLI**: `--no-spoken-disclaimer`
-- **Server**: `"spoken_disclaimer": false` in the request body
+- **CLI**: `--no-spoken-disclaimer` — **requires `--accept-marking-responsibility`**,
+  else the run is refused (exit 12).
+- **Server**: `"spoken_disclaimer": false` in the request body — **requires a
+  `"marking_attestation": "<text>"` field alongside it**, or a server launched
+  with `--accept-marking-responsibility` (the operator accepts the duty for every
+  response the process serves, which covers each request).
 
 When the spoken disclaimer is suppressed, the caller assumes
 responsibility for providing appropriate AI-disclosure to end users
-(e.g. a visual label in the UI). The spread-spectrum watermark and
-C2PA metadata are always embedded regardless of this setting.
+(e.g. a visual label in the UI) — that is exactly what the attestation
+records. The spread-spectrum watermark and C2PA metadata are always
+embedded regardless of this setting.
+
+**An unattested opt-out is denied, not refused** (#312, from v0.8.24). A server
+request that sets `"spoken_disclaimer": false` without any attestation still gets
+its audio — with the spoken disclaimer applied, i.e. the documented default. The
+denial is announced, never silent:
+
+```
+X-Crispasr-Spoken-Disclaimer: applied
+X-Crispasr-Marking-Warning:   'spoken_disclaimer': false ignored - it requires a
+                              'marking_attestation' field (or a server launched with
+                              --accept-marking-responsibility); served with the
+                              spoken AI-disclaimer
+```
+
+plus a `[MARKING] … no_spoken_disclaimer=DENIED` line in the server log. Serving
+the *stronger* default can't emit weaker-than-default output, and it doesn't hard-
+break clients written before the field existed — v0.8.22/v0.8.23 returned
+`400 marking_attestation_required` for that request instead, which took out voice
+cloning for every Subtitle Edit build up to v5.1.0-rc16. The CLI keeps its hard
+refusal: there the operator can just add the flag.
 
 **Latency (by design).** The disclaimer is a *full synthesis pass* of the
 neutral sentence on the loaded backend — not a pre-recorded clip — so it adds

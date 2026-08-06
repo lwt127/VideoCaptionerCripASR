@@ -26,6 +26,9 @@ fi
 export CRISPASR_MODEL_WHISPER="${CRISPASR_MODEL_WHISPER:-$_whisper_default}"
 unset _whisper_cache _whisper_default
 
+# Tiron (#295): Whisper large-v3 + inline <|speakerN|> markers (legacy ggml bin).
+export CRISPASR_MODEL_TIRON="${CRISPASR_MODEL_TIRON:-$CRISPASR_MODELS_DIR/tiron-q4_k.bin}"
+
 # ── Beam search backends ──
 export CRISPASR_MODEL_GLM_ASR="${CRISPASR_MODEL_GLM_ASR:-$CRISPASR_MODELS_DIR/glm-asr-nano.gguf}"
 export CRISPASR_MODEL_QWEN3_ASR="${CRISPASR_MODEL_QWEN3_ASR:-$CRISPASR_MODELS_DIR/qwen3-asr-0.6b.gguf}"
@@ -97,6 +100,17 @@ export CRISPASR_MODEL_ARK_ASR="${CRISPASR_MODEL_ARK_ASR:-$CRISPASR_MODELS_DIR/ar
 # Mini-Omni2 (gpt-omni/mini-omni2): Whisper-small + Qwen2-0.5B
 export CRISPASR_MODEL_MINI_OMNI2="${CRISPASR_MODEL_MINI_OMNI2:-$CRISPASR_MODELS_DIR/mini-omni2-q4_k.gguf}"
 export CRISPASR_MODEL_SNAC="${CRISPASR_MODEL_SNAC:-$CRISPASR_MODELS_DIR/snac-24khz.gguf}"
+
+# ── WeSpeaker ResNet34-LM (#324 foxnose diarization speaker embedder) ──
+export CRISPASR_MODEL_WESPEAKER="${CRISPASR_MODEL_WESPEAKER:-$CRISPASR_MODELS_DIR/wespeaker-resnet34-lm.gguf}"
+
+# ── GigaAM-v3 (ai-sage/GigaAM-v3, Russian ASR) ──
+# Default to the e2e_rnnt revision — best WER, and the only one that emits
+# punctuation + casing. The fixture is GigaAM's own example.wav:
+#   curl -o example.wav https://cdn.chatwm.opensmodel.sberdevices.ru/GigaAM/example.wav
+export CRISPASR_MODEL_GIGAAM="${CRISPASR_MODEL_GIGAAM:-$CRISPASR_MODELS_DIR/gigaam-v3-e2e-rnnt-q4_k.gguf}"
+export CRISPASR_MODEL_GIGAAM_F16="${CRISPASR_MODEL_GIGAAM_F16:-$CRISPASR_MODELS_DIR/gigaam-v3-e2e-rnnt-f16.gguf}"
+export CRISPASR_FIXTURE_GIGAAM="${CRISPASR_FIXTURE_GIGAAM:-$CRISPASR_MODELS_DIR/fixtures/gigaam-example.wav}"
 
 # ── Nemotron (streaming ASR) ──
 export CRISPASR_MODEL_NEMOTRON="${CRISPASR_MODEL_NEMOTRON:-$CRISPASR_MODELS_DIR/nemotron-3.5-asr-streaming-0.6b-q4_k.gguf}"

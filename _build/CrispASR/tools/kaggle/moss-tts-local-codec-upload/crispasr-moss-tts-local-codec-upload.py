@@ -22,10 +22,16 @@ REPO = TEMP / "CrispASR"
 MODELS = TEMP / "codec-models"
 MODELS.mkdir(parents=True, exist_ok=True)
 
-CRISPASR_REF = os.environ.get("CRISPASR_REF", "feat/moss-tts-local-4b")
+# feat/moss-tts-local-4b was merged long ago; cloning it pinned this kernel to a
+# stale converter, so a re-run would silently reproduce the old decode-only GGUF.
+CRISPASR_REF = os.environ.get("CRISPASR_REF", "main")
 HF_CODEC = os.environ.get("MOSS_CODEC", "OpenMOSS-Team/MOSS-Audio-Tokenizer-v2")
 GGUF_REPO = os.environ.get("MOSS_GGUF_REPO", "cstr/moss-tts-local-v1.5-GGUF")
-CODEC_NAME = "moss-tts-local-v1.5-codec.gguf"
+# The encoder-carrying codec is roughly twice the size and is useless until
+# encode() lands, so it does NOT overwrite the shipped decode-only file yet:
+# Subtitle Edit downloads that path. Ship it under a dev name, validate cloning
+# against it, and only then promote it over the published one.
+CODEC_NAME = os.environ.get("MOSS_CODEC_NAME", "moss-tts-local-v1.5-codec-enc.gguf")
 HFBASE = "https://huggingface.co"
 
 
@@ -92,7 +98,15 @@ def main():
     # ── upload with hang-tolerance + server-side verify ────────────────────
     from huggingface_hub import HfApi
     api = HfApi(token=hf_token)
-    api.create_repo(GGUF_REPO, repo_type="model", exist_ok=True)
+    # Only create the repo if it is genuinely absent. exist_ok=True still POSTs
+    # to /api/repos/create, and a fine-grained token that may write to existing
+    # repos but not create new ones gets 401 there — which killed this kernel
+    # AFTER a clean 4.25 GB conversion, before the upload was even attempted.
+    # exist_ok only swallows a 409 Conflict, not a 401.
+    try:
+        api.repo_info(GGUF_REPO, repo_type="model")
+    except Exception:  # noqa: BLE001 — absent, or not visible to this token
+        api.create_repo(GGUF_REPO, repo_type="model", exist_ok=True)
 
     def landed():
         try:
