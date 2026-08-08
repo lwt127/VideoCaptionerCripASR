@@ -100,16 +100,16 @@ class SubtitleOptimizer:
 
     def _parallel_optimize(self, chunks: List[Dict[str, str]]) -> Dict[str, str]:
         """并行优化所有块"""
-        futures = []
+        future_chunks = {}
         optimized_dict = {}
 
         for chunk in chunks:
             if not self.executor:
                 raise ValueError("线程池未初始化")
             future = self.executor.submit(self._safe_optimize_chunk, chunk)
-            futures.append(future)
+            future_chunks[future] = chunk
 
-        for future in as_completed(futures):
+        for future in as_completed(future_chunks):
             if not self.is_running:
                 logger.info("优化器已停止运行，退出优化")
                 break
@@ -119,7 +119,7 @@ class SubtitleOptimizer:
             except Exception as e:
                 logger.error(f"优化块失败：{str(e)}")
                 # 对于失败的块，保留原文
-                for k, v in chunk.items():
+                for k, v in future_chunks[future].items():
                     optimized_dict[k] = v
 
         return optimized_dict
@@ -158,8 +158,14 @@ class SubtitleOptimizer:
         )
 
         if cache_result:
-            logger.info("使用缓存的优化结果")
-            return json.loads(cache_result)
+            try:
+                cached_result = self._parse_optimized_result(
+                    json.loads(cache_result), "缓存"
+                )
+                logger.info("使用缓存的优化结果")
+                return cached_result
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.warning(f"优化缓存格式无效，重新调用API: {str(e)}")
 
         # 构建提示词
         messages = [
@@ -179,7 +185,10 @@ class SubtitleOptimizer:
         )
 
         # 解析结果
-        result: Dict[str, str] = json_repair.loads(response.choices[0].message.content)  # type: ignore
+        result = self._parse_optimized_result(
+            json_repair.loads(response.choices[0].message.content),  # type: ignore
+            "API",
+        )
 
         # 修复字幕对齐
         aligned_result = self._repair_subtitle(subtitle_chunk, result)
@@ -196,6 +205,17 @@ class SubtitleOptimizer:
             self.update_callback(aligned_result)
 
         return aligned_result
+
+    @staticmethod
+    def _parse_optimized_result(result: object, source: str) -> Dict[str, str]:
+        """验证优化器返回的字幕映射。"""
+        if not isinstance(result, dict):
+            raise ValueError(
+                f"{source}返回格式无效：期望JSON对象，实际为{type(result).__name__}"
+            )
+        if not all(isinstance(key, str) and isinstance(value, str) for key, value in result.items()):
+            raise ValueError(f"{source}返回格式无效：JSON对象的键和值必须都是字符串")
+        return result
 
     @staticmethod
     def _repair_subtitle(
