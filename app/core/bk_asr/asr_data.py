@@ -8,12 +8,14 @@ import platform
 
 
 def safe_filename(name: str, max_length: int = 80) -> str:
-    """Return the filename unchanged.
+    """Return a sanitized filename.
 
-    Long-path handling is performed at the save boundary, so we keep the
-    original filename intact here.
+    Leading/trailing whitespace is stripped because Windows cannot reliably
+    create directories whose names end with a space (it raises WinError 3
+    "The system cannot find the path specified"). Long-path handling is
+    performed at the save boundary, so the rest of the name is kept intact.
     """
-    return name
+    return name.strip()
 
 
 def handle_long_path(path: str) -> str:

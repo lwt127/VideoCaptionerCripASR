@@ -38,7 +38,7 @@ audioop-lts>=0.2; python_version >= "3.13"
 py7zr>=0.20
 
 # ---- Media download (online video tasks) ----
-yt-dlp>=2024.1.0
+yt-dlp>=2026.7.4
 
 # ---- Optional: ModelScope model downloads (used by the model downloader) ----
 # Only needed if you download models via ModelScope inside the app.
