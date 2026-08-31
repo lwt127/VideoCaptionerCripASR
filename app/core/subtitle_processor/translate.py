@@ -16,9 +16,14 @@ import signal
 import requests
 import re
 import html
+import time
 from urllib.parse import quote
 
 from app.core.bk_asr.asr_data import ASRData, ASRDataSeg
+from app.core.subtitle_processor.openrouter_batch import (
+    OpenRouterBatchRunner,
+    parse_chat_completion_content,
+)
 from app.core.utils import json_repair
 from app.core.subtitle_processor.prompt import (
     TRANSLATE_PROMPT,
@@ -188,6 +193,8 @@ class BaseTranslator(ABC):
 class OpenAITranslator(BaseTranslator):
     """OpenAI翻译器"""
 
+    BATCH_POLL_INTERVAL = 10
+
     def __init__(
         self,
         thread_num: int = 10,
@@ -223,7 +230,123 @@ class OpenAITranslator(BaseTranslator):
         if not (base_url and api_key):
             raise ValueError("环境变量 OPENAI_BASE_URL 和 OPENAI_API_KEY 必须设置")
 
+        self.base_url = base_url
+        self.api_key = api_key
         self.client = OpenAI(base_url=base_url, api_key=api_key)
+
+    def _parallel_translate(self, chunks: List[Dict[str, str]]) -> Dict[str, str]:
+        if not self.model.endswith(":batch"):
+            return super()._parallel_translate(chunks)
+        return self._translate_openrouter_batch(chunks)
+
+    def _get_prompt(self) -> str:
+        prompt = REFLECT_TRANSLATE_PROMPT if self.is_reflect else TRANSLATE_PROMPT
+        return Template(prompt).safe_substitute(
+            target_language=self.target_language, custom_prompt=self.custom_prompt
+        )
+
+    def _translate_openrouter_batch(
+        self, chunks: List[Dict[str, str]]
+    ) -> Dict[str, str]:
+        prompt = self._get_prompt()
+        prompt_hash = hashlib.md5(prompt.encode()).hexdigest()
+        cache_params = {
+            "target_language": self.target_language,
+            "is_reflect": self.is_reflect,
+            "temperature": self.temperature,
+            "prompt_hash": prompt_hash,
+        }
+        translated_dict = {}
+        pending_chunks = {}
+        batch_requests = []
+        base_model = self.model.removesuffix(":batch")
+
+        for chunk_index, chunk in enumerate(chunks):
+            cache_key = json.dumps(chunk, ensure_ascii=False)
+            cache_result = self.cache_manager.get_llm_result(
+                cache_key, self.model, **cache_params
+            )
+            if cache_result:
+                parsed_result = self._normalize_result(json.loads(cache_result))
+                translated_dict.update(parsed_result)
+                if self.update_callback:
+                    self.update_callback(parsed_result)
+                continue
+
+            custom_id = f"subtitle-chunk-{chunk_index}"
+            pending_chunks[custom_id] = (chunk, cache_key)
+            batch_requests.append(
+                {
+                    "custom_id": custom_id,
+                    "body": {
+                        "model": base_model,
+                        "messages": [
+                            {"role": "system", "content": prompt},
+                            {
+                                "role": "user",
+                                "content": json.dumps(chunk, ensure_ascii=False),
+                            },
+                        ],
+                        "temperature": self.temperature,
+                    },
+                }
+            )
+
+        if not batch_requests:
+            return translated_dict
+
+        runner = OpenRouterBatchRunner(
+            self.base_url,
+            self.api_key,
+            self.timeout,
+            self.BATCH_POLL_INTERVAL,
+            getattr(self, "batch_state_dir", None),
+        )
+        batch = runner.run(
+            base_model,
+            batch_requests,
+            "translation",
+            lambda: self.is_running,
+            {
+                "model": self.model,
+                "chunks": chunks,
+                "prompt": prompt,
+                "temperature": self.temperature,
+            },
+        )
+
+        results_by_id = {
+            result.get("custom_id"): result
+            for result in batch.data.get("results", [])
+        }
+        for custom_id, (chunk, cache_key) in pending_chunks.items():
+            batch_result = results_by_id.get(custom_id)
+            if not batch_result:
+                raise RuntimeError(f"OpenRouter batch 缺少结果：{custom_id}")
+            raw_result = self._parse_batch_result(batch_result)
+            if len(raw_result) != len(chunk):
+                raise RuntimeError(f"OpenRouter batch 翻译结果数量不匹配：{custom_id}")
+            self.cache_manager.set_llm_result(
+                cache_key,
+                json.dumps(raw_result, ensure_ascii=False),
+                self.model,
+                **cache_params,
+            )
+            normalized_result = self._normalize_result(raw_result)
+            translated_dict.update(normalized_result)
+            if self.update_callback:
+                self.update_callback(normalized_result)
+
+        runner.mark_processed(batch)
+        return translated_dict
+
+    def _parse_batch_result(self, batch_result: Dict[str, Any]) -> Dict[str, Any]:
+        return json_repair.loads(parse_chat_completion_content(batch_result))
+
+    def _normalize_result(self, result: Dict[str, Any]) -> Dict[str, str]:
+        if self.is_reflect:
+            return {k: f"{v['revised_translation']}" for k, v in result.items()}
+        return {k: f"{v}" for k, v in result.items()}
 
     def _translate_chunk(self, subtitle_chunk: Dict[str, str]) -> Dict[str, str]:
         """翻译字幕块"""
@@ -232,13 +355,7 @@ class OpenAITranslator(BaseTranslator):
         )
 
         # 获取提示词
-        if self.is_reflect:
-            prompt = REFLECT_TRANSLATE_PROMPT
-        else:
-            prompt = TRANSLATE_PROMPT
-        prompt = Template(prompt).safe_substitute(
-            target_language=self.target_language, custom_prompt=self.custom_prompt
-        )
+        prompt = self._get_prompt()
         prompt_hash = hashlib.md5(prompt.encode()).hexdigest()
 
         try:

@@ -355,7 +355,10 @@ class SubtitleInterface(QWidget):
         self.subtitle_table.verticalHeader().setDefaultAlignment(
             Qt.AlignCenter
         )  # 居中对齐
-        self.subtitle_table.verticalHeader().setDefaultSectionSize(50)  # 行高
+        self.subtitle_table.verticalHeader().setMinimumSectionSize(50)
+        self.subtitle_table.verticalHeader().setSectionResizeMode(
+            QHeaderView.ResizeToContents
+        )
         self.subtitle_table.verticalHeader().setMinimumWidth(20)  # 设置最小宽度
 
         self.subtitle_table.setEditTriggers(

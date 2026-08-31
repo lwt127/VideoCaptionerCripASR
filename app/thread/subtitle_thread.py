@@ -2,6 +2,7 @@ import datetime
 import os
 from pathlib import Path
 from typing import Dict
+from urllib.parse import urlparse
 
 from PyQt5.QtCore import QSettings, QThread, pyqtSignal
 
@@ -63,10 +64,19 @@ class SubtitleThread(QThread):
             return self.task.subtitle_config
 
         if self.task.subtitle_config.base_url and self.task.subtitle_config.api_key:
+            if (
+                self.task.subtitle_config.llm_model.endswith(":batch")
+                and urlparse(self.task.subtitle_config.base_url).hostname
+                != "openrouter.ai"
+            ):
+                raise Exception(self.tr(":batch 模型目前仅支持 OpenRouter API"))
+            validation_model = self.task.subtitle_config.llm_model.removesuffix(
+                ":batch"
+            )
             if not test_openai(
                 self.task.subtitle_config.base_url,
                 self.task.subtitle_config.api_key,
-                self.task.subtitle_config.llm_model,
+                validation_model,
             )[0]:
                 raise Exception(
                     self.tr(
@@ -102,6 +112,7 @@ class SubtitleThread(QThread):
             assert subtitle_path is not None, self.tr("字幕文件路径为空")
 
             subtitle_config = self.task.subtitle_config
+            interactive_model = subtitle_config.llm_model.removesuffix(":batch")
 
             asr_data = ASRData.from_subtitle_file(subtitle_path)
 
@@ -137,7 +148,7 @@ class SubtitleThread(QThread):
                 logger.info("正在字幕断句...")
                 splitter = SubtitleSplitter(
                     thread_num=subtitle_config.thread_num,
-                    model=subtitle_config.llm_model,
+                    model=interactive_model,
                     temperature=0.3,
                     timeout=60,
                     retry_times=1,
@@ -157,14 +168,14 @@ class SubtitleThread(QThread):
                 self.progress.emit(0, self.tr("优化字幕..."))
                 logger.info("正在优化字幕...")
                 self.finished_subtitle_length = 0  # 重置计数器
-                optimizer = SubtitleOptimizer(
+                self.optimizer = SubtitleOptimizer(
                     custom_prompt=custom_prompt,
                     model=subtitle_config.llm_model,
                     batch_num=subtitle_config.batch_size,
                     thread_num=subtitle_config.thread_num,
                     update_callback=self.callback,
                 )
-                asr_data = optimizer.optimize_subtitle(asr_data)
+                asr_data = self.optimizer.optimize_subtitle(asr_data)
                 self.update_all.emit(asr_data.to_json())
 
             # 4. 翻译字幕
@@ -180,7 +191,7 @@ class SubtitleThread(QThread):
                 logger.info("正在翻译字幕...")
                 self.finished_subtitle_length = 0  # 重置计数器
                 os.environ["DEEPLX_ENDPOINT"] = subtitle_config.deeplx_endpoint
-                translator = TranslatorFactory.create_translator(
+                self.translator = TranslatorFactory.create_translator(
                     translator_type=translator_map[subtitle_config.translator_service],
                     thread_num=subtitle_config.thread_num,
                     batch_num=subtitle_config.batch_size,
@@ -191,7 +202,7 @@ class SubtitleThread(QThread):
                     is_reflect=subtitle_config.need_reflect,
                     update_callback=self.callback,
                 )
-                asr_data = translator.translate_subtitle(asr_data)
+                asr_data = self.translator.translate_subtitle(asr_data)
                 # 移除末尾标点符号
                 if subtitle_config.need_remove_punctuation:
                     asr_data.remove_punctuation()
@@ -258,6 +269,12 @@ class SubtitleThread(QThread):
     def stop(self):
         """停止所有处理"""
         try:
+            if hasattr(self, "translator"):
+                try:
+                    self.translator.stop()
+                except Exception as e:
+                    logger.error(f"停止翻译器时出错：{str(e)}")
+
             # 先停止优化器
             if hasattr(self, "optimizer"):
                 try:

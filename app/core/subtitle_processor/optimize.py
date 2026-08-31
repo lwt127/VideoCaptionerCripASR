@@ -13,6 +13,10 @@ from app.core.bk_asr.asr_data import ASRData, ASRDataSeg
 from app.core.storage.cache_manager import CacheManager
 from app.core.utils import json_repair
 from app.core.subtitle_processor.alignment import SubtitleAligner
+from app.core.subtitle_processor.openrouter_batch import (
+    OpenRouterBatchRunner,
+    parse_chat_completion_content,
+)
 from app.core.subtitle_processor.prompt import OPTIMIZER_PROMPT
 from app.core.utils.logger import setup_logger
 
@@ -21,6 +25,8 @@ logger = setup_logger("subtitle_optimizer")
 
 class SubtitleOptimizer:
     """字幕优化器,支持缓存功能"""
+
+    BATCH_POLL_INTERVAL = 10
 
     def __init__(
         self,
@@ -53,6 +59,8 @@ class SubtitleOptimizer:
         if not (base_url and api_key):
             raise ValueError("环境变量 OPENAI_BASE_URL 和 OPENAI_API_KEY 必须设置")
 
+        self.base_url = base_url
+        self.api_key = api_key
         self.client = OpenAI(base_url=base_url, api_key=api_key)
 
     def _init_thread_pool(self):
@@ -100,6 +108,15 @@ class SubtitleOptimizer:
 
     def _parallel_optimize(self, chunks: List[Dict[str, str]]) -> Dict[str, str]:
         """并行优化所有块"""
+        if self.model.endswith(":batch"):
+            try:
+                return self._optimize_openrouter_batch(chunks)
+            except Exception as e:
+                logger.error(f"Batch 优化失败，保留原字幕：{str(e)}")
+                return {
+                    key: value for chunk in chunks for key, value in chunk.items()
+                }
+
         future_chunks = {}
         optimized_dict = {}
 
@@ -124,6 +141,112 @@ class SubtitleOptimizer:
 
         return optimized_dict
 
+    def _optimize_openrouter_batch(
+        self, chunks: List[Dict[str, str]]
+    ) -> Dict[str, str]:
+        optimized_dict: Dict[str, str] = {}
+        pending_chunks = {}
+        batch_requests = []
+        base_model = self.model.removesuffix(":batch")
+
+        for chunk_index, chunk in enumerate(chunks):
+            user_prompt = self._get_user_prompt(chunk)
+            cache_params = {
+                "temperature": self.temperature,
+                "model": self.model,
+            }
+            cache_key = f"{len(OPTIMIZER_PROMPT)}_{user_prompt}"
+            cache_result = self.cache_manager.get_llm_result(
+                cache_key, self.model, **cache_params
+            )
+            if cache_result:
+                try:
+                    optimized_dict.update(
+                        self._parse_optimized_result(
+                            json.loads(cache_result), "缓存"
+                        )
+                    )
+                    continue
+                except (json.JSONDecodeError, ValueError) as e:
+                    logger.warning(f"优化缓存格式无效，重新调用API: {str(e)}")
+
+            custom_id = f"optimizer-chunk-{chunk_index}"
+            pending_chunks[custom_id] = (
+                chunk,
+                cache_key,
+                cache_params,
+            )
+            batch_requests.append(
+                {
+                    "custom_id": custom_id,
+                    "body": {
+                        "model": base_model,
+                        "messages": [
+                            {"role": "system", "content": OPTIMIZER_PROMPT},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        "temperature": self.temperature,
+                    },
+                }
+            )
+
+        if not batch_requests:
+            return optimized_dict
+
+        runner = OpenRouterBatchRunner(
+            self.base_url,
+            self.api_key,
+            self.timeout,
+            self.BATCH_POLL_INTERVAL,
+            getattr(self, "batch_state_dir", None),
+        )
+        batch = runner.run(
+            base_model,
+            batch_requests,
+            "optimization",
+            lambda: self.is_running,
+            {
+                "model": self.model,
+                "chunks": chunks,
+                "custom_prompt": self.custom_prompt,
+                "temperature": self.temperature,
+            },
+        )
+        results_by_id = {
+            result.get("custom_id"): result
+            for result in batch.data.get("results", [])
+        }
+
+        for custom_id, (chunk, cache_key, cache_params) in pending_chunks.items():
+            try:
+                batch_result = results_by_id.get(custom_id)
+                if not batch_result:
+                    raise RuntimeError(
+                        f"OpenRouter batch 缺少结果：{custom_id}"
+                    )
+                result = self._parse_optimized_result(
+                    json_repair.loads(
+                        parse_chat_completion_content(batch_result)
+                    ),
+                    "Batch API",
+                )
+                aligned_result = self._repair_subtitle(chunk, result)
+                self.cache_manager.set_llm_result(
+                    cache_key,
+                    json.dumps(aligned_result, ensure_ascii=False),
+                    self.model,
+                    **cache_params,
+                )
+                optimized_dict.update(aligned_result)
+                if self.update_callback:
+                    self.update_callback(aligned_result)
+            except Exception as e:
+                logger.error(f"Batch 优化块失败 {custom_id}：{str(e)}")
+                optimized_dict.update(chunk)
+
+        runner.mark_processed(batch)
+        return optimized_dict
+
     def _safe_optimize_chunk(self, chunk: Dict[str, str]) -> Dict[str, str]:
         """安全的优化块，包含重试逻辑"""
         for i in range(self.retry_times):
@@ -140,11 +263,7 @@ class SubtitleOptimizer:
         logger.info(
             f"[+]正在优化字幕：{next(iter(subtitle_chunk))} - {next(reversed(subtitle_chunk))}"
         )
-        user_prompt = f"Correct the following subtitles. Keep the original language, do not translate:\n<input_subtitle>{str(subtitle_chunk)}</input_subtitle>"
-        if self.custom_prompt:
-            user_prompt += (
-                f"\nReference content:\n<prompt>{self.custom_prompt}</prompt>"
-            )
+        user_prompt = self._get_user_prompt(subtitle_chunk)
 
         # 检查缓存
         cache_params = {
@@ -205,6 +324,14 @@ class SubtitleOptimizer:
             self.update_callback(aligned_result)
 
         return aligned_result
+
+    def _get_user_prompt(self, subtitle_chunk: Dict[str, str]) -> str:
+        user_prompt = f"Correct the following subtitles. Keep the original language, do not translate:\n<input_subtitle>{str(subtitle_chunk)}</input_subtitle>"
+        if self.custom_prompt:
+            user_prompt += (
+                f"\nReference content:\n<prompt>{self.custom_prompt}</prompt>"
+            )
+        return user_prompt
 
     @staticmethod
     def _parse_optimized_result(result: object, source: str) -> Dict[str, str]:

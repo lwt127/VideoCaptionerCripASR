@@ -310,7 +310,10 @@ class TaskCreationInterface(QWidget):
         if not cookiefile_path.exists():
             InfoBar.warning(
                 self.tr("警告"),
-                self.tr("建议根据文档配置cookies.txt文件，以可以下载高清视频"),
+                self.tr(
+                    "YouTube 可能要求登录验证。请将已登录浏览器导出的 Netscape 格式 cookies "
+                    "保存为 AppData/cookies.txt 后再下载。"
+                ),
                 duration=5000,
                 parent=self,
             )
