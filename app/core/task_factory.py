@@ -137,6 +137,10 @@ class TaskFactory:
             base_url = cfg.openai_api_base.value
             api_key = cfg.openai_api_key.value
             llm_model = cfg.openai_model.value
+        elif current_service == LLMServiceEnum.GITHUB_COPILOT:
+            base_url = None
+            api_key = None
+            llm_model = cfg.github_copilot_model.value
         elif current_service == LLMServiceEnum.SILICON_CLOUD:
             base_url = cfg.silicon_cloud_api_base.value
             api_key = cfg.silicon_cloud_api_key.value
@@ -172,6 +176,7 @@ class TaskFactory:
 
         config = SubtitleConfig(
             # 翻译配置
+            llm_service=current_service,
             base_url=base_url,
             api_key=api_key,
             llm_model=llm_model,

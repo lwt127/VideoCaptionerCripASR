@@ -9,6 +9,7 @@ PyQt-Fluent-Widgets[full]>=1.5.0
 
 # ---- LLM / API clients ----
 openai>=1.0.0
+github-copilot-sdk>=1.0.0
 
 # ---- HTTP / networking ----
 requests>=2.28

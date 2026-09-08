@@ -77,6 +77,10 @@ class Config(QConfig):
     openai_api_key = ConfigItem("LLM", "OpenAI_API_Key", "")
     openai_api_base = ConfigItem("LLM", "OpenAI_API_Base", "https://api.openai.com/v1")
 
+    github_copilot_model = ConfigItem(
+        "LLM", "GitHubCopilot_Model", "gemini-3.7-flash"
+    )
+
     silicon_cloud_model = ConfigItem("LLM", "SiliconCloud_Model", "gpt-4o-mini")
     silicon_cloud_api_key = ConfigItem("LLM", "SiliconCloud_API_Key", "")
     silicon_cloud_api_base = ConfigItem(

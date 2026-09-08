@@ -17,6 +17,8 @@ from app.core.subtitle_processor.openrouter_batch import (
     OpenRouterBatchRunner,
     parse_chat_completion_content,
 )
+from app.core.subtitle_processor.llm_client import create_llm_client
+from app.core.entities import LLMServiceEnum
 from app.core.subtitle_processor.prompt import OPTIMIZER_PROMPT
 from app.core.utils.logger import setup_logger
 
@@ -38,8 +40,9 @@ class SubtitleOptimizer:
         timeout: int = 60,
         retry_times: int = 1,
         update_callback: Optional[Callable] = None,
+        llm_service: Optional[LLMServiceEnum] = None,
     ):
-        self._init_client()
+        self._init_client(llm_service)
         self.thread_num = thread_num
         self.batch_num = batch_num
         self.model = model
@@ -52,16 +55,13 @@ class SubtitleOptimizer:
         self._init_thread_pool()
         self.cache_manager = CacheManager(str(CACHE_PATH))
 
-    def _init_client(self):
+    def _init_client(self, llm_service: Optional[LLMServiceEnum] = None):
         """初始化OpenAI客户端"""
         base_url = os.getenv("OPENAI_BASE_URL")
         api_key = os.getenv("OPENAI_API_KEY")
-        if not (base_url and api_key):
-            raise ValueError("环境变量 OPENAI_BASE_URL 和 OPENAI_API_KEY 必须设置")
-
         self.base_url = base_url
         self.api_key = api_key
-        self.client = OpenAI(base_url=base_url, api_key=api_key)
+        self.client = create_llm_client(llm_service, base_url, api_key)
 
     def _init_thread_pool(self):
         """初始化线程池"""

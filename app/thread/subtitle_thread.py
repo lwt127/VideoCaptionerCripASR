@@ -9,7 +9,12 @@ from PyQt5.QtCore import QSettings, QThread, pyqtSignal
 from app.common.config import cfg
 from app.core.bk_asr.asr_data import ASRData
 from app.core.bk_asr.asr_data import handle_long_path, safe_filename
-from app.core.entities import SubtitleConfig, SubtitleTask, TranslatorServiceEnum
+from app.core.entities import (
+    LLMServiceEnum,
+    SubtitleConfig,
+    SubtitleTask,
+    TranslatorServiceEnum,
+)
 from app.core.subtitle_processor.split import SubtitleSplitter
 from app.core.subtitle_processor.summarization import SubtitleSummarizer
 from app.core.subtitle_processor.optimize import SubtitleOptimizer
@@ -47,6 +52,17 @@ class SubtitleThread(QThread):
 
     def _setup_api_config(self) -> SubtitleConfig:
         """设置API配置，返回SubtitleConfig"""
+        if self.task.subtitle_config.llm_service == LLMServiceEnum.GITHUB_COPILOT:
+            model = self.task.subtitle_config.llm_model
+            if not model or model.endswith(":batch"):
+                raise Exception(self.tr("GitHub Copilot 不支持 :batch 模型"))
+            from app.core.subtitle_processor.llm_client import test_copilot
+
+            is_success, message, _ = test_copilot(model)
+            if not is_success:
+                raise Exception(message)
+            return self.task.subtitle_config
+
         public_base_url = "https://ddg.bkfeng.top/v1"
         if self.task.subtitle_config.base_url == public_base_url:
             # 检查是否可以使用服务
@@ -139,8 +155,9 @@ class SubtitleThread(QThread):
             ):
                 self.progress.emit(2, self.tr("开始验证API配置..."))
                 subtitle_config = self._setup_api_config()
-                os.environ["OPENAI_BASE_URL"] = subtitle_config.base_url
-                os.environ["OPENAI_API_KEY"] = subtitle_config.api_key
+                if subtitle_config.llm_service != LLMServiceEnum.GITHUB_COPILOT:
+                    os.environ["OPENAI_BASE_URL"] = subtitle_config.base_url
+                    os.environ["OPENAI_API_KEY"] = subtitle_config.api_key
 
             # 2. 重新断句（对于字词级字幕）
             if asr_data.is_word_timestamp():
@@ -155,6 +172,7 @@ class SubtitleThread(QThread):
                     split_type=subtitle_config.split_type,
                     max_word_count_cjk=subtitle_config.max_word_count_cjk,
                     max_word_count_english=subtitle_config.max_word_count_english,
+                    llm_service=subtitle_config.llm_service,
                 )
                 asr_data = splitter.split_subtitle(asr_data)
                 asr_data.save(save_path=split_path)
@@ -174,6 +192,7 @@ class SubtitleThread(QThread):
                     batch_num=subtitle_config.batch_size,
                     thread_num=subtitle_config.thread_num,
                     update_callback=self.callback,
+                    llm_service=subtitle_config.llm_service,
                 )
                 asr_data = self.optimizer.optimize_subtitle(asr_data)
                 self.update_all.emit(asr_data.to_json())
@@ -201,6 +220,7 @@ class SubtitleThread(QThread):
                     custom_prompt=custom_prompt,
                     is_reflect=subtitle_config.need_reflect,
                     update_callback=self.callback,
+                    llm_service=subtitle_config.llm_service,
                 )
                 asr_data = self.translator.translate_subtitle(asr_data)
                 # 移除末尾标点符号

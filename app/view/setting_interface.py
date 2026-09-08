@@ -279,6 +279,14 @@ class SettingInterface(ScrollArea):
                     "claude-3-5-sonnet-20241022",
                 ],
             },
+            LLMServiceEnum.GITHUB_COPILOT: {
+                "prefix": "github_copilot",
+                "api_key_cfg": None,
+                "api_base_cfg": None,
+                "model_cfg": cfg.github_copilot_model,
+                "default_base": "",
+                "default_models": ["gemini-3.7-flash", "auto"],
+            },
             LLMServiceEnum.SILICON_CLOUD: {
                 "prefix": "silicon_cloud",
                 "api_key_cfg": cfg.silicon_cloud_api_key,
@@ -351,6 +359,24 @@ class SettingInterface(ScrollArea):
                     "api_base": None,
                     "api_key": None,
                     "model": None,
+                }
+                continue
+
+            if service == LLMServiceEnum.GITHUB_COPILOT:
+                model_card = EditComboBoxSettingCard(
+                    config["model_cfg"],
+                    FIF.ROBOT,
+                    self.tr("模型"),
+                    self.tr("使用已登录的 GitHub Copilot 订阅，无需 API Key"),
+                    config["default_models"],
+                    self.llmGroup,
+                )
+                setattr(self, f"{prefix}_model_card", model_card)
+                self.llm_service_configs[service] = {
+                    "cards": [model_card],
+                    "api_base": None,
+                    "api_key": None,
+                    "model": model_card,
                 }
                 continue
 
@@ -619,6 +645,16 @@ class SettingInterface(ScrollArea):
         if not service_config:
             return
 
+        if current_service == LLMServiceEnum.GITHUB_COPILOT:
+            model = service_config["model"].comboBox.currentText()
+            self.checkLLMConnectionCard.button.setEnabled(False)
+            self.checkLLMConnectionCard.button.setText(self.tr("正在检查..."))
+            self.connection_thread = LLMConnectionThread("", "", model, True)
+            self.connection_thread.finished.connect(self.onConnectionCheckFinished)
+            self.connection_thread.error.connect(self.onConnectionCheckError)
+            self.connection_thread.start()
+            return
+
         # 如果是公益模型，使用配置文件中的值
         if current_service == LLMServiceEnum.PUBLIC:
             api_base = cfg.public_api_base.value
@@ -768,15 +804,22 @@ class LLMConnectionThread(QThread):
     finished = pyqtSignal(bool, str, list)
     error = pyqtSignal(str)
 
-    def __init__(self, api_base, api_key, model):
+    def __init__(self, api_base, api_key, model, is_copilot=False):
         super().__init__()
         self.api_base = api_base
         self.api_key = api_key
         self.model = model
+        self.is_copilot = is_copilot
 
     def run(self):
         """检查 LLM 连接并获取模型列表"""
         try:
+            if self.is_copilot:
+                from app.core.subtitle_processor.llm_client import test_copilot
+
+                is_success, message, models = test_copilot(self.model)
+                self.finished.emit(is_success, message, models)
+                return
             is_success, message = test_openai(self.api_base, self.api_key, self.model)
             models = get_openai_models(self.api_base, self.api_key)
             self.finished.emit(is_success, message, models)

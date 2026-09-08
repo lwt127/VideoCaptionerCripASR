@@ -24,6 +24,8 @@ from app.core.subtitle_processor.openrouter_batch import (
     OpenRouterBatchRunner,
     parse_chat_completion_content,
 )
+from app.core.subtitle_processor.llm_client import create_llm_client
+from app.core.entities import LLMServiceEnum
 from app.core.utils import json_repair
 from app.core.subtitle_processor.prompt import (
     TRANSLATE_PROMPT,
@@ -207,6 +209,7 @@ class OpenAITranslator(BaseTranslator):
         timeout: int = 60,
         retry_times: int = 1,
         update_callback: Optional[Callable] = None,
+        llm_service: Optional[LLMServiceEnum] = None,
     ):
         super().__init__(
             thread_num=thread_num,
@@ -217,22 +220,19 @@ class OpenAITranslator(BaseTranslator):
             update_callback=update_callback,
         )
 
-        self._init_client()
+        self._init_client(llm_service)
         self.model = model
         self.custom_prompt = custom_prompt
         self.is_reflect = is_reflect
         self.temperature = temperature
 
-    def _init_client(self):
+    def _init_client(self, llm_service: Optional[LLMServiceEnum] = None):
         """初始化OpenAI客户端"""
         base_url = os.getenv("OPENAI_BASE_URL")
         api_key = os.getenv("OPENAI_API_KEY")
-        if not (base_url and api_key):
-            raise ValueError("环境变量 OPENAI_BASE_URL 和 OPENAI_API_KEY 必须设置")
-
         self.base_url = base_url
         self.api_key = api_key
-        self.client = OpenAI(base_url=base_url, api_key=api_key)
+        self.client = create_llm_client(llm_service, base_url, api_key)
 
     def _parallel_translate(self, chunks: List[Dict[str, str]]) -> Dict[str, str]:
         if not self.model.endswith(":batch"):
@@ -939,6 +939,7 @@ class TranslatorFactory:
         temperature: float = 0.7,
         is_reflect: bool = False,
         update_callback: Optional[Callable] = None,
+        llm_service: Optional[LLMServiceEnum] = None,
     ) -> BaseTranslator:
         """创建翻译器实例"""
         try:
@@ -952,6 +953,7 @@ class TranslatorFactory:
                     is_reflect=is_reflect,
                     temperature=temperature,
                     update_callback=update_callback,
+                    llm_service=llm_service,
                 )
             elif translator_type == TranslatorType.GOOGLE:
                 batch_num = 5

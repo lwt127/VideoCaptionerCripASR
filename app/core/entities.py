@@ -77,6 +77,7 @@ class LLMServiceEnum(Enum):
     """LLM服务"""
 
     OPENAI = "OpenAI"
+    GITHUB_COPILOT = "GitHub Copilot"
     SILICON_CLOUD = "SiliconCloud"
     DEEPSEEK = "DeepSeek"
     OLLAMA = "Ollama"
@@ -542,6 +543,7 @@ class SubtitleConfig:
     """字幕处理配置类"""
 
     # 翻译配置
+    llm_service: Optional[LLMServiceEnum] = None
     base_url: Optional[str] = None
     api_key: Optional[str] = None
     llm_model: Optional[str] = None

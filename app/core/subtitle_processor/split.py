@@ -10,6 +10,9 @@ from concurrent.futures import as_completed
 
 from openai import OpenAI
 
+from app.core.entities import LLMServiceEnum
+from app.core.subtitle_processor.llm_client import create_llm_client
+
 from app.config import CACHE_PATH
 from app.core.bk_asr.asr_data import ASRData, ASRDataSeg
 from app.core.storage.cache_manager import CacheManager
@@ -185,6 +188,7 @@ class SubtitleSplitter:
         max_word_count_cjk: int = MAX_WORD_COUNT_CJK,
         max_word_count_english: int = MAX_WORD_COUNT_ENGLISH,
         use_cache: bool = True,
+        llm_service: Optional[LLMServiceEnum] = None,
     ):
         """
         初始化字幕分割器
@@ -200,7 +204,7 @@ class SubtitleSplitter:
             max_word_count_english: 英文文本最大单词数
             use_cache: 是否使用缓存
         """
-        self._init_client()
+        self._init_client(llm_service)
         self.thread_num = thread_num
         self.model = model
         self.temperature = temperature
@@ -220,14 +224,11 @@ class SubtitleSplitter:
                 f"无效的分段类型: {split_type}，必须是 'semantic' 或 'sentence'"
             )
 
-    def _init_client(self):
+    def _init_client(self, llm_service: Optional[LLMServiceEnum] = None):
         """初始化OpenAI客户端"""
         base_url = os.getenv("OPENAI_BASE_URL")
         api_key = os.getenv("OPENAI_API_KEY")
-        if not (base_url and api_key):
-            raise ValueError("环境变量 OPENAI_BASE_URL 和 OPENAI_API_KEY 必须设置")
-
-        self.client = OpenAI(base_url=base_url, api_key=api_key)
+        self.client = create_llm_client(llm_service, base_url, api_key)
 
     def _init_thread_pool(self):
         """初始化线程池"""
