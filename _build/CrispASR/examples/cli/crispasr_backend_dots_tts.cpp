@@ -8,6 +8,7 @@
 #include "crispasr_backend_utils.h"
 #include "crispasr_model_mgr_cli.h"
 #include "crispasr_model_registry.h"
+#include "crispasr_voice_provenance.h"
 #include "whisper_params.h"
 
 #include "dots_tts.h"
@@ -132,6 +133,15 @@ public:
         // CAM++ speaker embedding. Needs the speaker-encoder GGUF (sibling, or
         // the registry companion). Without --voice, synthesis is text-only.
         if (!p.tts_voice.empty()) {
+            // Bare voice names resolve against --voice-dir: the server passes
+            // `voice` verbatim by design and the adapter owns the
+            // interpretation, so an unresolved adapter treats the literal name
+            // as a path and cloning silently fails over HTTP (#384). Shared
+            // resolver, so this agrees with the provenance gate; a name that
+            // is not a file there is returned unchanged.
+            const std::string voice = p.tts_voice_dir.empty()
+                                          ? p.tts_voice
+                                          : crispasr_voice::resolve_voice_path(p.tts_voice, p.tts_voice_dir);
             // Speaker-encoder GGUF: --codec-model override (if it names a spk
             // file), else the sibling dots-tts-soar-spk-*.gguf next to the core.
             std::string spk_path = discover_speaker(p.model);
@@ -139,12 +149,11 @@ public:
                 fprintf(stderr, "crispasr[dots-tts]: WARNING: --voice given but speaker encoder GGUF not found "
                                 "(expected dots-tts-soar-spk-f16.gguf beside the model) — ignoring voice prompt\n");
             } else if (dots_tts_set_speaker_path(ctx_, spk_path.c_str()) != 0 ||
-                       dots_tts_set_voice_prompt(ctx_, p.tts_voice.c_str()) != 0) {
+                       dots_tts_set_voice_prompt(ctx_, voice.c_str()) != 0) {
                 fprintf(stderr, "crispasr[dots-tts]: WARNING: failed to apply voice prompt '%s'\n",
                         p.tts_voice.c_str());
             } else if (!p.no_prints) {
-                fprintf(stderr, "crispasr[dots-tts]: voice = '%s' (encoder '%s')\n", p.tts_voice.c_str(),
-                        spk_path.c_str());
+                fprintf(stderr, "crispasr[dots-tts]: voice = '%s' (encoder '%s')\n", voice.c_str(), spk_path.c_str());
             }
         }
 

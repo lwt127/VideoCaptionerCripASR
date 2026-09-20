@@ -2,6 +2,11 @@
 license: cc-by-4.0
 language:
 - en
+- de
+- es
+- it
+- pt
+- fr
 base_model:
 - kyutai/pocket-tts
 pipeline_tag: text-to-speech
@@ -22,7 +27,7 @@ library_name: ggml
 GGUF / ggml conversion of [`kyutai/pocket-tts`](https://huggingface.co/kyutai/pocket-tts) for use with **[CrispStrobe/CrispASR](https://github.com/CrispStrobe/CrispASR)**.
 
 Pocket TTS is a lightweight (~100M param) continuous-latent autoregressive TTS model from Kyutai, based on the CALM paper (arXiv:2509.06926). Unlike codebook-based TTS models, Pocket TTS emits continuous float vectors — no discrete tokens, no softmax sampling:
-- **FlowLM backbone** — causal transformer (1024D, 16 heads, 6 layers, RoPE, GELU) operating at 12.5 Hz
+- **FlowLM backbone** — causal transformer (1024D, 16 heads, 6 layers; 24 layers for the French preview, RoPE, GELU) operating at 12.5 Hz
 - **Consistency head** — SimpleMLPAdaLN (512D, 6 ResBlocks) with timestep embedding → one-step LSD decode → 32-dim continuous latent vectors
 - **Mimi VAE decoder** — SEANet upsample convolutions + 2-layer transformer → 24 kHz PCM
 - **Mimi VAE encoder** *(voice-cloning builds only)* — SEANet downsample + 2-layer transformer + speaker projection → reference conditioning
@@ -35,10 +40,9 @@ Released under **CC-BY-4.0** license.
 ## Voice cloning
 
 Pocket TTS is zero-shot: it clones the timbre of a short reference clip. The
-**voice-cloning builds** (`pocket-tts-english-{f16,q8_0,q4_k}.gguf` — the ones
-*without* `novc` in the name) embed the Mimi VAE **encoder** and speaker
-projection needed to condition on a reference; the `novc` builds omit that
-encoder and are ~20 MB smaller.
+**voice-cloning builds** (the files *without* `novc` in the name) embed the Mimi
+VAE **encoder** and speaker projection needed to condition on a reference; the
+English-only `novc` builds omit that encoder and are ~20 MB smaller.
 
 ```bash
 # clone the timbre of ref.wav (any sample rate; mono is used)
@@ -54,8 +58,10 @@ single-speaker reference of a few seconds for best results.
 
 ## Files
 
-Two families: **voice-cloning** (default, embeds the Mimi encoder) and **`novc`**
-(decoder only, smaller — use when you only need the built-in default voice).
+The multilingual Q8_0/F16 files are full voice-cloning models. German, Spanish,
+Italian, and Portuguese are Kyutai's distilled 6-layer releases; French is the
+larger, undistilled 24-layer preview. The decoder-only **`novc`** alternatives
+are currently English-only.
 
 | File | Voice clone | Quant | Size | Notes |
 |---|:---:|---|---:|---|
@@ -65,6 +71,14 @@ Two families: **voice-cloning** (default, embeds the Mimi encoder) and **`novc`*
 | `pocket-tts-english-novc-f16.gguf`  | — | F16  | 200 MB | Decoder only |
 | `pocket-tts-english-novc-q8_0.gguf` | — | Q8_0 | 110 MB | Decoder only |
 | `pocket-tts-english-novc-q4_k.gguf` | — | Q4_K |  62 MB | Decoder only, smallest |
+| `pocket-tts-german-q8_0.gguf`        | ✅ | Q8_0 | 124 MB | German, distilled 6L |
+| `pocket-tts-spanish-q8_0.gguf`       | ✅ | Q8_0 | 124 MB | Spanish, distilled 6L |
+| `pocket-tts-italian-q8_0.gguf`       | ✅ | Q8_0 | 124 MB | Italian, distilled 6L |
+| `pocket-tts-portuguese-q8_0.gguf`    | ✅ | Q8_0 | 124 MB | Portuguese, distilled 6L |
+| `pocket-tts-french_24l-q8_0.gguf`    | ✅ | Q8_0 | 365 MB | French, undistilled 24L preview |
+
+F16 equivalents of every multilingual Q8_0 file are also available (about
+219 MB for each 6-layer model and 673 MB for French).
 
 ## Quick start
 
@@ -84,11 +98,14 @@ huggingface-cli download cstr/pocket-tts-GGUF pocket-tts-english-f16.gguf --loca
     --tts-output hello.wav --seed 42
 ```
 
-Or with auto-download (pulls the voice-cloning F16):
+Or with auto-download. `-l de`, `es`, `it`, `pt`, or `fr` selects and caches
+the matching Q8_0 checkpoint; omit `-l` for English:
 ```bash
-./build/bin/crispasr -m pocket-tts --auto-download \
-    --tts "The quick brown fox jumps over the lazy dog." \
-    --tts-output fox.wav
+./build/bin/crispasr --backend pocket-tts -m auto --auto-download -l es \
+    --accept-license pocket-tts-terms \
+    --voice ref.wav --i-have-rights \
+    --tts "Hola, este modelo ya habla español." \
+    --tts-output hola.wav
 ```
 
 ## Python binding

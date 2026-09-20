@@ -22,7 +22,9 @@ void silero_lid_free(struct silero_lid_context* ctx);
 // Returns the ISO-style language string (e.g. "en, English") on success,
 // or NULL on failure. Caller does NOT free the returned string (it points
 // into the context's language table).
-// `out_confidence` receives the log-probability of the top language.
+// `out_confidence` receives the softmax probability of the top language in
+// [0, 1] (raw classifier logits are softmaxed internally), matching the
+// whisper LID arm's confidence contract.
 const char* silero_lid_detect(struct silero_lid_context* ctx, const float* samples, int n_samples,
                               float* out_confidence);
 

@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include "portable_env.h"
 
 static uint64_t fnv1a(const float* p, size_t n) {
     const uint8_t* b = reinterpret_cast<const uint8_t*>(p);

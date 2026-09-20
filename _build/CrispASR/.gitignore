@@ -157,3 +157,7 @@ tools/kaggle/*/kaggle_harness.py
 # Agent/worktree scratch dir convention (see .claude/CLAUDE.md) — temp
 # clips, enrollment DBs, and log captures from live validation runs.
 /scratch/
+
+# .NET build output for the C# binding (dotnet build/test writes these in place)
+/bindings/csharp/**/bin/
+/bindings/csharp/**/obj/

@@ -9,13 +9,18 @@
 
 #include "crisp_punc.h"
 
+#include "core/bert_norm.h"
+#include "core/bert_pretok.h"
+#include "core/punct_marks.h"
 #include "core/gguf_loader.h"
-#include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "core/gpu_backend_pref.h"
 #include "gguf.h"
+#include "core/env_gate.h"
+#include "core/ggml_cpu_backend.h"
 
 #include <algorithm>
 #include <cassert>
@@ -33,12 +38,8 @@
 // ===========================================================================
 
 static bool fireredpunc_bench_enabled() {
-    static int v = -1;
-    if (v < 0) {
-        const char* e = std::getenv("FIREREDPUNC_BENCH");
-        v = (e && *e && *e != '0') ? 1 : 0;
-    }
-    return v != 0;
+    static const bool v = core_env::on("FIREREDPUNC_BENCH");
+    return v;
 }
 
 struct fireredpunc_bench_stage {
@@ -205,50 +206,143 @@ struct WordPieceTokenizer {
         return ids;
     }
 
-    // Basic BERT tokenization: lowercase, split on whitespace, WordPiece
-    std::vector<int> tokenize(const std::string& text) const {
+    // BERT tokenization for chinese-bert-wwm-ext (uncased, 21128).
+    //
+    // This used to split on ASCII whitespace ONLY and lowercase ASCII A-Z
+    // only, which is catastrophic for the CHINESE vocab it serves: Chinese
+    // text has no spaces, so a whole sentence became ONE word and every
+    // character after the first was looked up as a `##` continuation.
+    // Measured against hfl/chinese-bert-wwm-ext:
+    //
+    //   今天天气很好...  HF:   今  天  天  气  ...
+    //                    ours: 今 ##天 ##天 ##气 ...
+    //
+    // i.e. a different token id for essentially every character of every
+    // Chinese sentence — on the model's primary input language. Latin was
+    // wrong too (`café` -> `ca` `##f` `[UNK]` vs HF's `cafe`). Only pure
+    // ASCII English agreed: 2/7 fixtures exact.
+    //
+    // The HF-correct stack (core/bert_norm.h + core/bert_pretok.h, measured
+    // HF-exact for the embedders) runs by DEFAULT, behind
+    // CRISPEMBED_FIREREDPUNC_HF_TOK=0 as the opt-out. Token ids went 2/9 -> 9/9
+    // exact vs HF's BertTokenizer on the same vocab.
+    //
+    // ⚠ This block used to say the gate was OFF by default because the HF arm
+    // made the decoded output WORSE:
+    //
+    //   in:   café Müller ist hier und arbeitet gut
+    //   off:  Café Müller ist hier und arbeitet gut.     <- correct
+    //   on:   Café Müller ist hier und arbeitet. Gut     <- period misplaced
+    //
+    // That was true, and it was NOT this function: `fireredpunc_process` used
+    // to re-derive the subtoken COUNT per word ("Must match the tokenizer's
+    // splitting exactly") in a SECOND copy of the WordPiece loop with its own
+    // word list, so changing the splitting here alone desynchronised the
+    // alignment and the labels landed on the wrong positions.
+    //
+    // That unification HAS since been done — the counts now come from the
+    // tokenizer itself (`out_word_ntok`), the second loop is gone, and the
+    // default was flipped ON. The comment simply never got updated, so for a
+    // while the file documented the opposite of what it did. If you are here
+    // because the two disagree again, the CODE is the answer: read the
+    // `explicitly_off` call below, not this paragraph.
+    std::vector<int> tokenize(const std::string& text) const { return tokenize_ex(text, nullptr); }
+
+    // `out_tokens`, when non-null, receives the token SURFACE FORMS aligned
+    // 1:1 with the returned ids — `##` prefixes preserved, and an
+    // unsegmentable word recovered to its original characters (upstream's
+    // `recover_unk`). fireredpunc_process needs them because the blueprint
+    // rebuilds the punctuated text FROM THE TOKENS, not from the input.
+    std::vector<int> tokenize_ex(const std::string& text, std::vector<std::string>* out_tokens,
+                                 std::vector<std::string>* out_words = nullptr,
+                                 std::vector<int>* out_word_ntok = nullptr) const {
         if (is_sentencepiece)
             return tokenize_sp(text);
+        static const bool hf_tok = !core_env::explicitly_off("CRISPEMBED_FIREREDPUNC_HF_TOK");
         std::vector<int> ids;
+        auto emit = [&](int id, const std::string& tok) {
+            ids.push_back(id);
+            if (out_tokens)
+                out_tokens->push_back(tok);
+        };
 
-        // Split on whitespace
         std::vector<std::string> words;
-        std::string cur;
-        for (char c : text) {
-            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
-                if (!cur.empty()) {
-                    words.push_back(cur);
-                    cur.clear();
+        // ⚠ Pre-tokenize the ORIGINAL text, then normalize each word for the
+        // vocabulary lookup — not the other way round. Normalization is
+        // per-codepoint and cannot create or destroy a word boundary, so the
+        // two word lists correspond 1:1 by construction, and keeping the
+        // original spellings is what lets fireredpunc_process rebuild the
+        // user's text instead of a lowercased, accent-stripped copy of it.
+        std::vector<std::string> words_orig;
+        if (hf_tok) {
+            words_orig = core_bert::pretokenize(text);
+            words.reserve(words_orig.size());
+            for (const auto& w : words_orig)
+                words.push_back(core_bert::lower_strip_accents(w));
+        } else {
+            // Historical: split on ASCII whitespace, lowercase ASCII only.
+            std::string cur;
+            for (char c : text) {
+                if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                    if (!cur.empty()) {
+                        words.push_back(cur);
+                        cur.clear();
+                    }
+                } else {
+                    if (c >= 'A' && c <= 'Z')
+                        c = c - 'A' + 'a';
+                    cur += c;
                 }
-            } else {
-                // Lowercase ASCII
-                if (c >= 'A' && c <= 'Z')
-                    c = c - 'A' + 'a';
-                cur += c;
             }
+            if (!cur.empty())
+                words.push_back(cur);
         }
-        if (!cur.empty())
-            words.push_back(cur);
 
         // WordPiece each word
-        for (const auto& word : words) {
+        for (size_t wi = 0; wi < words.size(); wi++) {
+            const std::string& word = words[wi];
+            const size_t n_before = ids.size();
+            struct WordTally {
+                std::vector<int>* ntok;
+                std::vector<std::string>* ws;
+                const std::vector<std::string>* src;
+                size_t wi, n_before;
+                const std::vector<int>* ids;
+                ~WordTally() {
+                    if (!ntok)
+                        return;
+                    ntok->push_back((int)(ids->size() - n_before));
+                    if (ws && wi < src->size())
+                        ws->push_back((*src)[wi]);
+                }
+            } tally{out_word_ntok, out_words, &words_orig, wi, n_before, &ids};
+
             // Try to find the word as-is first
             auto it = token_to_id.find(word);
             if (it != token_to_id.end()) {
-                ids.push_back(it->second);
+                emit(it->second, word);
                 continue;
             }
 
-            // WordPiece: greedily match longest subword
+            // WordPiece: greedily match longest subword. HF emits ONE [UNK]
+            // for a word it cannot fully segment and DISCARDS the pieces it
+            // already matched (`is_bad` in WordpieceTokenizer.tokenize); the
+            // historical loop kept the prefix. Collect into a scratch vector
+            // so the whole word can be dropped.
+            std::vector<int> sub_ids;
+            std::vector<std::string> sub_toks;
+            bool is_bad = false;
             size_t start = 0;
             while (start < word.size()) {
                 size_t end = word.size();
                 int best_id = -1;
+                std::string best_tok;
                 while (end > start) {
                     std::string sub = (start == 0) ? word.substr(0, end) : ("##" + word.substr(start, end - start));
                     auto sit = token_to_id.find(sub);
                     if (sit != token_to_id.end()) {
                         best_id = sit->second;
+                        best_tok = sub;
                         break;
                     }
                     // Handle multi-byte UTF-8: don't split mid-character
@@ -257,18 +351,36 @@ struct WordPieceTokenizer {
                         end--;
                 }
                 if (best_id < 0) {
-                    // Character not in vocab — use [UNK]
-                    ids.push_back(unk_id);
+                    is_bad = true;
                     break;
                 }
-                ids.push_back(best_id);
-                start = (start == 0) ? (end > start ? end : end) : start + (end - start);
-                // Recalculate start for ##-prefixed case
-                if (start == 0)
-                    start = end;
-                else {
-                    // Already handled above
+                sub_ids.push_back(best_id);
+                sub_toks.push_back(best_tok);
+                start = end;
+            }
+            if (is_bad && hf_tok) {
+                // HF emits ONE [UNK] for the word. Upstream then runs
+                // `recover_unk`, which puts the ORIGINAL characters back in
+                // place of the [UNK] so the text can still be rebuilt from the
+                // tokens — each recovered character becoming its own token,
+                // looked up in the vocab and falling back to [UNK].
+                size_t i = 0;
+                while (i < word.size()) {
+                    size_t len = 1;
+                    while (i + len < word.size() && (word[i + len] & 0xC0) == 0x80)
+                        len++;
+                    const std::string ch = word.substr(i, len);
+                    auto cit = token_to_id.find(ch);
+                    emit(cit != token_to_id.end() ? cit->second : unk_id, ch);
+                    i += len;
                 }
+            } else if (is_bad) {
+                for (size_t k = 0; k < sub_ids.size(); k++)
+                    emit(sub_ids[k], sub_toks[k]);
+                emit(unk_id, "[UNK]");
+            } else {
+                for (size_t k = 0; k < sub_ids.size(); k++)
+                    emit(sub_ids[k], sub_toks[k]);
             }
         }
 
@@ -302,6 +414,7 @@ struct BertLayer {
 };
 
 struct fireredpunc_context {
+    std::vector<int> debug_ids; // fireredpunc_debug_token_ids scratch
     // Hyperparams
     int d_model = 768;
     int d_ffn = 3072;
@@ -395,13 +508,13 @@ static bool fireredpunc_load(fireredpunc_context& ctx, const char* path) {
     const char* punc_backend = getenv("FIREREDPUNC_BACKEND");
     const bool force_cpu = punc_backend && strcmp(punc_backend, "cpu") == 0;
     const bool force_gpu = punc_backend && strcmp(punc_backend, "gpu") == 0;
-    ctx.backend = (force_cpu && !force_gpu) ? ggml_backend_cpu_init() : crispasr_init_gpu_backend();
+    ctx.backend = (force_cpu && !force_gpu) ? core_cpu_backend::init() : crispasr_init_gpu_backend();
     if (!ctx.backend)
-        ctx.backend = ggml_backend_cpu_init();
+        ctx.backend = core_cpu_backend::init();
     // Always have a separate CPU backend on hand for ggml_backend_sched
     // to fall back to (issue #68). Even though the primary backend is
     // CPU here, we keep the two-backend shape uniform.
-    ctx.backend_cpu = ggml_backend_cpu_init();
+    ctx.backend_cpu = core_cpu_backend::init();
     core_gguf::WeightLoad wl;
     if (!core_gguf::load_weights(path, ctx.backend, "fireredpunc", wl))
         return false;
@@ -453,6 +566,12 @@ static bool fireredpunc_load(fireredpunc_context& ctx, const char* path) {
     }
     ctx.sched = ggml_backend_sched_new(backends, nullptr, n_backends, 8192, false, false);
 
+    // NOTE (cross-repo): CrispEmbed's copy of this file installs its imatrix
+    // collector on the sched here (crispembed_imatrix_install) so this model can
+    // produce imatrix-calibrated quants. CrispASR has no imatrix collector, so
+    // that call is the one intentional difference between the two copies, along
+    // with core_cpu_backend below. Everything else is meant to stay identical.
+
     return true;
 }
 
@@ -462,8 +581,35 @@ static bool fireredpunc_load(fireredpunc_context& ctx, const char* path) {
 
 static std::vector<int> fireredpunc_run(fireredpunc_context& ctx, const std::vector<int>& token_ids) {
     const int N = (int)token_ids.size();
-    // Prepend CLS + append SEP
-    const int seq_len = N + 2;
+    // Blueprint: [CLS] + tokens, and NO [SEP].
+    //
+    // fireredpunc_bert.py::_forward is `add_cls()` then BertModel then
+    // `outputs[0][:, 1:]` — it prepends [CLS], drops its output, and never
+    // appends a separator. This port used to append one anyway. BERT is
+    // bidirectional, so that is not a harmless trailing token: every real token
+    // attends to it, shifting the whole distribution.
+    //
+    // Measured against the blueprint (CrispEmbed
+    // tools/dump_fireredpunc_reference.py) on the f16 GGUF, 119 tokens: with
+    // [SEP] cos_min 0.931090 / max_abs 1.8431; without it cos_min 1.000000 /
+    // max_abs 0.0021 and 119/119 argmax agreement. An order of magnitude past
+    // the f16 numerical floor, i.e. structural, not precision.
+    //
+    // ⚠ SCOPED TO THE BERT PATH ONLY. This file also serves an XLM-RoBERTa
+    // variant (`fireredpunc.tokenizer_type == "sentencepiece"`, the
+    // fullstop-punc / punctuate-all models, 250002 vocab, 6 labels), and there
+    // the trailing `</s>` is CORRECT — RoBERTa token classification is trained
+    // with `<s> … </s>`. The blueprint above is FireRedPunc's and says nothing
+    // about that model, so its shape stays exactly as shipped; flipping it too
+    // would be changing a default on no evidence. Verified: that model's output
+    // is identical with and without the gate.
+    //
+    // CRISPEMBED_FIREREDPUNC_SEP=1 restores the old shape for bisection. The
+    // gate keeps CrispEmbed's spelling deliberately: this file is shared, and
+    // one name that works in both trees beats two that drift.
+    static const bool force_sep = core_env::on("CRISPEMBED_FIREREDPUNC_SEP");
+    const bool append_sep = force_sep || ctx.tokenizer.is_sentencepiece;
+    const int seq_len = N + (append_sep ? 2 : 1);
 
     // ggml context for compute graph
     size_t mem = ggml_tensor_overhead() * (ctx.n_layers * 40 + 50) + 1024 * 1024;
@@ -579,8 +725,9 @@ static std::vector<int> fireredpunc_run(fireredpunc_context& ctx, const std::vec
         ids[0] = ctx.cls_id;
         for (int i = 0; i < N; i++)
             ids[i + 1] = token_ids[i];
-        // SEP token: 102 for BERT, 2 for RoBERTa
-        ids[N + 1] = ctx.tokenizer.is_sentencepiece ? 2 : 102;
+        // SEP token: 102 for BERT, 2 for RoBERTa. Off by default — see above.
+        if (append_sep)
+            ids[N + 1] = ctx.tokenizer.is_sentencepiece ? 2 : 102;
         ggml_backend_tensor_set(inp_ids, ids.data(), 0, seq_len * sizeof(int32_t));
 
         std::vector<int32_t> pos(seq_len);
@@ -619,6 +766,22 @@ static std::vector<int> fireredpunc_run(fireredpunc_context& ctx, const std::vec
     // Read logits: [n_classes, N]
     std::vector<float> logits_buf(ctx.n_classes * N);
     ggml_backend_tensor_get(logits, logits_buf.data(), 0, logits_buf.size() * sizeof(float));
+
+    // Diff harness: append per-token raw class logits to $FIREREDPUNC_DUMP_LOGITS
+    // (one line per token, n_classes space-separated floats). Lets an A/B measure
+    // the pre-argmax distribution — where quantization/imatrix effects actually
+    // live — instead of the thresholded restored-string exact-match.
+    if (const char* dump_path = getenv("FIREREDPUNC_DUMP_LOGITS")) {
+        if (FILE* fp = fopen(dump_path, "a")) {
+            for (int t = 0; t < N; t++) {
+                for (int c = 0; c < ctx.n_classes; c++) {
+                    fprintf(fp, "%s%.7g", c ? " " : "", logits_buf[t * ctx.n_classes + c]);
+                }
+                fputc('\n', fp);
+            }
+            fclose(fp);
+        }
+    }
 
     // Argmax per token
     std::vector<int> preds(N);
@@ -663,6 +826,19 @@ fireredpunc_context* fireredpunc_init(const char* model_path) {
     return ctx;
 }
 
+const int* fireredpunc_debug_token_ids(fireredpunc_context* ctx, const char* text, int* out_n) {
+    static const int empty = 0;
+    if (!ctx || !text) {
+        if (out_n)
+            *out_n = 0;
+        return &empty;
+    }
+    ctx->debug_ids = ctx->tokenizer.tokenize(std::string(text));
+    if (out_n)
+        *out_n = (int)ctx->debug_ids.size();
+    return ctx->debug_ids.empty() ? &empty : ctx->debug_ids.data();
+}
+
 char* fireredpunc_process(fireredpunc_context* ctx, const char* text) {
     if (!ctx || !text)
         return nullptr;
@@ -670,7 +846,11 @@ char* fireredpunc_process(fireredpunc_context* ctx, const char* text) {
 
     // Tokenize
     std::string input(text);
-    std::vector<int> token_ids = ctx->tokenizer.tokenize(input);
+    static const bool hf_tok = !core_env::explicitly_off("CRISPEMBED_FIREREDPUNC_HF_TOK");
+    std::vector<std::string> tok_strs, words_orig;
+    std::vector<int> word_ntok;
+    std::vector<int> token_ids = ctx->tokenizer.tokenize_ex(
+        input, hf_tok ? &tok_strs : nullptr, hf_tok ? &words_orig : nullptr, hf_tok ? &word_ntok : nullptr);
     if (token_ids.empty()) {
         char* out = (char*)malloc(strlen(text) + 1);
         strcpy(out, text);
@@ -688,112 +868,182 @@ char* fireredpunc_process(fireredpunc_context* ctx, const char* text) {
         all_preds.insert(all_preds.end(), preds.begin(), preds.end());
     }
 
-    // Reconstruct text with punctuation
-    // First, get the tokens as strings for WordPiece reassembly
     std::string result;
-    std::vector<std::string> words;
-    // Split input on whitespace to match tokenizer
-    {
-        std::string cur;
-        for (char c : input) {
-            if (c == ' ' || c == '\t' || c == '\n') {
-                if (!cur.empty()) {
-                    words.push_back(cur);
-                    cur.clear();
-                }
+
+    // Blueprint reconstruction (fireredpunc/punc.py ModelIO.add_punc_to_txt).
+    // It walks TOKENS, not words: one prediction per token, `##` stripped, and
+    // a space inserted only between two adjacent alphanumeric tokens whose
+    // predecessor predicted "no punctuation".
+    //
+    //     for i, token in enumerate(token_seq):
+    //         tag = out_dict[pred_seq[i]]
+    //         if token.startswith("##"): token = token.replace("##", "")
+    //         elif re.search("[a-zA-Z0-9#]+", token) and i > 0 and \
+    //              re.search("[a-zA-Z0-9#]+", token_seq[i-1]):
+    //             if out_dict[pred_seq[i-1]] == DEFAULT_OUT: token = " " + token
+    //         txt += token + ("" if tag == DEFAULT_OUT else tag)
+    //
+    // This is what removes the "must match the tokenizer's splitting exactly"
+    // second WordPiece loop below: there is nothing to re-derive, because the
+    // predictions already line up with the tokens the model was fed.
+    //
+    // ⚠ Gate on the ALIGNMENT DATA, not on hf_tok alone. `tokenize_ex` returns
+    // early for a SentencePiece tokenizer (`if (is_sentencepiece) return
+    // tokenize_sp(text);`) and never fills out_words/out_word_ntok, so for the
+    // XLM-RoBERTa punctuation models — fullstop-punc / punctuate-all — these
+    // vectors come back EMPTY. Branching on hf_tok alone then ran a loop bounded
+    // by `words_orig.size()` zero times and returned an empty string: those
+    // models silently produced NOTHING on the default path, while
+    // CRISPEMBED_FIREREDPUNC_HF_TOK=0 worked fine.
+    //
+    // Testing for the data rather than for `is_sentencepiece` is deliberate: it
+    // fails safe for any future tokenizer that also skips the alignment, which
+    // a hard-coded arch test would not.
+    const bool have_word_alignment = !words_orig.empty() && words_orig.size() == word_ntok.size();
+    if (hf_tok && have_word_alignment) {
+        // ONE DELIBERATE DEVIATION FROM THE BLUEPRINT, and why.
+        //
+        // Upstream emits the TOKEN surface forms, so its output is lowercased
+        // and accent-stripped: `Café` -> `cafe`, and on out-of-domain Japanese
+        // `ナイーブ` -> `ナイーフ` (the dakuten is a combining mark the
+        // normalizer drops). That is fine for FireRedASR, which is restoring
+        // punctuation onto its own ASR output — but CrispEmbed exposes this as
+        // `--punct-model`, a post-processor over the user's OCR text, where
+        // silently rewriting characters is a regression, not a fix.
+        //
+        // So predictions follow the blueprint exactly (per token, off the
+        // HF-correct tokenization) while the emitted TEXT is the original
+        // word. Aggregating to the word is safe here precisely because the
+        // HF pre-tokenizer already splits every CJK ideograph into its own
+        // word — which is where the per-token granularity actually mattered.
+        //
+        // The subtoken counts come from the tokenizer itself (word_ntok), so
+        // the "must match the tokenizer's splitting exactly" second WordPiece
+        // loop is gone rather than kept in sync.
+        auto is_alnumish = [](const std::string& s) {
+            for (unsigned char c : s)
+                if (std::isalnum(c) || c == '#')
+                    return true;
+            return false;
+        };
+        int tok_i = 0, prev_pred = 0;
+        for (size_t w = 0; w < words_orig.size() && w < word_ntok.size(); w++) {
+            const int n_sub = word_ntok[w];
+            const int last = tok_i + n_sub - 1;
+            tok_i += n_sub;
+            const int pred = (n_sub > 0 && last < (int)all_preds.size()) ? all_preds[last] : 0;
+
+            // Blueprint spacing: a space only between two adjacent
+            // alphanumeric units whose predecessor predicted "no punctuation".
+            // CJK gets none, which is correct.
+            if (w > 0 && is_alnumish(words_orig[w]) && is_alnumish(words_orig[w - 1]) && prev_pred == 0) {
+                result += ' ';
+            }
+            result += words_orig[w];
+            if (pred > 0 && pred < (int)ctx->labels.size() && !core_punct::ends_in_mark(result)) {
+                result += ctx->labels[pred];
+            }
+            prev_pred = pred;
+        }
+        // punc.py: txt.replace("  ", " ")
+        for (size_t i = 0; i + 1 < result.size();) {
+            if (result[i] == ' ' && result[i + 1] == ' ') {
+                result.erase(i, 1);
             } else {
-                cur += c;
+                i++;
             }
         }
-        if (!cur.empty())
-            words.push_back(cur);
-    }
-
-    // Map predictions back to words. Multiple token predictions per word
-    // (from WordPiece splits) — take the prediction of the last subtoken.
-    int tok_idx = 0;
-    for (size_t w = 0; w < words.size(); w++) {
-        if (w > 0)
-            result += ' ';
-        result += words[w];
-
-        // Count how many subtokens this word consumed
-        // Re-tokenize just this word to count
-        std::string lword;
-        for (char c : words[w]) {
-            if (c >= 'A' && c <= 'Z')
-                lword += (char)(c - 'A' + 'a');
-            else
-                lword += c;
+    } else {
+        // Historical reconstruction: re-split the input on whitespace and take the
+        // LAST subtoken's prediction per word, re-deriving the subtoken count with
+        // a second copy of the WordPiece loop. Kept as the bit-exact comparison arm.
+        std::vector<std::string> words;
+        // Split input on whitespace to match tokenizer
+        {
+            std::string cur;
+            for (char c : input) {
+                if (c == ' ' || c == '\t' || c == '\n') {
+                    if (!cur.empty()) {
+                        words.push_back(cur);
+                        cur.clear();
+                    }
+                } else {
+                    cur += c;
+                }
+            }
+            if (!cur.empty())
+                words.push_back(cur);
         }
 
-        // Find how many tokens this word produced.
-        // Must match the tokenizer's splitting exactly.
-        int n_subtokens;
-        if (ctx->tokenizer.is_sentencepiece) {
-            // Use the SAME segmentation the model saw (Viterbi when scores present) —
-            // re-counting greedily here drifts on multi-subword words.
-            n_subtokens = (int)ctx->tokenizer.tokenize_sp(lword).size();
-        } else {
-            // WordPiece: try whole word, then greedy ## splitting
-            n_subtokens = 0;
-            auto it = ctx->tokenizer.token_to_id.find(lword);
-            if (it != ctx->tokenizer.token_to_id.end()) {
-                n_subtokens = 1;
+        // Map predictions back to words. Multiple token predictions per word
+        // (from WordPiece splits) — take the prediction of the last subtoken.
+        int tok_idx = 0;
+        for (size_t w = 0; w < words.size(); w++) {
+            if (w > 0)
+                result += ' ';
+            result += words[w];
+
+            // Count how many subtokens this word consumed
+            // Re-tokenize just this word to count
+            std::string lword;
+            for (char c : words[w]) {
+                if (c >= 'A' && c <= 'Z')
+                    lword += (char)(c - 'A' + 'a');
+                else
+                    lword += c;
+            }
+
+            // Find how many tokens this word produced.
+            // Must match the tokenizer's splitting exactly.
+            int n_subtokens;
+            if (ctx->tokenizer.is_sentencepiece) {
+                // Use the SAME segmentation the model saw (Viterbi when scores present) —
+                // re-counting greedily here drifts on multi-subword words.
+                n_subtokens = (int)ctx->tokenizer.tokenize_sp(lword).size();
             } else {
-                size_t start = 0;
-                while (start < lword.size()) {
-                    size_t end = lword.size();
-                    bool found = false;
-                    while (end > start) {
-                        std::string sub =
-                            (start == 0) ? lword.substr(0, end) : ("##" + lword.substr(start, end - start));
-                        if (ctx->tokenizer.token_to_id.count(sub)) {
-                            found = true;
-                            start = end;
+                // WordPiece: try whole word, then greedy ## splitting
+                n_subtokens = 0;
+                auto it = ctx->tokenizer.token_to_id.find(lword);
+                if (it != ctx->tokenizer.token_to_id.end()) {
+                    n_subtokens = 1;
+                } else {
+                    size_t start = 0;
+                    while (start < lword.size()) {
+                        size_t end = lword.size();
+                        bool found = false;
+                        while (end > start) {
+                            std::string sub =
+                                (start == 0) ? lword.substr(0, end) : ("##" + lword.substr(start, end - start));
+                            if (ctx->tokenizer.token_to_id.count(sub)) {
+                                found = true;
+                                start = end;
+                                n_subtokens++;
+                                break;
+                            }
+                            end--;
+                            while (end > start && (lword[end] & 0xC0) == 0x80)
+                                end--;
+                        }
+                        if (!found) {
                             n_subtokens++;
                             break;
                         }
-                        end--;
-                        while (end > start && (lword[end] & 0xC0) == 0x80)
-                            end--;
-                    }
-                    if (!found) {
-                        n_subtokens++;
-                        break;
                     }
                 }
             }
-        }
 
-        // Take the last subtoken's prediction for this word
-        int pred_idx = tok_idx + n_subtokens - 1;
-        tok_idx += n_subtokens;
+            // Take the last subtoken's prediction for this word
+            int pred_idx = tok_idx + n_subtokens - 1;
+            tok_idx += n_subtokens;
 
-        if (pred_idx < (int)all_preds.size()) {
-            int pred = all_preds[pred_idx];
-            if (pred > 0 && pred < (int)ctx->labels.size()) {
-                // #300: never stack punctuation on punctuation. A word that
-                // ALREADY ends in a mark (the text came from a model that
-                // punctuates natively, or from an earlier restore pass) would
-                // otherwise collect a second one — "your country." + "." =
-                // "your country..". Appending to a bare word is unaffected.
-                const char last = result.empty() ? '\0' : result[result.size() - 1];
-                const bool already =
-                    (last == '.' || last == ',' || last == '?' || last == '!' || last == ';' || last == ':');
-                bool already_fullwidth = false;
-                if (result.size() >= 3) {
-                    const unsigned char b0 = (unsigned char)result[result.size() - 3];
-                    const unsigned char b1 = (unsigned char)result[result.size() - 2];
-                    const unsigned char b2 = (unsigned char)result[result.size() - 1];
-                    already_fullwidth = (b0 == 0xEF && b1 == 0xBC && (b2 == 0x8C || b2 == 0x9F || b2 == 0x81)) ||
-                                        (b0 == 0xE3 && b1 == 0x80 && b2 == 0x82);
-                }
-                if (!already && !already_fullwidth)
+            if (pred_idx < (int)all_preds.size()) {
+                int pred = all_preds[pred_idx];
+                if (pred > 0 && pred < (int)ctx->labels.size() && !core_punct::ends_in_mark(result)) {
                     result += ctx->labels[pred];
+                }
             }
         }
-    }
+    } // end historical reconstruction
 
     // Auto-detect Latin script → map Chinese full-width punctuation to ASCII.
     // Count Latin letters vs CJK characters to decide.
@@ -807,7 +1057,18 @@ char* fireredpunc_process(fireredpunc_context* ctx, const char* text) {
                 cjk++; // rough: 3-byte+ UTF-8 = CJK/fullwidth
         }
         if (latin > cjk) {
-            // Replace full-width punctuation with ASCII equivalents
+            // Replace full-width punctuation with ASCII equivalents.
+            //
+            // Upstream's RuleBaedTxtFix does this with regexes that also
+            // insert a SPACE when the mark sits between two Latin letters:
+            //     re.sub(r"([a-z])。([a-z])", r"\1. \2", txt)   (and , ? !)
+            // while the start-of-string and end-of-string variants emit a bare
+            // mark. Without that space the blueprint's token-wise
+            // reconstruction yields "world.this", since it only spaces
+            // adjacent alphanumeric tokens when the previous tag was "no
+            // punctuation". Applied on the HF path only, so the historical arm
+            // stays byte-identical.
+            auto is_latin_alpha = [](unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); };
             std::string mapped;
             mapped.reserve(result.size());
             for (size_t i = 0; i < result.size();) {
@@ -815,26 +1076,25 @@ char* fireredpunc_process(fireredpunc_context* ctx, const char* text) {
                 if (b0 >= 0xE0 && i + 2 < result.size()) {
                     unsigned char b1 = (unsigned char)result[i + 1];
                     unsigned char b2 = (unsigned char)result[i + 2];
-                    if (b0 == 0xEF && b1 == 0xBC && b2 == 0x8C) {
-                        mapped += ",";
+                    const char* ascii = nullptr;
+                    if (b0 == 0xEF && b1 == 0xBC && b2 == 0x8C)
+                        ascii = ","; // ，
+                    else if (b0 == 0xE3 && b1 == 0x80 && b2 == 0x82)
+                        ascii = "."; // 。
+                    else if (b0 == 0xEF && b1 == 0xBC && b2 == 0x9F)
+                        ascii = "?"; // ？
+                    else if (b0 == 0xEF && b1 == 0xBC && b2 == 0x81)
+                        ascii = "!"; // ！
+                    if (ascii) {
+                        mapped += ascii;
+                        const bool prev_alpha =
+                            !mapped.empty() && is_latin_alpha((unsigned char)mapped[mapped.size() - 2]);
+                        const bool next_alpha = (i + 3 < result.size()) && is_latin_alpha((unsigned char)result[i + 3]);
+                        if (hf_tok && prev_alpha && next_alpha)
+                            mapped += ' ';
                         i += 3;
                         continue;
-                    } // ，
-                    if (b0 == 0xE3 && b1 == 0x80 && b2 == 0x82) {
-                        mapped += ".";
-                        i += 3;
-                        continue;
-                    } // 。
-                    if (b0 == 0xEF && b1 == 0xBC && b2 == 0x9F) {
-                        mapped += "?";
-                        i += 3;
-                        continue;
-                    } // ？
-                    if (b0 == 0xEF && b1 == 0xBC && b2 == 0x81) {
-                        mapped += "!";
-                        i += 3;
-                        continue;
-                    } // ！
+                    }
                 }
                 mapped += result[i++];
             }
@@ -855,13 +1115,23 @@ char* fireredpunc_process(fireredpunc_context* ctx, const char* text) {
             cap_next = false;
         } else {
             fixed += c;
-            // #308: an already-uppercase letter satisfies a pending capitalisation
-            // (e.g. Whisper's sentence-cased text). Without clearing cap_next here,
-            // it stayed set past the capital and up-cased the NEXT letter too
-            // ("Hello" -> "HEllo").
+            // #308: an ALREADY-uppercase letter must disarm cap_next, or the
+            // pending capitalisation lands on the NEXT character and "And"
+            // becomes "ANd". This applies on BOTH arms — it is a bug fix, not a
+            // behaviour preference, and it is the one that "lived in a dead
+            // copy" for months (762d9e27). Keep the literal form:
+            // tests/test-copies-in-sync.cpp greps for it in both copies.
             if (c >= 'A' && c <= 'Z') {
                 cap_next = false;
             }
+            // The HF path goes further. `cap_next` used to survive every
+            // character that was not a lowercase ASCII letter, so it stayed
+            // armed across CJK too: `我在Google...` came out as `GOogle`. Any
+            // non-space character ends the "start of sentence" position, which
+            // is also closer to upstream's RuleBaedTxtFix, where only txt[0]
+            // and a post-`.!?` position are capitalised.
+            if (hf_tok && c != ' ')
+                cap_next = false;
             // Check for sentence enders (. ? ! and their full-width versions)
             if (c == '.' || c == '?' || c == '!') {
                 cap_next = true;
@@ -892,8 +1162,6 @@ char* fireredpunc_process(fireredpunc_context* ctx, const char* text) {
         }
     }
 
-    if (std::getenv("FIREREDPUNC_DEBUG"))
-        fprintf(stderr, "[PUNCDBG] in=<%s>\n[PUNCDBG] out=<%s>\n", text, fixed.c_str());
     char* out = (char*)malloc(fixed.size() + 1);
     memcpy(out, fixed.c_str(), fixed.size() + 1);
     return out;
@@ -904,8 +1172,7 @@ void fireredpunc_free(fireredpunc_context* ctx) {
         return;
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
-    if (ctx->buf)
-        ggml_backend_buffer_free(ctx->buf);
+    core_gguf::release_weight_buffer(ctx->buf);
     if (ctx->w_ctx)
         ggml_free(ctx->w_ctx);
     if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)

@@ -10,6 +10,7 @@
 #include "crispasr_vad.h"
 
 #include "core/audio_chunking.h"
+#include "core/vad_failover.h" // §W4: detect an obviously-broken VAD result
 
 #include "firered_vad.h" // FireRedVAD (DFSMN) — alternative to Silero
 #include "crispasr.h"    // whisper_vad_* API (Silero VAD)
@@ -368,6 +369,36 @@ std::vector<crispasr_audio_slice> crispasr_compute_vad_slices(const float* sampl
     // JSON streaming can request a narrower close-gap-only policy so VAD never
     // hides a silence gap that should finalize an utterance.
     slices = crispasr_post_merge_vad_slices(slices, sample_rate, opts);
+
+    // PLAN.md §W4: is this result obviously wrong?
+    //
+    // Assessed HERE — after the merge, before the re-chunk below. The re-chunk
+    // splits long segments at `chunk_seconds`, so one 10-minute monologue
+    // becomes ~20 slices; measuring segment COUNT after that would report a
+    // healthy-looking number for any input and the few-segment signal could
+    // never fire. This is the last point where the slice list still means
+    // "what the VAD actually found".
+    //
+    // On failover we hand back fixed chunks over the whole buffer rather than
+    // one giant slice: "transcribe everything" has to stay within the chunk
+    // length the pipeline (and the backend's context) expects.
+    // Disable with CRISPASR_VAD_FAILOVER=0.
+    {
+        const char* off = std::getenv("CRISPASR_VAD_FAILOVER");
+        if (!(off && off[0] == '0') && sample_rate > 0) {
+            std::vector<core_vad_failover::Span> spans;
+            spans.reserve(slices.size());
+            for (const auto& s : slices)
+                spans.push_back({(double)s.t0_cs / 100.0, (double)s.t1_cs / 100.0});
+            const double audio_sec = (double)n_samples / (double)sample_rate;
+            const auto verdict = core_vad_failover::assess(spans, audio_sec);
+            if (verdict.failover) {
+                fprintf(stderr, "crispasr[vad]: %s — falling back to full-clip chunks\n", verdict.reason.c_str());
+                const int chunk = opts.chunk_seconds > 0 ? opts.chunk_seconds : 30;
+                return crispasr_fixed_chunk_slices(n_samples, sample_rate, chunk);
+            }
+        }
+    }
 
     // Post-split: break any VAD segment that exceeds chunk_seconds into
     // sub-segments. See crispasr_rechunk_slices — the same step is reused on the

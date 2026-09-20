@@ -29,7 +29,9 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 
+#include "core/utf8.h"
 #include "core/gguf_loader.h"
+#include "core/hifigan.h"          // #387 perf: shared GPU-capable HiFi-GAN vocoder
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "core/crispasr_env.h"
 #include "core/pinyin_g2p.h" // #294: Chinese g2p (jieba-min + pypinyin TONE3)
@@ -49,6 +51,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -98,6 +101,34 @@ static bool f5_f16_act_enabled() {
     return v != 0;
 }
 
+// DiT attention: default to a manual mul_mat/soft_max_ext/mul_mat SDPA path (F32
+// throughout), which is correct on every backend. Fused ggml_flash_attn_ext is
+// faster but accumulates the KQ product in F16 on flash kernels that ignore the
+// GGML_PREC_F32 hint (observed on P100/sm_60) — measured to drift ~16x more than
+// f16-weight rounding alone on the 0.3B and to NaN on the deeper/wider 1B. So
+// flash is OPT-IN: CRISPASR_F5_FLASH=1 selects it (safe only where the prec hint
+// is honoured). CRISPASR_F5_NO_FLASH=1 is still accepted (forces manual) for
+// back-compat. TODO: replace the env gate with an init-time probe that runs both
+// paths once and auto-selects manual where they diverge (self-calibrating, no
+// hardware allowlist).
+static bool f5_use_flash_attn() {
+    // READ PER CALL, NOT CACHED IN A STATIC. A `static int v` initialised once
+    // per process makes this switch untestable in-process: flipping
+    // CRISPASR_F5_FLASH on a live context would change nothing, so an A/B of
+    // flash vs manual would silently compare one path against ITSELF and pass.
+    // This repo has shipped exactly that bug — tests/test_sidon_live.cpp
+    // compared one RPE mode against itself for its entire existence because
+    // CRISPASR_SIDON_RPE was read once in init. The measurements that justified
+    // this switch were all separate processes and are unaffected, but a gate
+    // that cannot be toggled is not a gate. getenv here is on the DiT
+    // graph-construction path, not a per-frame loop.
+    const char* no = crispasr_env::get("CRISPASR_F5_NO_FLASH");
+    const char* yes = crispasr_env::get("CRISPASR_F5_FLASH");
+    const bool force_manual = (no && *no && *no != '0');
+    const bool opt_in_flash = (yes && *yes && *yes != '0');
+    return opt_in_flash && !force_manual;
+}
+
 // Opt-in (#294): compute the InputEmbedding (input_proj + 2× grouped conv-pos +
 // Mish + residual) on the GPU backend instead of host BLAS/scalar. On the default
 // (32 steps) that host stage is ~26% of the ODE loop on M1 and a larger share on a
@@ -131,6 +162,32 @@ struct f5_bench_stage {
 
 // ── Hyperparameters ──────────────────────────────────────────────
 
+// Text length for the duration estimate: CODEPOINTS by default, bytes under
+// CRISPASR_F5_TEXT_LEN_BYTES=1.
+//
+// Upstream F5-TTS uses `len(text.encode("utf-8"))` — bytes — on both sides of
+// the rate, and so does our reference dumper
+// (tools/reference_backends/f5_tts.py:259). Byte/byte cancels when reference
+// and target share a script, so upstream only misbehaves when they differ; our
+// no-ref-text branch was worse still, pairing a 13 chars/sec constant with a
+// byte count, so Devanagari or CJK inflated ~3x and the ODE solve ran for
+// minutes (#372).
+//
+// Codepoints are the better default, so that is the default. The gate exists so
+// the exact upstream arithmetic stays reachable: `crispasr-diff f5-tts` compares
+// against a reference that is deliberately STILL on bytes, because a reference
+// that adopted our change could no longer disagree with us. Same reasoning and
+// same shape as CRISPASR_F5_DURATION_CLAMP=0 further down.
+static size_t f5_text_len(const char* s) {
+    static const bool s_bytes = []() {
+        const char* e = crispasr_env::get("CRISPASR_F5_TEXT_LEN_BYTES");
+        return e && e[0] == '1';
+    }();
+    if (!s)
+        return 0;
+    return s_bytes ? std::strlen(s) : core_utf8::length(s);
+}
+
 struct f5_hparams {
     int dim = 1024;
     int depth = 22;
@@ -156,6 +213,15 @@ struct f5_hparams {
     int voc_num_layers = 8;
     int voc_n_fft = 1024;
     int voc_hop_length = 256;
+    // #387 Raon-OpenTTS deltas (default = stock F5/Vocos):
+    //   vocoder       "vocos" | "hifigan"  — which decoder to run
+    //   mel_spec_type "vocos" | "sbhifigan16k" — mel front-end variant
+    //   mel_center    STFT center padding (Vocos true, sbhifigan false)
+    // sbhifigan16k also ships its (slaney) filterbank + window as GGUF
+    // buffers, so the runtime never rebuilds the slaney basis in C++.
+    std::string vocoder = "vocos";
+    std::string mel_spec_type = "vocos";
+    bool mel_center = true;
 };
 
 // ── Weight structure ─────────────────────────────────────────────
@@ -289,8 +355,12 @@ struct f5_dit_graph_cache {
     ggml_tensor* t_emb_in = nullptr;  // (dim,)  — timestep embedding (shared over B)
     ggml_tensor* pos_in = nullptr;    // (T,) i32 — constant [0..T-1] (shared over B)
     ggml_tensor* output = nullptr;    // (mel_dim, T, B) — velocity/velocities
+    // #387-adj DiT diff probe (CRISPASR_F5_DIT_PROBE): per-block residual-stream
+    // outputs, tapped as graph outputs so they survive gallocr for read-back.
+    std::vector<ggml_tensor*> block_taps;
 
     void reset() {
+        block_taps.clear();
         if (galloc) {
             ggml_gallocr_free(galloc);
             galloc = nullptr;
@@ -361,6 +431,25 @@ struct f5_tts_context {
     // Reference audio state
     std::vector<float> ref_mel; // (T_ref, mel_dim) row-major
     int ref_mel_T = 0;
+
+    // #387 sbhifigan16k: shipped slaney mel filterbank (n_freqs*n_mels,
+    // layout fb[k*n_mels+m]) + Hann window (n_fft), copied verbatim from the
+    // GGUF; and the HiFi-GAN vocoder weights as CPU F32 (weight-norm already
+    // fused in the converter), keyed by their `voc.*` GGUF name.
+    std::vector<float> mel_fb;
+    std::vector<float> mel_window;
+    std::map<std::string, std::vector<float>> hifigan_w;
+    // #387 perf: the same voc.* HiFi-GAN weights as GGUF-resident ggml tensors
+    // (they live in w_ctx), so the vocoder can run through the shared,
+    // GPU-capable core_hifigan graph (im2col+gemm) instead of naive CPU loops.
+    // This is the default; hifigan_w above is populated only as the A/B CPU
+    // fallback (CRISPASR_F5_HIFIGAN_CPU=1). ups_w_perm holds the pre-permuted
+    // ConvTranspose1d upsample kernels for the decomposed col2im path.
+    std::map<std::string, ggml_tensor*> hifigan_ts;
+    core_hifigan::hparams voc_hp;
+    std::vector<ggml_tensor*> ups_w_perm;
+    ggml_context* ctx_perm = nullptr;
+    ggml_backend_buffer_t buf_perm = nullptr;
     std::string ref_text;
 
     // Diff harness: inject reference initial noise for reproducibility
@@ -595,7 +684,8 @@ static void f5_linear(const float* x, const float* W, const float* bias, float* 
 
 // ── Text Encoder (embedding + sinusoidal pos + ConvNeXtV2 blocks) ─
 
-static std::vector<float> compute_text_embed(f5_tts_context* ctx, const int32_t* tokens, int n_tokens, int seq_len) {
+static std::vector<float> compute_text_embed(f5_tts_context* ctx, const int32_t* tokens, int n_tokens, int seq_len,
+                                             bool drop_text = false) {
     const auto& hp = ctx->hp;
 
     // tokens are in range [-1, vocab_size-1]. We add 1 to make 0 the filler.
@@ -605,18 +695,25 @@ static std::vector<float> compute_text_embed(f5_tts_context* ctx, const int32_t*
         padded[i] = tokens[i] + 1; // shift by 1 (filler = 0)
     }
 
-    // Create text mask: 1 where padded == 0 (filler/padding)
+    // Create text mask: 1 where padded == 0 (filler/padding). Upstream computes
+    // this from the REAL (pre-drop) text, so the CFG-uncond arm (drop_text) still
+    // masks only the true padding positions — the valid positions keep the filler
+    // embedding, NOT zero. (Passing all-zeros for the uncond text embed was the
+    // #387-adj 1B bug: CFG's v=cond+2·(cond−uncond) doubles that error, which the
+    // deeper 1B turned into non-speech while the 0.3B tolerated it.)
     std::vector<float> text_mask(seq_len);
     for (int i = 0; i < seq_len; i++) {
         text_mask[i] = (padded[i] == 0) ? 1.0f : 0.0f;
     }
 
-    // Embedding lookup — use pre-dequantized cache (loaded at init).
+    // Embedding lookup — use pre-dequantized cache (loaded at init). drop_text
+    // (CFG uncond) looks up the filler row (index 0) at EVERY position, matching
+    // the reference's `text = torch.zeros_like(text)` before the embed.
     const std::vector<float>& emb_weight = ctx->text_cache.emb;
 
     std::vector<float> text_emb(seq_len * hp.text_dim, 0.0f);
     for (int t = 0; t < seq_len; t++) {
-        int idx = padded[t];
+        int idx = drop_text ? 0 : padded[t];
         if (idx >= 0 && idx < hp.text_num_embeds) {
             for (int d = 0; d < hp.text_dim; d++) {
                 text_emb[t * hp.text_dim + d] = emb_weight[idx * hp.text_dim + d];
@@ -825,14 +922,24 @@ static float mel_to_hz(float m) {
 //
 // Returns (T, n_mels) row-major mel spectrogram.
 
+// sr, and the optional shipped_fb / shipped_window / center args, are #387
+// additions. Vocos (stock F5) passes sr=24000, shipped_*=nullptr, center=true
+// → identical behaviour. sbhifigan16k passes sr=16000, the shipped slaney
+// filterbank + Hann window, and center=false (torchaudio Spectrogram default).
 static std::vector<float> compute_mel_spectrogram(const float* pcm_24k, int n_samples, int n_fft, int hop_length,
-                                                  int win_length, int n_mels, int& T_out) {
+                                                  int win_length, int n_mels, int& T_out, float sr = 24000.0f,
+                                                  const std::vector<float>* shipped_fb = nullptr,
+                                                  const std::vector<float>* shipped_window = nullptr,
+                                                  bool center = true) {
     int n_freqs = n_fft / 2 + 1; // 513
-    float sr = 24000.0f;
 
-    // ── Build mel filterbank (n_freqs × n_mels) ──
-    std::vector<float> mel_fb(n_freqs * n_mels, 0.0f);
-    {
+    // ── Mel filterbank (n_freqs × n_mels): shipped (slaney) or HTK-built ──
+    std::vector<float> mel_fb_local;
+    const float* mel_fb = nullptr;
+    if (shipped_fb && (int)shipped_fb->size() == n_freqs * n_mels) {
+        mel_fb = shipped_fb->data(); // slaney, copied verbatim from the GGUF
+    } else {
+        mel_fb_local.assign(n_freqs * n_mels, 0.0f);
         float f_min = 0.0f, f_max = sr / 2.0f;
         float mel_min = hz_to_mel(f_min);
         float mel_max = hz_to_mel(f_max);
@@ -850,29 +957,40 @@ static std::vector<float> compute_mel_spectrogram(const float* pcm_24k, int n_sa
                     val = (f - f_left) / (f_center - f_left);
                 else if (f > f_center && f <= f_right && f_right > f_center)
                     val = (f_right - f) / (f_right - f_center);
-                mel_fb[k * n_mels + m] = val;
+                mel_fb_local[k * n_mels + m] = val;
             }
         }
+        mel_fb = mel_fb_local.data();
     }
 
-    // ── Hann window ──
-    std::vector<float> hann(win_length);
-    for (int i = 0; i < win_length; i++)
-        hann[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * (float)i / (float)win_length));
+    // ── Hann window: shipped (torch periodic) or built ──
+    std::vector<float> hann_local;
+    const float* hann = nullptr;
+    if (shipped_window && (int)shipped_window->size() == win_length) {
+        hann = shipped_window->data();
+    } else {
+        hann_local.assign(win_length, 0.0f);
+        for (int i = 0; i < win_length; i++)
+            hann_local[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * (float)i / (float)win_length));
+        hann = hann_local.data();
+    }
 
-    // ── Center padding (reflect) ──
-    int pad = n_fft / 2;
+    // ── Padding: center=true reflect-pads n_fft/2 each side (Vocos);
+    //    center=false (sbhifigan16k) frames the raw signal, no padding. ──
+    const int pad = center ? n_fft / 2 : 0;
     int padded_len = n_samples + 2 * pad;
     std::vector<float> padded(padded_len);
-    // Reflect pad left
-    for (int i = 0; i < pad; i++)
-        padded[i] = pcm_24k[pad - i]; // reflect: index 1,2,3,...,pad
-    // Copy signal
-    for (int i = 0; i < n_samples; i++)
-        padded[pad + i] = pcm_24k[i];
-    // Reflect pad right
-    for (int i = 0; i < pad; i++)
-        padded[pad + n_samples + i] = pcm_24k[n_samples - 2 - i]; // reflect
+    if (center) {
+        for (int i = 0; i < pad; i++)
+            padded[i] = pcm_24k[pad - i]; // reflect: index 1,2,3,...,pad
+        for (int i = 0; i < n_samples; i++)
+            padded[pad + i] = pcm_24k[i];
+        for (int i = 0; i < pad; i++)
+            padded[pad + n_samples + i] = pcm_24k[n_samples - 2 - i]; // reflect
+    } else {
+        for (int i = 0; i < n_samples; i++)
+            padded[i] = pcm_24k[i];
+    }
 
     // ── STFT frames ──
     int T = (padded_len - n_fft) / hop_length + 1;
@@ -1105,10 +1223,31 @@ static bool f5_dit_cache_build(f5_tts_context* ctx, int T, int B) {
         k = ggml_permute(cache.gctx, k, 0, 2, 1, 3);
         v = ggml_permute(cache.gctx, v, 0, 2, 1, 3);
 
-        // Flash attention (bidirectional, no mask)
+        // Attention (bidirectional, no mask). q/k/v are (head_dim, T, n_heads, B) here.
         float attn_scale = 1.0f / sqrtf((float)head_dim);
-        ggml_tensor* attn_out = ggml_flash_attn_ext(cache.gctx, q, k, v, nullptr, attn_scale, 0.0f, 0.0f);
-        attn_out = ggml_reshape_3d(cache.gctx, attn_out, dim, T, B);
+        ggml_tensor* attn_out;
+        if (f5_use_flash_attn()) {
+            // Fused flash-attention (opt-in). Request F32 KQ accumulation — honored
+            // by most backends, but silently ignored by some flash kernels (P100/
+            // sm_60), which is why manual SDPA is the default. Sibling backends
+            // (bark_tts, beat_this, chatterbox) set this hint too.
+            attn_out = ggml_flash_attn_ext(cache.gctx, q, k, v, nullptr, attn_scale, 0.0f, 0.0f);
+            ggml_flash_attn_ext_set_prec(attn_out, GGML_PREC_F32);
+        } else {
+            // Manual SDPA, F32 throughout — correct on every backend (default).
+            ggml_tensor* kq = ggml_mul_mat(cache.gctx, k, q); // (T_k, T_q, n_heads, B)
+            kq = ggml_soft_max_ext(cache.gctx, kq, nullptr, attn_scale, 0.0f);
+            ggml_tensor* v_t = ggml_cont(cache.gctx, ggml_transpose(cache.gctx, v)); // (T_k, head_dim, n_heads, B)
+            ggml_tensor* kqv = ggml_mul_mat(cache.gctx, v_t, kq);                    // (head_dim, T_q, n_heads, B)
+            // → (head_dim, n_heads, T, B), matching flash_attn_ext's output layout.
+            attn_out = ggml_cont(cache.gctx, ggml_permute(cache.gctx, kqv, 0, 2, 1, 3));
+        }
+        // Collapse heads to inner_dim = n_heads*head_dim, NOT dim: F5 Attention
+        // sets inner_dim independently (dim_head defaults to 64), so inner_dim !=
+        // dim in general (1B: dim=1408, inner=1536). attn_o then maps inner→dim.
+        // (0.3B is unaffected: inner==dim==1024 there.)
+        const int inner_dim = n_heads * head_dim;
+        attn_out = ggml_reshape_3d(cache.gctx, attn_out, inner_dim, T, B);
 
         // O-proj + gated residual
         ggml_tensor* attn_proj = ggml_mul_mat(cache.gctx, blk.attn_o_weight, A(attn_out));
@@ -1131,6 +1270,12 @@ static bool f5_dit_cache_build(f5_tts_context* ctx, int T, int B) {
 
         // Gated residual
         x = ggml_add(cache.gctx, x_res, ggml_mul(cache.gctx, ff, gate_mlp));
+
+        // #387-adj: tap this block's residual-stream output for the DiT diff.
+        if (crispasr_env::present("CRISPASR_F5_DIT_PROBE")) {
+            ggml_set_output(x);
+            cache.block_taps.push_back(x);
+        }
     }
 
     // Final AdaLN + projection → velocity (mel_dim, T)
@@ -1157,6 +1302,10 @@ static bool f5_dit_cache_build(f5_tts_context* ctx, int T, int B) {
     // Build graph
     cache.gf = ggml_new_graph_custom(cache.gctx, 8192, false);
     ggml_build_forward_expand(cache.gf, cache.output);
+    // #387-adj: keep the tapped per-block outputs reachable so gallocr preserves
+    // them for read-back after compute.
+    for (ggml_tensor* tap : cache.block_taps)
+        ggml_build_forward_expand(cache.gf, tap);
 
     // Reserve then allocate memory layout on the compute backend (GPU when
     // use_gpu; falls back to backend_cpu otherwise). The DiT weights already
@@ -1442,6 +1591,9 @@ static void cpu_conv1d(const float* input, int C_in, int T, const float* weight,
     for (int g = 0; g < groups; g++) {
         int oc_start = g * ch_per_group_out;
         int ic_start = g * ch_per_group_in;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
         for (int oc = oc_start; oc < oc_start + ch_per_group_out; oc++) {
             for (int t = 0; t < T; t++) {
                 float sum = bias ? bias[oc] : 0.0f;
@@ -1459,6 +1611,35 @@ static void cpu_conv1d(const float* input, int C_in, int T, const float* weight,
             }
         }
     }
+}
+
+// Dilated 1-D conv (groups=1), same-padding. #387 HiFi-GAN resblocks.
+static void cpu_conv1d_dil(const float* input, int C_in, int T, const float* weight, const float* bias, int C_out,
+                           int K, int dilation, float* output) {
+    const int pad = dilation * (K - 1) / 2; // "same" for odd K
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int oc = 0; oc < C_out; oc++) {
+        for (int t = 0; t < T; t++) {
+            float sum = bias ? bias[oc] : 0.0f;
+            for (int ic = 0; ic < C_in; ic++) {
+                const float* in = input + (size_t)ic * T;
+                const float* w = weight + ((size_t)oc * C_in + ic) * K;
+                for (int k = 0; k < K; k++) {
+                    int ti = t + k * dilation - pad;
+                    if (ti >= 0 && ti < T)
+                        sum += in[ti] * w[k];
+                }
+            }
+            output[(size_t)oc * T + t] = sum;
+        }
+    }
+}
+
+static inline void cpu_leaky_relu(std::vector<float>& x, float slope) {
+    for (float& v : x)
+        v = v > 0.0f ? v : slope * v;
 }
 
 // ── CPU LayerNorm over last dim of (T, D) data ─────────────────────
@@ -1495,6 +1676,174 @@ static void transpose_tc(const float* src, int T, int C, float* dst) {
     for (int t = 0; t < T; t++)
         for (int c = 0; c < C; c++)
             dst[c * T + t] = src[t * C + c];
+}
+
+// ── CPU HiFi-GAN v1 decoder (#387 Raon-OpenTTS sbhifigan16k) ──────────────
+// mel_data is (T_mel, mel_dim) row-major (log-mel). Mirrors the reference
+// HifiganGenerator: conv_pre → for each of 4 stages { LeakyReLU →
+// ConvTranspose1d(rate) → sum_j resblock_j / 3 } → LeakyReLU → conv_post →
+// tanh. Weights come from ctx->hifigan_w (weight-norm fused in the converter);
+// the arch is the fixed sbhifigan16k config from Raon's vocoder.py.
+static std::vector<float> hifigan_decode(f5_tts_context* ctx, const float* mel_data, int T_mel, int mel_dim) {
+    const auto& W = ctx->hifigan_w;
+    auto has = [&](const std::string& n) { return W.find(n) != W.end(); };
+    auto get = [&](const std::string& n) -> const std::vector<float>& { return W.at(n); };
+
+    const int up_rates[4] = {8, 8, 2, 2};
+    const int up_kernels[4] = {16, 16, 4, 4};
+    const int rb_kernels[3] = {3, 7, 11};
+    const int rb_dils[3] = {1, 3, 5};
+    const float slope = 0.1f;
+    int init_ch = 512;
+
+    const auto voc_t0 = std::chrono::steady_clock::now();
+
+    // mel (T, C) → (C, T) for conv layout.
+    std::vector<float> x(mel_dim * T_mel);
+    transpose_tc(mel_data, T_mel, mel_dim, x.data());
+    int C = mel_dim, T = T_mel;
+
+    // conv_pre: Conv1d(mel_dim, init_ch, k=7, pad=3)
+    {
+        std::vector<float> out((size_t)init_ch * T, 0.0f);
+        cpu_conv1d(x.data(), C, T, get("voc.conv_pre.weight").data(), get("voc.conv_pre.bias").data(), init_ch, 7, 3, 1,
+                   out.data());
+        x = std::move(out);
+        C = init_ch;
+    }
+
+    int ch = init_ch;
+    for (int s = 0; s < 4; s++) {
+        cpu_leaky_relu(x, slope);
+        // ConvTranspose1d(ch, ch/2, k=up_kernels[s], stride=up_rates[s],
+        // pad=(k-stride)/2). PyTorch CT weight layout is (in_ch, out_ch, k).
+        const int out_ch = ch / 2;
+        const int stride = up_rates[s], k = up_kernels[s], pad = (k - stride) / 2;
+        const int T_out = (T - 1) * stride + k - 2 * pad;
+        const std::vector<float>& uw = get("voc.ups." + std::to_string(s) + ".weight");
+        const std::vector<float>& ub = get("voc.ups." + std::to_string(s) + ".bias");
+        std::vector<float> up((size_t)out_ch * T_out, 0.0f);
+        // Gather per output channel (parallel-safe: each oc writes its own row).
+        // For each output position `to`, sum over the input taps that scatter
+        // into it: to = ti*stride + kk - pad  ⇒  ti = (to + pad - kk)/stride.
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (int oc = 0; oc < out_ch; oc++) {
+            float* orow = up.data() + (size_t)oc * T_out;
+            for (int to = 0; to < T_out; to++) {
+                float acc = ub[oc];
+                for (int kk = 0; kk < k; kk++) {
+                    int num = to + pad - kk;
+                    if (num < 0 || (num % stride) != 0)
+                        continue;
+                    int ti = num / stride;
+                    if (ti < 0 || ti >= T)
+                        continue;
+                    for (int ic = 0; ic < ch; ic++) {
+                        float v = x[(size_t)ic * T + ti];
+                        float w = uw[(((size_t)ic * out_ch) + oc) * k + kk];
+                        acc += v * w;
+                    }
+                }
+                orow[to] = acc;
+            }
+        }
+        x = std::move(up);
+        ch = out_ch;
+        T = T_out;
+
+        // MRF: mean of 3 resblocks over the current (ch, T).
+        std::vector<float> acc((size_t)ch * T, 0.0f);
+        for (int j = 0; j < 3; j++) {
+            const int rb = s * 3 + j;
+            std::vector<float> h = x; // resblock input
+            for (int d = 0; d < 3; d++) {
+                // convs1[d]: dilated, then convs2[d]: dilation 1, each pre-LeakyReLU
+                std::vector<float> a = h;
+                cpu_leaky_relu(a, slope);
+                std::vector<float> b1((size_t)ch * T, 0.0f);
+                const std::string p1 = "voc.resblocks." + std::to_string(rb) + ".convs1." + std::to_string(d);
+                cpu_conv1d_dil(a.data(), ch, T, get(p1 + ".weight").data(), get(p1 + ".bias").data(), ch, rb_kernels[j],
+                               rb_dils[d], b1.data());
+                cpu_leaky_relu(b1, slope);
+                std::vector<float> b2((size_t)ch * T, 0.0f);
+                const std::string p2 = "voc.resblocks." + std::to_string(rb) + ".convs2." + std::to_string(d);
+                cpu_conv1d_dil(b1.data(), ch, T, get(p2 + ".weight").data(), get(p2 + ".bias").data(), ch,
+                               rb_kernels[j], 1, b2.data());
+                for (size_t i = 0; i < h.size(); i++)
+                    h[i] += b2[i]; // residual
+            }
+            for (size_t i = 0; i < acc.size(); i++)
+                acc[i] += h[i];
+        }
+        for (size_t i = 0; i < x.size(); i++)
+            x[i] = acc[i] / 3.0f;
+        (void)has;
+    }
+
+    // final LeakyReLU → conv_post: Conv1d(ch, 1, k=7, pad=3) → tanh
+    cpu_leaky_relu(x, slope);
+    std::vector<float> out((size_t)1 * T, 0.0f);
+    cpu_conv1d(x.data(), ch, T, get("voc.conv_post.weight").data(), get("voc.conv_post.bias").data(), 1, 7, 3, 1,
+               out.data());
+    for (float& v : out)
+        v = tanhf(v);
+
+    if (ctx->verbosity >= 1) {
+        double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - voc_t0).count();
+        fprintf(stderr, "f5_tts: hifigan_decode T_mel=%d → %zu samples in %.1f ms\n", T_mel, out.size(), ms);
+    }
+    return out;
+}
+
+// #387 perf: HiFi-GAN decode via the shared, GPU-capable core_hifigan graph.
+// Numerically identical to hifigan_decode() above (validated cos≈0.998 through
+// the CRISPASR_F5_VOCODE_MEL probe), but runs on the backend scheduler
+// (im2col+gemm, threaded/GPU) instead of naive CPU loops. This is the default
+// vocoder path; CRISPASR_F5_HIFIGAN_CPU=1 selects the CPU reference above.
+static std::vector<float> hifigan_decode_ggml(f5_tts_context* ctx, const float* mel_data, int T_mel, int mel_dim) {
+    const auto voc_t0 = std::chrono::steady_clock::now();
+
+    f5_mini_graph mg(ctx->sched);
+    // core_hifigan wants ne[0]=T (time is the conv1d spatial dim), ne[1]=n_mel.
+    ggml_tensor* mel_in = ggml_new_tensor_2d(mg.ctx, GGML_TYPE_F32, T_mel, mel_dim);
+    ggml_set_name(mel_in, "voc_mel_in");
+    ggml_set_input(mel_in);
+
+    ggml_tensor* audio = core_hifigan::forward(mg.ctx, mel_in, ctx->hifigan_ts, "voc", ctx->voc_hp, ctx->ups_w_perm);
+    ggml_set_name(audio, "audio_out");
+    ggml_set_output(audio);
+
+    ggml_cgraph* gf = ggml_new_graph_custom(mg.ctx, 32768, false);
+    ggml_build_forward_expand(gf, audio);
+    ggml_backend_sched_reset(mg.sched);
+    if (!ggml_backend_sched_alloc_graph(mg.sched, gf)) {
+        fprintf(stderr, "f5_tts: hifigan_decode(ggml) graph alloc failed\n");
+        return {};
+    }
+
+    // Incoming mel is (T, C) row-major (C contiguous per frame). core_hifigan
+    // needs ne[0]=T, i.e. T contiguous per channel: mel_voc[c*T + t].
+    {
+        std::vector<float> mel_voc((size_t)mel_dim * T_mel);
+        for (int t = 0; t < T_mel; t++)
+            for (int c = 0; c < mel_dim; c++)
+                mel_voc[(size_t)c * T_mel + t] = mel_data[(size_t)t * mel_dim + c];
+        ggml_backend_tensor_set(mel_in, mel_voc.data(), 0, mel_voc.size() * sizeof(float));
+    }
+
+    ggml_backend_sched_graph_compute(mg.sched, gf);
+
+    const int n = (int)ggml_nelements(audio);
+    std::vector<float> out(n);
+    ggml_backend_tensor_get(audio, out.data(), 0, (size_t)n * sizeof(float));
+
+    if (ctx->verbosity >= 1) {
+        double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - voc_t0).count();
+        fprintf(stderr, "f5_tts: hifigan_decode(ggml) T_mel=%d → %d samples in %.1f ms\n", T_mel, n, ms);
+    }
+    return out;
 }
 
 static std::vector<float> vocos_decode(f5_tts_context* ctx, const float* mel_data, int T_mel, int mel_dim) {
@@ -1971,6 +2320,10 @@ static bool load_weights(f5_tts_context* ctx, const char* path) {
     hp.voc_num_layers = core_gguf::kv_i32(meta, "f5.voc_num_layers", hp.voc_num_layers);
     hp.voc_n_fft = core_gguf::kv_i32(meta, "f5.voc_n_fft", hp.voc_n_fft);
     hp.voc_hop_length = core_gguf::kv_i32(meta, "f5.voc_hop_length", hp.voc_hop_length);
+    // #387 Raon deltas
+    hp.vocoder = core_gguf::kv_str(meta, "f5.vocoder", hp.vocoder.c_str());
+    hp.mel_spec_type = core_gguf::kv_str(meta, "f5.mel_spec_type", hp.mel_spec_type.c_str());
+    hp.mel_center = core_gguf::kv_bool(meta, "f5.mel_center", hp.mel_center);
 
     // Vocab
     auto vocab_chars = core_gguf::kv_str_array(meta, "f5.vocab");
@@ -2054,27 +2407,47 @@ static bool load_weights(f5_tts_context* ctx, const char* path) {
     // Rotary
     w.rotary_inv_freq = get("f5.rotary_inv_freq");
 
-    // Vocos
-    w.voc_embed_weight = get("voc.embed.weight");
-    w.voc_embed_bias = get("voc.embed.bias");
-    w.voc_norm_weight = get("voc.norm.weight");
-    w.voc_norm_bias = get("voc.norm.bias");
-    w.voc_blocks.resize(hp.voc_num_layers);
-    for (int i = 0; i < hp.voc_num_layers; i++) {
-        char buf[128];
-        auto g = [&](const char* suffix) -> ggml_tensor* {
-            snprintf(buf, sizeof(buf), "voc.blk.%d.%s", i, suffix);
-            return get(buf);
-        };
-        w.voc_blocks[i] = {
-            g("dw.weight"),  g("dw.bias"),        g("norm.weight"),  g("norm.bias"),   g("pw_up.weight"),
-            g("pw_up.bias"), g("pw_down.weight"), g("pw_down.bias"), g("layer_scale"),
-        };
+    // Vocos (stock F5) — only when this GGUF actually carries Vocos weights.
+    if (hp.vocoder == "vocos") {
+        w.voc_embed_weight = get("voc.embed.weight");
+        w.voc_embed_bias = get("voc.embed.bias");
+        w.voc_norm_weight = get("voc.norm.weight");
+        w.voc_norm_bias = get("voc.norm.bias");
+        w.voc_blocks.resize(hp.voc_num_layers);
+        for (int i = 0; i < hp.voc_num_layers; i++) {
+            char buf[128];
+            auto g = [&](const char* suffix) -> ggml_tensor* {
+                snprintf(buf, sizeof(buf), "voc.blk.%d.%s", i, suffix);
+                return get(buf);
+            };
+            w.voc_blocks[i] = {
+                g("dw.weight"),  g("dw.bias"),        g("norm.weight"),  g("norm.bias"),   g("pw_up.weight"),
+                g("pw_up.bias"), g("pw_down.weight"), g("pw_down.bias"), g("layer_scale"),
+            };
+        }
+        w.voc_final_norm_weight = get("voc.final_norm.weight");
+        w.voc_final_norm_bias = get("voc.final_norm.bias");
+        w.voc_head_weight = get("voc.head.weight");
+        w.voc_head_bias = get("voc.head.bias");
+    } else if (hp.vocoder == "hifigan") {
+        // #387: keep every voc.* HiFi-GAN tensor (weight-norm already fused in
+        // the converter) as a GGUF-resident ggml tensor so the shared,
+        // GPU-capable core_hifigan graph can consume it by name. The CPU float
+        // cache is populated only when the A/B fallback is requested
+        // (CRISPASR_F5_HIFIGAN_CPU=1). The arch (rates/kernels) is fixed by
+        // sbhifigan16k; see the voc_hp setup after the scheduler is created.
+        const bool cpu_voc = crispasr_env::truthy("CRISPASR_F5_HIFIGAN_CPU");
+        for (const auto& kv : ts) {
+            if (kv.first.rfind("voc.", 0) == 0) {
+                ctx->hifigan_ts[kv.first] = kv.second;
+                if (cpu_voc)
+                    read_tensor_f32(kv.second, ctx->hifigan_w[kv.first]);
+            }
+        }
+        // Shipped slaney mel filterbank + Hann window.
+        read_tensor_f32(get("f5.mel_fb"), ctx->mel_fb);
+        read_tensor_f32(get("f5.mel_window"), ctx->mel_window);
     }
-    w.voc_final_norm_weight = get("voc.final_norm.weight");
-    w.voc_final_norm_bias = get("voc.final_norm.bias");
-    w.voc_head_weight = get("voc.head.weight");
-    w.voc_head_bias = get("voc.head.bias");
 
     return true;
 }
@@ -2102,13 +2475,13 @@ struct f5_tts_context* f5_tts_init_from_file(const char* path_model, struct f5_t
     ctx->speed = params.speed;
 
     // Initialize backends
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (!ctx->backend_cpu) {
         fprintf(stderr, "f5_tts: failed to init CPU backend\n");
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, params.n_threads);
 
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (!ctx->backend)
@@ -2160,7 +2533,7 @@ struct f5_tts_context* f5_tts_init_from_file(const char* path_model, struct f5_t
         }
 
         // §185: Vocos vocoder weights (1× per synthesis, ~54 MB F32)
-        {
+        if (ctx->hp.vocoder == "vocos") {
             auto& vc = ctx->voc_cache;
             read_tensor_f32(w.voc_embed_weight, vc.embed_w);
             read_tensor_f32(w.voc_embed_bias, vc.embed_b);
@@ -2202,6 +2575,35 @@ struct f5_tts_context* f5_tts_init_from_file(const char* path_model, struct f5_t
         }
     }
 
+    // #387 perf: configure + prime the shared GPU-capable HiFi-GAN vocoder.
+    // Arch is fixed by sbhifigan16k (rates [8,8,2,2], kernels [16,16,4,4],
+    // MRF [3,7,11]×[1,3,5]); the Raon mel feeds the vocoder directly, so no
+    // pre-normalization. Pre-permute the ConvTranspose1d upsample kernels once
+    // for the decomposed col2im path (mirrors fastpitch/speecht5).
+    if (ctx->hp.vocoder == "hifigan") {
+        auto& vhp = ctx->voc_hp;
+        vhp.model_in_dim = ctx->hp.mel_dim;
+        vhp.upsample_initial_ch = 512;
+        vhp.leaky_relu_slope = 0.1f;
+        vhp.normalize_before = false;
+        vhp.upsample_rates = {8, 8, 2, 2};
+        vhp.upsample_kernel_sizes = {16, 16, 4, 4};
+        vhp.resblock_kernel_sizes = {3, 7, 11};
+        vhp.resblock_dilation_sizes = {{1, 3, 5}, {1, 3, 5}, {1, 3, 5}};
+
+        const int n = vhp.num_upsamples();
+        std::vector<ggml_tensor*> srcs(n);
+        std::vector<ggml_tensor**> dsts(n);
+        ctx->ups_w_perm.resize(n, nullptr);
+        for (int i = 0; i < n; i++) {
+            auto it2 = ctx->hifigan_ts.find("voc.ups." + std::to_string(i) + ".weight");
+            srcs[i] = (it2 != ctx->hifigan_ts.end()) ? it2->second : nullptr;
+            dsts[i] = &ctx->ups_w_perm[i];
+        }
+        core_convt::permute_convt1d_weights_batch(srcs.data(), dsts.data(), n, ctx->backend, &ctx->ctx_perm,
+                                                  &ctx->buf_perm);
+    }
+
     // Apply params (0 = use model default)
     ctx->ode_steps = params.ode_steps > 0 ? params.ode_steps : ctx->hp.ode_steps;
     ctx->cfg_strength = params.cfg_strength > 0.0f ? params.cfg_strength : ctx->hp.cfg_strength;
@@ -2220,8 +2622,12 @@ void f5_tts_free(struct f5_tts_context* ctx) {
         return;
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
+    if (ctx->buf_perm)
+        ggml_backend_buffer_free(ctx->buf_perm); // #387 perf: permuted ups kernels
+    if (ctx->ctx_perm)
+        ggml_free(ctx->ctx_perm);
     if (ctx->w_buf)
-        ggml_backend_buffer_free(ctx->w_buf);
+        core_gguf::release_weight_buffer(ctx->w_buf);
     if (ctx->w_ctx)
         ggml_free(ctx->w_ctx);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)
@@ -2322,15 +2728,32 @@ int f5_tts_set_reference(struct f5_tts_context* ctx, const float* pcm_24k, int n
     pcm_24k = ref_pcm.data();
     n_samples = (int)ref_pcm.size();
 
-    // Compute mel spectrogram of reference audio
+    // Compute mel spectrogram of reference audio. sbhifigan16k (#387) uses the
+    // shipped slaney filterbank + window and STFT center=false at 16 kHz.
     int T_ref;
-    ctx->ref_mel = compute_mel_spectrogram(pcm_24k, n_samples, ctx->hp.n_fft, ctx->hp.hop_length, ctx->hp.win_length,
-                                           ctx->hp.mel_dim, T_ref);
+    const bool sbmel = (ctx->hp.mel_spec_type == "sbhifigan16k");
+    ctx->ref_mel =
+        compute_mel_spectrogram(pcm_24k, n_samples, ctx->hp.n_fft, ctx->hp.hop_length, ctx->hp.win_length,
+                                ctx->hp.mel_dim, T_ref, (float)ctx->hp.sample_rate, sbmel ? &ctx->mel_fb : nullptr,
+                                sbmel ? &ctx->mel_window : nullptr, sbmel ? ctx->hp.mel_center : true);
 
     // If mel computation not yet implemented, allow setting ref_mel directly
     // via the diff harness (which provides it as a GGUF tensor)
     ctx->ref_mel_T = T_ref;
     ctx->ref_text = ref_text ? ref_text : "";
+
+    // #387 mel-parity probe: dump the computed reference mel (T, mel_dim
+    // row-major) as raw f32 and exit, so the sbhifigan slaney/center=false
+    // front-end can be diffed against the reference ref_mel without paying
+    // for the (minutes-on-CPU) DiT ODE loop that follows.
+    if (const char* dp = crispasr_env::get("CRISPASR_F5_DUMP_REFMEL")) {
+        FILE* f = fopen(dp, "wb");
+        if (f) {
+            fwrite(ctx->ref_mel.data(), sizeof(float), ctx->ref_mel.size(), f);
+            fclose(f);
+            fprintf(stderr, "f5_tts: dumped ref_mel (T=%d, mel=%d) → %s\n", ctx->ref_mel_T, ctx->hp.mel_dim, dp);
+        }
+    }
     return 0;
 }
 
@@ -2341,6 +2764,222 @@ int f5_tts_synthesize(struct f5_tts_context* ctx, const char* text, float** pcm_
     const auto& hp = ctx->hp;
     int mel_dim = hp.mel_dim;
     int text_dim = hp.text_dim;
+
+    // #387-adj: enable per-stage dumps (ode_step_N, vocos_input, …) from the
+    // environment so a real synthesis' ODE trajectory can be inspected without
+    // a CLI flag. Only sets when the caller hasn't already set a dump dir.
+    if (ctx->dump_dir.empty()) {
+        if (const char* dd = crispasr_env::get("CRISPASR_F5_DUMP_DIR"))
+            ctx->dump_dir = dd;
+    }
+
+    // #387 vocoder-parity probe: CRISPASR_F5_VOCODE_MEL=<file>[:T] reads a raw
+    // f32 mel (T × mel_dim, row-major), runs ONLY the vocoder, and returns the
+    // audio — bypassing the DiT so the CPU HiFi-GAN can be diffed against the
+    // reference vocoder output without the minutes-long ODE loop.
+    if (const char* mp = crispasr_env::get("CRISPASR_F5_VOCODE_MEL")) {
+        FILE* f = fopen(mp, "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            long bytes = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            int n = (int)(bytes / sizeof(float));
+            int T = n / mel_dim;
+            std::vector<float> mel(n);
+            size_t rd = fread(mel.data(), sizeof(float), n, f);
+            fclose(f);
+            (void)rd;
+            const bool cpu_voc = crispasr_env::truthy("CRISPASR_F5_HIFIGAN_CPU");
+            auto audio = (hp.vocoder == "hifigan") ? (cpu_voc ? hifigan_decode(ctx, mel.data(), T, mel_dim)
+                                                              : hifigan_decode_ggml(ctx, mel.data(), T, mel_dim))
+                                                   : vocos_decode(ctx, mel.data(), T, mel_dim);
+            *pcm_out = (float*)malloc(audio.size() * sizeof(float));
+            memcpy(*pcm_out, audio.data(), audio.size() * sizeof(float));
+            *sample_rate_out = hp.sample_rate;
+            fprintf(stderr, "f5_tts: VOCODE_MEL probe T=%d mel=%d → %zu samples\n", T, mel_dim, audio.size());
+            return (int)audio.size();
+        }
+    }
+
+    // #387-adj DiT diff probe: CRISPASR_F5_DIT_PROBE=<dir> injects a reference
+    // input-embed output (hidden.bin, T×dim f32) + timestep embedding
+    // (temb.bin, dim f32) straight into ONE DiT forward, then dumps our velocity
+    // (cpp_velocity.bin, T×mel) and every per-block residual output
+    // (cpp_block_<k>.bin, T×dim). Diffing these against the Python reference
+    // localizes the first divergent DiT stage without the ODE loop or the
+    // input/text front-end. shape.txt: "<T>".
+    if (const char* pdir = crispasr_env::get("CRISPASR_F5_DIT_PROBE")) {
+        const int dim = hp.dim;
+        std::string dir(pdir);
+        auto rd_bin = [&](const std::string& name, size_t nfloats) {
+            std::vector<float> v(nfloats);
+            FILE* f = fopen((dir + "/" + name).c_str(), "rb");
+            if (!f) {
+                fprintf(stderr, "f5_tts: DIT_PROBE missing %s\n", name.c_str());
+                return std::vector<float>();
+            }
+            size_t got = fread(v.data(), sizeof(float), nfloats, f);
+            fclose(f);
+            v.resize(got);
+            return v;
+        };
+        auto wr_bin = [&](const std::string& name, const std::vector<float>& v) {
+            FILE* f = fopen((dir + "/" + name).c_str(), "wb");
+            if (f) {
+                fwrite(v.data(), sizeof(float), v.size(), f);
+                fclose(f);
+            }
+        };
+        int T = 0;
+        if (FILE* sf = fopen((dir + "/shape.txt").c_str(), "r")) {
+            if (fscanf(sf, "%d", &T) != 1)
+                T = 0;
+            fclose(sf);
+        }
+        std::vector<float> hidden = rd_bin("hidden.bin", (size_t)T * dim);
+        std::vector<float> temb = rd_bin("temb.bin", (size_t)dim);
+        if (T > 0 && (int)hidden.size() == T * dim && (int)temb.size() == dim) {
+            std::vector<float> velocity = f5_dit_run(ctx, hidden.data(), T, temb.data());
+            wr_bin("cpp_velocity.bin", velocity);
+            auto& cache = ctx->dit_cache;
+            for (size_t k = 0; k < cache.block_taps.size(); k++) {
+                std::vector<float> b((size_t)T * dim);
+                ggml_backend_tensor_get(cache.block_taps[k], b.data(), 0, b.size() * sizeof(float));
+                wr_bin("cpp_block_" + std::to_string(k) + ".bin", b);
+            }
+            fprintf(stderr, "f5_tts: DIT_PROBE T=%d dim=%d → velocity + %zu block taps\n", T, dim,
+                    cache.block_taps.size());
+        } else {
+            fprintf(stderr, "f5_tts: DIT_PROBE bad inputs (T=%d hidden=%zu temb=%zu)\n", T, hidden.size(), temb.size());
+        }
+        *pcm_out = (float*)malloc(sizeof(float));
+        (*pcm_out)[0] = 0.0f;
+        *sample_rate_out = hp.sample_rate;
+        return 1;
+    }
+
+    // #387-adj input-path probe: CRISPASR_F5_INPUT_PROBE=<dir> reads the raw
+    // DiT inputs a reference forward used — x.bin (T×mel), cond.bin (T×mel),
+    // tokens.bin (nt i32, raw char indices), t.txt (float), shape.txt "<T> <nt>"
+    // — runs ONLY our input path and dumps cpp_temb.bin (dim), cpp_text_embed.bin
+    // (T×text_dim) and cpp_hidden.bin (T×dim). The DiT-block diff already proved
+    // the transformer stack byte-exact given matched hidden+temb, so this
+    // localizes the divergence to time-embed / text-encoder / input-embed.
+    if (const char* pdir = crispasr_env::get("CRISPASR_F5_INPUT_PROBE")) {
+        std::string dir(pdir);
+        auto rd = [&](const std::string& nm, size_t nf) {
+            std::vector<float> v(nf);
+            FILE* f = fopen((dir + "/" + nm).c_str(), "rb");
+            size_t got = f ? fread(v.data(), sizeof(float), nf, f) : 0;
+            if (f)
+                fclose(f);
+            v.resize(got);
+            return v;
+        };
+        auto wr = [&](const std::string& nm, const std::vector<float>& v) {
+            FILE* f = fopen((dir + "/" + nm).c_str(), "wb");
+            if (f) {
+                fwrite(v.data(), sizeof(float), v.size(), f);
+                fclose(f);
+            }
+        };
+        int T = 0, nt = 0;
+        float t_val = 0.5f;
+        if (FILE* sf = fopen((dir + "/shape.txt").c_str(), "r")) {
+            if (fscanf(sf, "%d %d", &T, &nt) != 2)
+                T = 0;
+            fclose(sf);
+        }
+        if (FILE* tf = fopen((dir + "/t.txt").c_str(), "r")) {
+            if (fscanf(tf, "%f", &t_val) != 1)
+                t_val = 0.5f;
+            fclose(tf);
+        }
+        std::vector<float> x = rd("x.bin", (size_t)T * mel_dim);
+        std::vector<float> cond = rd("cond.bin", (size_t)T * mel_dim);
+        std::vector<int32_t> tokens(nt);
+        if (FILE* kf = fopen((dir + "/tokens.bin").c_str(), "rb")) {
+            size_t got = fread(tokens.data(), sizeof(int32_t), nt, kf);
+            fclose(kf);
+            tokens.resize(got);
+        }
+        if (T > 0 && (int)x.size() == T * mel_dim && (int)cond.size() == T * mel_dim) {
+            std::vector<float> temb = compute_time_embed(ctx, t_val);
+            // COND arm (drop_audio_cond=false, drop_text=false)
+            std::vector<float> text_embed = compute_text_embed(ctx, tokens.data(), (int)tokens.size(), T);
+            std::vector<float> hidden =
+                f5_compute_hidden(ctx, x.data(), T, mel_dim, cond.data(), text_embed.data(), text_dim, false, false, 0);
+            wr("cpp_temb.bin", temb);
+            wr("cpp_text_embed.bin", text_embed);
+            wr("cpp_hidden.bin", hidden);
+            // UNCOND arm (CFG null: drop_audio_cond=true, drop_text=true) — the
+            // arm every earlier probe skipped; CFG amplifies its error 2×.
+            std::vector<float> text_embed_u =
+                compute_text_embed(ctx, tokens.data(), (int)tokens.size(), T, /*drop_text=*/true);
+            std::vector<float> hidden_u = f5_compute_hidden(ctx, x.data(), T, mel_dim, cond.data(), text_embed_u.data(),
+                                                            text_dim, /*drop_audio_cond=*/true, /*drop_text=*/true, 0);
+            std::vector<float> vel_u = f5_dit_run(ctx, hidden_u.data(), T, temb.data());
+            wr("cpp_text_embed_uncond.bin", text_embed_u);
+            wr("cpp_hidden_uncond.bin", hidden_u);
+            wr("cpp_velocity_uncond.bin", vel_u);
+            fprintf(stderr, "f5_tts: INPUT_PROBE T=%d nt=%zu → cond+uncond arms dumped\n", T, tokens.size());
+        } else {
+            fprintf(stderr, "f5_tts: INPUT_PROBE bad inputs (T=%d x=%zu cond=%zu)\n", T, x.size(), cond.size());
+        }
+        *pcm_out = (float*)malloc(sizeof(float));
+        (*pcm_out)[0] = 0.0f;
+        *sample_rate_out = hp.sample_rate;
+        return 1;
+    }
+
+    // #387-adj ODE trajectory probe: CRISPASR_F5_ODE_PROBE=<dir> injects a matched
+    // x0 (x0.bin, T×mel), cond (cond.bin, T×mel) and tokens (tokens.bin, nt i32),
+    // runs the FULL euler_solve, and dumps x at every step (ode_step_N.bin, via
+    // dump_dir) so the free-running trajectory can be diffed step-by-step against
+    // the reference — the ONLY probe that exposes compounding divergence (matched
+    // per-stage snapshots are structurally blind to it). shape.txt: "<T> <nt>".
+    if (const char* pdir = crispasr_env::get("CRISPASR_F5_ODE_PROBE")) {
+        std::string dir(pdir);
+        auto rd = [&](const std::string& nm, size_t nf) {
+            std::vector<float> v(nf);
+            FILE* f = fopen((dir + "/" + nm).c_str(), "rb");
+            size_t got = f ? fread(v.data(), sizeof(float), nf, f) : 0;
+            if (f)
+                fclose(f);
+            v.resize(got);
+            return v;
+        };
+        int T = 0, nt = 0;
+        if (FILE* sf = fopen((dir + "/shape.txt").c_str(), "r")) {
+            if (fscanf(sf, "%d %d", &T, &nt) != 2)
+                T = 0;
+            fclose(sf);
+        }
+        std::vector<float> x0 = rd("x0.bin", (size_t)T * mel_dim);
+        std::vector<float> cond = rd("cond.bin", (size_t)T * mel_dim);
+        std::vector<int32_t> tokens(nt);
+        if (FILE* kf = fopen((dir + "/tokens.bin").c_str(), "rb")) {
+            size_t got = fread(tokens.data(), sizeof(int32_t), nt, kf);
+            fclose(kf);
+            tokens.resize(got);
+        }
+        if (T > 0 && (int)x0.size() == T * mel_dim && (int)cond.size() == T * mel_dim) {
+            ctx->ref_init_noise = x0; // euler_solve uses this as y0
+            ctx->dump_dir = dir;      // euler_solve dumps ode_step_N here
+            std::vector<float> text_emb = compute_text_embed(ctx, tokens.data(), (int)tokens.size(), T);
+            std::vector<float> text_emb_u =
+                compute_text_embed(ctx, tokens.data(), (int)tokens.size(), T, /*drop_text=*/true);
+            std::vector<float> gen = euler_solve(ctx, cond, text_emb, text_emb_u, T, mel_dim, text_dim);
+            fprintf(stderr, "f5_tts: ODE_PROBE T=%d nt=%zu → trajectory dumped (%zu final)\n", T, tokens.size(),
+                    gen.size());
+        } else {
+            fprintf(stderr, "f5_tts: ODE_PROBE bad inputs (T=%d x0=%zu cond=%zu)\n", T, x0.size(), cond.size());
+        }
+        *pcm_out = (float*)malloc(sizeof(float));
+        (*pcm_out)[0] = 0.0f;
+        *sample_rate_out = hp.sample_rate;
+        return 1;
+    }
 
     // ── Text preparation ──
     std::string ref_text = ctx->ref_text;
@@ -2384,9 +3023,9 @@ int f5_tts_synthesize(struct f5_tts_context* ctx, const char* text, float** pcm_
         float ref_secs = (float)ref_T / mel_fps;
         ref_text_len = std::max(1, (int)(ref_secs * 13.0f));
     } else {
-        ref_text_len = (int)ref_text.size();
+        ref_text_len = (int)f5_text_len(ref_text.c_str());
     }
-    int gen_text_len = (int)strlen(text);
+    int gen_text_len = (int)f5_text_len(text);
     // Per-char speech rate derived from the reference (mel frames per char).
     // #294: the guard here must be ASYMMETRIC. Under-estimating the rate makes
     // `duration` too short and TRUNCATES the generated speech (drops the tail of
@@ -2401,6 +3040,27 @@ int f5_tts_synthesize(struct f5_tts_context* ctx, const char* text, float** pcm_
     // guard (a bad/too-long ref transcript must not collapse the rate to zero),
     // but only a very loose UPPER guard that catches a garbage near-empty
     // transcript (which would explode the duration) — not genuinely slow speech.
+    // SHORT-PROMPT HANDLING (#387-adj), ported from Raon's utils_infer.py — but
+    // only HALF of it, deliberately. Upstream does two things we did not:
+    //
+    //   (a) local_speed = 0.3 when the gen text is < 10 UTF-8 bytes, i.e. ~3.3x
+    //       MORE frames for one-word synthesis. PORTED below: without it a
+    //       one-word --tts was rushed or truncated on every f5-family backend.
+    //   (b) clamps sec_per_byte to a 12 chars/s floor via VAD. NOT PORTED, and
+    //       porting it would REINTRODUCE #294. The numbers, at mel_fps 93.75:
+    //           upstream 12 c/s cap   7.81 frames/byte = 1.08x fixed_rate
+    //           the cap that broke    18.03            = 2.50x  (truncated the
+    //             #294 reporter's slow reference — "leaves out parts of
+    //             sentences")
+    //           our current guard     57.69            = 8.00x
+    //       Upstream's clamp is 2.3x TIGHTER than one already measured to
+    //       truncate speech here. It is not the same quantity: upstream derives
+    //       sec_per_byte from VAD-measured speech with silence excluded, so the
+    //       clamp guards a silence-inflated ref; our `rate` comes from ref_T,
+    //       which INCLUDES silence and padding. Same number, different meaning.
+    //       Applying it literally would cap genuinely slow references.
+    //
+    // CRISPASR_F5_SHORT_PROMPT_SPEED=0 disables (a) for A/B.
     float rate = (float)ref_T / (float)std::max(1, ref_text_len);
     // The clamp is an ADD-ON over the upstream formula (which has no clamp); gate
     // it so it can be switched off. CRISPASR_F5_DURATION_CLAMP=0 restores the
@@ -2409,7 +3069,18 @@ int f5_tts_synthesize(struct f5_tts_context* ctx, const char* text, float** pcm_
     bool duration_clamp = !(clamp_env && std::strcmp(clamp_env, "0") == 0);
     if (duration_clamp)
         rate = std::min(std::max(rate, fixed_rate * 0.75f), fixed_rate * 8.0f);
-    int duration = ref_T + (int)(rate * (float)gen_text_len / ctx->speed);
+    // (a): upstream REPLACES the speed for very short gen text rather than
+    // multiplying, so a user --tts-speed does not compound with it.
+    const char* sp_env = crispasr_env::get("CRISPASR_F5_SHORT_PROMPT_SPEED");
+    const bool short_prompt_speed = !(sp_env && std::strcmp(sp_env, "0") == 0);
+    float eff_speed = ctx->speed;
+    if (short_prompt_speed && gen_text_len < 10 && gen_text_len > 0) {
+        eff_speed = 0.3f;
+        if (ctx->verbosity >= 1)
+            fprintf(stderr, "f5_tts: short gen text (%d bytes < 10) -> local_speed 0.3 (Raon utils_infer)\n",
+                    gen_text_len);
+    }
+    int duration = ref_T + (int)(rate * (float)gen_text_len / eff_speed);
 
     if (ctx->verbosity >= 1) {
         fprintf(stderr, "f5_tts: ref_T=%d duration=%d tokens=%zu text='%s'\n", ref_T, duration, tokens.size(),
@@ -2426,8 +3097,13 @@ int f5_tts_synthesize(struct f5_tts_context* ctx, const char* text, float** pcm_
         return 0;
     dump_stage(ctx, "text_embed", text_emb.data(), text_emb.size());
 
-    // Unconditional text embedding (all zeros)
-    std::vector<float> text_emb_uncond(duration * text_dim, 0.0f);
+    // Unconditional text embedding (CFG drop_text): the filler embedding run
+    // through the text encoder with the REAL padding mask — NOT all zeros (see
+    // compute_text_embed). #387-adj: the all-zeros shortcut garbled the 1B.
+    std::vector<float> text_emb_uncond = compute_text_embed(ctx, tokens.data(), (int)tokens.size(), duration,
+                                                            /*drop_text=*/true);
+    if (text_emb_uncond.empty())
+        return 0;
 
     // ── Conditioning (ref mel padded to duration) ──
     std::vector<float> cond(duration * mel_dim, 0.0f);
@@ -2472,9 +3148,12 @@ int f5_tts_synthesize(struct f5_tts_context* ctx, const char* text, float** pcm_
     }
     dump_stage(ctx, "vocos_input", gen_mel.data(), gen_mel.size());
 
-    // ── Vocos vocoder ──
-    f5_bench_stage _b_voc("vocos_vocoder");
-    auto audio = vocos_decode(ctx, gen_mel.data(), gen_T, mel_dim);
+    // ── Vocoder (Vocos for stock F5; HiFi-GAN for Raon sbhifigan16k, #387) ──
+    f5_bench_stage _b_voc("vocoder");
+    const bool cpu_voc = crispasr_env::truthy("CRISPASR_F5_HIFIGAN_CPU");
+    auto audio = (hp.vocoder == "hifigan") ? (cpu_voc ? hifigan_decode(ctx, gen_mel.data(), gen_T, mel_dim)
+                                                      : hifigan_decode_ggml(ctx, gen_mel.data(), gen_T, mel_dim))
+                                           : vocos_decode(ctx, gen_mel.data(), gen_T, mel_dim);
     if (audio.empty()) {
         // Fallback: return empty for now, will be filled once vocos is implemented
         *pcm_out = nullptr;

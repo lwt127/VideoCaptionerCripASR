@@ -34,11 +34,21 @@ namespace CrispASR.Tests
             Assert.Equal(0.03f, w.Alts[0].P);
         }
 
+        // Times are SECONDS (issue #291), formatted culture-invariantly so the
+        // string is the same on a machine whose decimal separator is a comma.
         [Fact]
-        public void Word_ToString_ShowsRange()
+        public void Word_ToString_ShowsRangeInSeconds()
         {
-            var w = new Word("test", 100, 200, 0.9f);
-            Assert.Equal("100-200 test", w.ToString());
+            var w = new Word("test", 1.0, 2.0, 0.9f);
+            Assert.Equal("1.00-2.00 test", w.ToString());
+        }
+
+        [Fact]
+        public void Word_UntimedSentinelSurvivesRoundTrip()
+        {
+            var w = new Word("test", -1.0, -1.0, 0.9f);
+            Assert.Equal(-1.0, w.T0);
+            Assert.Equal(-1.0, w.T1);
         }
 
         // ---- AltToken ----
@@ -72,10 +82,10 @@ namespace CrispASR.Tests
         }
 
         [Fact]
-        public void Segment_ToString_ShowsBracketedRange()
+        public void Segment_ToString_ShowsBracketedRangeInSeconds()
         {
-            var seg = new Segment("hello world", 50, 300, Array.Empty<Word>());
-            Assert.Equal("[50-300] hello world", seg.ToString());
+            var seg = new Segment("hello world", 0.5, 3.0, Array.Empty<Word>());
+            Assert.Equal("[0.50-3.00] hello world", seg.ToString());
         }
 
         [Fact]

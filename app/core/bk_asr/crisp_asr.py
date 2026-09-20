@@ -9,15 +9,18 @@ from ...config import BIN_PATH, MODEL_PATH
 from ..utils.logger import setup_logger
 from .asr_data import ASRData, ASRDataSeg
 from .base import BaseASR
+from .crisp_asr_catalog import CRISP_ASR_WHISPER_HF_REPOS
+from .crisp_asr_licenses import accepted_license_tag
+from .crisp_asr_options import ENGINE_FLAVORS, alignment_args
 
 logger = setup_logger("crisp_asr")
 
 # CrispASR 二进制目录（随应用打包在 resource/bin/CrispASR 下）
 CRISP_ASR_BIN = Path(BIN_PATH) / "CrispASR" / "crispasr.exe"
 
-# 期望的最低引擎版本；低于该版本的本地引擎会被自动升级（下载 v0.8.25）。
+# 期望的最低引擎版本；低于该版本的本地引擎会被自动升级（下载 v0.8.34）。
 # 与 crisp_asr_download_thread.CRISP_ASR_PINNED_TAG 保持一致。
-CRISP_ASR_MIN_VERSION = (0, 8, 25)
+CRISP_ASR_MIN_VERSION = (0, 8, 34)
 
 # CrispASR 引擎内部把解码后的采样点数量强转为 32 位有符号 int
 # （examples/cli/crispasr_run.cpp: `(int)samples.size()`）。解码后统一为
@@ -48,7 +51,7 @@ def cuda_available() -> bool:
 
 
 def engine_supports_cuda(exe_path) -> bool:
-    """运行 crispasr --version，判断该二进制的 ggml 后端是否包含 cuda/vulkan(GPU)。"""
+    """运行 crispasr --version，判断是否包含 CUDA（不把 Vulkan 当作 CUDA）。"""
     try:
         r = subprocess.run(
             [str(exe_path), "--version"],
@@ -64,7 +67,7 @@ def engine_supports_cuda(exe_path) -> bool:
         for line in out.splitlines():
             if "backends" in line.lower():
                 low = line.lower()
-                return "cuda" in low or "vulkan" in low
+                return r.returncode == 0 and "cuda" in low
         return False
     except Exception:
         return False
@@ -87,6 +90,8 @@ def engine_version(exe_path) -> tuple[int, int, int] | None:
         )
         out = (r.stdout or "") + (r.stderr or "")
         # 兼容 "version : 0.8.8"、"crispasr 0.8.8 (...)" 等多种输出格式
+        if r.returncode != 0:
+            return None
         m = re.search(r"(?:version\s*[:=]?\s*|crispasr\s+)v?(\d+)\.(\d+)\.(\d+)", out, re.IGNORECASE)
         if not m:
             m = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", out)
@@ -126,6 +131,11 @@ class CrispASR(BaseASR):
         use_vad: bool = True,
         use_cache: bool = False,
         need_word_time_stamp: bool = False,
+        license_acceptances: tuple[str, ...] = (),
+        engine_flavor: str = "auto",
+        alignment_mode: str = "default",
+        aligner: str = "qwen3-forced-aligner",
+        word_timestamps: bool = False,
     ):
         super().__init__(audio_path, False)
         assert os.path.exists(audio_path), f"音频文件 {audio_path} 不存在"
@@ -133,83 +143,73 @@ class CrispASR(BaseASR):
 
         self.backend = backend or "whisper"
         self.vad_method = vad_method or "silero"
+        # Enforce consent outside the GUI too, before downloads or inference.
+        self.accepted_license = accepted_license_tag(
+            self.backend, model or "auto", license_acceptances
+        )
 
-        # 解析模型参数：
-        #  - "auto" → 交由 CrispASR 下载该后端默认模型（缓存到其默认用户缓存目录）
-        #  - "ggml-*.bin"（whisper 后端）→ 优先用本地 models 目录的文件；
-        #    若本地不存在，则回退为 "auto"，让 CrispASR 自动下载默认 whisper 模型。
-        if model and model != "auto" and "ggml" in model.lower():
-            models_dir = Path(MODEL_PATH)
-            candidate = models_dir / model
-            if candidate.exists():
+        # Only use exact local matches. A missing selected model must never
+        # silently turn into "auto" or a different quantization/architecture.
+        self.model_arg = model or "auto"
+        self.hf_repo = None
+        if self.backend == "whisper" and self.model_arg in CRISP_ASR_WHISPER_HF_REPOS:
+            candidate = Path(MODEL_PATH) / self.model_arg
+            if candidate.is_file():
                 self.model_arg = str(candidate)
-                logger.info(f"使用本地模型文件: {self.model_arg}")
             else:
-                matches = list(models_dir.glob(f"*{Path(model).stem}*.bin"))
-                if matches:
-                    self.model_arg = str(matches[0])
-                    logger.info(f"使用本地模型文件: {self.model_arg}")
-                else:
-                    # 本地没有该 ggml 模型 → 交给 CrispASR 自动下载
-                    self.model_arg = "auto"
-                    logger.info(
-                        f"本地未找到模型 '{model}'，改用自动下载 (backend={self.backend})"
-                    )
-        else:
-            # 自动下载（CrispASR 使用其默认用户缓存目录）
-            self.model_arg = model or "auto"
-            logger.info(
-                f"使用自动下载模型: backend={self.backend}, model={self.model_arg}"
-            )
+                self.hf_repo = CRISP_ASR_WHISPER_HF_REPOS[self.model_arg]
+        elif self.backend == "whisper" and self.model_arg not in ("auto", "default"):
+            if not Path(self.model_arg).is_file():
+                raise ValueError(f"找不到指定 Whisper 模型: {self.model_arg}，不会改用其他模型")
+        logger.info("使用模型: backend=%s, model=%s", self.backend, self.model_arg)
 
         # 定位 crispasr 可执行文件（缺失时在 _run 阶段自动下载，不在此处抛错）
         self.crisp_asr_path = Path(crisp_asr_path) if crisp_asr_path else CRISP_ASR_BIN
 
         self.language = language
         self.lid_method = lid_method
-        self.use_gpu = use_gpu
+        if engine_flavor not in ENGINE_FLAVORS:
+            raise ValueError(f"未知引擎版本: {engine_flavor}")
+        self.engine_flavor = engine_flavor
+        # Explicit CPU flavors always disable offload; the GPU switch also
+        # allows CPU execution with a GPU build.
+        self.use_gpu = use_gpu and engine_flavor not in ("cpu", "cpu-legacy")
         self.use_vad = use_vad
-        self.need_word_time_stamp = need_word_time_stamp
+        self.need_word_time_stamp = need_word_time_stamp or word_timestamps
+        self.alignment_mode = alignment_mode
+        self.aligner = aligner
+        self._alignment_args = alignment_args(
+            alignment_mode, aligner, language, self.need_word_time_stamp
+        )
+        self._custom_engine = crisp_asr_path is not None
         self.process = None
 
     def _ensure_engine(self, callback) -> None:
-        """确保 crispasr 引擎二进制存在；缺失则从 GitHub Releases 自动下载。
+        """Keep each managed flavor in its own directory, safe for queued jobs."""
+        from app.thread.crisp_asr_download_thread import validate_engine
 
-        在转录线程内同步执行，进度通过 callback 反馈，不阻塞 UI 线程。
-
-        若开启 GPU 且检测到 NVIDIA 显卡，但当前引擎为 CPU-only 构建，
-        则自动下载 CUDA 构建以启用 GPU 加速。
-        """
-        want_cuda = self.use_gpu and cuda_available()
-
-        # 已存在引擎时：
-        #   1) 版本低于最低要求 → 升级到目标版本（v0.8.25）；
-        #   2) 需要 CUDA 但当前为 CPU-only → 升级为 CUDA 构建。
-        if self.crisp_asr_path.exists():
-            ver = engine_version(self.crisp_asr_path)
-            need_upgrade = ver is not None and ver < CRISP_ASR_MIN_VERSION
-            if need_upgrade:
-                logger.info(
-                    "当前 CrispASR 版本 %s 低于要求 %s，升级引擎…",
-                    ".".join(map(str, ver)),
-                    ".".join(map(str, CRISP_ASR_MIN_VERSION)),
-                )
-                callback(0, "正在升级 CrispASR 引擎到新版本…")
-                self._download_engine(callback, prefer_gpu=want_cuda)
-            elif want_cuda and not engine_supports_cuda(self.crisp_asr_path):
-                logger.info("检测到 NVIDIA GPU，但当前 CrispASR 为 CPU 构建，升级为 CUDA 构建…")
-                callback(0, "检测到显卡，正在下载 CUDA 版 CrispASR 引擎…")
-                self._download_engine(callback, prefer_gpu=True)
-            else:
-                if want_cuda:
-                    logger.info("CrispASR 引擎已支持 CUDA，使用 GPU 加速")
+        flavor = self.engine_flavor
+        if not self.use_gpu:
+            # Qwen alignment creates its own GPU-enabled context upstream.
+            # Use a CPU-only binary, not just the main ASR's --no-gpu flag.
+            flavor = "cpu-legacy" if flavor == "cpu-legacy" else "cpu"
+        elif flavor == "auto":
+            flavor = "cuda" if self.use_gpu and cuda_available() else "cpu"
+        if self._custom_engine:
+            validate_engine(self.crisp_asr_path, flavor)
             return
+        # Reuse the original bundled CUDA12 build in Auto mode without moving it.
+        if self.engine_flavor == "auto" and CRISP_ASR_BIN.is_file():
+            try:
+                validate_engine(CRISP_ASR_BIN, flavor)
+                self.crisp_asr_path = CRISP_ASR_BIN
+                return
+            except (RuntimeError, OSError, subprocess.SubprocessError):
+                pass
+        self.crisp_asr_path = CRISP_ASR_BIN.parent / flavor / "crispasr.exe"
+        self._download_engine(callback, flavor=flavor)
 
-        logger.info("未检测到 CrispASR 引擎，开始自动下载…")
-        callback(0, "正在下载 CrispASR 引擎…")
-        self._download_engine(callback, prefer_gpu=want_cuda)
-
-    def _download_engine(self, callback, prefer_gpu: bool):
+    def _download_engine(self, callback, prefer_gpu: bool = False, flavor=None):
         """下载并安装 CrispASR 引擎（CPU 或 CUDA 构建）。"""
         try:
             from app.thread.crisp_asr_download_thread import (
@@ -220,7 +220,7 @@ class CrispASR(BaseASR):
                 f"未找到 CrispASR 引擎，且无法加载下载模块: {e}"
             )
 
-        target_dir = Path(CRISP_ASR_BIN).parent
+        target_dir = self.crisp_asr_path.parent
 
         def _dl_progress(pct: int, msg: str):
             # 引擎下载占进度前 30%，避免与转录进度冲突
@@ -230,7 +230,8 @@ class CrispASR(BaseASR):
             target_dir,
             prefer_gpu=prefer_gpu,
             progress=_dl_progress,
-            force=True,  # 允许覆盖已有（CPU→CUDA 升级）
+            force=False,  # 验证并复用同版本；批次任务不会重复覆盖正在使用的引擎。
+            flavor=flavor,
         )
         self.crisp_asr_path = Path(exe)
         logger.info("CrispASR 引擎已就绪: %s (GPU=%s)", self.crisp_asr_path, prefer_gpu)
@@ -273,6 +274,12 @@ class CrispASR(BaseASR):
             "--output-file",
             str(output_base),
         ]
+
+        if self.hf_repo:
+            params.extend(["--hf-repo", self.hf_repo, "--hf-file", self.model_arg])
+        if self.accepted_license:
+            params.extend(["--accept-license", self.accepted_license])
+        params.extend(self._alignment_args)
 
         # GPU 控制：默认启用 GPU，关闭时传 --no-gpu
         if not self.use_gpu:
@@ -598,6 +605,7 @@ class CrispASR(BaseASR):
         return (
             f"crispasr-{self.crc32_hex}-{self.need_word_time_stamp}"
             f"-{self.backend}-{Path(str(self.model_arg)).name}-{self.language}"
+            f"-{self.alignment_mode}-{self.aligner}-{self.engine_flavor}-{self.use_gpu}"
         )
 
     def get_audio_duration(self, filepath: str) -> int:

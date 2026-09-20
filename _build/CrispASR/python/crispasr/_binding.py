@@ -4,9 +4,12 @@ Provides speech-to-text transcription using ggml inference.
 Wraps the whisper.h C API from crispasr / CrispASR.
 """
 
+import codecs
+import contextlib
 import ctypes
 import os
 import platform
+import threading
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -504,6 +507,7 @@ class DiarizeMethod:
     XCORR = 1       # stereo only
     VAD_TURNS = 2   # mono-friendly, timing-based
     PYANNOTE = 3    # mono-friendly, GGUF pyannote seg model
+    FOXNOSE = 4     # mono-friendly, WeSpeaker + spectral clustering
 
 
 @dataclass
@@ -517,6 +521,52 @@ class DiarizeSegment:
     t0: float
     t1: float
     speaker: int = -1
+
+
+@dataclass
+class DiarizeTurn:
+    """One audio-derived speaker turn returned by FoxNose.
+
+    Times are seconds on the same absolute timeline as
+    :class:`DiarizeSegment`. Other diarization methods return no turns.
+    """
+    t0: float
+    t1: float
+    speaker: int
+
+
+class _DiarizeSegAbi(ctypes.Structure):
+    _fields_ = [
+        ("t0_cs", ctypes.c_int64),
+        ("t1_cs", ctypes.c_int64),
+        ("speaker", ctypes.c_int32),
+        ("_pad", ctypes.c_int32),
+    ]
+
+
+class _DiarizeOptsAbi(ctypes.Structure):
+    # APPEND-ONLY mirror of crispasr_diarize_opts_abi. Keep the explicit
+    # padding field: native code reads all 48 bytes on 64-bit platforms.
+    _fields_ = [
+        ("method", ctypes.c_int32),
+        ("n_threads", ctypes.c_int32),
+        ("slice_t0_cs", ctypes.c_int64),
+        ("pyannote_model_path", ctypes.c_char_p),
+        ("foxnose_embedder_path", ctypes.c_char_p),
+        ("min_speakers", ctypes.c_int32),
+        ("max_speakers", ctypes.c_int32),
+        ("num_speakers", ctypes.c_int32),
+        ("_pad2", ctypes.c_int32),
+    ]
+
+
+class _DiarizeTurnAbi(ctypes.Structure):
+    _fields_ = [
+        ("t0_cs", ctypes.c_int64),
+        ("t1_cs", ctypes.c_int64),
+        ("speaker", ctypes.c_int32),
+        ("_pad", ctypes.c_int32),
+    ]
 
 
 # =========================================================================
@@ -1106,17 +1156,78 @@ def diarize_segments(
     pyannote_model_path: Optional[str] = None,
     n_threads: int = 4,
     slice_t0: float = 0.0,
+    foxnose_embedder_path: Optional[str] = None,
+    min_speakers: int = 0,
+    max_speakers: int = 0,
+    num_speakers: int = 0,
     lib_path: Optional[str] = None,
 ) -> bool:
     """Assign a speaker index to each of ``segs``, mutating in place.
 
-    Four methods — see :class:`DiarizeMethod`. ``left`` is mono PCM for
+    Five methods — see :class:`DiarizeMethod`. ``left`` is mono PCM for
     mono-only methods, otherwise the left channel of a stereo pair.
     All PCM is 16 kHz float32. Returns ``True`` on success; only
-    ``PYANNOTE`` can fail (model load failure).
+    Model-backed methods can fail when their model cannot be loaded.
     """
+    ok, _ = _diarize_segments_impl(
+        segs, left, right=right, is_stereo=is_stereo, method=method,
+        pyannote_model_path=pyannote_model_path, n_threads=n_threads,
+        slice_t0=slice_t0, foxnose_embedder_path=foxnose_embedder_path,
+        min_speakers=min_speakers, max_speakers=max_speakers,
+        num_speakers=num_speakers, lib_path=lib_path, want_turns=False,
+    )
+    return ok
+
+
+def diarize_segments_with_turns(
+    segs: List[DiarizeSegment],
+    left: np.ndarray,
+    *,
+    right: Optional[np.ndarray] = None,
+    is_stereo: bool = False,
+    method: int = DiarizeMethod.VAD_TURNS,
+    pyannote_model_path: Optional[str] = None,
+    n_threads: int = 4,
+    slice_t0: float = 0.0,
+    foxnose_embedder_path: Optional[str] = None,
+    min_speakers: int = 0,
+    max_speakers: int = 0,
+    num_speakers: int = 0,
+    lib_path: Optional[str] = None,
+) -> Tuple[bool, List[DiarizeTurn]]:
+    """Label ``segs`` and return audio-derived FoxNose speaker turns.
+
+    The returned timestamps are seconds on the same absolute timeline as the
+    input segments. Non-FoxNose methods return an empty turn list.
+    """
+    return _diarize_segments_impl(
+        segs, left, right=right, is_stereo=is_stereo, method=method,
+        pyannote_model_path=pyannote_model_path, n_threads=n_threads,
+        slice_t0=slice_t0, foxnose_embedder_path=foxnose_embedder_path,
+        min_speakers=min_speakers, max_speakers=max_speakers,
+        num_speakers=num_speakers, lib_path=lib_path, want_turns=True,
+    )
+
+
+def _diarize_segments_impl(
+    segs: List[DiarizeSegment],
+    left: np.ndarray,
+    *,
+    right: Optional[np.ndarray],
+    is_stereo: bool,
+    method: int,
+    pyannote_model_path: Optional[str],
+    n_threads: int,
+    slice_t0: float,
+    foxnose_embedder_path: Optional[str],
+    min_speakers: int,
+    max_speakers: int,
+    num_speakers: int,
+    lib_path: Optional[str],
+    want_turns: bool,
+) -> Tuple[bool, List[DiarizeTurn]]:
     if not segs or left is None or len(left) == 0:
-        return True
+        return True, []
 
     lib = ctypes.CDLL(lib_path or _find_lib())
     if not hasattr(lib, "crispasr_diarize_segments_abi"):
@@ -1139,46 +1250,73 @@ def diarize_segments(
     else:
         right_ptr = left_ptr
 
-    # ABI structs must match crispasr_c_api.cpp.
-    class _SegAbi(ctypes.Structure):
-        _fields_ = [
-            ("t0_cs", ctypes.c_int64),
-            ("t1_cs", ctypes.c_int64),
-            ("speaker", ctypes.c_int32),
-            ("_pad", ctypes.c_int32),
-        ]
-
-    class _OptsAbi(ctypes.Structure):
-        _fields_ = [
-            ("method", ctypes.c_int32),
-            ("n_threads", ctypes.c_int32),
-            ("slice_t0_cs", ctypes.c_int64),
-            ("pyannote_model_path", ctypes.c_char_p),
-        ]
-
-    seg_array = (_SegAbi * len(segs))()
+    seg_array = (_DiarizeSegAbi * len(segs))()
     for i, s in enumerate(segs):
         seg_array[i].t0_cs = int(round(s.t0 * 100))
         seg_array[i].t1_cs = int(round(s.t1 * 100))
         seg_array[i].speaker = s.speaker
         seg_array[i]._pad = 0
 
-    opts = _OptsAbi(
+    opts = _DiarizeOptsAbi(
         method=int(method),
         n_threads=int(n_threads),
         slice_t0_cs=int(round(slice_t0 * 100)),
         pyannote_model_path=(pyannote_model_path.encode("utf-8")
                              if pyannote_model_path else None),
+        foxnose_embedder_path=(foxnose_embedder_path.encode("utf-8")
+                               if foxnose_embedder_path else None),
+        min_speakers=int(min_speakers),
+        max_speakers=int(max_speakers),
+        num_speakers=int(num_speakers),
+        _pad2=0,
     )
 
-    rc = lib.crispasr_diarize_segments_abi(
-        left_ptr, right_ptr, int(len(left_np)), 1 if is_stereo else 0,
-        ctypes.byref(seg_array), len(segs), ctypes.byref(opts),
-    )
+    turns: List[DiarizeTurn] = []
+    if want_turns:
+        if not hasattr(lib, "crispasr_diarize_segments_turns_abi"):
+            raise RuntimeError(
+                "crispasr_diarize_segments_turns_abi not in loaded library — "
+                "rebuild CrispASR 0.8.30+ to receive FoxNose turns."
+            )
+        fn = lib.crispasr_diarize_segments_turns_abi
+        fn.argtypes = [
+            ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int32, ctypes.c_int32, ctypes.c_void_p, ctypes.c_int32,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32,
+            ctypes.POINTER(ctypes.c_int32),
+        ]
+        fn.restype = ctypes.c_int
+        turn_cap = max(1, (len(left_np) + 7999) // 8000 + len(segs) + 16)
+        for attempt in range(2):
+            turn_array = (_DiarizeTurnAbi * turn_cap)()
+            n_turns = ctypes.c_int32()
+            rc = fn(
+                left_ptr, right_ptr, int(len(left_np)), 1 if is_stereo else 0,
+                ctypes.byref(seg_array), len(segs), ctypes.byref(opts),
+                ctypes.byref(turn_array), turn_cap, ctypes.byref(n_turns),
+            )
+            if rc == 2 and attempt == 0 and n_turns.value > turn_cap:
+                turn_cap = n_turns.value
+                continue
+            if rc == 0:
+                turns = [
+                    DiarizeTurn(
+                        t0=turn_array[i].t0_cs / 100.0,
+                        t1=turn_array[i].t1_cs / 100.0,
+                        speaker=int(turn_array[i].speaker),
+                    )
+                    for i in range(min(n_turns.value, turn_cap))
+                ]
+            break
+    else:
+        rc = lib.crispasr_diarize_segments_abi(
+            left_ptr, right_ptr, int(len(left_np)), 1 if is_stereo else 0,
+            ctypes.byref(seg_array), len(segs), ctypes.byref(opts),
+        )
     if rc == 0:
         for i, s in enumerate(segs):
             s.speaker = int(seg_array[i].speaker)
-    return rc == 0
+    return rc == 0, turns
 
 
 class Session:
@@ -1811,7 +1949,7 @@ class Session:
         return vocab
 
     # ---------------------------------------------------------------------
-    # TTS synthesis (vibevoice, qwen3-tts, miotts, moss-tts, moss-tts-local, omnivoice, kokoro, orpheus, chatterbox, outetts, indextts, voxcpm2, csm, dia, zonos-tts, bark, speecht5, parler-tts, pocket-tts, kugelaudio, tada, lfm2-audio, dots-tts)
+    # TTS synthesis (vibevoice, qwen3-tts, miotts, moss-tts, moss-tts-local, confucius4-tts, omnivoice, kokoro, orpheus, chatterbox, outetts, indextts, voxcpm2, csm, dia, zonos-tts, bark, speecht5, parler-tts, pocket-tts, kugelaudio, tada, lfm2-audio, dots-tts, fireredtts3)
     # ---------------------------------------------------------------------
 
     def set_codec_path(self, path: str) -> None:
@@ -1932,7 +2070,7 @@ class Session:
             raise RuntimeError(f"set_speaker_id failed (rc={rc}) for backend {self.backend!r}")
 
     def set_instruct(self, instruct: str) -> None:
-        """Set the natural-language voice description (qwen3-tts VoiceDesign).
+        """Set the voice description / style instruct (qwen3-tts, parler, omnivoice).
 
         VoiceDesign generates speech in a voice **described by a
         natural-language instruction** — no reference WAV, no preset
@@ -1943,9 +2081,24 @@ class Session:
 
         Required for qwen3-tts VoiceDesign before
         :meth:`synthesize`. Re-callable; latest call wins. Raises if
-        the active backend isn't VoiceDesign.
+        the active backend has no instruct contract.
 
         Detect VoiceDesign via :meth:`is_voice_design`.
+
+        .. warning::
+           **omnivoice does not take free prose.** It was trained on a
+           closed 48-item vocabulary — a gender, age, pitch, style,
+           accent or Chinese dialect, comma-separated, at most one per
+           category — and the string reaches its prompt literally, so
+           anything else is rejected rather than ignored::
+
+               s.set_instruct("female, elderly, british accent")   # ok
+               s.set_instruct("a gruff pirate")                    # raises
+
+           Casing and separator width are normalised for you, and the
+           whole instruct is unified to the language of the text being
+           spoken (``"male, elderly"`` becomes ``男，老年`` for Chinese
+           text). See docs/tts.md for the full vocabulary.
         """
         if not hasattr(self._lib, "crispasr_session_set_instruct"):
             raise RuntimeError("set_instruct API not present in this libcrispasr build")
@@ -1975,6 +2128,18 @@ class Session:
             )
         if rc != 0:
             raise RuntimeError(f"set_tts_phonemes failed (rc={rc})")
+
+    def set_tts_pad_silence_ms(self, ms: int) -> None:
+        """Pad N ms of silence at the beginning of TTS output. Useful to bypass VLC playback bugs where it drops the first ~1.5s of audio while parsing a large C2PA chunk.
+
+        Args:
+            ms: Milliseconds of silence to pad (e.g. 1500).
+        """
+        if not hasattr(self._lib, "crispasr_session_set_tts_pad_silence_ms"):
+            raise RuntimeError("set_tts_pad_silence_ms API not present in this libcrispasr build")
+        self._lib.crispasr_session_set_tts_pad_silence_ms.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self._lib.crispasr_session_set_tts_pad_silence_ms.restype = None
+        self._lib.crispasr_session_set_tts_pad_silence_ms(self._session, int(ms))
 
     def clear_phoneme_cache(self) -> None:
         """Drop the kokoro per-session phoneme cache.
@@ -2020,6 +2185,29 @@ class Session:
         rc = self._lib.crispasr_session_set_target_language(self._handle, lang.encode("utf-8"))
         if rc != 0:
             raise RuntimeError(f"set_target_language failed (rc={rc})")
+
+    def set_tts_reference_language(self, lang: str) -> None:
+        """Language a voice-cloning reference clip is spoken in (issue #329).
+
+        Cross-lingual TTS backends (cosyvoice3) compare it to the requested
+        output language — :meth:`set_target_language`, falling back to
+        :meth:`set_source_language` — and drop the reference transcript when
+        they differ, so the clone speaks the target language rather than
+        carrying the reference's accent.
+
+        Optional: the backend otherwise infers the reference language from the
+        voice-bank entry or the reference transcript. That inference cannot
+        answer for a short transcript, and when it cannot, the requested target
+        language has no effect — set this to make it explicit. Empty string
+        clears.
+        """
+        if not hasattr(self._lib, "crispasr_session_set_tts_reference_language"):
+            raise RuntimeError("session-state API not present in this libcrispasr build")
+        self._lib.crispasr_session_set_tts_reference_language.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        self._lib.crispasr_session_set_tts_reference_language.restype = ctypes.c_int
+        rc = self._lib.crispasr_session_set_tts_reference_language(self._handle, lang.encode("utf-8"))
+        if rc != 0:
+            raise RuntimeError(f"set_tts_reference_language failed (rc={rc})")
 
     def set_punctuation(self, enable: bool) -> None:
         """Toggle punctuation + capitalisation in the output (canary/cohere
@@ -2142,7 +2330,7 @@ class Session:
 
     def set_tts_steps(self, steps: int) -> None:
         """Set the diffusion / CFM / masked-iterative step count for step-based
-        TTS backends (chatterbox, vibevoice, kugelaudio, tada, irodori, omnivoice).
+        TTS backends (chatterbox, vibevoice, kugelaudio, tada, irodori, omnivoice, supertonic).
 
         Higher = better fidelity, slower. Soft no-op (rc=-2) when the active
         backend has no step-based stage.
@@ -2260,6 +2448,16 @@ class Session:
         if rc != 0 and rc != -2:
             raise RuntimeError(f"set_max_speech_tokens failed (rc={rc})")
 
+    def set_min_speech_tokens(self, n: int) -> None:
+        """Set the floor on generated audio length (MOSS TTS). Units are codec frames at 12.5 Hz (80 ms each), so n=25 floors at ~2 s; other backends no-op (rc=-2)."""
+        if not hasattr(self._lib, "crispasr_session_set_min_speech_tokens"):
+            return
+        self._lib.crispasr_session_set_min_speech_tokens.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self._lib.crispasr_session_set_min_speech_tokens.restype = ctypes.c_int
+        rc = self._lib.crispasr_session_set_min_speech_tokens(self._handle, int(n))
+        if rc != 0 and rc != -2:
+            raise RuntimeError(f"set_min_speech_tokens failed (rc={rc})")
+
     def set_length_scale(self, scale: float) -> None:
         """Set the per-phoneme length-scale / speaking-rate scalar. Honoured by kokoro."""
         if not hasattr(self._lib, "crispasr_session_set_length_scale"):
@@ -2347,6 +2545,38 @@ class Session:
         )
         if rc != 0:
             raise RuntimeError(f"set_fallback_thresholds failed (rc={rc})")
+
+    def set_sensitivity(self, preset: str) -> None:
+        """Apply a named bundle of the four decoder fallback thresholds.
+
+        One of "conservative", "balanced" (the shipped defaults, always a
+        no-op) or "aggressive"; "strict"/"default"/"loose" are aliases.
+        Mirrors the CLI's --sensitivity.
+
+        conservative tightens the entropy and logprob bars and LOWERS
+        no_speech_thold, so borderline audio is discarded rather than guessed
+        at -- fewer hallucinations, some marginal speech lost. aggressive does
+        the opposite: quiet or whispered audio still produces text.
+
+        The four thresholds interact (a decode is only retried when the
+        logprob AND no-speech bars are both crossed), which is why they move
+        as a set. A later set_fallback_thresholds() overrides this.
+
+        Raises ValueError for an unrecognised preset -- a typo is never
+        silently treated as "balanced".
+        """
+        if not hasattr(self._lib, "crispasr_session_set_sensitivity"):
+            return
+        self._lib.crispasr_session_set_sensitivity.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        self._lib.crispasr_session_set_sensitivity.restype = ctypes.c_int
+        rc = self._lib.crispasr_session_set_sensitivity(self._handle, str(preset).encode("utf-8"))
+        if rc == -2:
+            raise ValueError(
+                f"unknown sensitivity preset {preset!r} "
+                "(expected: conservative, balanced, aggressive)"
+            )
+        if rc != 0:
+            raise RuntimeError(f"set_sensitivity failed (rc={rc})")
 
     def set_alt_n(self, n: int) -> None:
         """Set per-token top-N alternative-candidate capture for whisper greedy decode. 0 = off."""
@@ -2634,8 +2864,8 @@ class Session:
         ``kokoro``, ``orpheus``, ``chatterbox``, ``indextts``, ``voxcpm2-tts``,
         ``csm``, ``dia``, ``fastpitch``, ``bananamind-tts``, ``speecht5``,
         ``melotts``, ``piper``, ``parler-tts``, ``outetts``, ``cosyvoice3-tts``,
-        ``pocket-tts``, ``f5-tts``, ``irodori-tts``, ``bark``, ``kugelaudio``, ``tada``,
-        ``lfm2-audio``, ``voxtral-tts``, ``dots-tts``, ``omnivoice``.
+        ``pocket-tts``, ``f5-tts``, ``irodori-tts``, ``supertonic``, ``bark``, ``kugelaudio``, ``tada``,
+        ``lfm2-audio``, ``voxtral-tts``, ``dots-tts``, ``fireredtts3``, ``omnivoice``.
         For qwen3-tts call :meth:`set_codec_path` and one of:
 
         * :meth:`set_voice` — Base variants (WAV + ref_text, or voice-pack GGUF)
@@ -2679,6 +2909,33 @@ class Session:
         ]
         self._lib.crispasr_session_accept_marking_responsibility.restype = ctypes.c_int
         self._lib.crispasr_session_accept_marking_responsibility(self._handle, attestation.encode("utf-8"))
+
+    def set_speaker_identity(self, identity: str) -> None:
+        """Declare whose voice a PRESET voice is: "real_person", "synthetic" or
+        "unknown". A preset shipped inside a model can be an identifiable
+        individual, which makes its output a deep fake under EU AI Act
+        Art. 3(60) even though nothing was cloned — so "not a clone" is not
+        the same as "nothing to disclose". Setting real_person makes the
+        Art. 50(4) reminder fire for a non-cloned voice; it does NOT require a
+        consent attestation, because the donor's agreement to the training is
+        settled upstream and you cannot attest to it.
+
+        Raises :class:`ValueError` on an unrecognised value rather than
+        silently downgrading it to "unknown" — a typo must not quietly remove
+        a duty you meant to declare.
+        """
+        if not hasattr(self._lib, "crispasr_session_set_speaker_identity"):
+            raise RuntimeError("speaker-identity API not present in this libcrispasr build")
+        self._lib.crispasr_session_set_speaker_identity.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        self._lib.crispasr_session_set_speaker_identity.restype = ctypes.c_int
+        rc = self._lib.crispasr_session_set_speaker_identity(self._handle, identity.encode("utf-8"))
+        if rc == -2:
+            raise ValueError(
+                f"unrecognised speaker_identity {identity!r}; "
+                "expected 'real_person', 'synthetic' or 'unknown'"
+            )
+        if rc != 0:
+            raise RuntimeError(f"set_speaker_identity failed (rc={rc})")
 
     def synthesize_raw(self, text: str) -> "np.ndarray":
         """UNMARKED synthesis (no watermark), for callers that post-process
@@ -2830,6 +3087,33 @@ class Session:
             self._lib.crispasr_session_translate_text_free.restype = None
             self._lib.crispasr_session_translate_text_free(text_out)
         return arr, transcript
+
+    def input_sample_rate(self) -> int:
+        """Sample rate this backend expects for input PCM, in Hz.
+
+        :meth:`speech_to_speech` and the other PCM entry points want audio at
+        the backend's native rate, and it varies by backend — so telling
+        callers to resample to it, without giving them a way to ask what it
+        is, is not actionable (issue #321).
+        """
+        if not hasattr(self._lib, "crispasr_session_input_sample_rate"):
+            raise RuntimeError("input_sample_rate not present in this libcrispasr build")
+        self._lib.crispasr_session_input_sample_rate.argtypes = [ctypes.c_void_p]
+        self._lib.crispasr_session_input_sample_rate.restype = ctypes.c_int
+        return int(self._lib.crispasr_session_input_sample_rate(self._handle))
+
+    def output_sample_rate(self) -> int:
+        """Sample rate of PCM this backend returns, in Hz.
+
+        The counterpart to :meth:`input_sample_rate`: what
+        :meth:`speech_to_speech` and :meth:`synthesize` hand back. 24 kHz for
+        conversational S2S, 48 kHz for Sidon and VoxCPM2 AudioVAE.
+        """
+        if not hasattr(self._lib, "crispasr_session_output_sample_rate"):
+            raise RuntimeError("output_sample_rate not present in this libcrispasr build")
+        self._lib.crispasr_session_output_sample_rate.argtypes = [ctypes.c_void_p]
+        self._lib.crispasr_session_output_sample_rate.restype = ctypes.c_int
+        return int(self._lib.crispasr_session_output_sample_rate(self._handle))
 
     def close(self) -> None:
         if getattr(self, "_handle", None):
@@ -3416,6 +3700,37 @@ def detect_backend_from_gguf(
     return out.value.decode("utf-8")
 
 
+def detect_backends_from_gguf(
+    gguf_path: str,
+    *,
+    lib_path: Optional[str] = None,
+) -> list:
+    """Every backend that can open this GGUF, primary first (#433).
+
+    ``detect_backend_from_gguf`` is 1:1 — one architecture string, one backend —
+    and that is not always the whole truth. A voxcpm2 GGUF opens both as
+    ``voxcpm2-tts`` (the full TTS pipeline) and as ``voxcpm2-vae`` (the
+    standalone causal VAE upscaler): the VAE entry point calls the same loader
+    with ``vae_only``, and there is no separate VAE model to download.
+
+    Returns ``[]`` when the architecture maps to no backend, matching
+    ``detect_backend_from_gguf`` returning ``""``.
+    """
+    lib = ctypes.CDLL(lib_path or _find_lib())
+    fn = lib.crispasr_detect_backends_from_gguf
+    fn.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+    fn.restype = ctypes.c_int
+
+    cap = 512
+    out = ctypes.create_string_buffer(cap)
+    rc = fn(gguf_path.encode("utf-8"), out, cap)
+    # rc == -5 is "buffer too small", never a truncated list — the ABI refuses
+    # rather than naming fewer backends than exist.
+    if rc < 0:
+        raise RuntimeError(f"detect_backends_from_gguf failed (rc={rc})")
+    return [l for l in out.value.decode("utf-8").splitlines() if l]
+
+
 # =========================================================================
 # Direct Parakeet API (bypasses unified session)
 # =========================================================================
@@ -3636,8 +3951,21 @@ def watermark_load_model(gguf_path: str) -> None:
         raise RuntimeError(f"crispasr_watermark_load_model failed (rc={rc})")
 
 
-def watermark_embed(pcm: "numpy.ndarray", alpha: float = 0.005) -> None:
-    """Embed an AI-generated watermark into float32 PCM in-place."""
+def watermark_embed(pcm: "numpy.ndarray", alpha: float = -1.0) -> None:
+    """Embed an AI-generated watermark into float32 PCM in-place.
+
+    ``alpha`` controls spread-spectrum strength; ignored when AudioSeal is
+    loaded. The default (``<= 0``) selects the band-limited strength that makes
+    the mark reliably *detectable*, which is the property EU AI Act Art. 50(2)
+    requires — this is the call :func:`Session.synthesize_raw` callers use to
+    discharge marking themselves, so it has to produce a findable mark.
+
+    This defaulted to ``0.005`` — the strength the C ABI documents as "too
+    faint to reliably detect on real speech". An explicit positive alpha is
+    passed through verbatim and bypasses the robust default, so every caller
+    that relied on the default was emitting audio it could not detect a
+    watermark in. Only pass a literal alpha to A/B watermark strength.
+    """
     import numpy as np
     if pcm.dtype != np.float32:
         raise TypeError("pcm must be float32")
@@ -3660,3 +3988,823 @@ def watermark_detect(pcm: "numpy.ndarray") -> float:
     fn.restype = ctypes.c_float
     return float(fn(pcm.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                     ctypes.c_int(len(pcm))))
+
+
+# ---------------------------------------------------------------------------
+# Chat / LLM — the crispasr_chat.h surface
+# ---------------------------------------------------------------------------
+#
+# EU AI Act: this surface generates synthetic TEXT, which the runtime does NOT
+# mark for you the way every audio path watermarks. Show
+# `ChatSession.ai_disclosure_text()` at or before the first turn of anything
+# that talks to a person, and read docs/eu-ai-act.md §6.6 before shipping.
+#
+# Every entry point of that header is bound here, crispasr_chat_memory_estimate
+# included.
+
+# The one error code crispasr_chat.h promises as a contract. Every other
+# non-zero value is a diagnostic aid — read the message, don't switch on it.
+CRISPASR_CHAT_ERR_ABORTED = 40
+
+
+class ChatAborted(RuntimeError):
+    """A registered abort predicate stopped the generation.
+
+    Subclasses :class:`RuntimeError`, which is what every other failure on
+    this binding raises, so ``except RuntimeError`` still catches a cancel
+    while ``except ChatAborted`` tells a cancel apart from a decode fault.
+
+    Whatever text already reached ``on_token`` is valid, and the session has
+    been flushed back to its just-opened state — reuse it directly, without a
+    :meth:`ChatSession.reset`.
+    """
+
+
+@dataclass
+class ChatMessage:
+    """One turn in a conversation.
+
+    ``role`` is one of "system", "user", "assistant", "tool" (the OpenAI chat
+    schema); the model's chat template maps those onto whatever it expects.
+    Every method that takes messages also accepts plain dicts with the same
+    two keys.
+    """
+    role: str
+    content: str
+
+
+# ABI structs — must match include/crispasr_chat.h.
+class _ChatErrorAbi(ctypes.Structure):
+    _fields_ = [
+        ("code", ctypes.c_int32),
+        ("message", ctypes.c_char * 256),
+    ]
+
+
+class _ChatMessageAbi(ctypes.Structure):
+    _fields_ = [
+        ("role", ctypes.c_char_p),
+        ("content", ctypes.c_char_p),
+    ]
+
+
+class _ChatOpenParamsAbi(ctypes.Structure):
+    _fields_ = [
+        ("n_threads", ctypes.c_int32),
+        ("n_threads_batch", ctypes.c_int32),
+        ("n_ctx", ctypes.c_int32),
+        ("n_batch", ctypes.c_int32),
+        ("n_ubatch", ctypes.c_int32),
+        ("n_gpu_layers", ctypes.c_int32),
+        ("use_mmap", ctypes.c_bool),
+        ("use_mlock", ctypes.c_bool),
+        ("embeddings", ctypes.c_bool),
+        ("chat_template", ctypes.c_char_p),
+    ]
+
+
+class _ChatGenerateParamsAbi(ctypes.Structure):
+    _fields_ = [
+        ("max_tokens", ctypes.c_int32),
+        ("temperature", ctypes.c_float),
+        ("top_k", ctypes.c_int32),
+        ("top_p", ctypes.c_float),
+        ("min_p", ctypes.c_float),
+        ("repeat_penalty", ctypes.c_float),
+        ("repeat_last_n", ctypes.c_int32),
+        ("seed", ctypes.c_uint32),
+        ("stop", ctypes.POINTER(ctypes.c_char_p)),
+        ("n_stop", ctypes.c_size_t),
+        ("prefill_only", ctypes.c_bool),
+    ]
+
+
+def _chat_lib(lib_path: Optional[str] = None):
+    """Load libcrispasr and declare every crispasr_chat_* signature."""
+    lib = ctypes.CDLL(lib_path or _find_lib())
+    if not hasattr(lib, "crispasr_chat_open"):
+        raise RuntimeError("chat API not present in this libcrispasr build")
+
+    err_p = ctypes.POINTER(_ChatErrorAbi)
+    msg_p = ctypes.POINTER(_ChatMessageAbi)
+    open_p = ctypes.POINTER(_ChatOpenParamsAbi)
+    gen_p = ctypes.POINTER(_ChatGenerateParamsAbi)
+
+    lib.crispasr_chat_open_params_default.argtypes = [open_p]
+    lib.crispasr_chat_open_params_default.restype = None
+    lib.crispasr_chat_generate_params_default.argtypes = [gen_p]
+    lib.crispasr_chat_generate_params_default.restype = None
+
+    lib.crispasr_chat_open.argtypes = [ctypes.c_char_p, open_p, err_p]
+    lib.crispasr_chat_open.restype = ctypes.c_void_p
+    lib.crispasr_chat_close.argtypes = [ctypes.c_void_p]
+    lib.crispasr_chat_close.restype = None
+    lib.crispasr_chat_reset.argtypes = [ctypes.c_void_p, err_p]
+    lib.crispasr_chat_reset.restype = ctypes.c_int32
+
+    # Returned as POINTER(c_char), not c_char_p: ctypes turns a c_char_p
+    # restype into a bytes object and loses the pointer we have to hand back
+    # to crispasr_chat_string_free.
+    lib.crispasr_chat_generate.argtypes = [ctypes.c_void_p, msg_p, ctypes.c_size_t, gen_p, err_p]
+    lib.crispasr_chat_generate.restype = ctypes.POINTER(ctypes.c_char)
+    lib.crispasr_chat_string_free.argtypes = [ctypes.POINTER(ctypes.c_char)]
+    lib.crispasr_chat_string_free.restype = None
+
+    lib.crispasr_chat_generate_stream.argtypes = [
+        ctypes.c_void_p, msg_p, ctypes.c_size_t, gen_p,
+        ChatSession._ON_TOKEN_CB_TYPE, ctypes.c_void_p, err_p,
+    ]
+    lib.crispasr_chat_generate_stream.restype = ctypes.c_int32
+    lib.crispasr_chat_set_abort_callback.argtypes = [
+        ctypes.c_void_p, ChatSession._ABORT_CB_TYPE, ctypes.c_void_p,
+    ]
+    lib.crispasr_chat_set_abort_callback.restype = None
+
+    lib.crispasr_chat_count_tokens.argtypes = [ctypes.c_void_p, msg_p, ctypes.c_size_t, err_p]
+    lib.crispasr_chat_count_tokens.restype = ctypes.c_int32
+    lib.crispasr_chat_memory_estimate.argtypes = [ctypes.c_char_p, open_p, err_p]
+    lib.crispasr_chat_memory_estimate.restype = ctypes.c_size_t
+    lib.crispasr_chat_n_ctx.argtypes = [ctypes.c_void_p]
+    lib.crispasr_chat_n_ctx.restype = ctypes.c_int32
+    lib.crispasr_chat_template_name.argtypes = [ctypes.c_void_p]
+    lib.crispasr_chat_template_name.restype = ctypes.c_char_p
+    lib.crispasr_chat_ai_disclosure_text.argtypes = []
+    lib.crispasr_chat_ai_disclosure_text.restype = ctypes.c_char_p
+    return lib
+
+
+def _chat_raise(err: _ChatErrorAbi, fallback: str, code_hint: int = 0):
+    """Raise the right exception for a filled crispasr_chat_error.
+
+    The one-shot path signals failure by returning NULL, so there `err` is the
+    only carrier; the streaming path also returns the code, passed as
+    `code_hint`.
+    """
+    code = err.code if err.code != 0 else code_hint
+    message = err.message.decode("utf-8", "replace") if err.message else ""
+    if not message:
+        message = fallback
+    if code == CRISPASR_CHAT_ERR_ABORTED:
+        raise ChatAborted(message)
+    raise RuntimeError(message)
+
+
+def _chat_cstr(value: str, field: str) -> bytes:
+    """UTF-8 encode a string for the C ABI, rejecting an interior NUL.
+
+    C reads a NUL as the end of the string, so a NUL inside a model path, a
+    message, a stop sequence or a chat template would silently drop everything
+    after it instead of being passed through — for a path, that means opening
+    a different file from the one the caller named. Rust's ``CString::new``
+    rejects the same input; this raises :class:`ValueError` naming the field.
+    """
+    data = value.encode("utf-8")
+    if b"\x00" in data:
+        raise ValueError(f"{field} contains an interior NUL byte, which C cannot carry")
+    return data
+
+
+def _chat_messages(messages) -> Tuple[ctypes.Array, list]:
+    """Build the C message array. The returned list keeps the encoded bytes
+    alive for as long as the caller holds it — the array only holds pointers."""
+    encoded = []
+    for i, m in enumerate(messages):
+        if isinstance(m, ChatMessage):
+            role, content = m.role, m.content
+        else:
+            role, content = m["role"], m["content"]
+        encoded.append((_chat_cstr(role, f"messages[{i}].role"),
+                        _chat_cstr(content, f"messages[{i}].content")))
+    arr = (_ChatMessageAbi * len(encoded))()
+    for i, (role_b, content_b) in enumerate(encoded):
+        arr[i].role = role_b
+        arr[i].content = content_b
+    return arr, encoded
+
+
+def _chat_open_params(
+    lib, *,
+    n_threads: Optional[int] = None,
+    n_threads_batch: Optional[int] = None,
+    n_ctx: Optional[int] = None,
+    n_batch: Optional[int] = None,
+    n_ubatch: Optional[int] = None,
+    n_gpu_layers: Optional[int] = None,
+    use_mmap: Optional[bool] = None,
+    use_mlock: Optional[bool] = None,
+    chat_template: Optional[str] = None,
+) -> Tuple[_ChatOpenParamsAbi, list]:
+    """ABI defaults with the fields the caller named applied over them, so no
+    default is duplicated here. `None` means "leave the ABI's own value"."""
+    params = _ChatOpenParamsAbi()
+    lib.crispasr_chat_open_params_default(ctypes.byref(params))
+    if n_threads is not None:
+        params.n_threads = int(n_threads)
+    if n_threads_batch is not None:
+        params.n_threads_batch = int(n_threads_batch)
+    if n_ctx is not None:
+        params.n_ctx = int(n_ctx)
+    if n_batch is not None:
+        params.n_batch = int(n_batch)
+    if n_ubatch is not None:
+        params.n_ubatch = int(n_ubatch)
+    if n_gpu_layers is not None:
+        params.n_gpu_layers = int(n_gpu_layers)
+    if use_mmap is not None:
+        params.use_mmap = bool(use_mmap)
+    if use_mlock is not None:
+        params.use_mlock = bool(use_mlock)
+    keep = []
+    if chat_template is not None:
+        tmpl = _chat_cstr(chat_template, "chat_template")
+        keep.append(tmpl)
+        params.chat_template = tmpl
+    return params, keep
+
+
+def _chat_generate_params(
+    lib, *,
+    max_tokens: Optional[int] = None,
+    temperature: Optional[float] = None,
+    top_k: Optional[int] = None,
+    top_p: Optional[float] = None,
+    min_p: Optional[float] = None,
+    repeat_penalty: Optional[float] = None,
+    repeat_last_n: Optional[int] = None,
+    seed: Optional[int] = None,
+    stop: Optional[List[str]] = None,
+    prefill_only: Optional[bool] = None,
+) -> Tuple[_ChatGenerateParamsAbi, list]:
+    """As :func:`_chat_open_params`, for the per-call sampler settings."""
+    params = _ChatGenerateParamsAbi()
+    lib.crispasr_chat_generate_params_default(ctypes.byref(params))
+    if max_tokens is not None:
+        params.max_tokens = int(max_tokens)
+    if temperature is not None:
+        params.temperature = float(temperature)
+    if top_k is not None:
+        params.top_k = int(top_k)
+    if top_p is not None:
+        params.top_p = float(top_p)
+    if min_p is not None:
+        params.min_p = float(min_p)
+    if repeat_penalty is not None:
+        params.repeat_penalty = float(repeat_penalty)
+    if repeat_last_n is not None:
+        params.repeat_last_n = int(repeat_last_n)
+    if seed is not None:
+        params.seed = int(seed)
+    if prefill_only is not None:
+        params.prefill_only = bool(prefill_only)
+    keep = []
+    if stop:
+        items = [_chat_cstr(s, f"stop[{i}]") for i, s in enumerate(stop)]
+        arr = (ctypes.c_char_p * len(items))(*items)
+        keep.append(items)
+        keep.append(arr)
+        params.stop = ctypes.cast(arr, ctypes.POINTER(ctypes.c_char_p))
+        params.n_stop = len(items)
+    return params, keep
+
+
+class _ChatCallbackState:
+    """Carries an exception a Python callback raised across the native call.
+
+    ctypes prints and swallows an exception that escapes a callback, and
+    letting one unwind through C is undefined behaviour either way, so the
+    trampolines below stash it here and the calling method re-raises once the
+    native call has returned.
+
+    Once ``error`` is set neither callback calls into the caller's code again:
+    a predicate that raised cannot be trusted to answer, and once the token
+    callback has raised there is nobody left to hand chunks to. The abort
+    trampoline then answers "stop" on its own, which is what turns either
+    failure into a cancellation of the run.
+    """
+    __slots__ = ("error",)
+
+    def __init__(self):
+        self.error = None
+
+
+class ChatSession:
+    """Text → text chat / LLM session over a GGUF model.
+
+    Usage::
+
+        with crispasr.ChatSession("gemma-3-1b-it-Q4_K_M.gguf") as chat:
+            msgs = [{"role": "user", "content": "Name three primes."}]
+            print(chat.count_tokens(msgs), "of", chat.n_ctx, "prompt tokens")
+            print(chat.generate(msgs))
+
+    One call at a time per session, which crispasr_chat.h requires and this
+    class enforces: a :meth:`generate` or :meth:`generate_stream` entered while
+    another thread is inside one on the same session raises
+    :class:`RuntimeError` instead of waiting. It is a diagnostic, not a queue —
+    the intended pattern is one session per worker thread, and a caller who
+    lands here has two threads sharing a session, which no amount of waiting
+    turns into concurrency. :meth:`close` is the exception: it waits, since
+    freeing the session under a running call is worse than a pause.
+
+    Pass the WHOLE conversation in ``messages`` on every call: the session
+    compares the templated prompt against the tokens it already holds and
+    decodes only the new suffix. Passing just the latest turn is not wrong, it
+    simply shares no prefix and re-prefills from scratch.
+
+    Generation releases the GIL for its duration — ctypes drops the GIL around
+    every call into a :class:`ctypes.CDLL`, which is how this library is
+    loaded — so other Python threads run while the model decodes.
+    ``on_token`` and ``should_continue`` re-acquire it for their own duration and
+    both run on the calling thread.
+    """
+
+    # void(const char* utf8_chunk, void* user) and bool(void* user). Both are
+    # built per call and held in the calling frame, which outlives the native
+    # call it made: ctypes keeps no reference of its own, and a collected
+    # trampoline is a dangling function pointer inside a running generation.
+    # An instance attribute cannot hold them — it is one slot, so a second
+    # call on the same session overwrites it and frees a pointer C is still
+    # holding, and close() on another thread does the same.
+    _ON_TOKEN_CB_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_void_p)
+    _ABORT_CB_TYPE = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p)
+
+    def __init__(
+        self, model_path: str, *,
+        lib_path: Optional[str] = None,
+        n_threads: Optional[int] = None,
+        n_threads_batch: Optional[int] = None,
+        n_ctx: Optional[int] = None,
+        n_batch: Optional[int] = None,
+        n_ubatch: Optional[int] = None,
+        n_gpu_layers: Optional[int] = None,
+        use_mmap: Optional[bool] = None,
+        use_mlock: Optional[bool] = None,
+        chat_template: Optional[str] = None,
+    ):
+        """Open a GGUF chat model. Every parameter left as ``None`` keeps the
+        value ``crispasr_chat_open_params_default`` supplies.
+
+        ``chat_template`` overrides the template baked into the GGUF; ``None``
+        reads ``tokenizer.chat_template`` from the model and falls back to
+        "chatml".
+        """
+        # First, so close() from __del__ can take them even if the open below
+        # fails.
+        self._init_state()
+        self._lib = _chat_lib(lib_path)
+        params, _keep = _chat_open_params(
+            self._lib, n_threads=n_threads, n_threads_batch=n_threads_batch,
+            n_ctx=n_ctx, n_batch=n_batch, n_ubatch=n_ubatch,
+            n_gpu_layers=n_gpu_layers, use_mmap=use_mmap, use_mlock=use_mlock,
+            chat_template=chat_template,
+        )
+        err = _ChatErrorAbi()
+        handle = self._lib.crispasr_chat_open(
+            _chat_cstr(model_path, "model_path"), ctypes.byref(params), ctypes.byref(err))
+        if not handle:
+            _chat_raise(err, f"failed to open chat model {model_path!r}")
+        self._handle = handle
+
+    @property
+    def n_ctx(self) -> int:
+        """The session's context window, in tokens."""
+        with self._use("n_ctx", closed_raises=False) as handle:
+            return int(self._lib.crispasr_chat_n_ctx(handle))
+
+    @property
+    def template_name(self) -> str:
+        """The chat template the session resolved against — "chatml",
+        "llama3", "gemma", ..."""
+        # C returns a pointer into the session's own string, valid only until
+        # close — but the c_char_p restype makes ctypes copy the bytes into a
+        # Python object as the call returns, which is inside the hold. `name`
+        # is that copy, so decoding it outside costs nothing and races nothing.
+        # A restype of POINTER(c_char) here would be a use-after-free.
+        with self._use("template_name", closed_raises=False) as handle:
+            name = self._lib.crispasr_chat_template_name(handle)
+        return name.decode("utf-8") if name else ""
+
+    def reset(self) -> None:
+        """Clear the KV cache so the next generate re-prefills from scratch.
+        Call it when starting a new conversation in a reused session — not
+        after a :class:`ChatAborted`, which already flushed."""
+        err = _ChatErrorAbi()
+        with self._use("reset") as handle:
+            rc = self._lib.crispasr_chat_reset(handle, ctypes.byref(err))
+        if rc != 0:
+            _chat_raise(err, "crispasr_chat_reset failed", rc)
+
+    def count_tokens(self, messages) -> int:
+        """Prompt tokens a FRESH session prefills for ``messages``.
+
+        Counts the whole prompt — the template's control tokens, the leading
+        BOS, and the trailing generation prompt — so it compares straight
+        against :attr:`n_ctx`. An empty ``messages`` counts the template's
+        own opening, which is whatever that template emits for no messages —
+        template-dependent, and possibly nothing at all: several chat
+        templates write only from inside their loop over the messages, and
+        those return ``0``. Do not read a positive overhead into it. On a
+        session part-way
+        through a conversation it is an upper bound, since only the unheld
+        suffix is re-decoded. A pure query: it touches neither the KV cache
+        nor the history.
+        """
+        msgs, _keep = _chat_messages(messages)
+        err = _ChatErrorAbi()
+        with self._use("count_tokens") as handle:
+            n = self._lib.crispasr_chat_count_tokens(
+                handle, msgs, len(msgs), ctypes.byref(err))
+        if n < 0:
+            # A negative return is the failure sentinel, not an error code —
+            # `err` is the only carrier here, so there is no hint to pass.
+            _chat_raise(err, "crispasr_chat_count_tokens failed")
+        return int(n)
+
+    def generate(
+        self, messages, *,
+        should_continue: Optional[Callable[[], bool]] = None,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        min_p: Optional[float] = None,
+        repeat_penalty: Optional[float] = None,
+        repeat_last_n: Optional[int] = None,
+        seed: Optional[int] = None,
+        stop: Optional[List[str]] = None,
+        prefill_only: Optional[bool] = None,
+    ) -> str:
+        """Apply the chat template to ``messages``, generate, return the reply.
+
+        Sampler settings left as ``None`` keep the ABI's own defaults.
+        ``max_tokens=0`` is not "generate nothing": the ABI reads any
+        non-positive value as unset and applies its own default of 256 — pass
+        ``prefill_only=True`` to suppress generation instead.
+        ``should_continue`` is described on :meth:`generate_stream`; on abort
+        this raises :class:`ChatAborted` and the partial text is discarded,
+        since the one-shot path has nowhere to hand it back. Called on a
+        session another thread is already generating on, it raises
+        :class:`RuntimeError` without waiting — see the class docstring.
+        """
+        params, _keep = _chat_generate_params(
+            self._lib, max_tokens=max_tokens, temperature=temperature,
+            top_k=top_k, top_p=top_p, min_p=min_p,
+            repeat_penalty=repeat_penalty, repeat_last_n=repeat_last_n,
+            seed=seed, stop=stop, prefill_only=prefill_only)
+        msgs, _msg_keep = _chat_messages(messages)
+        err = _ChatErrorAbi()
+        state = _ChatCallbackState()
+
+        with self._use("generate") as handle:
+            self._enter_call("generate")
+            try:
+                abort_cb = self._register_abort(handle, should_continue, state)
+                try:
+                    out = self._lib.crispasr_chat_generate(
+                        handle, msgs, len(msgs), ctypes.byref(params), ctypes.byref(err))
+                finally:
+                    self._clear_abort(handle, should_continue)
+                    # C no longer holds the pointer, so the trampoline may go.
+                    del abort_cb
+            finally:
+                self._call_lock.release()
+        # A callback that raised outranks whatever the native call reported.
+        if state.error is not None:
+            raise state.error
+        if not out:
+            _chat_raise(err, "crispasr_chat_generate failed")
+        try:
+            return ctypes.cast(out, ctypes.c_char_p).value.decode("utf-8", "replace")
+        finally:
+            self._lib.crispasr_chat_string_free(out)
+
+    def generate_stream(
+        self, messages, on_token: Callable[[str], None], *,
+        should_continue: Optional[Callable[[], bool]] = None,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        min_p: Optional[float] = None,
+        repeat_penalty: Optional[float] = None,
+        repeat_last_n: Optional[int] = None,
+        seed: Optional[int] = None,
+        stop: Optional[List[str]] = None,
+        prefill_only: Optional[bool] = None,
+    ) -> None:
+        """Generate, calling ``on_token(chunk)`` once per detokenised chunk.
+
+        Concatenating the chunks yields exactly what :meth:`generate` returns
+        for the same messages and params — except when a stop sequence ends
+        the generation. The C side hands each piece to the callback before it
+        scans for a match, so the chunk the match lands in has already been
+        delivered, while the one-shot return value is truncated before the
+        match. With ``stop`` set, the streamed text is therefore the one-shot
+        text plus that last chunk, and a caller who wants the truncated form
+        has to cut it back themselves.
+
+        Every chunk is whole characters. A model that spells a character the
+        tokeniser does not hold emits it one byte per token, so those bytes
+        are buffered here and delivered once the character is complete: such
+        a run of tokens produces ONE call rather than one per token, and the
+        number of calls is therefore at most the number of tokens, not equal
+        to it. If the generation stops part-way through a character the
+        leftover bytes arrive as replacement characters in a final call,
+        rather than being dropped.
+
+        ``on_token`` runs on the calling thread for the duration of this call
+        only, with the session mutex held — so like ``should_continue`` it must
+        not call back into this session, which deadlocks. Called on a session
+        another thread is already generating on, this raises
+        :class:`RuntimeError` without waiting — see the class docstring.
+        ``max_tokens=0`` behaves as on :meth:`generate`: it selects the ABI's
+        default of 256, not "no tokens".
+
+        **Abort polarity: ``should_continue()`` returns True to LET THE
+        GENERATION CONTINUE** and False to abort it — a "may I keep going?"
+        predicate. That is the polarity of ``crispasr_chat_abort_callback``
+        in crispasr_chat.h, which in turn matches the encoder-begin callback
+        on the ASR surface; this binding passes your answer to C as it is,
+        without inverting it. It is called on the generating thread before
+        each prompt batch and before each sampled token, and on the CPU
+        backend additionally from inside a running compute graph, so keep it
+        cheap and non-blocking. It must not call back into this session: the
+        session mutex is held for the whole generation and re-entering
+        deadlocks. On abort this raises :class:`ChatAborted`, having already
+        delivered the partial text through ``on_token``, and the session is
+        left reusable without a :meth:`reset`.
+
+        An exception from ``on_token`` or ``should_continue`` never unwinds
+        through C. It is captured, further chunks are dropped, and the
+        exception is re-raised from this method once the native call has
+        returned. If an abort predicate is registered the generation is also
+        cancelled: from the next check onwards the predicate is no longer
+        consulted and the answer is "stop". With no predicate registered
+        there is no way to ask the ABI to stop, so the call runs to
+        completion first.
+        """
+        params, _keep = _chat_generate_params(
+            self._lib, max_tokens=max_tokens, temperature=temperature,
+            top_k=top_k, top_p=top_p, min_p=min_p,
+            repeat_penalty=repeat_penalty, repeat_last_n=repeat_last_n,
+            seed=seed, stop=stop, prefill_only=prefill_only)
+        msgs, _msg_keep = _chat_messages(messages)
+        err = _ChatErrorAbi()
+        state = _ChatCallbackState()
+
+        # The C side hands over raw bytes, and a model that spells a character
+        # the tokeniser does not hold emits it one byte per token — so a chunk
+        # can end part-way through a character. The incremental decoder keeps
+        # the unfinished tail for the next chunk and only substitutes a
+        # replacement character for bytes no continuation could complete.
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+
+        def _token_trampoline(chunk, _user):
+            if state.error is not None:
+                return
+            try:
+                text = decoder.decode(chunk if chunk else b"")
+                if text:
+                    on_token(text)
+            except BaseException as e:  # re-raised after the native call returns
+                state.error = e
+
+        # A local, and only a local: this frame outlives the native call it is
+        # handed to, which is exactly the span C may call through it.
+        token_cb = ChatSession._ON_TOKEN_CB_TYPE(_token_trampoline)
+        with self._use("generate_stream") as handle:
+            self._enter_call("generate_stream")
+            try:
+                abort_cb = self._register_abort(handle, should_continue, state)
+                try:
+                    rc = self._lib.crispasr_chat_generate_stream(
+                        handle, msgs, len(msgs), ctypes.byref(params),
+                        token_cb, None, ctypes.byref(err))
+                finally:
+                    self._clear_abort(handle, should_continue)
+                    # C no longer holds either pointer, so both trampolines may go.
+                    del abort_cb
+            finally:
+                self._call_lock.release()
+        # Bytes still buffered are a character the generation stopped in the
+        # middle of; hand them over with replacement rather than lose output.
+        # Aborted or not, they belong to the caller.
+        if state.error is None:
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                try:
+                    on_token(tail)
+                except BaseException as e:
+                    state.error = e
+        if state.error is not None:
+            raise state.error
+        if rc != 0:
+            _chat_raise(err, "crispasr_chat_generate_stream failed", rc)
+
+    def _init_state(self) -> None:
+        """The session state that exists before — and independently of — the
+        native handle.
+
+        ``_call_lock`` enforces one generation at a time. ``_lifetime`` is a
+        separate, briefly-held lock counting the calls currently holding the
+        handle, so :meth:`close` can wait for all of them, including the ones
+        that take no part in ``_call_lock``.
+        """
+        self._call_lock = threading.Lock()
+        self._lifetime = threading.Condition()
+        self._in_use = 0
+        self._handle = None
+
+    @contextlib.contextmanager
+    def _use(self, method: str, *, closed_raises: bool = True):
+        """Hold the native handle for the span of one call.
+
+        Every operation that hands ``self._handle`` to C goes through this,
+        the properties and :meth:`count_tokens` included.
+
+        ``crispasr_chat_close`` counts the calls that are already inside C and
+        waits for them, so this is not what keeps a running generation's
+        session alive — C does that. What C cannot see is the window between
+        this method reading ``self._handle`` and the native call actually
+        entering C: a close landing there finds nothing inside, frees, and the
+        pending call goes through with a dangling pointer. Counting on the
+        Python side covers that window, because the count is taken before the
+        handle leaves this frame and released after the call returns.
+
+        The lock is held only to read the handle and move the counter, never
+        across the native call, so this neither serialises calls nor blocks a
+        read-only accessor behind a running generation.
+
+        With ``closed_raises=False`` a closed session yields NULL instead of
+        raising, for the three read-only accessors whose C entry points answer
+        a null session with the "nothing here" value.
+        """
+        with self._lifetime:
+            handle = self._handle
+            if not handle and closed_raises:
+                raise RuntimeError(f"ChatSession.{method}: session is closed")
+            if handle:
+                self._in_use += 1
+        try:
+            yield handle
+        finally:
+            if handle:
+                with self._lifetime:
+                    self._in_use -= 1
+                    if not self._in_use:
+                        self._lifetime.notify_all()
+
+    def _enter_call(self, method: str) -> None:
+        """Claim the session for one native call, or say who already has it.
+
+        Held for the span in which C holds pointers to this call's
+        trampolines, so a second call cannot register over them and
+        :meth:`close` cannot free the session under them. The acquire does not
+        block: crispasr_chat.h allows one call at a time per session, so a
+        thread arriving here is misusing the session and gets told which rule
+        it broke, rather than a wait that looks like working concurrency.
+        """
+        if self._call_lock.acquire(blocking=False):
+            return
+        raise RuntimeError(
+            f"ChatSession.{method}: this session is already running a call on "
+            "another thread. crispasr_chat.h allows one call at a time per "
+            "session — use one session per worker thread.")
+
+    def _register_abort(self, handle, should_continue, state: _ChatCallbackState):
+        """Register the abort predicate for one call, returning its trampoline.
+
+        The caller holds the returned object until :meth:`_clear_abort` has
+        run. It is a return value and not an instance attribute because an
+        attribute is one slot: a second call assigning to it would drop this
+        trampoline's last reference while C still held the pointer.
+
+        Its answer goes to C as it is: True continues, False aborts, the same
+        way round as ``crispasr_chat_abort_callback`` in crispasr_chat.h. The
+        one thing this adds is the failure paths, which answer False without
+        consulting the predicate at all — a predicate that raised cannot be
+        asked again, and once the token callback has raised there is nobody
+        left reading the output.
+        """
+        if should_continue is None:
+            return None
+
+        def _abort_trampoline(_user):
+            if state.error is not None:
+                return False
+            try:
+                return bool(should_continue())
+            except BaseException as e:  # re-raised after the native call returns
+                state.error = e
+                return False
+
+        abort_cb = ChatSession._ABORT_CB_TYPE(_abort_trampoline)
+        self._lib.crispasr_chat_set_abort_callback(handle, abort_cb, None)
+        return abort_cb
+
+    def _clear_abort(self, handle, should_continue) -> None:
+        if should_continue is None:
+            return
+        # A NULL instance of the callback type, not None: a function-pointer
+        # argtype rejects None on newer CPython.
+        self._lib.crispasr_chat_set_abort_callback(
+            handle, ChatSession._ABORT_CB_TYPE(), None)
+
+    @staticmethod
+    def memory_estimate(
+        model_path: str, *,
+        lib_path: Optional[str] = None,
+        n_threads: Optional[int] = None,
+        n_threads_batch: Optional[int] = None,
+        n_ctx: Optional[int] = None,
+        n_batch: Optional[int] = None,
+        n_ubatch: Optional[int] = None,
+        n_gpu_layers: Optional[int] = None,
+        use_mmap: Optional[bool] = None,
+        use_mlock: Optional[bool] = None,
+        chat_template: Optional[str] = None,
+    ) -> int:
+        """Conservative working set in bytes (weights + KV cache +
+        activations) for a model on disk, reading its metadata but never its
+        tensor data — a pre-flight guard for low-memory devices. The
+        parameters matter mostly for ``n_ctx``, which sizes the KV term
+        linearly; leave it ``None`` and the model's own trained context is
+        used.
+
+        The number is deliberately high, not approximate. The KV term bills
+        both the K and the V cache at the full attention width ``n_embd``,
+        but a grouped-query model gives each layer a K/V width that is a
+        fraction of that: on Gemma 3 1B the KV term comes out 4.50× llama.cpp's
+        real cache (117.00 MiB against 26.00 MiB at ``n_ctx`` 1024), which is
+        1.33× on the whole estimate at ``n_ctx`` 4096. Over-reporting is the
+        safe direction for a "will this fit?" guard: it can turn away a model
+        that would just have fitted, and never admits one that would not.
+
+        Raises :class:`RuntimeError` if the estimate could not be made — a
+        model that could not be read is a failure, not a zero estimate.
+        """
+        lib = _chat_lib(lib_path)
+        params, _keep = _chat_open_params(
+            lib, n_threads=n_threads, n_threads_batch=n_threads_batch,
+            n_ctx=n_ctx, n_batch=n_batch, n_ubatch=n_ubatch,
+            n_gpu_layers=n_gpu_layers, use_mmap=use_mmap, use_mlock=use_mlock,
+            chat_template=chat_template,
+        )
+        err = _ChatErrorAbi()
+        n = lib.crispasr_chat_memory_estimate(
+            _chat_cstr(model_path, "model_path"), ctypes.byref(params), ctypes.byref(err))
+        if n == 0:
+            _chat_raise(err, f"could not estimate memory for chat model {model_path!r}")
+        return int(n)
+
+    @staticmethod
+    def ai_disclosure_text(*, lib_path: Optional[str] = None) -> str:
+        """The canonical "you are talking to an AI" wording (EU AI Act Art.
+        50(1)). Show it visibly, at or before the first turn."""
+        lib = _chat_lib(lib_path)
+        text = lib.crispasr_chat_ai_disclosure_text()
+        return text.decode("utf-8") if text else ""
+
+    def close(self) -> None:
+        """Free the session and its KV cache. Idempotent.
+
+        Unlike :meth:`generate`, this WAITS rather than raising: closing is the
+        one thing a second thread legitimately wants to do to a busy session,
+        and a shutdown path cannot usefully be told "try again" — nor may
+        ``__exit__`` and ``__del__`` raise. A generation holds the session for
+        as long as it decodes, so expect the wait to be that long; cancel first
+        with ``should_continue`` if you need it to be shorter.
+
+        The handle is retired before the wait, so a call arriving after this
+        point is refused with :class:`RuntimeError` instead of joining the
+        queue.
+
+        The wait covers EVERY call holding the handle, not only the generate
+        pair. ``crispasr_chat_close`` does its own waiting for the calls that
+        have already reached C, but it cannot see one that has read the handle
+        here and not yet entered; :meth:`count_tokens`, :meth:`reset` and the
+        properties are all in that state for a moment, so they are counted and
+        waited on here.
+
+        Called from inside ``on_token`` or ``should_continue`` it deadlocks,
+        like every other re-entry into a session mid-call.
+        """
+        with self._lifetime:
+            handle, self._handle = self._handle, None
+            if not handle:
+                return
+            while self._in_use:
+                self._lifetime.wait()
+            self._lib.crispasr_chat_close(handle)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass

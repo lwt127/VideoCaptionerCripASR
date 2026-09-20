@@ -100,12 +100,12 @@ public:
             parakeet_result_free(r);
     }
 
-    std::vector<crispasr_segment> transcribe(const float* samples, int n_samples, int64_t t_offset_cs,
-                                             const whisper_params& params) override {
-        std::vector<crispasr_segment> out;
-        if (!ctx_)
-            return out;
-
+    // Per-call settings that live on the parakeet_context. transcribe() applies
+    // them on every call; the split encode/decode pair gets them via
+    // begin_split_run() instead, once, on the caller's thread — applying them
+    // from encode_slice() would mutate decode state on the producer thread
+    // while the consumer is decoding.
+    void apply_sticky_params(const whisper_params& params) {
         // Sticky per-call sampling state. The setter just stores the
         // value on the parakeet_context, so subsequent transcribe calls
         // re-pick it up. We zero it on the first temp==0 call so a user
@@ -148,6 +148,15 @@ public:
                 ptrs.push_back(s.c_str());
             parakeet_set_hotwords(ctx_, ptrs.data(), (int)ptrs.size(), params.hotwords_boost);
         }
+    }
+
+    std::vector<crispasr_segment> transcribe(const float* samples, int n_samples, int64_t t_offset_cs,
+                                             const whisper_params& params) override {
+        std::vector<crispasr_segment> out;
+        if (!ctx_)
+            return out;
+
+        apply_sticky_params(params);
 
         // Issue #89 / #257: long-audio path selection, the single-pass OOM
         // fallback, and --chunk-seconds output segmentation are hoisted into the
@@ -166,8 +175,130 @@ public:
         return out;
     }
 
+    // ---- Split transcribe: encode ∥ decode across dispatcher slices ----
+    //
+    // Used by the VAD / chunk slice loop, where each slice is short enough to be
+    // exactly one encode + one decode — i.e. transcribe()'s SINGLE_PASS path cut
+    // in half. The encoder runs on ctx_'s ggml backend (GPU) and the TDT decoder
+    // on the CPU via cblas, so the caller can overlap them.
+    //
+    // Only advertised when the decoder really is the CPU path: on CUDA/Vulkan
+    // parakeet_decode_frames() is itself a ggml graph on ctx_'s backend and
+    // would race the encoder. JA models are excluded because they never take the
+    // plain single-pass route (#89).
+    struct enc_state {
+        float* buf = nullptr;
+        int T_enc = 0;
+        int d_model = 0;
+    };
+
+    bool supports_split_transcribe() const override {
+        return ctx_ != nullptr && !is_ja_model_ && parakeet_decode_uses_backend(ctx_) == 0;
+    }
+
+    // A slice qualifies only when transcribe() would run it as ONE pass. A
+    // longer slice takes the LONGFORM/STREAMED multi-window route, whose
+    // per-window context and merging this split path does not reproduce.
+    bool can_split_slice(int n_samples, const whisper_params& params) const override {
+        if (!ctx_ || n_samples <= 0)
+            return false;
+        parakeet_orchestrate_opts oo;
+        oo.chunk_seconds_explicit = params.chunk_seconds_explicit;
+        oo.chunk_seconds = params.chunk_seconds;
+        oo.chunk_overlap_seconds = params.chunk_overlap_seconds;
+        oo.no_prints = params.no_prints;
+        return parakeet_slice_is_single_pass(ctx_, n_samples, is_ja_model_, oo);
+    }
+
+    encoded_slice encode_slice(const float* samples, int n_samples, const whisper_params& params) override {
+        encoded_slice e;
+        if (!ctx_ || !samples || n_samples <= 0 || !can_split_slice(n_samples, params))
+            return e;
+        auto* st = new enc_state();
+        st->buf = parakeet_encode(ctx_, samples, n_samples, &st->T_enc, &st->d_model);
+        if (!st->buf) { // encode failed (e.g. VRAM OOM) — caller falls back to transcribe()
+            delete st;
+            return e;
+        }
+        e.h = st;
+        return e;
+    }
+
+    std::vector<crispasr_segment> decode_slice(encoded_slice e, int64_t t_offset_cs,
+                                               const whisper_params& /*params*/) override {
+        std::vector<crispasr_segment> out;
+        auto* st = static_cast<enc_state*>(e.h);
+        if (!st)
+            return out;
+        for (const auto& ps : parakeet_decode_frames_to_segments(ctx_, st->buf, st->T_enc, st->d_model, t_offset_cs))
+            out.push_back(seg_from_parakeet_seg(ps));
+        free(st->buf);
+        delete st;
+        return out;
+    }
+
+    void begin_split_run(const whisper_params& params) override { apply_sticky_params(params); }
+
+    // Issue #350's dropped-span repair. parakeet_transcribe_segments() runs it
+    // at the end of the SINGLE_PASS branch, so the split path — which is that
+    // branch cut in half — has to run it too or the repair silently stops
+    // happening (measured: 2 words lost on a 300 s clip). It re-encodes, so the
+    // dispatcher calls it only after the pipeline has joined.
+    void repair_slice(const float* samples, int n_samples, int64_t t_offset_cs, std::vector<crispasr_segment>& segs,
+                      const whisper_params& params) override {
+        if (!ctx_ || is_ja_model_ || !samples || n_samples <= 0)
+            return; // JA has its own #89 machinery; matches `repair = !is_ja`
+        std::vector<parakeet_seg> ps;
+        ps.reserve(segs.size());
+        for (const auto& s : segs)
+            ps.push_back(parakeet_seg_from_seg(s));
+        if (parakeet_repair_segments(ctx_, samples, n_samples, t_offset_cs, ps, params.no_prints) <= 0)
+            return; // untouched — leave the originals rather than round-trip them
+        segs.clear();
+        for (const auto& p : ps)
+            segs.push_back(seg_from_parakeet_seg(p));
+    }
+
+    void release_encoded(encoded_slice e) override {
+        auto* st = static_cast<enc_state*>(e.h);
+        if (!st)
+            return;
+        free(st->buf);
+        delete st;
+    }
+
     // Convert a neutral parakeet_seg (from the shared orchestration) into the
     // CLI crispasr_segment type.
+    // Inverse of seg_from_parakeet_seg, so repair_slice() can hand the library
+    // segments in its own shape and take the repaired list back. Only the
+    // fields the repair reasons about (text + word/token times) round-trip;
+    // the dispatcher-owned ones (speaker, chunk_id) are set after it runs.
+    static parakeet_seg parakeet_seg_from_seg(const crispasr_segment& seg) {
+        parakeet_seg ps;
+        ps.text = seg.text;
+        ps.t0 = seg.t0;
+        ps.t1 = seg.t1;
+        ps.words.reserve(seg.words.size());
+        for (const auto& w : seg.words) {
+            parakeet_seg::word pw;
+            pw.text = w.text;
+            pw.t0 = w.t0;
+            pw.t1 = w.t1;
+            ps.words.push_back(std::move(pw));
+        }
+        ps.tokens.reserve(seg.tokens.size());
+        for (const auto& t : seg.tokens) {
+            parakeet_seg::token pt;
+            pt.text = t.text;
+            pt.id = t.id;
+            pt.t0 = t.t0;
+            pt.t1 = t.t1;
+            pt.p = t.confidence;
+            ps.tokens.push_back(std::move(pt));
+        }
+        return ps;
+    }
+
     static crispasr_segment seg_from_parakeet_seg(const parakeet_seg& ps) {
         crispasr_segment seg;
         seg.text = ps.text;

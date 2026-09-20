@@ -13,6 +13,7 @@
 
 #define _USE_MATH_DEFINES
 #include "chatterbox.h"
+#include "chatterbox_attn_policy.h"
 #include "chatterbox_s3gen.h"
 #include "chatterbox_ve.h"
 #include "chatterbox_text_prep.h"
@@ -44,6 +45,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 namespace {
 
@@ -914,11 +916,11 @@ struct chatterbox_context {
         if (voice_ctx_w)
             ggml_free(voice_ctx_w);
         if (voice_buf_w)
-            ggml_backend_buffer_free(voice_buf_w);
+            core_gguf::release_weight_buffer(voice_buf_w);
         if (ctx_w)
             ggml_free(ctx_w);
         if (buf_w)
-            ggml_backend_buffer_free(buf_w);
+            core_gguf::release_weight_buffer(buf_w);
         if (backend && backend != backend_cpu)
             ggml_backend_free(backend);
         if (backend_cpu)
@@ -2583,6 +2585,19 @@ static ggml_cgraph* build_graph_t3_gpt2_kv(chatterbox_context* c, int n_past, in
     // you need to compare it against speech_emb(tok) + wpe(pos).
     const bool dump_layers = (std::getenv("CRISPASR_CHATTERBOX_DUMP_GPT2_LAYERS") != nullptr);
 
+    // Issue #402: attention-path selection (naive on Vulkan, flash elsewhere;
+    // env-overridable both ways — see chatterbox_attn_policy.h).
+    const bool naive_attn = chatterbox_attn::use_naive_t3(c->backend ? ggml_backend_name(c->backend) : nullptr,
+                                                          std::getenv("CRISPASR_CHATTERBOX_NAIVE_ATTN"),
+                                                          std::getenv("CRISPASR_CHATTERBOX_FLASH_ATTN"));
+    static bool s_attn_logged = false;
+    if (!s_attn_logged) {
+        s_attn_logged = true;
+        fprintf(stderr, "chatterbox: T3 GPT-2 attention = %s (backend %s)\n",
+                naive_attn ? "naive softmax(QK^T)V" : "flash_attn_ext",
+                c->backend ? ggml_backend_name(c->backend) : "none");
+    }
+
     for (uint32_t il = 0; il < hp.n_layers; il++) {
         const auto& b = c->t3.gpt2_blocks[il];
         ggml_tensor* residual = cur;
@@ -2634,15 +2649,20 @@ static ggml_cgraph* build_graph_t3_gpt2_kv(chatterbox_context* c, int n_past, in
             ggml_view_3d(ctx0, use_kv_k, hd, Lk, n_kv, use_kv_k->nb[1], use_kv_k->nb[2], (size_t)il * use_kv_k->nb[3]);
         ggml_tensor* v_layer_view =
             ggml_view_3d(ctx0, use_kv_v, hd, Lk, n_kv, use_kv_v->nb[1], use_kv_v->nb[2], (size_t)il * use_kv_v->nb[3]);
-        ggml_tensor* Kfull = ggml_cont(ctx0, k_layer_view);
-        ggml_tensor* Vfull = ggml_cont(ctx0, v_layer_view);
+        ggml_tensor* Kfull = k_layer_view;
+        ggml_tensor* Vfull = v_layer_view;
 
         // Permute Q to (hd, T, n_h)
         Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
 
-        // Attention. CRISPASR_CHATTERBOX_NAIVE_ATTN=1 swaps ggml_flash_attn_ext
-        // for an explicit softmax(QK^T)V path. Useful for isolating flash_attn
-        // accumulator-order differences from other bugs. Layout follows
+        // Attention. Issue #402: the Vulkan FLASH_ATTN_EXT pipeline crashes on
+        // RADV (Radeon 780M) for this geometry while the explicit path runs a
+        // full synthesis correctly, so chatterbox_attn::use_naive_t3() makes
+        // naive attention the DEFAULT on Vulkan backends —
+        // CRISPASR_CHATTERBOX_FLASH_ATTN=1 opts back in, and the pre-existing
+        // CRISPASR_CHATTERBOX_NAIVE_ATTN=1 debug gate still forces the naive
+        // path on every backend (for isolating flash_attn accumulator-order
+        // differences from other bugs). Layout follows
         // src/qwen3_asr.cpp:895-924: scores = mul_mat(K, Q); soft_max_ext
         // (fused scale + mask + softmax); V is permuted (Lk, hd, n_h) for the
         // attn = mul_mat(V', scores) step that contracts over Lk. The result
@@ -2652,7 +2672,18 @@ static ggml_cgraph* build_graph_t3_gpt2_kv(chatterbox_context* c, int n_past, in
         // ggml.h docs, so skipping the permute here gave wrong outputs in an
         // earlier attempt.
         ggml_tensor* attn;
-        if (std::getenv("CRISPASR_CHATTERBOX_NAIVE_ATTN")) {
+        // PR #410 A/B escape hatch. The default flash path consumes the
+        // already-contiguous per-layer views directly; materialize only for
+        // eager attention or when explicitly reproducing the old path.
+        static const bool force_kv_cont = []() {
+            const char* e = std::getenv("CRISPASR_CHATTERBOX_KV_CONT");
+            return e && *e && std::strcmp(e, "0") != 0;
+        }();
+        if (naive_attn || force_kv_cont) {
+            Kfull = ggml_cont(ctx0, Kfull);
+            Vfull = ggml_cont(ctx0, Vfull);
+        }
+        if (naive_attn) {
             ggml_tensor* scores = ggml_mul_mat(ctx0, Kfull, Q);
             scores = ggml_soft_max_ext(ctx0, scores, (T > 1) ? causal_mask : nullptr, attn_scale, 0.0f);
             ggml_tensor* Vp = ggml_cont(ctx0, ggml_permute(ctx0, Vfull, 1, 0, 2, 3));
@@ -3069,7 +3100,7 @@ extern "C" struct chatterbox_context* chatterbox_init_from_file(const char* path
     // norm precision plumbing that hasn't been audited yet. Default is
     // therefore T3 GPU + S3Gen CPU: correct output, ~most of the GPU
     // speedup (T3 AR loop is the slow stage).
-    c->backend_cpu = ggml_backend_cpu_init();
+    c->backend_cpu = core_cpu_backend::init();
     if (!c->backend_cpu) {
         fprintf(stderr, "chatterbox: failed to init CPU backend\n");
         delete c;
@@ -3091,7 +3122,7 @@ extern "C" struct chatterbox_context* chatterbox_init_from_file(const char* path
             cb_threads = std::max(c->n_threads, std::min(8, hw > 0 ? hw : 4));
         }
         c->n_threads = cb_threads;
-        ggml_backend_cpu_set_n_threads(c->backend_cpu, cb_threads);
+        core_cpu_backend::set_n_threads(c->backend_cpu, cb_threads);
         if (params.verbosity >= 1)
             fprintf(stderr, "chatterbox: CPU backend threads=%d\n", cb_threads);
     }
@@ -4019,7 +4050,7 @@ static int chatterbox_load_voice_gguf(chatterbox_context* ctx, const char* path)
         ctx->voice_ctx_w = nullptr;
     }
     if (ctx->voice_buf_w) {
-        ggml_backend_buffer_free(ctx->voice_buf_w);
+        core_gguf::release_weight_buffer(ctx->voice_buf_w);
         ctx->voice_buf_w = nullptr;
     }
     ctx->voice_tensors.clear();
@@ -4242,7 +4273,7 @@ static int chatterbox_install_native_voice(chatterbox_context* ctx, const float 
         ctx->voice_ctx_w = nullptr;
     }
     if (ctx->voice_buf_w) {
-        ggml_backend_buffer_free(ctx->voice_buf_w);
+        core_gguf::release_weight_buffer(ctx->voice_buf_w);
         ctx->voice_buf_w = nullptr;
     }
     ctx->voice_tensors.clear();
@@ -4343,16 +4374,13 @@ extern "C" int chatterbox_set_voice_from_wav(struct chatterbox_context* ctx, con
         return chatterbox_load_voice_gguf(ctx, wav_path);
     }
 
-    // Native WAV cloning. The path forks on the input sample rate:
-    //   - 24 kHz mono WAV: full atomic clone — all 5 conds are derived
-    //     from the same reference audio and installed together. The 16 kHz
-    //     versions used by VE / S3Tokenizer / CAMPPlus come from a
-    //     core_audio polyphase resampler (kaiser-windowed sinc, β=8.6).
-    //   - 16 kHz mono WAV: partial M2+M3 clone (T3-side conds only) —
-    //     gen.{prompt_token, prompt_feat, embedding} stay at default
-    //     voice values. Updating gen.prompt_token alone without the
-    //     matching prompt_feat / embedding feeds S3Gen's flow matcher
-    //     inconsistent conditioning and silences the output (verified).
+    // Native WAV cloning is atomic for both supported source rates: all five
+    // conditionals are derived from one reference and installed together.
+    // VE / S3Tokenizer / CAMPPlus consume 16 kHz; the Matcha prompt mel
+    // consumes 24 kHz.  Derive the missing rate with the shared polyphase
+    // resampler instead of leaving 16 kHz references on the old T3-only path,
+    // which rendered with S3Gen's default voice and therefore did not actually
+    // clone the supplied speaker.
     std::vector<float> pcm_24k;
     std::vector<float> pcm_16k_owner; // owns the 16 k buffer when it's
                                       // resampled from 24 kHz
@@ -4381,8 +4409,8 @@ extern "C" int chatterbox_set_voice_from_wav(struct chatterbox_context* ctx, con
                     stderr,
                     "chatterbox: native WAV cloning failed.\n"
                     "  Tried 24 kHz: %s\n  Tried 16 kHz: %s\n"
-                    "  Re-encode the reference (`ffmpeg -i %s -ar 24000 -ac 1 ref.wav`) — 24 kHz mono PCM16/F32 "
-                    "enables full atomic cloning, 16 kHz keeps the partial M2+M3 path. Or fall back to the python "
+                    "  Re-encode the reference as 16 or 24 kHz mono PCM16/F32 "
+                    "(`ffmpeg -i %s -ar 24000 -ac 1 ref.wav`). Or fall back to the python "
                     "baker (`python models/bake-chatterbox-voice-from-wav.py --input %s --output my_voice.gguf`).\n",
                     err24.c_str(), err16.c_str(), wav_path, wav_path);
                 return -1;
@@ -4390,6 +4418,13 @@ extern "C" int chatterbox_set_voice_from_wav(struct chatterbox_context* ctx, con
             pcm_16k_owner = std::move(pcm_16k_native);
             pcm_16k = pcm_16k_owner.data();
             n_16k = (int)pcm_16k_owner.size();
+            pcm_24k = core_audio::resample_polyphase(pcm_16k, n_16k, 16000, 24000);
+            n_24k = (int)pcm_24k.size();
+            atomic_path = !pcm_24k.empty();
+            if (!atomic_path) {
+                fprintf(stderr, "chatterbox: failed to resample 16 kHz voice reference to 24 kHz\n");
+                return -1;
+            }
         }
     }
 
@@ -4424,7 +4459,7 @@ extern "C" int chatterbox_set_voice_from_wav(struct chatterbox_context* ctx, con
         }
     }
 
-    // CAMPPlus + 24 kHz prompt mel — only on the atomic (24 kHz input) path.
+    // CAMPPlus + 24 kHz prompt mel — both source rates now take this atomic path.
     // Both go through the s3gen sub-context's public C ABI hooks (the
     // campplus weights live there). Returned buffers are malloc'd; copy
     // into stable std::vectors and free.
@@ -4467,19 +4502,11 @@ extern "C" int chatterbox_set_voice_from_wav(struct chatterbox_context* ctx, con
         return rc;
 
     if (ctx->params.verbosity >= 1) {
-        if (atomic_path) {
-            fprintf(stderr,
-                    "chatterbox: atomic native WAV clone (%s, %d samples @ 24 kHz, %d @ 16 kHz) — all 5 conds "
-                    "(speaker_emb, %zu speech_prompt_tokens, %zu prompt_token, prompt_feat (T_mel=%d), "
-                    "gen.embedding (192-d)) installed.\n",
-                    wav_path, n_24k, n_16k, speech_prompt_tokens.size(), prompt_tokens.size(), T_prompt_feat);
-        } else {
-            fprintf(stderr,
-                    "chatterbox: partial native WAV clone (%s, %d samples @ 16 kHz) — T3-side conds cloned "
-                    "(speaker_emb, %zu speech_prompt_tokens). S3Gen prompt (gen.{prompt_token, prompt_feat, "
-                    "embedding}) still defaults; re-encode at 24 kHz mono for full atomic cloning.\n",
-                    wav_path, n_16k, speech_prompt_tokens.size());
-        }
+        fprintf(stderr,
+                "chatterbox: atomic native WAV clone (%s, %d samples @ 24 kHz, %d @ 16 kHz) — all 5 conds "
+                "(speaker_emb, %zu speech_prompt_tokens, %zu prompt_token, prompt_feat (T_mel=%d), "
+                "gen.embedding (192-d)) installed.\n",
+                wav_path, n_24k, n_16k, speech_prompt_tokens.size(), prompt_tokens.size(), T_prompt_feat);
     }
     return 0;
 }

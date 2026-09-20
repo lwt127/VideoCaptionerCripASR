@@ -133,6 +133,16 @@ The `--variant fixed_speaker` flag bakes the German speaker roster into `orpheus
 - **SNAC codec:** [`hubertsiuzdak/snac_24khz`](https://huggingface.co/hubertsiuzdak/snac_24khz) (MIT) — see [`cstr/snac-24khz-GGUF`](https://huggingface.co/cstr/snac-24khz-GGUF).
 - **GGUF conversion + ggml runtime:** [`CrispStrobe/CrispASR`](https://github.com/CrispStrobe/CrispASR) — see `src/orpheus.cpp`, `src/orpheus_snac.cpp`, `models/convert-orpheus-to-gguf.py`.
 
+## Voice provenance (EU AI Act Art. 50(4))
+
+The upstream card describes this checkpoint as fine-tuned *"primarily on natural human speech recordings"* — permissively licensed podcasts, lectures and OER — and its 19 speakers were **extracted from those recordings** (*"not all speakers could be reconstructed"*). They are real people who spoke in public.
+
+CrispASR records this as `speaker_identity=real_person`. Output synthesized with it carries a **spoken AI disclosure**, because audio resembling an identifiable person is a deep fake under Art. 3(60) whether or not any cloning took place. It does **not** require `--i-have-rights`: the donor's agreement to the training is a licensing matter settled upstream, which a downstream operator cannot attest to.
+
+Override per run with `--speaker-identity`, or stamp a file permanently with
+`models/stamp-speaker-identity.py`. See
+[`docs/eu-ai-act.md` §6.2a](https://github.com/CrispStrobe/CrispASR/blob/main/docs/eu-ai-act.md).
+
 ## License
 
 Llama-3.2 community license (inherited from the talker base). Includes the Acceptable Use Policy and the "Built with Llama" attribution requirement. Commercial use is permitted under the community license terms.

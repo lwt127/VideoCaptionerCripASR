@@ -10,11 +10,10 @@ namespace CrispASR.Tests
     /// </summary>
     public class TitaNetTests
     {
-        private static bool CanLoadLibrary()
-        {
-            try { _ = Session.AvailableBackends(); return true; }
-            catch { return false; }
-        }
+        // Routed through Live so CRISPASR_CS_REQUIRE_LIVE can turn a silent
+        // skip into a failure (issue #291 — nothing in CI ever loaded the
+        // library, so the suite was green either way).
+        private static bool CanLoadLibrary() => Live.LibraryLoadable();
 
         [Fact]
         public void TitaNet_ImplementsIDisposable()
@@ -70,11 +69,10 @@ namespace CrispASR.Tests
 
     public class SpeakerDbTests
     {
-        private static bool CanLoadLibrary()
-        {
-            try { _ = Session.AvailableBackends(); return true; }
-            catch { return false; }
-        }
+        // Routed through Live so CRISPASR_CS_REQUIRE_LIVE can turn a silent
+        // skip into a failure (issue #291 — nothing in CI ever loaded the
+        // library, so the suite was green either way).
+        private static bool CanLoadLibrary() => Live.LibraryLoadable();
 
         [Fact]
         public void SpeakerDb_ImplementsIDisposable()

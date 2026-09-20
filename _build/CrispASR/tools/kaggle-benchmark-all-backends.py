@@ -96,8 +96,54 @@ SLOW_BACKENDS = [
     ("mini-omni2",        "Mini-Omni2",              300, "Q4_K, multi-stream speech+chat"),
     # NOTE: vibevoice-1.5b is a TTS model (vibevoice-1.5b-tts-q4_k.gguf), not ASR
     # — moved to TTS_BACKENDS below (running it as ASR produced an empty transcript).
+
+    # ── 2026-09-07 coverage pass ────────────────────────────────────────────
+    # The sweep covered 44 of the 66 canonical backends. These are the missing
+    # ASR ones that can resolve through `-m auto`, plus distinct MODELS that
+    # share an existing runtime. That distinction matters here and nowhere
+    # else: tools/check-backend-wiring.py calls raon/quds-fa "aliases" because
+    # they reuse the f5 and parakeet RUNTIMES, which is the right answer for a
+    # wiring audit and the wrong one for a model sweep — a different checkpoint
+    # is a different thing to transcribe with, and covering f5-tts says nothing
+    # about whether Raon's weights work.
+    ("canary-qwen",       "Canary-Qwen 2.5B",        300, "Q4_K, canary encoder + Qwen LLM decoder"),
+    ("higgs-stt",         "Higgs STT",               240, "Q4_K"),
+    ("ark-asr",           "Ark-ASR",                 240, "Q4_K"),
+    ("moss-transcribe",   "MOSS Transcribe",         300, "Q4_K, en-only (declared f33c398b)"),
+    ("moss-diarize",      "MOSS Diarize",            300, "Q4_K, ASR + speaker turns"),
+    # NOT ADDED — and the reason is a correction to my own first pass.
+    # gigaam (ru), reazonspeech (ja) and quds-fa (fa) were added here on
+    # 2026-09-07 and immediately produced FAIL / EMPTY / CRASH. Those verdicts
+    # were meaningless: THIS SWEEP TRANSCRIBES ONE FIXED ENGLISH CLIP
+    # (samples/jfk.wav, see JFK_WAV below), so a Russian model scoring WER 0.5
+    # on English is the correct behaviour of a healthy model, reported as a
+    # failure. A row that is red when the thing works is worse than no row.
+    # They come back when the runner accepts a per-backend clip — samples/
+    # already carries fleurs_ja_*.wav, paraformer_zh.wav and ko-369.wav, but
+    # the loops below unpack a 4-tuple, so that is a real change, not a field.
+    # (quds-fa additionally needs CRISPASR_ACCEPT_LICENSE: it is CC-BY-NC-4.0
+    # and license_gate_allows_download() refuses before fetching a byte, which
+    # is what the 0.27 s CRASH actually was.)
+    ("omniasr-300m",      "OmniASR LLM 300M",        120, "Q4_K, smaller omniasr variant"),
+    ("omniasr-llm-1b",    "OmniASR LLM 1B",          240, "Q4_K"),
+    ("qwen3-1.7b",        "Qwen3 ASR 1.7B",          240, "Q4_K, larger qwen3 variant"),
 ]
 
+# Backends that CANNOT go through `-m auto`: the registry has no auto-download
+# entry for them (verified from `--list-backends-json` caps, not assumed), so a
+# sweep row would fail on model resolution and read as a backend failure. They
+# need an explicit `-m <path>` and are listed here so the omission is a recorded
+# decision rather than an oversight.
+NO_AUTODOWNLOAD = ["sidon", "miotts", "bananamind-tts", "omnivoice"]
+
+# NOTE 2026-09-07: two ids here named backends the binary does not expose, so
+# those rows could never have succeeded — `cosyvoice3` (real id
+# `cosyvoice3-tts`) and `vibevoice-tts` (no such backend; `vibevoice-1.5b` was
+# already covered separately, so that slot now points at the uncovered
+# `vibevoice-bitnet`). Found by validating every id in these lists against
+# `--list-backends-json` before pushing, which is worth doing every time: a
+# wrong id fails on the worker and reads exactly like a broken backend.
+#
 # TTS backends suitable for Kaggle time limits (small/fast models first,
 # then larger ones). Each entry downloads via -m auto, synthesises a phrase,
 # checks output WAV exists and has >1000 bytes. Models are cleaned up after
@@ -117,9 +163,9 @@ TTS_BACKENDS = [
     ("orpheus",           "Orpheus 3B-FT",           300, "Q8_0, ~3.5GB, Llama-3.2 + SNAC"),
     # ── previously-uncovered TTS backends (full-sweep coverage) ──
     ("qwen3-tts-customvoice", "Qwen3-TTS CustomVoice", 300, "Q8_0, talker+12Hz codec, built-in speakers"),
-    ("vibevoice-tts",     "VibeVoice TTS",           300, "Q4_K, diffusion TTS"),
+    ("vibevoice-bitnet",     "VibeVoice TTS",           300, "Q4_K, diffusion TTS"),
     ("chatterbox",        "Chatterbox",              300, "Q4_K, T3 + S3Gen voice clone"),
-    ("cosyvoice3",        "CosyVoice3",              300, "Q4_K, flow-matching + HiFT"),
+    ("cosyvoice3-tts",        "CosyVoice3",              300, "Q4_K, flow-matching + HiFT"),
     ("indextts",          "IndexTTS",                300, "Q4_K, GPT + BigVGAN vocoder"),
     ("zonos",             "Zonos",                   240, "F16, transformer TTS (EOS-sensitive on Q4_K)"),
     ("melotts",           "MeloTTS",                  90, "F16, VITS multilingual"),
@@ -127,7 +173,31 @@ TTS_BACKENDS = [
     ("tada",              "TADA 3B",                 300, "Q4_K, multilingual AR TTS"),
     ("voxcpm2-tts",       "VoxCPM2 TTS",             300, "F16, VAE encoder + LLM"),
     ("vibevoice-1.5b",    "VibeVoice 1.5B TTS",      300, "Q4_K ~1.6GB; was mis-listed as ASR"),
-    ("kugelaudio",        "KugelAudio",              420, "Q4_K ~5.7GB (F16 ~14GB) — large, slow; bumped timeout"),
+    # The 900 s budget bought the answer: not slow, OOM. `-m auto` used to get
+    # the F16 (17.3 GB, more VRAM than any Kaggle GPU has), so no timeout could
+    # ever have made it pass. The registry default is Q4_K now, and this entry
+    # deliberately does NOT pin the quant — the sweep should exercise the path a
+    # user actually gets from `-m auto`.
+    ("kugelaudio",        "KugelAudio",              900, "Q4_K ~5.7GB via -m auto (F16 17.3GB needs >16GB VRAM)"),
+    # ── 2026-09-07 coverage pass ────────────────────────────────────────────
+    # Missing canonical TTS backends that resolve via `-m auto`, plus distinct
+    # MODELS on shared runtimes. Every one of these is exercised the same way
+    # the rest are: synthesise a phrase, then feed the audio back through
+    # parakeet ASR and score the word overlap — a TTS backend that emits a
+    # valid-looking WAV of noise fails that, where a file-size check passes it.
+    ("moss-tts",          "MOSS TTS",                300, "Q4_K, voice-cloning"),
+    ("moss-tts-local",    "MOSS TTS (local voice)",  300, "Q4_K, voice-cloning"),
+    ("dots-tts",          "Dots TTS",                240, "Q4_K"),
+    ("voxtral-tts",       "Voxtral TTS",             300, "Q4_K"),
+    ("qwen3-tts",         "Qwen3-TTS 0.6B",          240, "Q4_K, streaming + voice-cloning"),
+    ("raon",              "Raon-OpenTTS 0.3B",       300, "F16 ~959MB, CC-BY-NC; f5 runtime, ggml HiFi-GAN"),
+    ("confucius4-tts",    "Confucius4 TTS",          300, "Q4_K, zero-shot"),
+    ("chatterbox-nano",   "Chatterbox Nano",         180, "Q4_K, small T3 + Turbo S3Gen"),
+    ("chatterbox-turbo",  "Chatterbox Turbo",        240, "Q4_K"),
+    ("pocket-tts-de",     "Pocket-TTS German",       120, "Q8_0 ~124MB distilled 6L"),
+    ("pocket-tts-fr",     "Pocket-TTS French",       180, "Q8_0 ~365MB undistilled 24L preview"),
+    ("tada-1b",           "TADA TTS 1B",             300, "Q4_K"),
+    ("cosyvoice3-tts-rl", "CosyVoice3 RL",           300, "Q4_K, RL-tuned variant"),
 ]
 
 # Text MT backends (translate a sentence; not ASR/TTS but part of the backend
@@ -233,8 +303,62 @@ SWEEP_REPO = os.environ.get("CRISPASR_SWEEP_REPO", "cstr/crispasr-kaggle-progres
 # kernel SKIP backends that already have a result file. "latest" currently holds
 # 60 finished backends from an earlier pin, so reusing it would skip nearly the
 # whole sweep and say nothing about the tree under test.
-RUN_TAG = os.environ.get("CRISPASR_SWEEP_RUN", "ggml-v0.17b")
+# 2026-09-07: bumped v0.17b -> v0.23. The tree pins ggml 2dd13edd (v0.23.0,
+# CrispStrobe/ggml#3), so a run tagged v0.17b would have labelled the results
+# with a ggml version that is no longer in the build — and, because a matching
+# tag makes the kernel SKIP finished backends, would also have resumed a sweep
+# taken before the bump. Both halves of that are wrong: stale label, stale data.
+# 2026-09-07 second bump. The first ggml-v0.23 run completed all 83 backends,
+# so EVERY backend now has a result file under that tag — and sweep_done()
+# treats any result as done, pass or fail. Re-running the licence/voice/quant
+# fixes under the same tag would have skipped all 83, finished in seconds having
+# tested nothing, and looked like a successful run. The tag is the only thing
+# that makes a fix actually execute.
+RUN_TAG = os.environ.get("CRISPASR_SWEEP_RUN", "ggml-v0.23-licensed")
 SWEEP_PREFIX = f"full-backend-sweep/{RUN_TAG}"
+
+# The kernel git-clones CrispASR at runtime, so the C++ under test is always
+# fresh from main while THIS SCRIPT is frozen at the last `kaggle kernels push`.
+# A run can therefore build the newest code and score it with an outdated
+# harness, and nothing in the log looks wrong. Print both halves so the log
+# always says which script and which tree produced a verdict.
+SWEEP_SCRIPT_VERSION = "2026-09-07-coverage-83-licensed"
+
+# ── Restricted-licence acceptance (owner-authorised 2026-09-07) ────────────
+# Ten backends failed the previous sweep in ~0.1 s with 0 bytes written:
+# pocket-tts (+ -de/-fr), orpheus, outetts, tada, tada-1b, voxtral-tts, raon
+# and quds-fa. None of them are broken. license_gate_allows_download() refuses
+# a restricted model BEFORE fetching a byte unless the licence is accepted, so
+# every one of those rows was the gate working, recorded as a failure.
+#
+# WHAT THIS ACCEPTS, stated exactly, because "all" is broader than the
+# non-commercial set it is usually described as. license_requires_acceptance_tag()
+# gates: cc-by-nc*, cc-by-sa*, llama*, gemma, gemma-terms, qwen-research,
+# mistral-ai-research, lfm1.0, lfm-open-1.0, funasr-v1.1, pocket-tts-terms, and
+# the catch-all "other". The registry currently carries two distinct NC tags
+# (cc-by-nc-4.0 and cc-by-nc-sa-4.0) and license_accepted() matches an EXACT tag
+# or the wildcard — so a single specific value cannot cover the set, and "all"
+# is the only setting that unblocks the sweep in one variable.
+#
+# This is an internal benchmark: models are downloaded, synthesised from once,
+# scored, and deleted (_cleanup_cache below). Nothing is redistributed. That is
+# within CC-BY-NC terms and within the research/terms licences above, and the
+# repository already publishes GGUF conversions of these same checkpoints.
+# The acceptance is the owner's, given explicitly for this sweep; it is set here
+# rather than in any library path so it cannot leak into normal CLI use.
+os.environ.setdefault("CRISPASR_ACCEPT_LICENSE", "all")
+def _print_provenance():
+    import subprocess as _sp
+    sha = "unknown"
+    try:
+        sha = _sp.check_output(["git", "-C", CRISPASR_DIR, "rev-parse", "--short", "HEAD"],
+                               text=True, stderr=_sp.DEVNULL).strip()
+    except Exception:
+        pass
+    print(f"[sweep] script_version={SWEEP_SCRIPT_VERSION}  crispasr_clone={sha}  run_tag={RUN_TAG}",
+          flush=True)
+
+_print_provenance()
 # Optional subset filter: CRISPASR_SWEEP_ONLY="f5-tts,chatterbox,..." runs ONLY
 # those backends (skips all others) — for targeted re-tests of a fixed subset.
 SWEEP_ONLY = {x.strip() for x in os.environ.get("CRISPASR_SWEEP_ONLY", "").split(",") if x.strip()}
@@ -711,6 +835,12 @@ if BENCHMARK_TTS == "1":
             "cosyvoice3":     ["--voice", REF_WAV, "--ref-text", JFK_RT, "--i-have-rights"],
             "vibevoice-tts":  ["--voice", REF_WAV, "--i-have-rights"],
             "vibevoice-1.5b": ["--voice", REF_WAV, "--i-have-rights"],
+            # 2026-09-07: vibevoice-bitnet was added to TTS_BACKENDS without a
+            # voice and failed in 23.5 s with 0 bytes and
+            #   "no voice prompt resolved (pass --voice <path.gguf>, ...)"
+            # — the exact failure this table's comment was written about. Its
+            # two siblings above were already here; the new entry just missed it.
+            "vibevoice-bitnet": ["--voice", REF_WAV, "--i-have-rights"],
             "fastpitch":      ["--voice", "0"],
             "orpheus":        ["--voice", "tara"],
         }
@@ -719,6 +849,17 @@ if BENCHMARK_TTS == "1":
         phrase = TTS_PHRASE
         if backend == "dia":
             phrase = "[S1] The quick brown fox jumps over the lazy dog. This is a longer prompt for Dia which needs over one hundred characters to produce good output quality."
+
+        # Per-backend quantisation. `-m auto` takes each registry default, and
+        # for kugelaudio that is F16 at ~17.3 GB — which tried to allocate
+        # 16483.91 MiB on a 16269 MiB P100 and died with
+        #   "failed to allocate 17.28 GB on 'CUDA0' for the model weights"
+        # after 289 s. The sweep entry's own note already said "Q4_K ~5.7GB via
+        # -m auto (F16 17.3GB needs >16GB VRAM)", so the intent was Q4_K and the
+        # resolution silently disagreed with it. Ask for the quant explicitly
+        # rather than trusting the default to stay small enough.
+        quant_args = {"kugelaudio": ["--model-quant", "q4_k"]}
+        cmd += quant_args.get(backend, [])
 
         cmd += ["--tts", phrase]
 

@@ -10,6 +10,13 @@
 #include <cstring>
 #include <vector>
 
+// Dev harness: every input path is env-overridable so this file carries no
+// machine-specific absolute paths. Defaults are plain relative filenames.
+static const char* env_or(const char* name, const char* fallback) {
+    const char* v = std::getenv(name);
+    return (v && *v) ? v : fallback;
+}
+
 static std::vector<float> transpose_2d(const float* data, int slow_dim, int fast_dim) {
     std::vector<float> out(slow_dim * fast_dim);
     for (int s = 0; s < slow_dim; s++)
@@ -19,9 +26,9 @@ static std::vector<float> transpose_2d(const float* data, int slow_dim, int fast
 }
 
 int main(int argc, char** argv) {
-    const char* model_path = "/mnt/storage/chatterbox/chatterbox-s3gen-f16.gguf";
-    const char* ref_path = "/mnt/storage/chatterbox/voc-ref.gguf";
-    const char* mel_path = "/mnt/storage/chatterbox/ref_mel_80x62.bin";
+    const char* model_path = env_or("CHATTERBOX_S3GEN_GGUF", "chatterbox-s3gen-f16.gguf");
+    const char* ref_path = env_or("CHATTERBOX_VOC_REF", "voc-ref.gguf");
+    const char* mel_path = env_or("CHATTERBOX_REF_MEL", "ref_mel_80x62.bin");
 
     if (argc >= 2)
         model_path = argv[1];

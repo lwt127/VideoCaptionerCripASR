@@ -82,6 +82,20 @@ fn emit_runtime_rpath(build_dir: &Path) {
     let lib_subdir_str = lib_subdir.display();
     let ggml_subdir = build_dir.join("ggml").join("src");
     let ggml_subdir_str = ggml_subdir.display();
+
+    // #359/#361: `cargo:rustc-link-arg` applies ONLY to the crate whose build
+    // script emitted it. A DEPENDENT's test and bin binaries get none of it, so
+    // `cargo test -p crispasr` linked with zero LC_RPATH entries and died with
+    // "Library not loaded: @rpath/libcrispasr...". The doc comment above has
+    // claimed `cargo test` works out of the workspace since this was written; it
+    // did not.
+    //
+    // This crate declares `links = "crispasr"`, so anything it prints as
+    // `cargo:KEY=VALUE` reaches a direct dependent's build script as
+    // `DEP_CRISPASR_<KEY>`. Publish the two directories and let crispasr's own
+    // build.rs re-emit the rpath for its tests and bins.
+    println!("cargo:libdir={lib_subdir_str}");
+    println!("cargo:ggmldir={ggml_subdir_str}");
     match target_os.as_str() {
         "macos" => {
             println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_subdir_str}");

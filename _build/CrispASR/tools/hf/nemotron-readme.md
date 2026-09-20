@@ -89,6 +89,7 @@ GGUF conversion of [nvidia/nemotron-3.5-asr-streaming-0.6b](https://huggingface.
 | File | Size | Description |
 |------|------|-------------|
 | `nemotron-3.5-asr-streaming-0.6b-f16.gguf` | 1.3 GB | F16 weights (full precision, F32 pre-encode) |
+| `nemotron-3.5-asr-streaming-0.6b-q8_0.gguf` | 686 MB | Q8_0 quantized (high precision, low footprint) |
 | `nemotron-3.5-asr-streaming-0.6b-q4_k.gguf` | 458 MB | Q4_K quantized (recommended, ~2x faster) |
 
 ## Usage with CrispASR

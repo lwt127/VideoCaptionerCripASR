@@ -3,7 +3,9 @@
 #include "audio_resample.h"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <numeric>
 #include <vector>
@@ -70,6 +72,9 @@ static int gcd(int a, int b) {
 
 } // namespace
 
+// Largest upsample this will perform. See the note in resample_polyphase.
+static constexpr int kMaxResampleRatio = 64;
+
 std::vector<float> resample_polyphase(const float* in, int n_in, int src_rate, int dst_rate, int num_zeros,
                                       float kaiser_beta) {
     if (!in || n_in <= 0 || src_rate <= 0 || dst_rate <= 0)
@@ -80,15 +85,47 @@ std::vector<float> resample_polyphase(const float* in, int n_in, int src_rate, i
         return out;
     }
 
+    // BOUND THE EXPANSION BEFORE COMPUTING ANYTHING.
+    //
+    // `sr` reaches most callers straight out of a decoded file header, so
+    // dst_rate/src_rate is attacker-controlled. A WAV declaring sampleRate = 1
+    // asks this function for a 16000x upsample: 176 000 input samples become
+    // 2.816e9 output floats, 11.3 GB. (Same input, different code path, as the
+    // crispasr_audio_load ceiling — that one bounds the DECODE, this bounds the
+    // RESAMPLE, and the CLI reaches only this one.)
+    //
+    // THE PREVIOUS GUARD DID NOT GUARD. n_out was computed into an `int`, so
+    // that case overflowed to -1478967296 and the `n_out <= 0` test below
+    // caught it BY LUCK — the product happened to land negative. At 300 000
+    // input samples the same expression overflows to +505032704 and at 400 000
+    // to +2105032704: positive, past the test, allocating gigabytes and then
+    // resampling with a length that has nothing to do with the data. A guard
+    // whose input has already overflowed is not a guard.
+    //
+    // 64x against what real conversions need: 8k->48k is 6x, 16k->48k is 3x,
+    // 8k->96k is 12x. Five times the headroom of the most extreme legitimate
+    // ratio, and three orders of magnitude below the abusive one.
+    const int64_t n_out64 = ((int64_t)n_in * dst_rate + src_rate - 1) / src_rate;
+    if (n_out64 <= 0 || n_out64 > (int64_t)n_in * kMaxResampleRatio || n_out64 > (int64_t)INT_MAX) {
+        // LOUD, because the caller cannot tell an empty return from silence.
+        // read_audio_data assigned this straight into its PCM buffer, so the
+        // CLI reported "0 samples ... no speech detected" and exited 0 — a
+        // rejection rendered as a successful transcription of nothing.
+        std::fprintf(stderr,
+                     "[crispasr-resample] refusing %d samples at %d Hz -> %d Hz: %lld output samples exceeds the "
+                     "%dx expansion limit. A sample rate this far from the target usually means a malformed "
+                     "header.\n",
+                     n_in, src_rate, dst_rate, (long long)n_out64, kMaxResampleRatio);
+        return {};
+    }
+
     const int g = gcd(src_rate, dst_rate);
     const int L = dst_rate / g;
     const int M = src_rate / g;
 
     // Total output length — round up so we never silently drop trailing
     // input samples.
-    const int n_out = (int)(((int64_t)n_in * dst_rate + src_rate - 1) / src_rate);
-    if (n_out <= 0)
-        return {};
+    const int n_out = (int)n_out64;
 
     auto h = build_filter(L, M, num_zeros, kaiser_beta);
     const int half_len = ((int)h.size() - 1) / 2;
@@ -99,6 +136,18 @@ std::vector<float> resample_polyphase(const float* in, int n_in, int src_rate, i
     // sample `j` sits at upsampled position `j * L`. So the filter
     // tap index for input sample `j` contributing to output `i` is
     // `(i * M - j * L) + half_len` — must be in [0, total_len).
+    // Input-sample half-width of the filter. A tap exists for input `j`
+    // while |i*M - j*L| <= half_len, i.e. within half_len/L input samples of
+    // `j_center` — which is `num_zeros` only when L >= M (any upsample). For
+    // a downsample (M > L) `up` is M, so the filter spans num_zeros*M/L input
+    // samples and a fixed ±num_zeros window drops its outer taps: it cut the
+    // Kaiser window off mid-slope, costing DC gain and adding ripple
+    // (0.25 → 0.2495 ± 5.4e-4 at 24→16 kHz; the every-rate guard in
+    // tests/test-audio-resample.cpp is the regression). The `tap` bounds
+    // check below still discards anything genuinely outside the filter, so
+    // the +1 is only there to cover the phase offset.
+    const int j_span = half_len / L + 1;
+
     std::vector<float> out((size_t)n_out, 0.0f);
     for (int i = 0; i < n_out; i++) {
         const int64_t i_up = (int64_t)i * M;      // position in upsampled stream
@@ -106,8 +155,8 @@ std::vector<float> resample_polyphase(const float* in, int n_in, int src_rate, i
         const int phase_offset = (int)(i_up % L); // fractional component
         // Iterate over the input window that covers half_len upsampled
         // taps in each direction.
-        const int j_min = std::max(0, j_center - num_zeros);
-        const int j_max = std::min(n_in - 1, j_center + num_zeros + 1);
+        const int j_min = std::max(0, j_center - j_span);
+        const int j_max = std::min(n_in - 1, j_center + j_span);
         double s = 0.0;
         for (int j = j_min; j <= j_max; j++) {
             // Filter tap index for this (i, j) pair:

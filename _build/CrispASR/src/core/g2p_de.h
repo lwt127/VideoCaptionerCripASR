@@ -10,6 +10,9 @@
 
 #pragma once
 
+#include "core/g2p_de_unstressed.h"
+#include "core/num2words_de.h" // #316: spell digits out before phonemizing
+
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -624,6 +627,31 @@ inline std::string lts_word_to_ipa(const std::string& word) {
 
 struct context {
     dictionary dict;
+
+    // #316 round 2: carry punctuation through into the phoneme string. Kokoro's
+    // 178-symbol vocabulary contains `,.;:!?…—"«»“”` — they are how the model
+    // knows to pause, and dropping them delivers a paragraph in one breath.
+    // English proved it (misaki emits them and we did not); this is the same
+    // defect in the same shape. Off by default: piper's phoneme inventory is
+    // espeak's, and that consumer has never been fed punctuation, so the flag
+    // is the caller's to set. See g2p_en::style.
+    bool emit_punctuation = false;
+
+    // Read the German closed class the way espeak reads it IN A SENTENCE.
+    // `espeak_de.tsv` was generated one word at a time, so every entry is the
+    // citation form — and espeak stresses "sie" as `zˈiː` alone but `ziː` in a
+    // sentence. We therefore put a primary stress on every article, pronoun,
+    // preposition and auxiliary, which is the German shape of the #316 English
+    // bug. Turning this on takes token agreement with espeak's sentence output
+    // from 45.9% to 87.1%.
+    //
+    // ON by default since the training recipe was found: dida-80b/kokoro-deutsch
+    // phonemizes the WHOLE SENTENCE through espeak (misaki's
+    // `EspeakG2P(language="de")`), so espeak's sentence-level de-stressing is
+    // in the training data and the citation form is a spelling the model never
+    // saw. That is source evidence, not a preference.
+    // CRISPASR_G2P_DE_UNSTRESS=0 restores the citation forms for A/B.
+    bool unstress_function_words = true;
 };
 
 // ── Tokenizer ───────────────────────────────────────────────────────
@@ -633,7 +661,8 @@ inline std::vector<std::string> tokenize(const std::string& text) {
     std::string cur;
     for (size_t i = 0; i < text.size(); i++) {
         char c = text[i];
-        if (c == ' ' || c == ',' || c == '.' || c == '!' || c == '?' || c == ';' || c == ':' || c == '-' || c == '\n') {
+        if (c == ' ' || c == ',' || c == '.' || c == '!' || c == '?' || c == ';' || c == ':' || c == '-' || c == '\n' ||
+            c == '"' || c == '(' || c == ')' || c == '[' || c == ']') {
             if (!cur.empty()) {
                 tokens.push_back(cur);
                 cur.clear();
@@ -687,16 +716,49 @@ inline std::string word_to_ipa(const context& ctx, const std::string& word) {
 }
 
 inline std::string text_to_ipa(const context& ctx, const std::string& text) {
-    auto words = tokenize(text);
+    // #316: spell numbers out FIRST. Digits are in no pronunciation dictionary
+    // and no letter-to-sound rule, so a numeric token phonemized to the EMPTY
+    // string and vanished from the audio — "Ich habe 82 Euro" was spoken as
+    // "Ich habe Euro". Nothing errored; the number was simply gone.
+    //
+    // This must run before tokenize(), which splits on ',' and '.' — the two
+    // characters German uses as decimal mark and thousands separator. Expanding
+    // afterwards would already have "3,14" torn into "3", "," and "14".
+    auto words = tokenize(core_num2words_de::expand(text));
+    // A mark that the consumer wants goes flush against the word before it and
+    // is followed by a space, the way misaki emits English. A mark it does not
+    // want still separates its neighbours — with ONE space, not the two the old
+    // loop produced around every comma. `-` is a separator only: it is in no
+    // TTS vocabulary here.
     std::string ipa;
+    bool pending_space = false;
     for (const auto& w : words) {
-        if (w.size() == 1 &&
-            (w[0] == ',' || w[0] == '.' || w[0] == '!' || w[0] == '?' || w[0] == ';' || w[0] == ':' || w[0] == '-')) {
+        const bool punct = w.size() == 1 && strchr(",.!?;:-\"()[]'", w[0]) != nullptr;
+        if (punct && (!ctx.emit_punctuation || w[0] == '-' || w[0] == '\'')) {
+            if (!ipa.empty())
+                pending_space = true;
             continue;
         }
-        if (!ipa.empty())
+        if (punct) {
+            ipa += w; // attaches to the word before it
+            pending_space = true;
+            continue;
+        }
+        std::string ph = word_to_ipa(ctx, w);
+        if (ph.empty())
+            continue;
+        if (ctx.unstress_function_words) {
+            std::string lower;
+            for (char c : w)
+                lower += (char)tolower((unsigned char)c);
+            const std::string un = core_g2p_de_unstressed::lookup(lower);
+            if (!un.empty())
+                ph = un;
+        }
+        if (!ipa.empty() && (pending_space || ipa.back() != ' '))
             ipa += ' ';
-        ipa += word_to_ipa(ctx, w);
+        pending_space = false;
+        ipa += ph;
     }
     return ipa;
 }

@@ -138,7 +138,11 @@ jobs:
       # A tarball that cannot self-build is the documented contract for this
       # crate, so there is nothing for verification to prove. What DOES need
       # proving — that the FFI compiles against the real ABI — is covered by CI
-      # on every push (cargo check on both crates), not by this step.
+      # by .github/workflows/bindings-rust.yml (cargo check on both crates plus
+      # cargo test on the wrapper), not by this step. That workflow is named
+      # here deliberately: this comment asserted the check existed for months
+      # while no workflow in the repo invoked cargo at all, and it is
+      # load-bearing — it is the stated reason publishing may use --no-verify.
       #
       # crispasr-sys must be on crates.io before the high-level crate's version
       # dep resolves, hence the ordering and the index wait below.

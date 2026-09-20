@@ -2,13 +2,13 @@
 the Python ctypes binding.
 
 Does NOT instantiate models or run inference — purely checks that the
-binding declares (and can look up) all 152 symbols in this smoke-test set.
+binding declares (and can look up) every symbol in this smoke-test set.
 Requires CRISPASR_LIB_PATH pointing at a built libcrispasr.{so,dylib}.
 
 KNOWN GAP: this list is a curated subset, NOT the full export surface.
-src/crispasr_c_api.cpp currently declares 199 distinct CA_EXPORT symbols, so
-~47 are unlisted and this test would not notice if a binding stopped exposing
-one of them. Treat a green run as "the listed symbols are reachable", not as
+This test does not enumerate the full export surface and would not notice if
+an unlisted binding symbol disappeared. Treat a green run as "the listed
+symbols are reachable", not as
 "the ABI is fully covered". When adding symbols here, prefer closing the gap
 over matching the existing count. Regenerate the true export list with:
 
@@ -39,6 +39,7 @@ ALL_SYMBOLS = [
     "crispasr_detect_language",
     "crispasr_detect_language_pcm",
     "crispasr_diarize_segments_abi",
+    "crispasr_diarize_segments_turns_abi",
     "crispasr_enhance_audio_rnnoise",
     "crispasr_kokoro_lang_has_native_voice_abi",
     "crispasr_kokoro_lang_is_german_abi",
@@ -131,11 +132,17 @@ ALL_SYMBOLS = [
     "crispasr_session_set_punc_model",
     "crispasr_session_set_punctuation",
     "crispasr_session_set_repetition_penalty",
+    "crispasr_session_set_sensitivity",
     "crispasr_session_set_source_language",
     "crispasr_session_set_speaker_name",
     "crispasr_session_set_target_language",
     "crispasr_session_set_temperature",
     "crispasr_session_set_top_p",
+    "crispasr_session_set_tts_reference_language",
+    # EU AI Act Art. 50(4): whose voice a PRESET voice is. Listed here so the
+    # parity suite proves every binding can actually resolve it — the mechanism
+    # shipped reachable only from the C ABI once already.
+    "crispasr_session_set_speaker_identity",
     "crispasr_session_set_translate",
     "crispasr_session_set_tts_seed",
     "crispasr_session_set_tts_steps",
@@ -209,7 +216,7 @@ def test_symbol_resolves(lib, symbol):
 
 def test_symbol_count(lib):
     """Sanity-check accidental edits to the maintained symbol set."""
-    assert len(ALL_SYMBOLS) == 152, f"expected 152 symbols, got {len(ALL_SYMBOLS)}"
+    assert len(ALL_SYMBOLS) == 155, f"expected 155 symbols, got {len(ALL_SYMBOLS)}"
 
 
 def test_python_binding_imports():

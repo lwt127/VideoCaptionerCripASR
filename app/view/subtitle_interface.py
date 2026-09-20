@@ -208,10 +208,10 @@ class SubtitleInterface(QWidget):
         self._setup_bottom_layout()
 
     def set_values(self):
-        self.layout_button.setText(cfg.subtitle_layout.value)
+        self.layout_button.setText(self.tr(cfg.subtitle_layout.value))
         self.translate_button.setChecked(cfg.need_translate.value)
         self.optimize_button.setChecked(cfg.need_optimize.value)
-        self.target_language_button.setText(cfg.target_language.value.value)
+        self.target_language_button.setText(self.tr(cfg.target_language.value.value))
         self.target_language_button.setEnabled(cfg.need_translate.value)
 
     def _setup_top_layout(self):
@@ -249,7 +249,7 @@ class SubtitleInterface(QWidget):
         self.layout_button.setMinimumWidth(125)
         self.layout_menu = RoundMenu(parent=self)
         for layout in ["译文在上", "原文在上", "仅译文", "仅原文"]:
-            action = Action(text=layout)
+            action = Action(text=self.tr(layout))
             action.triggered.connect(
                 lambda checked, l=layout: signalBus.subtitle_layout_changed.emit(l)
             )
@@ -286,7 +286,7 @@ class SubtitleInterface(QWidget):
         self.target_language_menu = RoundMenu(parent=self)
         self.target_language_menu.setMaxVisibleItems(10)
         for lang in TargetLanguageEnum:
-            action = Action(text=lang.value)
+            action = Action(text=self.tr(lang.value))
             action.triggered.connect(
                 lambda checked, l=lang.value: signalBus.target_language_changed.emit(l)
             )
@@ -809,7 +809,7 @@ class SubtitleInterface(QWidget):
         """处理翻译语言变更"""
         for lang in TargetLanguageEnum:
             if lang.value == language:
-                self.target_language_button.setText(lang.value)
+                self.target_language_button.setText(self.tr(lang.value))
                 cfg.set(cfg.target_language, lang)
                 break
 
@@ -828,7 +828,7 @@ class SubtitleInterface(QWidget):
     def on_subtitle_layout_changed(self, layout: str):
         """处理字幕排布变更"""
         cfg.set(cfg.subtitle_layout, layout)
-        self.layout_button.setText(layout)
+        self.layout_button.setText(self.tr(layout))
 
 
 class PromptDialog(MessageBoxBase):

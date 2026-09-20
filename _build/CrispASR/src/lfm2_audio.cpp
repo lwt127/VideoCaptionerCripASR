@@ -594,14 +594,14 @@ lfm2_audio_context* lfm2_audio_init_from_file(const char* path_model, lfm2_audio
     }
     ctx->use_gpu = params.use_gpu;
     // Initialize backend: GPU if available and requested, else CPU
-    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init();
     if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
-    ctx->backend_cpu = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (ctx->backend_cpu)
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads);
-    if (ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, params.n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, params.n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, params.n_threads);
     ctx->compute_meta.resize(256ULL * 1024 * 1024); // 256 MB scratch for prefill
     ctx->decode_meta.resize(64ULL * 1024 * 1024);   // 64 MB scratch for T=1 decode
 
@@ -664,7 +664,7 @@ void lfm2_audio_free(lfm2_audio_context* ctx) {
     if (!ctx)
         return;
     if (ctx->detok.buf)
-        ggml_backend_buffer_free(ctx->detok.buf);
+        core_gguf::release_weight_buffer(ctx->detok.buf);
     if (ctx->detok.ctx)
         ggml_free(ctx->detok.ctx);
     if (ctx->sched)
@@ -676,7 +676,7 @@ void lfm2_audio_free(lfm2_audio_context* ctx) {
     ctx->model.pw_q8.free();
     ctx->model.qkv_fused.free();
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend)
@@ -1850,7 +1850,7 @@ static std::vector<int32_t> lfm2_depthformer_sample_frame(lfm2_audio_context* ct
 
     ggml_cgraph* gf0 = ggml_new_graph(ctx0);
     ggml_build_forward_expand(gf0, proj_out);
-    ggml_graph_compute_with_ctx(ctx0, gf0, ctx->n_threads);
+    core_cpu_backend::compute(ctx0, gf0, ctx->n_threads);
 
     // Extract projected values
     std::vector<float> proj_data(codebooks * depth_dim);
@@ -2052,7 +2052,7 @@ static std::vector<int32_t> lfm2_depthformer_sample_frame(lfm2_audio_context* ct
             if (vs)
                 ggml_build_forward_expand(gf, vs);
         }
-        ggml_graph_compute_with_ctx(sc, gf, ctx->n_threads);
+        core_cpu_backend::compute(sc, gf, ctx->n_threads);
 
         // Update KV cache from snapshots
         for (int il = 0; il < depth_n_layers; il++) {
@@ -2089,7 +2089,7 @@ static std::vector<int32_t> lfm2_depthformer_sample_frame(lfm2_audio_context* ct
             ggml_tensor* emb_out = ggml_dup(sc, emb);
             ggml_cgraph* gf2 = ggml_new_graph(sc);
             ggml_build_forward_expand(gf2, emb_out);
-            ggml_graph_compute_with_ctx(sc, gf2, 1);
+            core_cpu_backend::compute(sc, gf2, 1);
             memcpy(prev_emb.data(), emb_out->data, sizeof(float) * depth_dim);
         }
 
@@ -2112,6 +2112,7 @@ static std::vector<int32_t> lfm2_depthformer_sample_frame(lfm2_audio_context* ct
 // ISTFT-based audio decoder: Mimi codes → PCM at 24 kHz.
 // Uses the detokenizer model weights if loaded, otherwise returns nullptr.
 #include "core/istft.h"
+#include "core/ggml_cpu_backend.h"
 
 // Helper: embed audio codes via audio_embedding and sum across codebooks.
 // Returns (hidden,) float vector = sum_c audio_embd[code_c + c * audio_vocab].
@@ -2287,7 +2288,7 @@ static float* lfm2_detokenize(lfm2_audio_context* ctx, const std::vector<std::ve
         ggml_tensor* o = ggml_dup(ec, rows);
         ggml_cgraph* g = ggml_new_graph(ec);
         ggml_build_forward_expand(g, o);
-        ggml_graph_compute_with_ctx(ec, g, 1);
+        core_cpu_backend::compute(ec, g, 1);
         const float* od = (const float*)o->data;
         for (int j = 0; j < h; j++) {
             float s = 0;
@@ -2378,7 +2379,7 @@ static float* lfm2_detokenize(lfm2_audio_context* ctx, const std::vector<std::ve
     ggml_tensor* out = ggml_dup(c0, lin);
     ggml_set_name(out, "do");
     ggml_build_forward_expand(gf, out);
-    ggml_graph_compute_with_ctx(c0, gf, ctx->n_threads);
+    core_cpu_backend::compute(c0, gf, ctx->n_threads);
 
     // 4. Split log_mag + angle → ISTFT → PCM
     const float* od = (const float*)out->data;

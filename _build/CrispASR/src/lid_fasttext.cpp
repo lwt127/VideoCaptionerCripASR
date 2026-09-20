@@ -39,6 +39,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `LID_FASTTEXT_BENCH=1` for per-stage timings.
@@ -475,7 +476,7 @@ extern "C" struct lid_fasttext_context* lid_fasttext_init_from_file(const char* 
     }
 
     // Pass 2: weights — CPU backend (small enough that GPU offload is overhead).
-    ctx->backend = ggml_backend_cpu_init();
+    ctx->backend = core_cpu_backend::init();
     if (!ctx->backend) {
         fprintf(stderr, "lid_fasttext: ggml_backend_cpu_init failed\n");
         delete ctx;

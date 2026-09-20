@@ -12,13 +12,22 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
+#include <system_error>
 
 #ifdef _WIN32
 #include <direct.h>
 #include <process.h>
 #include <sys/stat.h>
 #include <windows.h>
+// MinGW's mkdir takes only a path — no mode — so the POSIX two-argument calls
+// below are a hard error there ("too many arguments to function
+// 'int mkdir(const char*)'"). Same shim src/crispasr_cache.cpp already carries
+// for exactly this reason; MSVC does not declare mkdir at all, so it needs it
+// too. Only build.yml's msbuild ALL_BUILD compiles the tests on Windows, which
+// is why this went unnoticed.
+#define mkdir(d, m) _mkdir(d)
 static std::string make_temp_dir() {
     char buf[MAX_PATH];
     GetTempPathA(MAX_PATH, buf);
@@ -92,6 +101,45 @@ TEST_CASE("file_present: non-empty file returns true", "[unit]") {
     const std::string tmp = make_temp_dir() + "/nonempty.bin";
     write_file(tmp, "fake model bytes");
     REQUIRE(crispasr_cache::file_present(tmp));
+    remove_file(tmp);
+}
+
+// #393: a cached GGUF larger than 2 GiB was reported MISSING on Windows, so
+// `-m auto` re-downloaded a model that was already on disk. MSVC's `stat` is
+// `_stat64i32` — a 32-bit st_size — and it fails outright past 2 GiB, which is
+// every model this cache exists to hold. The file is created SPARSE (seek past
+// the end, write one byte), so it costs a few KiB on NTFS/ext4/APFS rather than
+// 2 GiB; a filesystem that refuses that just skips the test rather than
+// filling the disk.
+TEST_CASE("file_present: a file larger than 2 GiB is found (#393)", "[unit]") {
+    const std::string tmp = make_temp_dir() + "/large.bin";
+    constexpr long long kOver2GiB = 2LL * 1024 * 1024 * 1024 + 4096;
+
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f)
+        SKIP("could not create the temp file");
+#ifdef _WIN32
+    const bool seek_ok = _fseeki64(f, kOver2GiB - 1, SEEK_SET) == 0;
+#else
+    const bool seek_ok = fseeko(f, (off_t)(kOver2GiB - 1), SEEK_SET) == 0;
+#endif
+    const bool wrote = seek_ok && fputc(0, f) != EOF;
+    const bool closed = fclose(f) == 0;
+    if (!wrote || !closed) {
+        remove_file(tmp);
+        SKIP("filesystem would not take a sparse 2 GiB file");
+    }
+
+    // Guard the guard: if the file did not actually reach that size, the test
+    // would pass for the wrong reason on the very platform it targets.
+    std::error_code ec;
+    const std::uintmax_t actual = std::filesystem::file_size(std::filesystem::path(tmp), ec);
+    if (ec || actual < (std::uintmax_t)kOver2GiB) {
+        remove_file(tmp);
+        SKIP("sparse file did not reach 2 GiB");
+    }
+
+    CHECK(crispasr_cache::file_present(tmp));
     remove_file(tmp);
 }
 

@@ -42,6 +42,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 namespace {
 
@@ -220,13 +221,13 @@ struct tabcnn_context* tabcnn_init(const char* model_path, int n_threads) {
     if (getenv("CRISPASR_TABCNN_NO_GPU") == nullptr)
         ctx->backend = crispasr_init_gpu_backend();
     if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
     if (!ctx->backend) {
         delete ctx;
         return nullptr;
     }
-    if (ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
 
     if (!core_gguf::load_weights(model_path, ctx->backend, "tabcnn", ctx->wl)) {
         tabcnn_free(ctx);

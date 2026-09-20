@@ -206,6 +206,19 @@ int main(int argc, char** argv) {
     gp.seed = args.seed;
 
     const bool one_shot = args.force_one_shot || !stdin_is_tty();
+
+    // EU AI Act Art. 50(1) — disclose AI interaction, at or before the first
+    // turn. Always emitted, in both modes, on stderr so stdout stays a clean
+    // pipeline of model output.
+    //
+    // Arguably not owed here: a terminal you launched with `-m model.gguf` is
+    // "obvious to a reasonably well-informed person". But this binary is
+    // installed as a reference for downstream wrappers, and a reference that
+    // omits the disclosure teaches every wrapper to omit it — in an app chat
+    // bubble, where obviousness plainly does not hold. Cheaper to model the
+    // right thing than to document it and hope. See docs/eu-ai-act.md §6.6.
+    std::fprintf(stderr, "%s\n", crispasr_chat_ai_disclosure_text());
+
     const char* color_user = args.no_color ? "" : "\x1b[36m";
     const char* color_bot = args.no_color ? "" : "\x1b[32m";
     const char* color_off = args.no_color ? "" : "\x1b[0m";

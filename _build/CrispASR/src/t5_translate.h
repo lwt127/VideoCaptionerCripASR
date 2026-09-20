@@ -40,6 +40,13 @@ char* t5_translate(struct t5_translate_context* ctx, const char* text, int max_n
 // tokens to the input and corrupts the encoder context.
 bool t5_has_token(struct t5_translate_context* ctx, const char* token_str);
 
+// #333 diff harness: per-stage parity against tools/reference_backends/madlad.py.
+// Loads the runtime and the reference GGUF and compares inline (the dots-tts /
+// voxtral-tts pattern). Source tokens are taken FROM the reference so a
+// tokenizer disagreement cannot masquerade as numeric drift.
+// Returns 0 when every stage passes, 1 on a failing stage, 2 on a load error.
+int t5_translate_diff(const char* model_gguf, const char* ref_gguf, int verbosity);
+
 #ifdef __cplusplus
 }
 #endif

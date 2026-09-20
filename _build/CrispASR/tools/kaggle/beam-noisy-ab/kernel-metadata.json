@@ -1,0 +1,15 @@
+{
+  "id": "chr1s4/crispasr-beam-noisy-ab-higgs-ark",
+  "title": "CrispASR beam noisy AB higgs ark",
+  "code_file": "beam_noisy_ab.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_internet": "true",
+  "competition_sources": [],
+  "dataset_sources": ["chr1s4/crispasr-hf-token", "chr1s4/crispasr-ccache"],
+  "kernel_sources": [],
+  "model_sources": [],
+  "machine_shape": "GPU_T4_X2"
+}

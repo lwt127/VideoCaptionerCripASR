@@ -44,7 +44,8 @@ bool contains_ci(const std::string& haystack, const char* needle) {
 
 class TitaNetEmbedder : public CrispasrSpeakerEmbedder {
 public:
-    explicit TitaNetEmbedder(titanet_context* ctx) : ctx_(ctx) {}
+    TitaNetEmbedder(titanet_context* ctx, std::string path, int n_threads)
+        : ctx_(ctx), path_(std::move(path)), n_threads_(n_threads) {}
     ~TitaNetEmbedder() override {
         if (ctx_)
             titanet_free(ctx_);
@@ -60,8 +61,19 @@ public:
         return n == 192;
     }
 
+    std::unique_ptr<CrispasrSpeakerEmbedder> clone() const override {
+        if (path_.empty())
+            return nullptr;
+        titanet_context* c = titanet_init(path_.c_str(), n_threads_);
+        if (!c)
+            return nullptr;
+        return std::make_unique<TitaNetEmbedder>(c, path_, n_threads_);
+    }
+
 private:
     titanet_context* ctx_;
+    std::string path_;
+    int n_threads_ = 1;
 };
 
 // IndexTTS-BigVGAN ECAPA-TDNN adapter. The runtime expects 24 kHz mono
@@ -72,7 +84,8 @@ private:
 // resampling artifacts at the highest frequencies.
 class IndexTtsEcapaEmbedder : public CrispasrSpeakerEmbedder {
 public:
-    explicit IndexTtsEcapaEmbedder(indextts_voc_context* ctx) : ctx_(ctx) {}
+    IndexTtsEcapaEmbedder(indextts_voc_context* ctx, std::string path, int n_threads)
+        : ctx_(ctx), path_(std::move(path)), n_threads_(n_threads) {}
     ~IndexTtsEcapaEmbedder() override {
         if (ctx_)
             indextts_voc_free(ctx_);
@@ -110,8 +123,19 @@ public:
         return true;
     }
 
+    std::unique_ptr<CrispasrSpeakerEmbedder> clone() const override {
+        if (path_.empty())
+            return nullptr;
+        indextts_voc_context* c = indextts_voc_init(path_.c_str(), n_threads_, /*use_gpu=*/false);
+        if (!c)
+            return nullptr;
+        return std::make_unique<IndexTtsEcapaEmbedder>(c, path_, n_threads_);
+    }
+
 private:
     indextts_voc_context* ctx_;
+    std::string path_;
+    int n_threads_ = 1;
 };
 
 // Resolve the IndexTTS-BigVGAN companion GGUF, auto-downloading on
@@ -123,9 +147,10 @@ std::string resolve_indextts_bigvgan(const std::string& model_spec, const std::s
         model_spec.compare(model_spec.size() - 5, 5, ".gguf") == 0) {
         return model_spec;
     }
-    return crispasr_cache::ensure_cached_file(
-        "indextts-bigvgan.gguf", "https://huggingface.co/cstr/indextts-1.5-GGUF/resolve/main/indextts-bigvgan.gguf",
-        quiet, "crispasr[diarize-embedder]", cache_dir);
+    return crispasr_managed_download("indextts-bigvgan.gguf",
+                                     "https://huggingface.co/cstr/indextts-1.5-GGUF/resolve/main/indextts-bigvgan.gguf",
+                                     "Apache-2.0 (see https://huggingface.co/IndexTeam/IndexTTS-1.5)", quiet,
+                                     "crispasr[diarize-embedder]", cache_dir);
 }
 
 } // namespace
@@ -178,7 +203,7 @@ std::unique_ptr<CrispasrSpeakerEmbedder> crispasr_make_speaker_embedder(const st
             fprintf(stderr, "crispasr[diarize]: failed to load IndexTTS-BigVGAN from '%s'\n", resolved.c_str());
             return nullptr;
         }
-        return std::make_unique<IndexTtsEcapaEmbedder>(ctx);
+        return std::make_unique<IndexTtsEcapaEmbedder>(ctx, resolved, n_threads);
     }
 
     // Default: TitaNet. Resolve "auto" + bare filenames via the
@@ -198,5 +223,5 @@ std::unique_ptr<CrispasrSpeakerEmbedder> crispasr_make_speaker_embedder(const st
         fprintf(stderr, "crispasr[diarize]: failed to load speaker embedder from '%s'\n", resolved.c_str());
         return nullptr;
     }
-    return std::make_unique<TitaNetEmbedder>(ctx);
+    return std::make_unique<TitaNetEmbedder>(ctx, resolved, n_threads);
 }

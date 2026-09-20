@@ -536,6 +536,13 @@ class TranscribeConfig:
     faster_whisper_ff_mdx_kim2: bool = False
     faster_whisper_one_word: bool = True
     faster_whisper_prompt: Optional[str] = None
+    # Deprecated; retained only for compatibility with older task configuration.
+    crisp_asr_cohere_multilingual: bool = False
+    crisp_asr_license_acceptances: tuple[str, ...] = ()
+    crisp_asr_engine_flavor: str = "auto"
+    crisp_asr_alignment_mode: str = "default"
+    crisp_asr_aligner: str = "qwen3-forced-aligner"
+    crisp_asr_word_timestamps: bool = False
 
 
 @dataclass

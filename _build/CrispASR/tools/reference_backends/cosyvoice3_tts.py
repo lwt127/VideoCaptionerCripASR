@@ -128,6 +128,13 @@ DEFAULT_STAGES = [
     "s3tok_blk_11",             # after final FSMN/attention block   (T_tok, 1280)
     "s3tok_proj",               # FSQ projection (pre-tanh)          (T_tok, 8)
     "s3tok_tokens",             # quantised speech token ids         (T_tok,)
+    # Phase 7 — the WAV-clone front-end (#334). These three are what a
+    # `--voice ref.wav` clone actually rides on, and none of them had a stage:
+    # the harness ended at the talker/flow/HiFT, so a wrong CAMPPlus embedding
+    # or a wrong prompt mel would just clone the wrong voice, silently.
+    "clone_spk_emb",            # CAMPPlus 192-d speaker embedding    (192,)
+    "clone_prompt_feat_24k",    # matcha log-mel of the 24 kHz prompt (T_mel, 80)
+    "clone_speech_tokens",      # speech_tokenizer_v3 ids as f32      (T_tok,)
 ]
 
 # Fixed test-vector parameters for the Phase 3b dumps. Pinned so the
@@ -1211,6 +1218,137 @@ def _s3tok_onnx_path(model_dir: Path) -> Path:
     raise SystemExit("speech_tokenizer_v3.onnx not found (set CV3_S3TOK_ONNX)")
 
 
+def _matcha_mel_24k(y_np: np.ndarray) -> np.ndarray:
+    """matcha `mel_spectrogram` at CosyVoice3's yaml settings — the same
+    front end `models/convert-cosyvoice3-voices-to-gguf.py::_matcha_mel`
+    bakes into the voice bank, and the same one
+    `chatterbox_campplus::compute_prompt_feat_24k` reimplements in C++
+    (n_fft/win 1920, hop 480, sr 24000, fmin 0, fmax 8000, center=False,
+    magnitude with an additive 1e-9 inside the sqrt, natural log clipped at
+    1e-5). Returns (T_frames, 80) f32.
+    """
+    import torch
+
+    n_fft, hop, win, n_mels = 1920, 480, 1920, 80
+    sr, fmin, fmax = 24000, 0.0, 8000.0
+
+    key = (sr, n_fft, n_mels, fmin, fmax)
+    cached = _MATCHA_MEL_FB.get(key)
+    if cached is None:
+        cached = torch.from_numpy(_librosa_slaney_fb(sr, n_fft, n_mels, fmin, fmax)).float()
+        _MATCHA_MEL_FB[key] = cached
+    mel_basis = cached
+
+    y = torch.from_numpy(np.asarray(y_np, dtype=np.float32)).unsqueeze(0)
+    pad = (n_fft - hop) // 2
+    y = torch.nn.functional.pad(y.unsqueeze(1), (pad, pad), mode="reflect").squeeze(1)
+    spec = torch.stft(y, n_fft, hop_length=hop, win_length=win,
+                      window=torch.hann_window(win), center=False,
+                      pad_mode="reflect", normalized=False, onesided=True,
+                      return_complex=True)
+    spec = torch.sqrt(spec.real.pow(2) + spec.imag.pow(2) + 1e-9)
+    spec = torch.matmul(mel_basis, spec)
+    spec = torch.log(torch.clamp(spec, min=1e-5))
+    return spec.squeeze(0).transpose(0, 1).numpy()
+
+
+def _librosa_slaney_fb(sr: int, n_fft: int, n_mels: int, fmin: float, fmax: float) -> np.ndarray:
+    """librosa.filters.mel(htk=False, norm='slaney'), hand-rolled so the
+    dumper does not depend on librosa's version-to-version drift."""
+    f_min, f_sp = 0.0, 200.0 / 3
+    min_log_hz, min_log_mel = 1000.0, (1000.0 - f_min) / f_sp
+    logstep = np.log(6.4) / 27.0
+
+    def hz_to_mel(hz):
+        hz = np.asarray(hz, dtype=np.float64)
+        mels = (hz - f_min) / f_sp
+        return np.where(hz >= min_log_hz, min_log_mel + np.log(hz / min_log_hz) / logstep, mels)
+
+    def mel_to_hz(mels):
+        mels = np.asarray(mels, dtype=np.float64)
+        hz = f_min + f_sp * mels
+        return np.where(mels >= min_log_mel, min_log_hz * np.exp(logstep * (mels - min_log_mel)), hz)
+
+    fft_freqs = np.linspace(0, sr / 2.0, n_fft // 2 + 1)
+    hz_pts = mel_to_hz(np.linspace(hz_to_mel(fmin), hz_to_mel(fmax), n_mels + 2))
+    weights = np.zeros((n_mels, n_fft // 2 + 1), dtype=np.float64)
+    for i in range(n_mels):
+        lo = (fft_freqs - hz_pts[i]) / (hz_pts[i + 1] - hz_pts[i])
+        hi = (hz_pts[i + 2] - fft_freqs) / (hz_pts[i + 2] - hz_pts[i + 1])
+        weights[i] = np.maximum(0.0, np.minimum(lo, hi))
+    weights *= (2.0 / (hz_pts[2:n_mels + 2] - hz_pts[:n_mels]))[:, np.newaxis]
+    return weights
+
+
+_MATCHA_MEL_FB: Dict[tuple, "object"] = {}
+
+
+def _s3tok_token_ids(model_dir: Path, audio: np.ndarray) -> np.ndarray:
+    """speech_tokenizer_v3 ids for 16 kHz `audio` — reuses the Phase 6 path
+    so the clone stage cannot drift from the s3tok stages."""
+    return _capture_s3tok_stages(model_dir, audio, {"s3tok_tokens"})["s3tok_tokens"]
+
+
+def _campplus_onnx_path(model_dir: Path) -> Path:
+    import os
+    env = os.environ.get("CV3_CAMPPLUS_ONNX")
+    if env:
+        return Path(env)
+    for cand in (model_dir / "campplus.onnx",
+                 Path("/Volumes/backups/ai/upstream/cosyvoice3-onnx/campplus.onnx")):
+        if cand.exists():
+            return cand
+    raise SystemExit("campplus.onnx not found (set CV3_CAMPPLUS_ONNX)")
+
+
+def _capture_clone_frontend_stages(model_dir: Path, audio: np.ndarray,
+                                   wanted: Set[str]) -> Dict[str, np.ndarray]:
+    """The three products a `--voice ref.wav` clone is built from (#334).
+
+    `audio` is real 16 kHz mono, exactly what `crispasr-diff` passes as
+    --audio; the C++ side reads the same WAV. Each stage mirrors the driving
+    code in CosyVoice's `frontend.py`:
+
+      * spk_emb  — torchaudio kaldi fbank(80, dither=0, 16 kHz), per-utterance
+                   mean subtraction, then campplus.onnx.
+      * prompt_feat_24k — the reference resampled to 24 kHz and run through
+                   matcha's mel_spectrogram (n_fft/win 1920, hop 480, fmin 0,
+                   fmax 8000, center=False), which is `_extract_speech_feat`.
+      * speech_tokens — speech_tokenizer_v3.onnx on the 16 kHz audio.
+
+    ⚠ The runtime caps the prompt mel at 10 s (DEC_COND_LEN), so this does
+    too — otherwise the two sides disagree on length for a longer clip and
+    the diff reports a shape mismatch instead of a value one.
+    """
+    import torch
+    import torchaudio
+    import torchaudio.compliance.kaldi as kaldi
+    import onnxruntime as ort
+
+    out: Dict[str, np.ndarray] = {}
+    wav16 = torch.from_numpy(np.asarray(audio, dtype=np.float32)).unsqueeze(0)
+
+    if "clone_spk_emb" in wanted:
+        feat = kaldi.fbank(wav16, num_mel_bins=80, dither=0, sample_frequency=16000)
+        feat = feat - feat.mean(dim=0, keepdim=True)
+        sess = ort.InferenceSession(str(_campplus_onnx_path(model_dir)),
+                                    providers=["CPUExecutionProvider"])
+        emb = sess.run(None, {sess.get_inputs()[0].name: feat.unsqueeze(0).cpu().numpy()})[0]
+        out["clone_spk_emb"] = np.asarray(emb, dtype=np.float32).reshape(-1)
+
+    if "clone_prompt_feat_24k" in wanted:
+        wav24 = torchaudio.transforms.Resample(16000, 24000)(wav16)
+        wav24 = wav24[:, :10 * 24000]  # DEC_COND_LEN, matches the runtime cap
+        mel = _matcha_mel_24k(wav24.squeeze(0).numpy())
+        out["clone_prompt_feat_24k"] = mel.astype(np.float32)
+
+    if "clone_speech_tokens" in wanted:
+        toks = _s3tok_token_ids(model_dir, audio)
+        out["clone_speech_tokens"] = np.asarray(toks, dtype=np.float32)
+
+    return out
+
+
 def _capture_s3tok_stages(model_dir: Path, audio: np.ndarray,
                           wanted: Set[str]) -> Dict[str, np.ndarray]:
     """Run speech_tokenizer_v3.onnx on `audio` (real 16 kHz mono) with the
@@ -1359,6 +1497,12 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
     if any(s.startswith("s3tok_") for s in requested):
         s3 = _capture_s3tok_stages(model_dir, audio, requested)
         for name, arr in s3.items():
+            if name in requested:
+                out[name] = arr
+
+    # ---- Phase 7 WAV-clone front-end (#334) ----
+    if any(s.startswith("clone_") for s in requested):
+        for name, arr in _capture_clone_frontend_stages(model_dir, audio, requested).items():
             if name in requested:
                 out[name] = arr
 

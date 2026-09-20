@@ -77,6 +77,42 @@ build/bin/crispasr --backend cohere -m cohere-transcribe-arabic-q4_k.gguf audio.
 
 ---
 
+## Supported languages: `en` and `ar` only
+
+This finetune's `config.json` lists exactly two: `en`, `ar`. That matters more
+than it sounds, because **nothing else can tell you**. The finetune keeps the
+base tokenizer, so all 183 ISO-639-1 `<|xx|>` tokens are present in the vocab —
+`<|de|>`, `<|ru|>`, `<|ja|>` all decode without error. And Cohere Transcribe
+answers a wrong language *fluently* rather than failing. On one 8 s Arabic
+clip, `-l ru` added a hallucinated leading word, `-l ja` swapped the quotation
+marks for brackets, and `-l de` changed the diacritics — all plausible, none
+flagged.
+
+So CrispASR reads the whitelist from the GGUF and substitutes loudly:
+
+```
+cohere: language 'de' is not supported by this model — using 'en' instead. Supported: en, ar
+```
+
+The GGUFs here carry `cohere_transcribe.supported_languages`. For any Cohere
+GGUF converted before that key existed, declare it at runtime instead:
+
+```bash
+CRISPASR_COHERE_LANGS=en,ar build/bin/crispasr --backend cohere -m old.gguf audio.wav -l auto
+```
+
+With the list present and `-l auto`, CrispASR identifies the language by
+**probing this model itself** — one short decode per candidate, no whisper-tiny
+download — and can therefore only ever return `en` or `ar`:
+
+```
+cohere[lid]: en  len=64   agree=1.00 div=0.79 score=158  :: The city is located in the city of Jerry, a large city of Je
+cohere[lid]: ar  len=82   agree=1.00 div=1.00 score=328  :: العاصفة شبه الاستوائية "جيري" تغا
+crispasr: LID -> language = 'ar' (cohere-probe, p=0.675)
+```
+
+---
+
 ## Architecture
 
 | Component | Details |
@@ -112,3 +148,11 @@ build/bin/crispasr-diff cohere cohere-transcribe-arabic-f16.gguf \
 - **Source model**: [CohereLabs/cohere-transcribe-arabic-07-2026](https://huggingface.co/CohereLabs/cohere-transcribe-arabic-07-2026)
 - **English sibling**: [cstr/cohere-transcribe-03-2026-GGUF](https://huggingface.co/cstr/cohere-transcribe-03-2026-GGUF) — Cohere Transcribe 2B (lowest English WER)
 - **C++ runtime**: [CrispStrobe/CrispASR](https://github.com/CrispStrobe/CrispASR)
+
+## Provenance and EU AI Act Art. 53 note
+
+- **Upstream model:** [CohereLabs/cohere-transcribe-arabic-07-2026](https://huggingface.co/CohereLabs/cohere-transcribe-arabic-07-2026) — published by `CohereLabs`.
+- **Upstream licence:** `apache-2.0`. This repository redistributes under the same terms; it grants no rights the upstream licence does not.
+- **What was done here:** format conversion and/or quantisation only (GGUF). No training, no fine-tuning, no merging, no distillation, no change to architecture, vocabulary or capability. Only the numeric representation of the upstream weights differs.
+- **Training data:** documented — where it is documented at all — by the upstream provider; see the upstream model card. No training data was used, added or selected by this repository. No training-content summary was found on the upstream model card at the time of writing; that documentation gap is upstream's and is not filled here.
+- **Provider status:** under Regulation (EU) 2024/1689 the upstream authors remain the provider of this model. Converting the serialisation format does not make this repository the provider of a new general-purpose AI model, and no such claim is made. Questions about training content, copyright policy or model capability belong upstream.

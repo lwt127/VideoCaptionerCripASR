@@ -112,3 +112,46 @@ TEST_CASE("French text_to_ipa", "[g2p_fr][sentence]") {
         CHECK(g2p_fr::text_to_ipa(ctx, "").empty());
     }
 }
+
+// ── #316 round 2: punctuation is the consumer's choice ──────────────────────
+//
+// Kokoro's 178-symbol vocabulary contains `,.;:!?` and they are how it pauses;
+// dropping them delivered a paragraph in one breath. English proved it against
+// misaki; this is the same defect in the same shape, one language over. Off by
+// default so piper — whose espeak inventory has never been fed punctuation — is
+// unchanged.
+
+TEST_CASE("fr: punctuation is dropped by default, kept on request", "[g2p_fr][unit][punct]") {
+    g2p_fr::context ctx;
+    const std::string plain = g2p_fr::text_to_ipa(ctx, "a b, c.");
+    CHECK(plain.find(',') == std::string::npos);
+    CHECK(plain.find('.') == std::string::npos);
+    // A dropped mark still separates its neighbours — with ONE space, not the
+    // two the old loop emitted around every comma.
+    CHECK(plain.find("  ") == std::string::npos);
+
+    ctx.emit_punctuation = true;
+    const std::string kept = g2p_fr::text_to_ipa(ctx, "a b, c.");
+    CHECK(kept.find(',') != std::string::npos);
+    CHECK(kept.find('.') != std::string::npos);
+    // A mark sits flush against the word before it and is followed by a space.
+    CHECK(kept.find(" ,") == std::string::npos);
+    CHECK(kept.find(", ") != std::string::npos);
+}
+
+TEST_CASE("fr: the hyphen is a separator, never a mark", "[g2p_fr][unit][punct]") {
+    g2p_fr::context ctx;
+    ctx.emit_punctuation = true;
+    // No TTS vocabulary here has an ASCII hyphen, and misaki drops it.
+    CHECK(g2p_fr::text_to_ipa(ctx, "a-b").find('-') == std::string::npos);
+}
+
+TEST_CASE("fr: a quoted word is looked up without its quotes", "[g2p_fr][unit][punct]") {
+    // The tokenizer split on ,.!?;:- only, so a quoted word reached every
+    // lookup tier WEARING its quotes and fell through to the letter-to-sound
+    // rules — the same defect that made English read "dramatic" as DRAM-atic.
+    g2p_fr::context ctx;
+    const std::string quoted = g2p_fr::text_to_ipa(ctx, "\"ab\"");
+    const std::string bare = g2p_fr::text_to_ipa(ctx, "ab");
+    CHECK(quoted == bare);
+}

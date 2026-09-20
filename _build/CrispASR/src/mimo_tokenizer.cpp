@@ -57,6 +57,7 @@
 #include <numeric>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -420,13 +421,13 @@ extern "C" struct mimo_tokenizer_context* mimo_tokenizer_init_from_file(const ch
     core_gguf::free_metadata(gctx);
 
     // ---- Backends ----
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (!ctx->backend_cpu) {
         fprintf(stderr, "mimo_tokenizer: failed to init CPU backend\n");
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (!ctx->backend)
         ctx->backend = ctx->backend_cpu;
@@ -442,7 +443,14 @@ extern "C" struct mimo_tokenizer_context* mimo_tokenizer_init_from_file(const ch
     if (const char* e = std::getenv("CRISPASR_MIMO_TOK_CPU"); e && *e && *e != '0')
         weights_be = ctx->backend_cpu;
 #if defined(GGML_USE_CUDA)
-    ctx->cuda_rvq_available = weights_be == ctx->backend && ggml_backend_is_cuda(ctx->backend);
+    // ggml_backend_is_cuda() is a CUDA-MODULE symbol: linking it into
+    // libcrispasr.so fails with "undefined reference" in the release CUDA
+    // build. Test the backend NAME instead, which is core ggml and is what
+    // granite_speech, dots_tts and omnivoice already do. ROCm is included
+    // for the same reason granite_speech includes it.
+    const char* be_name = ctx->backend ? ggml_backend_name(ctx->backend) : nullptr;
+    ctx->cuda_rvq_available =
+        weights_be == ctx->backend && be_name && (std::strstr(be_name, "CUDA") || std::strstr(be_name, "ROCm"));
 #endif
     core_gguf::WeightLoad wl;
     if (!core_gguf::load_weights(path_model, weights_be, "mimo_tokenizer", wl)) {
@@ -552,7 +560,7 @@ extern "C" void mimo_tokenizer_free(struct mimo_tokenizer_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->buf_w)
-        ggml_backend_buffer_free(ctx->buf_w);
+        core_gguf::release_weight_buffer(ctx->buf_w);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)
@@ -567,7 +575,7 @@ extern "C" void mimo_tokenizer_set_n_threads(struct mimo_tokenizer_context* ctx,
         return;
     ctx->n_threads = n_threads;
     if (ctx->backend_cpu)
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, n_threads);
 }
 
 // ===========================================================================

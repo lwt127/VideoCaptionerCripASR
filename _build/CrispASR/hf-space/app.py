@@ -510,6 +510,20 @@ Each tab loads its own backend through the server's `/load` endpoint; the server
                 "Text → speech via the OpenAI-compatible `/v1/audio/speech` endpoint. "
                 "Load Kokoro before synthesizing — Kokoro is the only TTS engine that fits comfortably on free-tier CPU."
             )
+            # EU AI Act Art. 50 disclosure. Art. 50(2) marking is discharged by the
+            # binary (every /v1/audio/speech response is watermarked and carries a
+            # C2PA manifest), but as the DEPLOYER of this Space we owe the
+            # human-readable disclosure — Art. 50(4) is explicit that a
+            # machine-readable mark alone does not satisfy it. Stated here rather
+            # than only in the README because it has to be visible at first
+            # exposure, on the surface that produces the audio.
+            gr.Markdown(
+                "> ⚠️ **Audio produced here is AI-generated.** Every clip is watermarked and carries "
+                "[C2PA Content Credentials](https://c2pa.org/) identifying it as synthetic — the marking survives "
+                "download. If you republish it, say that it is AI-generated "
+                "([EU AI Act Art. 50](https://github.com/CrispStrobe/CrispASR/blob/main/docs/eu-ai-act.md)). "
+                "Voice cloning is not enabled in this Space."
+            )
             with gr.Row():
                 tts_choice = gr.Dropdown(
                     [e[0] for e in TTS_MODELS], value=TTS_MODELS[0][0], label="TTS backend / model", scale=3

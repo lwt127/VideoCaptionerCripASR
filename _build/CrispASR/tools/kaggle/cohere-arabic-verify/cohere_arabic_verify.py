@@ -222,10 +222,14 @@ if PY_OK:
         jstep("python_fail", err=str(e)[:150])
 
 # ───────────────────────── overhang-masking A/B ───────────────────────────
-# Does CRISPASR_COHERE_MASK_OVERHANG=1 change/improve the transcript? Test on
-# 8s, a boundary-length ~11s single-pass clip (where overhang lands on a
-# subsampling boundary), and 40s (chunked). Keep the feature only if it helps.
+# HISTORICAL: this A/B asked whether CRISPASR_COHERE_MASK_OVERHANG=1 helped.
+# It concluded, and the env var was removed from the C++ side — current
+# binaries read no such variable, so on a fresh build both arms below run the
+# IDENTICAL default path and "identical: true" is vacuous, not a finding.
+RUN_OVERHANG_AB = False  # flip only against a checkout that still reads the var
 try:
+    if not RUN_OVERHANG_AB:
+        raise RuntimeError("skipped: CRISPASR_COHERE_MASK_OVERHANG no longer read by current C++")
     import soundfile as sf
     a40, sr = sf.read(str(CLIPS["long_40s"]))
     clip11 = TMP / "ar_11s.wav"

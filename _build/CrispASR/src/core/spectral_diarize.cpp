@@ -10,8 +10,12 @@
 #include <numeric>
 #include <cstdlib>
 #include <functional>
+#include <atomic>
 #include <random>
 #include <string>
+#include <thread>
+
+#include "parallel_for.h"
 
 namespace core_spectral {
 
@@ -807,8 +811,9 @@ float silhouette_precomputed(const float* distance, int n, const std::vector<int
         count[(size_t)v]++;
 
     double total = 0.0;
+    std::vector<double> sum((size_t)k);
     for (int i = 0; i < n; i++) {
-        std::vector<double> sum((size_t)k, 0.0);
+        std::fill(sum.begin(), sum.end(), 0.0);
         for (int j = 0; j < n; j++) {
             if (j == i)
                 continue;
@@ -910,7 +915,8 @@ std::vector<int> refine_spherical(const float* x, int n, int d, const std::vecto
     return cur;
 }
 
-SpeakerEstimate estimate_speakers(const float* x, int n, int d, int min_k, int max_k, unsigned seed) {
+static SpeakerEstimate estimate_speakers_impl(const float* x, int n, int d, int min_k, int max_k, unsigned seed,
+                                              const float* sim_precomputed, int n_threads) {
     SpeakerEstimate est;
     est.min_k_used = std::max(1, min_k);
     est.best_k = std::max(1, min_k);
@@ -927,7 +933,12 @@ SpeakerEstimate estimate_speakers(const float* x, int n, int d, int min_k, int m
     // Single-speaker veto: if even the 10th percentile of off-diagonal cosine
     // similarity is high, everything is one voice and BIC would over-split it.
     {
-        std::vector<float> sim = cosine_similarity(x, n, d);
+        std::vector<float> sim_local;
+        if (!sim_precomputed) {
+            sim_local = cosine_similarity(x, n, d);
+            sim_precomputed = sim_local.data();
+        }
+        const float* sim = sim_precomputed;
         std::vector<float> off;
         off.reserve((size_t)n * (n - 1));
         for (int i = 0; i < n; i++)
@@ -984,17 +995,31 @@ SpeakerEstimate estimate_speakers(const float* x, int n, int d, int min_k, int m
     // against PCA noise-component variances of ~0.03.
     const int k_occupancy = std::max(1, n / (pca_dim + 1));
     const int k_upper = std::max(min_k + 1, std::min({max_k + 1, n / 2 + 1, k_occupancy + 1}));
+    // Every k's GMM is seeded independently (seed + init*7919 inside gmm_bic)
+    // and touches only its own slot, so the sweep parallelises without
+    // changing a single BIC; the argmin below runs serially in ascending k,
+    // preserving the old first-wins tie-break.
+    const int k_lo = std::max(1, min_k);
+    const int k_cnt = std::max(0, k_upper - k_lo);
+    std::vector<float> bics((size_t)k_cnt, 0.0f);
+    std::vector<char> bic_ok((size_t)k_cnt, 0);
+    core_parallel::for_each_task(k_cnt, n_threads, [&](int i, int) {
+        float bic = 0.0f;
+        if (gmm_bic(proj.data(), n, pca_dim, k_lo + i, kGmmNInit, kGmmMaxIter, seed, &bic)) {
+            bics[(size_t)i] = bic;
+            bic_ok[(size_t)i] = 1;
+        }
+    });
     float best_bic = std::numeric_limits<float>::infinity();
     int best_k = min_k;
     bool any = false;
-    for (int k = std::max(1, min_k); k < k_upper; k++) {
-        float bic = 0.0f;
-        if (!gmm_bic(proj.data(), n, pca_dim, k, kGmmNInit, kGmmMaxIter, seed, &bic))
+    for (int i = 0; i < k_cnt; i++) {
+        if (!bic_ok[(size_t)i])
             continue;
-        est.k_bics.push_back(bic);
-        if (bic < best_bic) {
-            best_bic = bic;
-            best_k = k;
+        est.k_bics.push_back(bics[(size_t)i]);
+        if (bics[(size_t)i] < best_bic) {
+            best_bic = bics[(size_t)i];
+            best_k = k_lo + i;
         }
         any = true;
     }
@@ -1007,15 +1032,32 @@ SpeakerEstimate estimate_speakers(const float* x, int n, int d, int min_k, int m
     return est;
 }
 
+SpeakerEstimate estimate_speakers(const float* x, int n, int d, int min_k, int max_k, unsigned seed, int n_threads) {
+    return estimate_speakers_impl(x, n, d, min_k, max_k, seed, nullptr, n_threads);
+}
+
 std::vector<int> cluster_speakers(const float* x, int n, int d, int min_speakers, int max_speakers, int num_speakers,
-                                  SpeakerEstimate* out_estimate, unsigned seed) {
+                                  SpeakerEstimate* out_estimate, unsigned seed, int n_threads) {
     if (n <= 0)
         return {};
     if (n < 2)
         return std::vector<int>((size_t)n, 0);
 
+    // ONE O(n^2 d) similarity pass for the whole function. Everything below —
+    // the affinity every spectral run clusters on, the p10 single-speaker veto
+    // inside the estimator, and the silhouette's distance matrix — is a cheap
+    // transform of this one matrix; it used to be recomputed per spectral run.
+    std::vector<float> sim = cosine_similarity(x, n, d);
+    std::vector<float> aff = sim;
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++) {
+            float v = (aff[(size_t)i * n + j] + 1.0f) * 0.5f;
+            aff[(size_t)i * n + j] = std::max(v, 0.0f);
+        }
+    for (int i = 0; i < n; i++)
+        aff[(size_t)i * n + i] = 1.0f;
+
     auto run = [&](int k) {
-        std::vector<float> aff = cosine_affinity(x, n, d);
         std::vector<int> lab = spectral_labels(aff.data(), n, k, seed);
         return refine_spherical(x, n, d, lab);
     };
@@ -1030,9 +1072,8 @@ std::vector<int> cluster_speakers(const float* x, int n, int d, int min_speakers
 
     SpeakerEstimate est;
     if (count_method_from_env() == CountMethod::NmeSc) {
-        std::vector<float> aff0 = cosine_affinity(x, n, d);
         NmeScDiag diag;
-        est.best_k = estimate_speakers_nme_sc(aff0.data(), n, min_speakers, max_speakers, seed, &diag);
+        est.best_k = estimate_speakers_nme_sc(aff.data(), n, min_speakers, max_speakers, seed, &diag);
         est.reason = "nme-sc";
         if (out_estimate)
             *out_estimate = est;
@@ -1047,8 +1088,7 @@ std::vector<int> cluster_speakers(const float* x, int n, int d, int min_speakers
         return run(est.best_k);
     }
     if (count_method_from_env() == CountMethod::Eigengap) {
-        std::vector<float> aff0 = cosine_affinity(x, n, d);
-        est.best_k = estimate_speakers_eigengap(aff0.data(), n, min_speakers, max_speakers, seed);
+        est.best_k = estimate_speakers_eigengap(aff.data(), n, min_speakers, max_speakers, seed);
         est.reason = "eigengap";
         if (out_estimate)
             *out_estimate = est;
@@ -1056,7 +1096,7 @@ std::vector<int> cluster_speakers(const float* x, int n, int d, int min_speakers
         // the silhouette pass — which is what saturates — is skipped.
         return run(est.best_k);
     }
-    est = estimate_speakers(x, n, d, min_speakers, max_speakers, seed);
+    est = estimate_speakers_impl(x, n, d, min_speakers, max_speakers, seed, sim.data(), n_threads);
     if (out_estimate)
         *out_estimate = est;
     const int k = est.best_k;
@@ -1102,17 +1142,29 @@ std::vector<int> cluster_speakers(const float* x, int n, int d, int min_speakers
     if (upper <= lower)
         return run(k);
 
-    std::vector<float> aff = cosine_affinity(x, n, d);
     std::vector<float> dist((size_t)n * n);
     for (size_t i = 0; i < dist.size(); i++)
         dist[i] = std::max(1.0f - aff[i], 0.0f);
 
+    // Every k's spectral run + silhouette is independent (read-only inputs,
+    // per-call RNG seeded from the same `seed`), so the sweep parallelises
+    // without moving a single score; the argmax below stays serial in
+    // ascending k, preserving the old strictly-greater tie-break.
+    const int n_cand = upper - lower + 1;
+    std::vector<std::vector<int>> cand_labels((size_t)n_cand);
+    std::vector<float> cand_sil((size_t)n_cand, 0.0f);
+    core_parallel::for_each_task(n_cand, n_threads, [&](int i, int) {
+        const int c = lower + i;
+        cand_labels[(size_t)i] = refine_spherical(x, n, d, spectral_labels(aff.data(), n, c, seed));
+        cand_sil[(size_t)i] = silhouette_precomputed(dist.data(), n, cand_labels[(size_t)i]);
+    });
+
     int best_k = k;
     std::vector<int> best_labels;
     float best_score = -std::numeric_limits<float>::infinity();
-    for (int c = lower; c <= upper; c++) {
-        std::vector<int> lab = refine_spherical(x, n, d, spectral_labels(aff.data(), n, c, seed));
-        const float sil = silhouette_precomputed(dist.data(), n, lab);
+    for (int i = 0; i < n_cand; i++) {
+        const int c = lower + i;
+        const float sil = cand_sil[(size_t)i];
         const float score = sil + kSilhouetteKBonus * (float)std::log((double)std::max(c, 1));
         if (std::getenv("CRISPASR_DIARIZE_DEBUG"))
             fprintf(stderr, "  spectral: k=%d silhouette=%.4f score=%.4f%s\n", c, sil, score,
@@ -1120,7 +1172,7 @@ std::vector<int> cluster_speakers(const float* x, int n, int d, int min_speakers
         if (score > best_score) {
             best_score = score;
             best_k = c;
-            best_labels = std::move(lab);
+            best_labels = std::move(cand_labels[(size_t)i]);
         }
     }
     if (out_estimate && best_k != k) {

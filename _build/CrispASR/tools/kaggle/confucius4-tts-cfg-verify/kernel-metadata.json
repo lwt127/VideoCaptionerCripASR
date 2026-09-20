@@ -1,0 +1,14 @@
+{
+  "id": "chr1s4/crispasr-confucius4-cfg-verify",
+  "title": "crispasr-confucius4-cfg-verify",
+  "code_file": "confucius4-tts-cfg-verify.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "false",
+  "enable_internet": "true",
+  "dataset_sources": ["chr1s4/crispasr-hf-token", "chr1s4/crispasr-ccache"],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}

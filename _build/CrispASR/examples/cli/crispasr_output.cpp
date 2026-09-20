@@ -4,12 +4,16 @@
 
 #include "crispasr_output.h"
 
+#include "core/asr_time_order.h"
+
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
+
+#include <cstdlib>
 
 // ---------------------------------------------------------------------------
 // Timestamp + path helpers
@@ -347,6 +351,22 @@ static std::vector<std::string> pack_text_to_maxlen(const std::string& text, int
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Issue #356: time-order guard
+//
+// The predicate itself lives in src/core/asr_time_order.h because the session
+// C ABI needs the same check on a different segment struct and cannot include
+// anything from examples/cli. These are the CLI/server-side names for it.
+// ---------------------------------------------------------------------------
+
+int crispasr_first_backward_segment(const std::vector<crispasr_segment>& segments, int64_t* prev_cs, int64_t* cur_cs) {
+    return core_time_order::first_backward(segments, prev_cs, cur_cs);
+}
+
+void crispasr_warn_if_segments_backward(const std::vector<crispasr_segment>& segments, const char* where) {
+    core_time_order::warn_if_backward(segments, where);
+}
+
 std::vector<crispasr_disp_segment> crispasr_make_disp_segments(const std::vector<crispasr_segment>& segments,
                                                                int max_len, bool split_on_punct) {
     std::vector<crispasr_disp_segment> out;
@@ -662,8 +682,7 @@ bool crispasr_write_json(const std::string& path, const std::vector<crispasr_seg
             f << ",\n      \"language\":   \"" << json_escape(s.lang_id) << "\"";
         if (!s.audio_event.empty())
             f << ",\n      \"audio_event\":\"" << json_escape(s.audio_event) << "\"";
-        if (!s.emotion.empty())
-            f << ",\n      \"emotion\":    \"" << json_escape(s.emotion) << "\"";
+        // No "emotion" key by design — see crispasr_backend.h / docs/eu-ai-act.md.
         if (!s.itn_flag.empty())
             f << ",\n      \"itn_flag\":   \"" << json_escape(s.itn_flag) << "\"";
         // #292: chunk scope. Only present on multi-chunk runs (single-pass leaves
@@ -1027,6 +1046,12 @@ static double cs_to_sec(int64_t cs) {
     return cs / 100.0;
 }
 
+// Defined below, next to diarized_json which has always used it. Declared here
+// so verbose_json can emit the same "A"/"B" labels rather than the raw internal
+// "(speaker 0) " — two formats of one API disagreeing about what a speaker is
+// called would be worse than the omission this fixes (#326).
+static std::string normalise_speaker(const std::string& raw);
+
 std::string crispasr_segments_to_openai_verbose_json(const std::vector<crispasr_segment>& segs, double duration_s,
                                                      const std::string& language, const std::string& task,
                                                      float temperature) {
@@ -1067,6 +1092,16 @@ std::string crispasr_segments_to_openai_verbose_json(const std::vector<crispasr_
 
         // no_speech_prob — not available from most backends, emit 0.
         js << "      \"no_speech_prob\": 0.0";
+
+        // Speaker label, when diarization produced one (#326). Not part of
+        // OpenAI's verbose_json schema, which is why it is emitted only when
+        // non-empty: a client that does not know the field never sees it, and
+        // one that asked for --diarize is not silently charged for a stage
+        // whose entire output this format used to discard. `diarized_json`
+        // remains the richer format; this is so the standard one stops lying.
+        if (!s.speaker.empty()) {
+            js << ",\n      \"speaker\": \"" << json_escape(normalise_speaker(s.speaker)) << "\"";
+        }
 
         // Word-level timestamps if available.
         if (!s.words.empty()) {

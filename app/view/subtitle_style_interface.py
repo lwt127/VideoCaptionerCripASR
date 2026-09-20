@@ -183,8 +183,10 @@ class SubtitleStyleInterface(QWidget):
             FIF.ALIGNMENT,
             self.tr("字幕排布"),
             self.tr("设置主字幕和副字幕的显示方式"),
-            texts=["译文在上", "原文在上", "仅译文", "仅原文"],
+            texts=[self.tr(text) for text in ("译文在上", "原文在上", "仅译文", "仅原文")],
         )
+        for index, value in enumerate(("译文在上", "原文在上", "仅译文", "仅原文")):
+            self.layoutCard.comboBox.setItemData(index, value)
 
         # 垂直间距
         self.verticalSpacingCard = SpinBoxSettingCard(
@@ -368,7 +370,7 @@ class SubtitleStyleInterface(QWidget):
     def __setValues(self):
         """设置初始值"""
         # 设置字幕排布
-        self.layoutCard.comboBox.setCurrentText(cfg.get(cfg.subtitle_layout))
+        self.layoutCard.comboBox.setCurrentText(self.tr(cfg.get(cfg.subtitle_layout)))
         # 设置字幕样式
         self.styleNameComboBox.comboBox.setCurrentText(cfg.get(cfg.subtitle_style_name))
 
@@ -405,7 +407,7 @@ class SubtitleStyleInterface(QWidget):
         # 字幕排布
         self.layoutCard.currentTextChanged.connect(self.onSettingChanged)
         self.layoutCard.currentTextChanged.connect(
-            lambda: cfg.set(cfg.subtitle_layout, self.layoutCard.comboBox.currentText())
+            lambda: cfg.set(cfg.subtitle_layout, self.layoutCard.comboBox.currentData())
         )
         # 垂直间距
         self.verticalSpacingCard.spinBox.valueChanged.connect(self.onSettingChanged)
@@ -438,7 +440,7 @@ class SubtitleStyleInterface(QWidget):
 
         # 连接字幕排布信号
         self.layoutCard.comboBox.currentTextChanged.connect(
-            signalBus.subtitle_layout_changed
+            lambda _: signalBus.subtitle_layout_changed.emit(self.layoutCard.comboBox.currentData())
         )
         signalBus.subtitle_layout_changed.connect(self.on_subtitle_layout_changed)
 
@@ -453,7 +455,7 @@ class SubtitleStyleInterface(QWidget):
 
     def on_subtitle_layout_changed(self, layout: str):
         cfg.subtitle_layout.value = layout
-        self.layoutCard.setCurrentText(layout)
+        self.layoutCard.setCurrentText(self.tr(layout))
 
     def onOrientationChanged(self):
         """当预览方向改变时调用"""
@@ -545,7 +547,7 @@ class SubtitleStyleInterface(QWidget):
         main_text, sub_text = PERVIEW_TEXTS[self.previewTextCard.comboBox.currentText()]
 
         # 字幕布局
-        layout = self.layoutCard.comboBox.currentText()
+        layout = self.layoutCard.comboBox.currentData()
         if layout == "译文在上":
             main_text, sub_text = sub_text, main_text
         elif layout == "原文在上":

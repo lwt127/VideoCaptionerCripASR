@@ -36,6 +36,63 @@ void cohere_free(struct cohere_context* ctx);
 // lang: ISO-639-1 code e.g. "en", "fr", "de" (NULL → autodetect, not implemented yet)
 char* cohere_transcribe(struct cohere_context* ctx, const float* samples, int n_samples, const char* lang);
 
+// ---- Supported languages ----
+//
+// Cohere Transcribe accepts a FIXED language set and performs no detection of
+// its own; a wrong code yields a fluent wrong-language transcript, never an
+// error. The set comes from the model's config.json (14 codes for the base
+// model, {en, ar} for the Arabic finetune, which shares the base tokenizer —
+// so the vocab cannot tell them apart) and rides in the GGUF.
+//
+// Returns 0 when the GGUF predates the metadata key. That means UNKNOWN, not
+// "none": treat it as "no restriction available", never as an empty whitelist.
+int cohere_n_supported_languages(struct cohere_context* ctx);
+
+// ISO-639-1 code at index i, or NULL if out of range. Points into the context;
+// valid until cohere_free().
+const char* cohere_supported_language(struct cohere_context* ctx, int i);
+
+// ---- Probe-based language identification ----
+//
+// Cohere Transcribe has no language-detection head, but it does answer a
+// language prompt — so the model is its own detector: transcribe a short clip
+// once per supported language and keep the candidate whose output looks most
+// like real speech. This needs no second model, and it can only ever return a
+// language this model actually supports, which an external detector (whisper-
+// tiny knows 99) cannot promise.
+//
+// The cost is one encode + one short decode PER CANDIDATE, so it is a good
+// trade for the Arabic finetune (2 candidates) and an expensive one for the
+// 14-language base model. Callers decide; see CRISPASR_COHERE_PROBE_MAX_LANGS
+// in the CLI.
+
+// Optional text-language-detector hook. Given a probe transcript and the
+// candidate code it was produced under, return that detector's probability in
+// [0,1] that the text really is in `lang` (0 if it cannot tell). Agreement is
+// the strongest single signal among same-script languages; scoring still works
+// without it, just more weakly. NULL = unavailable.
+typedef float (*cohere_text_lid_fn)(const char* text, const char* lang, void* user_data);
+
+struct cohere_lid_params {
+    float probe_seconds;         // leading clip length to probe (default 20)
+    int max_new_tokens;          // cap per probe decode (default 48)
+    cohere_text_lid_fn text_lid; // optional agreement hook (default NULL)
+    void* text_lid_user;         // opaque, passed back to text_lid
+    int verbosity;               // >0 prints per-candidate scores to stderr
+};
+
+struct cohere_lid_params cohere_lid_default_params(void);
+
+// Detect the spoken language by probing the model over its own supported set.
+// Writes an ISO-639-1 code into out_lang and, if non-NULL, the winner's share
+// of the total score into out_confidence.
+//
+// Returns false when the GGUF carries no supported-language list (nothing to
+// probe over — fall back to an external detector) or when every probe came
+// back empty.
+bool cohere_detect_language(struct cohere_context* ctx, const float* samples, int n_samples,
+                            struct cohere_lid_params params, char* out_lang, int out_lang_size, float* out_confidence);
+
 // Vocabulary helpers
 int cohere_n_vocab(struct cohere_context* ctx);
 const char* cohere_token_to_str(struct cohere_context* ctx, int token_id);

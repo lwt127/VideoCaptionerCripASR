@@ -6,6 +6,8 @@
 //   - Same projector topology (stack-4-frames + 2×Linear)
 
 #include "voxtral4b.h"
+
+#include "voxtral_tekken_vocab.h" // #338 active-vocabulary bound
 #include "core/crispasr_env.h"
 
 #ifndef M_PI
@@ -376,10 +378,18 @@ static bool voxtral4b_load_model(voxtral4b_model& model, voxtral4b_vocab& vocab,
             vocab.tekken_vocab_blob.resize(n);
             for (size_t i = 0; i < n; i++)
                 vocab.tekken_vocab_blob[i] = (uint8_t)(int)f32[i];
-            vocab.rank_offset.reserve(vocab.n_vocab);
-            vocab.rank_length.reserve(vocab.n_vocab);
+            // #338: the same active-vocabulary bound voxtral_tts needed. A
+            // rank becomes the token id `rank + n_specials`, so ranks must stop
+            // at the last row of the embedding table — `n_vocab` here is the
+            // SERIALIZED length (default 150000) and is allowed to exceed
+            // llm_vocab_size (131072). Without the cap, a text whose BPE path
+            // reaches a tail entry indexes token_embd out of bounds.
+            const int n_active = voxtral_tekken::active_bpe_count((int)model.hparams.llm_vocab_size, vocab.n_specials);
+            const int n_ranks = (n_active > 0 && n_active < vocab.n_vocab) ? n_active : vocab.n_vocab;
+            vocab.rank_offset.reserve(n_ranks);
+            vocab.rank_length.reserve(n_ranks);
             size_t pos = 0;
-            for (int r = 0; r < vocab.n_vocab; r++) {
+            for (int r = 0; r < n_ranks; r++) {
                 if (pos + 2 > n)
                     break;
                 uint16_t len;
@@ -508,6 +518,7 @@ static void voxtral4b_fft(float* in, int N, float* out) {
 #include "core/ffn.h"
 #include "core/attention.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -931,17 +942,17 @@ extern "C" struct voxtral4b_context* voxtral4b_init_from_file(const char* path,
     ctx->params = params;
     ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
-    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init();
     if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
-    ctx->backend_cpu = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (ctx->backend_cpu)
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
-    if (ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
 
     if (!voxtral4b_load_model(ctx->model, ctx->vocab, path, ctx->backend, ctx->backend_cpu)) {
-        delete ctx;
+        voxtral4b_free(ctx); // frees the backends this ctx already owns
         return nullptr;
     }
 
@@ -1060,9 +1071,9 @@ extern "C" void voxtral4b_free(voxtral4b_context* ctx) {
     if (ctx->fused_ctx)
         ggml_free(ctx->fused_ctx);
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.buf_cpu)
-        ggml_backend_buffer_free(ctx->model.buf_cpu);
+        core_gguf::release_weight_buffer(ctx->model.buf_cpu);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)

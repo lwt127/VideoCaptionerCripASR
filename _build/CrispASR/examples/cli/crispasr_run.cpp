@@ -10,6 +10,7 @@
 #include "crispasr_backend.h"
 #include "crispasr_cache.h"
 #include "crispasr_gap_fill.h"
+#include "crispasr_split_pipeline.h"
 #include "tada_encoder.h"
 
 #include <sys/stat.h>
@@ -58,9 +59,14 @@
 #include "core/crispasr_c2pa.h"
 #include "crispasr_tts_chunking.h"
 #include "crispasr_tts_disclaimer.h"
-#include "crispasr_watermark.h"
+#include "crispasr_consent_record.h"
+#include "crispasr_voice_clone_policy.h"
+#include "crispasr_voice_provenance.h"
+#include "core/crispasr_watermark.h"
 #include "crispasr_watermark_dispatch.h"
+#include "crispasr_watermark_stats.h"
 #include "core/crispasr_wav_writer.h"
+#include "core/segment_hygiene.h" // PLAN.md §W2/§W5/§W6 opt-in segment cleanup
 #include "crispasr_mp3_writer.h"  // MP3 output via in-tree glint encoder
 #include "crispasr_aac_writer.h"  // AAC-LC (ADTS) output via in-tree glint encoder
 #include "crispasr_mp4_writer.h"  // AAC/Opus-in-MP4 muxer (C2PA-capable container)
@@ -80,6 +86,8 @@
 #include <fcntl.h>
 #include <io.h>
 #endif
+#include <condition_variable>
+#include <deque>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -433,6 +441,17 @@ int warn_unsupported(const CrispasrBackend& backend, const whisper_params& p) {
 }
 
 // Merge individual-slice results into a flat list preserving time order.
+//
+// PLAN.md §W2/§W5/§W6 hygiene runs HERE rather than at the four
+// `merge_segments(...)` call sites, because this is the structural chokepoint
+// they all pass through — a hand-patched list of call sites is the exact shape
+// of bug the copies-in-sync guard was built for (it covered 1 of 14 files for
+// months). Every stage is opt-in via env; with none set this is byte-for-byte
+// the old function.
+//
+// It also has to be here rather than per-slice: §W5 collapses runs of
+// near-identical segments, and a loop that straddles a slice boundary is only
+// visible once the slices are flat.
 std::vector<crispasr_segment> merge_segments(std::vector<std::vector<crispasr_segment>>&& per_slice,
                                              const std::vector<crispasr_audio_slice>& /*slices*/) {
     std::vector<crispasr_segment> out;
@@ -444,11 +463,133 @@ std::vector<crispasr_segment> merge_segments(std::vector<std::vector<crispasr_se
         for (auto& s : v)
             out.push_back(std::move(s));
     }
-    return out;
+
+    // Issue #356: the structural chokepoint every slice result passes through
+    // is also the last place a producer's ordering mistake can be caught before
+    // it reaches the writers. Diagnostic only — this reports, it never reorders,
+    // because a reorder here would paper over the producing bug.
+    const auto hy = core_seg_hygiene::config_from_env();
+    if (!core_seg_hygiene::any_enabled(hy)) {
+        crispasr_warn_if_segments_backward(out, "slice merge");
+        return out;
+    }
+
+    std::vector<core_seg_hygiene::Seg> view;
+    view.reserve(out.size());
+    for (const auto& s : out)
+        view.push_back({s.text, s.t0, s.t1, 0.0f, false});
+
+    int dropped = 0;
+    const auto kept = core_seg_hygiene::apply_all(view, hy, &dropped);
+
+    // Map each surviving view back onto its original, so every field the view
+    // does not carry (speaker, words, tokens, chunk_id) is preserved rather
+    // than reconstructed. apply_all only removes segments and rewrites
+    // text/t1 — it never reorders — so a forward scan on t0 is exact.
+    //
+    // Resolve the whole mapping BEFORE touching `out`: the bail-out below
+    // returns `out` unchanged, which is only true if nothing has been moved
+    // out of it yet. Matching first, mutating second, keeps that promise.
+    std::vector<size_t> pick;
+    pick.reserve(kept.size());
+    size_t oi = 0;
+    for (const auto& k : kept) {
+        while (oi < out.size() && out[oi].t0 != k.t0)
+            oi++;
+        if (oi >= out.size())
+            break;
+        pick.push_back(oi++);
+    }
+    if (pick.size() != kept.size()) { // unmatched view: never silently lose content
+        crispasr_warn_if_segments_backward(out, "slice merge");
+        return out;
+    }
+
+    std::vector<crispasr_segment> res;
+    res.reserve(pick.size());
+    for (size_t i = 0; i < pick.size(); i++) {
+        crispasr_segment seg = std::move(out[pick[i]]);
+        seg.text = kept[i].text;
+        seg.t1 = kept[i].t1; // a merged run spans to the end of its last member
+        res.push_back(std::move(seg));
+    }
+    if (dropped > 0 || res.size() != out.size())
+        fprintf(stderr, "crispasr[hygiene]: %zu -> %zu segments (%d dropped)\n", out.size(), res.size(), dropped);
+    crispasr_warn_if_segments_backward(res, "slice merge + hygiene");
+    return res;
 }
 
 bool crispasr_words_have_positive_span(const std::vector<crispasr_word>& words) {
     return !words.empty() && words.back().t1 > words.front().t0;
+}
+
+// The Python forced-aligner blueprint runs once for an audio chunk and that
+// chunk's complete transcript.  Doing one model call per ASR segment loses the
+// global monotonic sequence and was the root of #444.  Align the slice once,
+// then partition the returned units back onto the original display segments.
+static bool crispasr_align_slice_segments(const std::string& aligner_model, const std::vector<float>& samples,
+                                          int range_start, int range_end, int64_t offset_cs, int n_threads,
+                                          bool force_aligner, std::vector<crispasr_segment>& segs,
+                                          bool* out_load_failed = nullptr) {
+    std::vector<size_t> targets;
+    std::vector<size_t> counts;
+    std::string transcript;
+    size_t expected_words = 0;
+    for (size_t i = 0; i < segs.size(); i++) {
+        if (!segs[i].words.empty() && !force_aligner)
+            continue;
+        const size_t n = crispasr_tokenise_align_words(segs[i].text).size();
+        if (n == 0)
+            continue;
+        if (!transcript.empty())
+            transcript += ' ';
+        transcript += segs[i].text;
+        targets.push_back(i);
+        counts.push_back(n);
+        expected_words += n;
+    }
+    if (targets.empty() || range_end <= range_start)
+        return false;
+
+    auto aligned = crispasr_align_words(aligner_model, transcript, samples.data() + range_start,
+                                        range_end - range_start, offset_cs, n_threads, out_load_failed);
+    if (aligned.size() != expected_words) {
+        fprintf(stderr, "crispasr[aligner]: slice returned %zu units for %zu inputs; keeping ASR timestamps\n",
+                aligned.size(), expected_words);
+        return false;
+    }
+
+    // A model class outside the supplied clip is not a usable alignment.
+    // Reject the complete result rather than installing a partly clamped,
+    // apparently precise subtitle track.
+    const int64_t end_cs = offset_cs + (int64_t)(range_end - range_start) * 100 / 16000;
+    int64_t previous_end = offset_cs;
+    for (const auto& w : aligned) {
+        if (w.t0_cs < previous_end || w.t1_cs < w.t0_cs || w.t0_cs < offset_cs || w.t1_cs > end_cs + 8) {
+            fprintf(stderr,
+                    "crispasr[aligner]: non-monotonic/out-of-range slice result at %lld..%lld cs "
+                    "(clip %lld..%lld); keeping ASR timestamps\n",
+                    (long long)w.t0_cs, (long long)w.t1_cs, (long long)offset_cs, (long long)end_cs);
+            return false;
+        }
+        previous_end = w.t1_cs;
+    }
+    if (aligned.back().t1_cs <= aligned.front().t0_cs)
+        return false;
+
+    size_t cursor = 0;
+    for (size_t j = 0; j < targets.size(); j++) {
+        auto& seg = segs[targets[j]];
+        seg.words.clear();
+        seg.words.reserve(counts[j]);
+        for (size_t k = 0; k < counts[j]; k++) {
+            auto& src = aligned[cursor++];
+            seg.words.push_back({std::move(src.text), src.t0_cs, src.t1_cs});
+        }
+        seg.t0 = seg.words.front().t0;
+        seg.t1 = seg.words.back().t1;
+    }
+    return true;
 }
 
 // True if any segment carries a non-whitespace character (i.e. real text).
@@ -824,7 +965,31 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
             fprintf(stderr, "crispasr: %s is %s-only — skipping language detection\n", backend.name(), sole_lang);
     }
 
+    // Some backends can identify the language with the model already loaded
+    // (cohere probes its own supported set). Prefer that over an external
+    // detector when the user did not name one explicitly: it downloads
+    // nothing, and — the real reason — it can only return a language the
+    // backend actually supports, whereas whisper-tiny LID knows 99 and will
+    // happily hand back one the model was never trained on.
+    bool probed_ok = false;
     if (want_auto_lang && !has_native_lid && !lid_disabled) {
+        crispasr_lid_result probe;
+        if (crispasr_backend_probe_language(backend, samples.data(), (int)samples.size(), params, probe)) {
+            lid_info.lang_code = probe.lang_code;
+            lid_info.confidence = probe.confidence;
+            lid_info.source = probe.source;
+            params.language = probe.lang_code;
+            if (params.source_lang.empty())
+                params.source_lang = probe.lang_code;
+            probed_ok = true;
+            if (!params.no_prints) {
+                fprintf(stderr, "crispasr: LID -> language = '%s' (%s, p=%.3f)\n", probe.lang_code.c_str(),
+                        probe.source.c_str(), probe.confidence);
+            }
+        }
+    }
+
+    if (want_auto_lang && !has_native_lid && !lid_disabled && !probed_ok) {
         crispasr_lid_result lid;
         if (crispasr_detect_language_cli(samples.data(), (int)samples.size(), params, lid)) {
             lid_info.lang_code = lid.lang_code;
@@ -970,7 +1135,7 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
         if (effective_chunk_seconds == 0 && (backend.capabilities() & CAP_UNBOUNDED_INPUT)) {
             fprintf(stderr,
                     "crispasr: %s backend — full-audio / library-internal streaming "
-                    "(use --chunk-seconds N if OOM, --vad for long files)\n",
+                    "(use --chunk-seconds N if OOM; --vad to skip silence)\n",
                     backend.name());
         } else if (params.chunk_seconds_explicit && params.chunk_seconds > 0 &&
                    (backend.capabilities() & CAP_UNBOUNDED_INPUT) && (int)samples.size() > params.chunk_seconds * SR) {
@@ -1168,13 +1333,13 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
             for (auto& seg : segs) {
                 if (!seg.words.empty() && !params.force_aligner)
                     continue;
-                // Find the original audio region for this segment.
-                const int s = (int)((double)seg.t0 / 100.0 * SR);
-                const int e = std::min((int)samples.size(), (int)((double)seg.t1 / 100.0 * SR));
-                if (e > s) {
+                // Align this segment against its own original-audio region.
+                const auto range = crispasr_alignment_audio_range(seg.t0, seg.t1, 0, (int)samples.size(), SR);
+                if (range.valid()) {
                     bool load_failed = false;
-                    auto words = crispasr_ctc_align(params.aligner_model, seg.text, samples.data() + s, e - s, seg.t0,
-                                                    params.n_threads, &load_failed);
+                    auto words =
+                        crispasr_ctc_align(params.aligner_model, seg.text, samples.data() + range.start,
+                                           range.end - range.start, range.offset_cs, params.n_threads, &load_failed);
                     aligner_load_failed = aligner_load_failed || load_failed;
                     if (crispasr_words_have_positive_span(words)) {
                         seg.t0 = words.front().t0;
@@ -1397,21 +1562,35 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
     // Atomic so parallel workers can safely increment it.
     std::atomic<size_t> slices_done{0};
 
-    auto process_slice = [&](size_t i, CrispasrBackend& be) {
+    // Slice i's encoder input range (slice ± optional acoustic context).
+    auto slice_ext_range = [&](size_t i, int& ext_start, int& ext_end, int64_t& ext_t0_cs) {
         const auto& sl = slices[i];
-
-        // Optionally extend the slice with acoustic context.
-        int ext_start = sl.start;
-        int ext_end = sl.end;
+        ext_start = sl.start;
+        ext_end = sl.end;
         if (use_chunk_context) {
             const int ctx_samples = (int)(kChunkContextS * SR);
             ext_start = std::max(0, sl.start - ctx_samples);
             ext_end = std::min((int)samples.size(), sl.end + ctx_samples);
         }
-        const int64_t ext_t0_cs = (int64_t)((double)ext_start / SR * 100.0);
+        ext_t0_cs = (int64_t)((double)ext_start / SR * 100.0);
+    };
 
-        std::vector<crispasr_segment> segs =
-            be.transcribe(samples.data() + ext_start, ext_end - ext_start, ext_t0_cs, params);
+    // Everything after the model call: logits capture, context trimming,
+    // storage, progress. Shared by the sequential, worker-pool and pipelined
+    // paths so all three produce identical per_slice contents.
+    // Per-slice progress, split out of finish_slice so the pipelined path can
+    // report as each slice DECODES while still storing segments after the join.
+    auto tick_slice_progress = [&]() {
+        if (params.print_progress && slices.size() > 1) {
+            const size_t done = slices_done.fetch_add(1) + 1;
+            const int pct = (int)(done * 100 / slices.size());
+            fprintf(stderr, "crispasr: progress = %3d%% (%zu/%zu slices)\n", pct, done, slices.size());
+        }
+    };
+
+    auto finish_slice = [&](size_t i, std::vector<crispasr_segment> segs, CrispasrBackend& be,
+                            bool report_progress = true) {
+        const auto& sl = slices[i];
         if (params.return_logits) {
             if (const auto* logits = be.last_ctc_logits())
                 per_slice_logits[i] = *logits;
@@ -1507,19 +1686,10 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
                     params.force_aligner ? 1 : 0, want_align ? 1 : 0);
         }
         if (want_align) {
-            for (auto& seg : segs) {
-                if (!seg.words.empty() && !params.force_aligner)
-                    continue;
-                bool load_failed = false;
-                auto words = crispasr_ctc_align(params.aligner_model, seg.text, samples.data() + sl.start,
-                                                sl.end - sl.start, sl.t0_cs, params.n_threads, &load_failed);
-                aligner_load_failed = aligner_load_failed || load_failed;
-                if (crispasr_words_have_positive_span(words)) {
-                    seg.t0 = words.front().t0;
-                    seg.t1 = words.back().t1;
-                    seg.words = std::move(words);
-                }
-            }
+            bool load_failed = false;
+            crispasr_align_slice_segments(params.aligner_model, samples, sl.start, sl.end, sl.t0_cs, params.n_threads,
+                                          params.force_aligner, segs, &load_failed);
+            aligner_load_failed = aligner_load_failed || load_failed;
         }
 
         // Issue #267: diarize AFTER alignment so word timestamps (native
@@ -1582,12 +1752,17 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
 
         // Per-slice progress for unified backends (whisper uses its own
         // encoder-level callback). Print to stderr so it doesn't mix
-        // with transcript output.
-        if (params.print_progress && slices.size() > 1) {
-            const size_t done = slices_done.fetch_add(1) + 1;
-            const int pct = (int)(done * 100 / slices.size());
-            fprintf(stderr, "crispasr: progress = %3d%% (%zu/%zu slices)\n", pct, done, slices.size());
-        }
+        // with transcript output. The pipelined path already ticked it at
+        // decode time, so it passes report_progress=false here.
+        if (report_progress)
+            tick_slice_progress();
+    };
+
+    auto process_slice = [&](size_t i, CrispasrBackend& be) {
+        int ext_start = 0, ext_end = 0;
+        int64_t ext_t0_cs = 0;
+        slice_ext_range(i, ext_start, ext_end, ext_t0_cs);
+        finish_slice(i, be.transcribe(samples.data() + ext_start, ext_end - ext_start, ext_t0_cs, params), be);
     };
 
     const int n_workers = params.return_logits ? 1 : std::min(params.n_processors, (int32_t)slices.size());
@@ -1610,7 +1785,161 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
         return merged;
     };
 
-    if (n_workers > 1 && slices.size() > 1) {
+    // Encode ∥ decode pipelining over slices. Backends that expose a split
+    // transcribe run the encoder (GPU) for slice N+1 on a worker thread while
+    // this thread runs the decoder (CPU) for slice N. Same shape of win as the
+    // worker pool below, but with ONE model resident instead of N — so it is
+    // preferred whenever the user has not explicitly asked for -p workers.
+    //
+    // Skipped when return_logits is set: last_ctc_logits() is per-backend state
+    // read right after the model call, and only the serial path can attribute it
+    // to the right slice.
+    //
+    // Not every slice necessarily qualifies (a slice long enough to take a
+    // backend's multi-window route does not), and the pipeline must never fall
+    // back to transcribe() while the producer is running — that would encode on
+    // two threads at once. So the slice list is walked in RUNS of consecutive
+    // qualifying slices: each run gets its own producer thread that is joined
+    // before anything else touches the model, and non-qualifying slices are
+    // processed sequentially in between.
+    //
+    // The conditions live in crispasr_split_pipeline.h so there is one place to
+    // add one and a unit test per condition. Two were missing here: the env
+    // override dropped return_logits / worker-pool, and NOTHING covered the #89
+    // gap-fill that finish_slice runs when vad_slice_cap_seconds() > 0 — that
+    // one re-enters be.transcribe() on the consumer thread and aborts the
+    // process on a ggml assert when the producer is mid-encode.
+    crispasr_split::Inputs split_in;
+    split_in.multiple_slices = slices.size() > 1;
+    split_in.backend_supports_split = backend.supports_split_transcribe();
+    split_in.worker_pool_requested = n_workers > 1;
+    split_in.return_logits = params.return_logits;
+    {
+        const char* gf = getenv("CRISPASR_GAP_FILL");
+        const bool gap_fill_on = !gf || atoi(gf) != 0;
+        split_in.post_pass_reenters_model = backend.vad_slice_cap_seconds() > 0 && gap_fill_on;
+    }
+    const bool use_split_pipeline = crispasr_split::enabled(split_in, getenv("CRISPASR_SLICE_PIPELINE"));
+
+    // Run slices [lo, hi) through the encode ∥ decode pipeline.
+    auto pipeline_run = [&](size_t lo, size_t hi) {
+        struct pending {
+            CrispasrBackend::encoded_slice enc;
+            int64_t t0_cs = 0;
+            bool ok = false;
+        };
+        std::deque<pending> q;
+        std::mutex m;
+        std::condition_variable cv_full, cv_empty;
+        std::vector<size_t> failed_slices;
+        const size_t kCap = 2;
+
+        std::thread producer([&] {
+            for (size_t i = lo; i < hi; i++) {
+                int ext_start = 0, ext_end = 0;
+                int64_t ext_t0_cs = 0;
+                slice_ext_range(i, ext_start, ext_end, ext_t0_cs);
+                pending p;
+                p.t0_cs = ext_t0_cs;
+                p.enc = backend.encode_slice(samples.data() + ext_start, ext_end - ext_start, params);
+                p.ok = (p.enc.h != nullptr);
+                std::unique_lock<std::mutex> lk(m);
+                cv_full.wait(lk, [&] { return q.size() < kCap; });
+                q.push_back(p);
+                cv_empty.notify_one();
+            }
+        });
+
+        // Join on every exit path. Without this an exception escaping the loop
+        // below reaches ~std::thread with the producer still joinable, which is
+        // std::terminate.
+        struct join_guard {
+            std::thread& t;
+            ~join_guard() {
+                if (t.joinable())
+                    t.join();
+            }
+        } jg{producer};
+
+        // Decoded segments are held until the producer has joined: the repair
+        // pass below re-encodes, so it cannot run while the producer is
+        // encoding — and it has to run BEFORE finish_slice trims and stores,
+        // which is where transcribe() applies it. Progress is still ticked here
+        // so a pipelined run reports as it goes rather than all at the end.
+        std::vector<std::vector<crispasr_segment>> decoded(hi - lo);
+        for (size_t i = lo; i < hi; i++) {
+            pending p;
+            {
+                std::unique_lock<std::mutex> lk(m);
+                cv_empty.wait(lk, [&] { return !q.empty(); });
+                p = q.front();
+                q.pop_front();
+                cv_full.notify_one();
+            }
+            if (!p.ok) {
+                // Unexpected encode failure (e.g. VRAM OOM) on a slice that did
+                // qualify. Defer to AFTER the join: the fallback re-encodes, and
+                // that must not overlap the producer.
+                failed_slices.push_back(i);
+                continue;
+            }
+            decoded[i - lo] = backend.decode_slice(p.enc, p.t0_cs, params);
+            tick_slice_progress();
+        }
+
+        producer.join();
+
+        // Single-threaded again: repair, then store; then retry anything the
+        // encoder dropped (process_slice re-encodes too, hence also here).
+        for (size_t i = lo; i < hi; i++) {
+            if (std::find(failed_slices.begin(), failed_slices.end(), i) != failed_slices.end())
+                continue;
+            int ext_start = 0, ext_end = 0;
+            int64_t ext_t0_cs = 0;
+            slice_ext_range(i, ext_start, ext_end, ext_t0_cs);
+            backend.repair_slice(samples.data() + ext_start, ext_end - ext_start, ext_t0_cs, decoded[i - lo], params);
+            finish_slice(i, std::move(decoded[i - lo]), backend, /*report_progress=*/false);
+        }
+        for (size_t i : failed_slices)
+            process_slice(i, backend);
+    };
+
+    if (use_split_pipeline) {
+        // Per-call settings that transcribe() would apply on every call —
+        // sampling, beam, attention context, hotwords. The split pair cannot do
+        // it (encode_slice runs on the producer thread), so it happens once
+        // here, on this thread, before any producer starts. Without it
+        // `--beam-size 4` decoded greedily.
+        backend.begin_split_run(params);
+        std::vector<char> qualifies(slices.size(), 0);
+        size_t n_ok = 0;
+        for (size_t i = 0; i < slices.size(); i++) {
+            int es = 0, ee = 0;
+            int64_t et = 0;
+            slice_ext_range(i, es, ee, et);
+            qualifies[i] = backend.can_split_slice(ee - es, params) ? 1 : 0;
+            n_ok += qualifies[i];
+        }
+        if (!params.no_prints && params.verbose)
+            fprintf(stderr, "crispasr: pipelining encode/decode over %zu/%zu slices\n", n_ok, slices.size());
+
+        size_t i = 0;
+        while (i < slices.size()) {
+            if (!qualifies[i]) {
+                process_slice(i, backend);
+                i++;
+                continue;
+            }
+            size_t j = i;
+            while (j < slices.size() && qualifies[j])
+                j++;
+            if (j - i >= 2)
+                pipeline_run(i, j);
+            else
+                process_slice(i, backend); // lone qualifying slice: nothing to overlap
+            i = j;
+        }
+    } else if (n_workers > 1 && slices.size() > 1) {
         // Parallel slice processing with separate backend instances
         if (!params.no_prints) {
             fprintf(stderr, "crispasr: parallel processing %zu slices with %d workers\n", slices.size(), n_workers);
@@ -1997,7 +2326,7 @@ static std::string crispasr_stream_common_speaker(const std::vector<crispasr_seg
     std::string spk;
     for (const auto& s : segs) {
         if (s.speaker.empty())
-            continue;
+            return "";
         if (spk.empty())
             spk = s.speaker;
         else if (spk != s.speaker)
@@ -2106,6 +2435,49 @@ int crispasr_run_backend(const whisper_params& params_in) {
         }
     }
 
+    // ── --print-speaker-identity: whose voice does this file produce? ─────
+    // Standalone verb, resolved with the SAME code the disclosure gate uses:
+    // the stamp inside the file first, then the researched legacy table. Runs
+    // before any backend/model resolution — it inspects a file, not a session.
+    //
+    // Exists so a script never has to restate a verdict. Anything that needs to
+    // know (the stamping driver, a packaging step, an operator asking "will
+    // this disclose?") asks the binary and gets the answer the runtime will
+    // actually act on, instead of keeping a third copy of the table that drifts.
+    //
+    // Prints one of real_person / synthetic / unknown on stdout. Exit 0 when
+    // the answer is established, 3 when it is unknown — so a shell driver can
+    // skip unknowns with `if crispasr --print-speaker-identity f; then ...`.
+    if (!params.print_speaker_identity_file.empty()) {
+        const std::string& path = params.print_speaker_identity_file;
+        // The stamp is authoritative wherever it exists; the tables are the
+        // legacy fallback for files published before it. Same strongest-duty
+        // combination the synthesis path applies, so this cannot report an
+        // answer weaker than the one that will be enforced.
+        const crispasr_voice::SpeakerIdentity stamped = crispasr_voice::read_model_speaker_identity(path);
+        const crispasr_voice::PackProvenance pack = crispasr_voice::read_pack_provenance(path);
+        // Both tables: this file may be a voice PACK or a MODEL, and the verb
+        // has no session to ask which. The model table keys on a backend name,
+        // so derive it from what the file declares about itself.
+        crispasr_voice::SpeakerIdentity table = crispasr_voice::identity_for_voice_pack(path);
+        if (table == crispasr_voice::SpeakerIdentity::Unknown) {
+            const std::string arch = crispasr_voice::read_gguf_architecture(path);
+            if (!arch.empty())
+                table = crispasr_voice::identity_for_model(crispasr_voice::backend_for_architecture(arch), path);
+        }
+        const crispasr_voice::SpeakerIdentity id = crispasr_voice::resolve_speaker_identity(
+            /*override=*/crispasr_voice::parse_speaker_identity(params.tts_speaker_identity),
+            /*pack=*/pack.identity == crispasr_voice::SpeakerIdentity::Unknown ? table : pack.identity,
+            /*backend=*/crispasr_voice::SpeakerIdentity::Unknown, stamped);
+        printf("%s\n", crispasr_voice::to_string(id));
+        if (!params.no_prints) {
+            fprintf(stderr, "crispasr: '%s' -> speaker_identity=%s (stamp=%s, table=%s)\n", path.c_str(),
+                    crispasr_voice::to_string(id), crispasr_voice::to_string(stamped),
+                    crispasr_voice::to_string(table));
+        }
+        return id == crispasr_voice::SpeakerIdentity::Unknown ? 3 : 0;
+    }
+
     // ── --detect-watermark: standalone watermark detection verb ───────────
     // Reads a WAV file, runs watermark detection, prints the result, exits.
     // This is handled before any backend/model resolution so no GGUF is
@@ -2159,14 +2531,56 @@ int crispasr_run_backend(const whisper_params& params_in) {
 
         float confidence = crispasr_wm_dispatch::detect(pcm.data(), n_samples, (int)wav_sr);
 
+        const bool neural = crispasr_wm_dispatch::get_ctx() != nullptr;
+        const double dur_s = wav_sr > 0 ? (double)n_samples / (double)wav_sr : 0.0;
+
         fprintf(stdout, "File: %s\n", wav_path.c_str());
+        fprintf(stdout, "Detector: %s\n", neural ? "AudioSeal (neural)" : "spread-spectrum (built-in)");
+        fprintf(stdout, "Analysed: %.2f s\n", dur_s);
         fprintf(stdout, "Watermark confidence: %.4f\n", confidence);
-        if (confidence > 0.65f) {
-            fprintf(stdout, "Result: AI-GENERATED WATERMARK DETECTED\n");
-        } else if (confidence >= 0.4f) {
-            fprintf(stdout, "Result: UNCERTAIN\n");
+
+        if (neural) {
+            // AudioSeal returns a probability, not a bin-agreement fraction —
+            // the binomial null in crispasr_watermark_stats.h does not apply.
+            fprintf(stdout, "Result: %s\n",
+                    confidence > 0.5f ? "AI-GENERATED WATERMARK DETECTED"
+                                      : "No watermark detected (this does NOT mean the audio is human-made)");
         } else {
-            fprintf(stdout, "Result: No watermark detected\n");
+            // Spread-spectrum: the score is the fraction of CRISPASR_WATERMARK_NBINS
+            // pseudo-random bins agreeing with the embedder's sign pattern, so
+            // unwatermarked audio scores 0.5 on average — NOT 0. Report the exact
+            // probability of reaching this score by chance instead of a bare
+            // threshold: the old `> 0.65` bar is p = 0.055, i.e. it called roughly
+            // one in eighteen clean files watermarked, in the past tense.
+            if (crispasr_watermark_detect_uses_frames()) {
+                // Per-frame t + decoy specificity. The score is a calibrated
+                // confidence, not a bin count, so the binomial null does not
+                // apply and no p-value is printed — quoting one would invent an
+                // n that was never scored.
+                const auto verdict = crispasr_wm_stats::classify_frames(confidence);
+                fprintf(stdout, "Statistic: per-frame t + decoy specificity\n");
+                fprintf(stdout, "Result: %s\n", crispasr_wm_stats::verdict_line(verdict));
+                if (verdict != crispasr_wm_stats::Verdict::Detected && dur_s < 1.0) {
+                    fprintf(stdout,
+                            "Note: %.2f s is below the %d-frame minimum this statistic needs; it returns 0\n"
+                            "      rather than guess. A negative is not evidence the audio is human-made.\n",
+                            dur_s, crispasr_wm::kDetectMinFrames);
+                }
+            } else {
+                const double p = crispasr_wm_stats::p_value(confidence, CRISPASR_WATERMARK_NBINS);
+                const auto verdict = crispasr_wm_stats::classify(confidence, CRISPASR_WATERMARK_NBINS);
+                fprintf(stdout, "Statistic: bin-sign agreement (legacy)\n");
+                fprintf(stdout, "Chance of this score without a watermark: %.2g\n", p);
+                fprintf(stdout, "Result: %s\n", crispasr_wm_stats::verdict_line(verdict));
+                if (verdict != crispasr_wm_stats::Verdict::Detected && dur_s < 10.0) {
+                    fprintf(stdout,
+                            "Note: %.1f s is short for this detector — it averages spectra across frames, so\n"
+                            "      confidence grows with duration (measured: 69%% of 1 s clips vs 100%% of 10 s\n"
+                            "      clips clear the 0.65 bar). Unset CRISPASR_WATERMARK_DETECT to use the\n"
+                            "      per-frame statistic, which reads 97%% at 1 s with fewer false positives.\n",
+                            dur_s);
+                }
+            }
         }
 
         crispasr_wm_dispatch::shutdown();
@@ -2208,6 +2622,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
         // words can be re-grouped per segment afterwards.
         std::vector<std::string> segment_texts;
         bool is_srt_input = false;
+        bool is_json_input = false;
         auto trim = [](std::string s) {
             while (!s.empty() && (s.front() == ' ' || s.front() == '\t'))
                 s.erase(s.begin());
@@ -2216,28 +2631,78 @@ int crispasr_run_backend(const whisper_params& params_in) {
             return s;
         };
         if (!params.text_file.empty()) {
-            FILE* tf = fopen(params.text_file.c_str(), "rb");
-            if (!tf) {
-                fprintf(stderr, "crispasr[align-only]: cannot open text file '%s'\n", params.text_file.c_str());
-                return 10;
-            }
-            fseek(tf, 0, SEEK_END);
-            long sz = ftell(tf);
-            fseek(tf, 0, SEEK_SET);
-            std::string raw(sz, '\0');
-            if ((long)fread(&raw[0], 1, sz, tf) != sz) {
-                fprintf(stderr, "crispasr[align-only]: short read from '%s'\n", params.text_file.c_str());
+            std::string raw;
+            // "-" means stdin (#317). An embedder like Subtitle Edit already
+            // holds the transcript in memory and would otherwise have to spill
+            // it to a temp file purely to hand it over — a temp file it then
+            // owns, has to name uniquely, and has to clean up. Piping is one
+            // less thing to get wrong, and costs nothing when unused.
+            if (params.text_file == "-") {
+                char buf[65536];
+                size_t n;
+                while ((n = fread(buf, 1, sizeof(buf), stdin)) > 0)
+                    raw.append(buf, n);
+                if (ferror(stdin)) {
+                    fprintf(stderr, "crispasr[align-only]: error reading transcript from stdin\n");
+                    return 10;
+                }
+                if (raw.empty()) {
+                    fprintf(stderr, "crispasr[align-only]: --text-file - was given but stdin was empty.\n");
+                    return 10;
+                }
+            } else {
+                FILE* tf = fopen(params.text_file.c_str(), "rb");
+                if (!tf) {
+                    fprintf(stderr, "crispasr[align-only]: cannot open text file '%s'\n", params.text_file.c_str());
+                    return 10;
+                }
+                fseek(tf, 0, SEEK_END);
+                long sz = ftell(tf);
+                fseek(tf, 0, SEEK_SET);
+                raw.assign((size_t)sz, '\0');
+                if ((long)fread(&raw[0], 1, sz, tf) != sz) {
+                    fprintf(stderr, "crispasr[align-only]: short read from '%s'\n", params.text_file.c_str());
+                    fclose(tf);
+                    return 10;
+                }
                 fclose(tf);
-                return 10;
             }
-            fclose(tf);
 
-            // Detect .srt by extension: cue texts kept, timestamps/indices stripped.
+            // Detect format by extension; stdin has no extension so sniff
+            // content instead. Order: .srt, .json, then plain .txt fallback.
             const std::string& p = params.text_file;
             is_srt_input = (p.size() >= 4 && (p.substr(p.size() - 4) == ".srt" || p.substr(p.size() - 4) == ".SRT"));
+            if (p == "-")
+                is_srt_input = raw.find(" --> ") != std::string::npos;
+
+            // #317: detect JSON — by extension or by content sniff for stdin.
+            // Accepts CrispASR --output-json transcription and the align-only
+            // JSON format, extracting the "text" field from each segment.
+            is_json_input = (p.size() >= 5 && (p.substr(p.size() - 5) == ".json" || p.substr(p.size() - 5) == ".JSON"));
+            if (p == "-" && !is_srt_input) {
+                // Sniff: JSON starts with '{' or '[' (ignoring whitespace).
+                for (size_t c = 0; c < raw.size(); c++) {
+                    if (raw[c] == ' ' || raw[c] == '\t' || raw[c] == '\n' || raw[c] == '\r')
+                        continue;
+                    is_json_input = (raw[c] == '{' || raw[c] == '[');
+                    break;
+                }
+            }
+
             if (is_srt_input) {
                 for (auto& cue : crispasr_parse_srt_cues(raw))
                     segment_texts.push_back(trim(std::move(cue)));
+            } else if (is_json_input) {
+                segment_texts = crispasr_parse_json_segments(raw);
+                if (segment_texts.empty()) {
+                    fprintf(stderr, "crispasr[align-only]: JSON input has no 'text' fields. "
+                                    "Expected CrispASR --output-json format with a \"transcription\" array, "
+                                    "or an array of {\"text\": \"...\"}.\n");
+                    return 10;
+                }
+                if (!params.no_prints)
+                    fprintf(stderr, "crispasr[align-only]: parsed %zu segment(s) from JSON input\n",
+                            segment_texts.size());
             } else {
                 // Plain .txt: each non-empty line is one segment.
                 size_t i = 0;
@@ -2259,7 +2724,17 @@ int crispasr_run_backend(const whisper_params& params_in) {
             if (!t.empty())
                 segment_texts.push_back(std::move(t));
         } else {
-            fprintf(stderr, "crispasr[align-only]: requires --ref-text or --text-file.\n");
+            // #317: two people hit this and read it as the aligner failing. It
+            // is not — alignment needs a transcript to align, and only the
+            // caller has one. Say what to pass, since the answer is short.
+            fprintf(stderr, "crispasr[align-only]: no transcript given — alignment needs the text to align.\n"
+                            "  --text-file <file.txt>   one segment per line\n"
+                            "  --text-file <file.srt>   re-time existing cues (text kept, timings discarded)\n"
+                            "  --text-file <file.json>  CrispASR JSON output (--output-json); extracts segment texts\n"
+                            "  --text-file -            read from stdin (auto-detects SRT/JSON/plain text)\n"
+                            "  --ref-text \"...\"         a single segment inline\n"
+                            "Only -am (the aligner model) is needed besides; -m/--backend, --vad and\n"
+                            "--max-len belong to transcription and are unused here.\n");
             return 10;
         }
 
@@ -2275,8 +2750,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
             return 10;
         }
 
-        // segment output: explicit, or auto for .srt input (re-timed cues).
-        const bool segment_mode = gran == "segment" || (gran == "auto" && is_srt_input);
+        // segment output: explicit, or auto for structured input (SRT cues / JSON segments).
+        const bool segment_mode = gran == "segment" || (gran == "auto" && (is_srt_input || is_json_input));
 
         // Load audio.
         if (params.fname_inp.empty()) {
@@ -2475,7 +2950,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
     // PLAN #74a — chatterbox-family auto-route by --language. Pure
     // English variants ("chatterbox" / "chatterbox-turbo" / aliases)
     // get swapped to the language-matching sibling when the user passes
-    // `-l de` (kartoffelbox-turbo) or `-l ar` (lahgtna-chatterbox), but
+    // `-l de` (kartoffelbox-turbo), `-l ar` (lahgtna-chatterbox), or
+    // `-l fi` (chatterbox-finnish-nano), but
     // only when -m auto is in effect — if the user passed an explicit
     // model path they've already picked the variant. Mirrors the kokoro
     // `-l de` German-backbone routing convention. No-op when the user
@@ -2491,6 +2967,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
                 routed = "kartoffelbox-turbo";
             } else if (params.language == "ar") {
                 routed = "lahgtna-chatterbox";
+            } else if (params.language == "fi") {
+                routed = "chatterbox-finnish-nano";
             }
             if (!routed.empty()) {
                 if (!params.no_prints) {
@@ -2500,6 +2978,34 @@ int crispasr_run_backend(const whisper_params& params_in) {
                 backend_name = routed;
                 params.backend = routed;
             }
+        }
+    }
+
+    // #411 — Pocket-TTS publishes a separate checkpoint per language. Keep
+    // the simple `--backend pocket-tts -m auto -l xx` interface and select
+    // the matching registry entry before model resolution. An explicit model
+    // path remains authoritative.
+    if (model_is_auto && !params.language.empty() && params.language != "auto" &&
+        (backend_name == "pocket-tts" || backend_name == "pocket_tts" || backend_name == "pockettts" ||
+         backend_name == "pocket")) {
+        std::string routed;
+        if (params.language == "de")
+            routed = "pocket-tts-de";
+        else if (params.language == "es")
+            routed = "pocket-tts-es";
+        else if (params.language == "it")
+            routed = "pocket-tts-it";
+        else if (params.language == "pt")
+            routed = "pocket-tts-pt";
+        else if (params.language == "fr")
+            routed = "pocket-tts-fr";
+        if (!routed.empty()) {
+            if (!params.no_prints) {
+                fprintf(stderr, "crispasr: -l %s with --backend %s — auto-routing to %s\n", params.language.c_str(),
+                        backend_name.c_str(), routed.c_str());
+            }
+            backend_name = routed;
+            params.backend = routed;
         }
     }
 
@@ -2544,8 +3050,21 @@ int crispasr_run_backend(const whisper_params& params_in) {
             const float slice_chunk = params.vad_export_raw         ? 0.0f
                                       : params.chunk_seconds > 0.0f ? params.chunk_seconds
                                                                     : 30.0f;
-            auto slices =
-                crispasr_compute_audio_slices(samples.data(), (int)samples.size(), SR, (int)slice_chunk, params);
+            bool export_vad_load_failed = false;
+            auto slices = crispasr_compute_audio_slices(samples.data(), (int)samples.size(), SR, (int)slice_chunk,
+                                                        params, &export_vad_load_failed);
+            // #311 follow-up: --vad-export is a separate verb from the
+            // transcribe path, and only that path carried the strict check. A
+            // VAD model that failed to load here still wrote a file full of
+            // fixed chunk boundaries labelled as if VAD had produced them —
+            // and, with --strict-pipeline, still exited 0.
+            if (export_vad_load_failed && crispasr_compute_strict_reqs(params).vad) {
+                fprintf(stderr,
+                        "crispasr: error: required VAD model '%s' failed to load for '%s' "
+                        "(--require-vad/--strict-pipeline) — refusing to export fixed chunks as VAD output.\n",
+                        params.vad_model.c_str(), fname.c_str());
+                return CRISPASR_STRICT_RC_VAD;
+            }
             // Multi-file: each input gets its own export path derived
             // from the input name. Single-file: use the explicit path.
             std::string export_path = params.vad_export_file;
@@ -2742,7 +3261,9 @@ int crispasr_run_backend(const whisper_params& params_in) {
             // Bake to a temp ref GGUF in the cache dir, keyed so repeat runs reuse it.
             std::string tmp = crispasr_cache::dir(params.cache_dir) + "/tada-inline-voice.gguf";
             if (tada_encoder_write_ref_gguf(tmp.c_str(), result, params.tts_ref_text.c_str(),
-                                            params.language.empty() ? nullptr : params.language.c_str()) != 0) {
+                                            params.language.empty() ? nullptr : params.language.c_str(),
+                                            /*cloned_from_recording=*/true,
+                                            params.tts_consent_attestation.c_str()) != 0) {
                 fprintf(stderr, "crispasr[tada-clone]: failed to write reference GGUF\n");
                 return 20;
             }
@@ -2760,7 +3281,18 @@ int crispasr_run_backend(const whisper_params& params_in) {
             if (!params.no_prints)
                 fprintf(stderr, "crispasr[tada-clone]: baked voice ref (%d tokens) → %s\n", result.n_tokens,
                         tmp.c_str());
+            // Remember the recording BEFORE the rewrite: consent was given for
+            // that file, so it is what the audit record hashes. The baked pack
+            // is derived and not byte-stable across runs.
+            params.tts_voice_source_recording = params.tts_voice;
             params.tts_voice = tmp; // backend init() now sees a .gguf reference
+            // The rewrite above erases the ONLY evidence this voice is a clone:
+            // the consent + spoken-disclosure gates below classify by suffix, so
+            // `--voice victim.wav` silently became a .gguf and stopped being a
+            // clone — no --i-have-rights demanded, no [CONSENT] line, no audible
+            // AI disclosure, on the flow docs/tts.md documents as the one-command
+            // clone. Remember it explicitly instead.
+            params.tts_voice_baked_from_wav = true;
         }
     }
 
@@ -2772,6 +3304,26 @@ int crispasr_run_backend(const whisper_params& params_in) {
     }
 
     warn_unsupported(*backend, params);
+
+    // A monolingual backend can only ever emit sole_language(); asking it for a
+    // different one is not a warning, it is a request it cannot satisfy. Before
+    // this, `crispasr -m moonshine.gguf -l de audio.wav` transcribed ENGLISH and
+    // exited 0 — the wrong-language output looked like a model quality problem
+    // rather than a rejected flag. Compared through whisper_lang_id() so the
+    // spelled-out form (`-l german`) is caught the same way, with a raw string
+    // compare as the fallback for codes outside whisper's table.
+    if (const char* sole_lang = backend->sole_language(); sole_lang && params.language != "auto") {
+        const int want = whisper_lang_id(params.language.c_str());
+        const int have = whisper_lang_id(sole_lang);
+        const bool same = (want != -1 && have != -1) ? (want == have) : (params.language == sole_lang);
+        if (!same) {
+            fprintf(stderr,
+                    "crispasr: error: backend '%s' is %s-only and cannot transcribe '%s'. "
+                    "Use -l %s, or -l auto, or pick a multilingual backend.\n",
+                    backend->name(), sole_lang, params.language.c_str(), sole_lang);
+            return 14;
+        }
+    }
 
     if (!backend->init(params)) {
         fprintf(stderr, "crispasr: error: failed to initialise backend '%s'\n", backend_name.c_str());
@@ -2857,6 +3409,22 @@ int crispasr_run_backend(const whisper_params& params_in) {
         if (params.tts_ref_text.empty()) {
             fprintf(stderr, "crispasr[%s]: requires --ref-text \"transcript of the audio\"\n", verb);
             return 20;
+        }
+        // --make-ref extracts a reusable voiceprint from a person's recording —
+        // the clone itself, one step ahead of synthesis. It sat before the TTS
+        // block's consent gate and returned early, so it was the one way to build
+        // a clone with no attestation demanded anywhere. --align only emits word
+        // timestamps and stays ungated.
+        if (params.make_ref && !params.tts_voice_clone_consent) {
+            fprintf(stderr,
+                    "crispasr[make-ref]: building a voice reference requires the --i-have-rights flag.\n"
+                    "\n"
+                    "  --make-ref extracts a reusable voiceprint from '%s'. By passing\n"
+                    "  --i-have-rights you attest:\n"
+                    "  \"I have the consent of the speaker whose voice this clones,\n"
+                    "   or it is my own voice.\"\n",
+                    params.tts_voice.c_str());
+            return 17;
         }
 
         const std::string out_path = params.make_ref_output.empty() ? "tada-ref-custom.gguf" : params.make_ref_output;
@@ -2951,8 +3519,13 @@ int crispasr_run_backend(const whisper_params& params_in) {
         // --make-ref: write the voice reference GGUF.
         fprintf(stderr, "crispasr[make-ref]: %d tokens × %d-d → %s\n", result.n_tokens, result.embed_dim,
                 out_path.c_str());
+        // Stamped as a clone: this pack came from a real recording, and the
+        // synthesis-time gates read the stamp back rather than guessing from the
+        // .gguf suffix (which is how --make-ref output used to reach a backend
+        // with no attestation demanded and no audible disclosure attached).
         rc = tada_encoder_write_ref_gguf(out_path.c_str(), result, params.tts_ref_text.c_str(),
-                                         params.language.empty() ? nullptr : params.language.c_str());
+                                         params.language.empty() ? nullptr : params.language.c_str(),
+                                         /*cloned_from_recording=*/true, params.tts_consent_attestation.c_str());
         if (rc != 0) {
             fprintf(stderr, "crispasr[make-ref]: failed to write GGUF (rc=%d)\n", rc);
             return 20;
@@ -2979,29 +3552,85 @@ int crispasr_run_backend(const whisper_params& params_in) {
         // Honor the --no-watermark opt-out (equivalent to CRISPASR_NO_WATERMARK).
         crispasr_wm_dispatch::set_disabled(params.tts_no_watermark);
 
-        // Voice-cloning consent gate: if the voice is a .wav reference
-        // (i.e. voice cloning), require --i-have-rights attestation.
-        const bool is_voice_clone = !params.tts_voice.empty() && params.tts_voice.size() >= 4 &&
-                                    (params.tts_voice.compare(params.tts_voice.size() - 4, 4, ".wav") == 0 ||
-                                     params.tts_voice.compare(params.tts_voice.size() - 4, 4, ".WAV") == 0);
+        // Consent-record sink: --consent-log set this at parse time; the env
+        // var covers wrappers that cannot add a flag. Explicit flag wins.
+        crispasr_consent::init_log_path_from_env();
+
+        // Voice-cloning consent gate. A clone is a .wav reference, a voice baked
+        // from one during this run, or a pack that declares it was derived from a
+        // real recording — NOT merely "the path ends in .wav", which missed the
+        // inline-bake rewrite above and every .gguf-only cloning backend
+        // (chatterbox has no .wav path at all). See crispasr_voice_clone_policy.h.
+        const crispasr_voice::CloneDecision clone_decision = crispasr_voice::classify_voice(
+            params.tts_voice, params.tts_voice_dir, params.tts_voice_baked_from_wav, backend->voice_bank_path());
+        const bool is_voice_clone = clone_decision.is_clone;
         if (is_voice_clone && !params.tts_voice_clone_consent) {
-            fprintf(stderr, "crispasr: error: voice cloning requires the --i-have-rights flag.\n"
-                            "\n"
-                            "  By passing --i-have-rights you attest:\n"
-                            "  \"I have the consent of the speaker whose voice this clones,\n"
-                            "   or it is my own voice.\"\n"
-                            "\n"
-                            "  Usage: crispasr --tts \"text\" --voice speaker.wav --i-have-rights\n");
+            fprintf(stderr,
+                    "crispasr: error: voice cloning requires the --i-have-rights flag.\n"
+                    "\n"
+                    "  By passing --i-have-rights you attest:\n"
+                    "  \"I have the consent of the speaker whose voice this clones,\n"
+                    "   or it is my own voice.\"\n"
+                    "\n"
+                    "  Usage: crispasr --tts \"text\" --voice speaker.wav --i-have-rights\n"
+                    "  (this voice is a clone: %s)\n",
+                    clone_decision.reason);
             return 17;
         }
         if (is_voice_clone) {
-            // Log consent attestation with timestamp for audit trail
+            // Log consent attestation with timestamp for audit trail.
+            // `ref_sha256` binds the record to the BYTES that were cloned, not
+            // just the name they were cloned under — a name is not evidence,
+            // because the file can be swapped afterwards and the line still
+            // reads true. Hash whatever the backend will actually open (the
+            // --voice-dir resolution), so a bare name records the same thing a
+            // full path would. See crispasr_consent_record.h.
             auto now = std::chrono::system_clock::now();
             auto t = std::chrono::system_clock::to_time_t(now);
             char ts[64];
             std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S%z", std::localtime(&t));
-            fprintf(stderr, "[CONSENT] ts=%s voice=%s attestation=\"%s\"\n", ts, params.tts_voice.c_str(),
-                    params.tts_consent_attestation.c_str());
+            // For an inline bake, hash the ORIGINAL recording rather than the
+            // temp pack it was baked into — that is the file consent covers.
+            const std::string ref_target =
+                !params.tts_voice_source_recording.empty()
+                    ? params.tts_voice_source_recording
+                    : crispasr_voice::resolve_voice_path(params.tts_voice, params.tts_voice_dir);
+            std::string ref = crispasr_consent::file_sha256(ref_target);
+            crispasr_consent::emit(
+                "CONSENT", ts,
+                {{"voice", params.tts_voice},
+                 {"clone_reason", clone_decision.reason},
+                 {"attestation", params.tts_consent_attestation, /*quoted=*/true},
+                 {"ref_sha256", ref.empty() ? "none" : ref},
+                 {"ref_is", params.tts_voice_source_recording.empty() ? "resolved-voice" : "source-recording"}});
+        }
+
+        // Art. 50(4) applies to a PRESET voice too when that voice is an
+        // identifiable person: the audience cannot tell which pipeline made the
+        // audio, and Art. 3(60) does not ask them to. Resolve whose voice this
+        // is — operator override, then the pack's declaration, then the
+        // backend's — and disclose on either ground. Notably this does NOT feed
+        // the consent gate above; see crispasr_speaker_identity.h.
+        bool identity_recognised = true;
+        const crispasr_voice::SpeakerIdentity identity_override =
+            crispasr_voice::parse_speaker_identity(params.tts_speaker_identity, &identity_recognised);
+        if (!identity_recognised) {
+            // Report the typo rather than silently treating it as Unknown: the
+            // operator meant to answer this question, and "real-person" landing
+            // as "unknown" would drop the disclosure they asked for.
+            fprintf(stderr,
+                    "crispasr: warning: unrecognised --speaker-identity '%s'; treating as 'unknown'. "
+                    "Expected real_person, synthetic or unknown.\n",
+                    params.tts_speaker_identity.c_str());
+        }
+        const crispasr_voice::SpeakerIdentity speaker_identity = crispasr_voice::resolve_speaker_identity(
+            identity_override, clone_decision.pack_identity, backend->declared_speaker_identity(params.model),
+            crispasr_voice::read_model_speaker_identity(params.model));
+        const bool needs_spoken_disclosure =
+            crispasr_voice::requires_spoken_disclosure(is_voice_clone, speaker_identity);
+        if (crispasr_voice::should_warn_unknown_identity(is_voice_clone, speaker_identity) &&
+            crispasr_voice::claim_unknown_identity_warning(backend_name)) {
+            fprintf(stderr, "%s\n", crispasr_voice::unknown_identity_warning(backend_name).c_str());
         }
 
         // Sample rate of the synthesized PCM — backend-declared. Most TTS
@@ -3041,7 +3670,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
                 fwrite(s16.data(), sizeof(int16_t), s16.size(), stdout);
                 fflush(stdout);
             };
-            if (is_voice_clone && !params.tts_no_spoken_disclaimer) {
+            if (needs_spoken_disclosure && !params.tts_no_spoken_disclaimer) {
                 const auto& disc = crispasr_tts_get_disclaimer(backend.get(), params);
                 if (!disc.empty()) {
                     std::vector<float> d(disc.begin(), disc.end());
@@ -3096,12 +3725,13 @@ int crispasr_run_backend(const whisper_params& params_in) {
             return 15;
         }
 
-        // Prepend spoken AI-disclosure for voice-cloned output. The
-        // disclaimer is synthesized with the neutral/default voice (not
-        // the cloned voice) and cached. 300ms silence gap.
-        // Skipped when --no-spoken-disclaimer is set; watermark + C2PA
-        // provenance remain regardless.
-        if (is_voice_clone && !params.tts_no_spoken_disclaimer) {
+        // Prepend the spoken AI-disclosure — for a voice clone, and for a preset
+        // voice that belongs to an identifiable person (Art. 50(4) attaches to
+        // the audio, not to the pipeline). The disclaimer is synthesized with
+        // the neutral/default voice (not the cloned voice) and cached. 300ms
+        // silence gap. Skipped when --no-spoken-disclaimer is set; watermark +
+        // C2PA provenance remain regardless.
+        if (needs_spoken_disclosure && !params.tts_no_spoken_disclaimer) {
             crispasr_tts_prepend_disclaimer(audio, backend.get(), params);
         }
 
@@ -3130,6 +3760,16 @@ int crispasr_run_backend(const whisper_params& params_in) {
             }
         }
 
+        // Optional leading-silence padding. Useful to bypass VLC playback bugs
+        // where it drops the first ~1.5s of audio while parsing a large C2PA chunk.
+        if (params.tts_pad_silence_ms > 0) {
+            size_t pad_samples = (size_t)((double)params.tts_pad_silence_ms / 1000.0 * sr_in);
+            audio.insert(audio.begin(), pad_samples, 0.0f);
+            if (!params.no_prints)
+                fprintf(stderr, "crispasr: padded %.2fs of leading silence\n",
+                        (double)params.tts_pad_silence_ms / 1000.0);
+        }
+
         // Resolve the output path first so we can enforce the watertight floor
         // BEFORE embedding: if this container can't carry C2PA, --no-watermark is
         // overridden so the file is never fully unmarked.
@@ -3149,11 +3789,57 @@ int crispasr_run_backend(const whisper_params& params_in) {
         // PCM (which has already been watermarked) and warn if confidence
         // is too low. This catches edge cases where the embed silently
         // failed or the audio is too short / silent to hold a watermark.
-        {
-            float conf = crispasr_wm_dispatch::detect(audio.data(), (int)audio.size(), sr_in);
-            if (conf < 0.6f) {
-                fprintf(stderr, "crispasr: warning: watermark verification LOW (confidence=%.3f)\n", conf);
+        // Only meaningful for the spread-spectrum detector, and only on audio
+        // long enough to score: the detector averages spectra across frames, so
+        // a short clip scores near chance (0.5) even when the embed worked
+        // perfectly. The old bare `< 0.6` bar therefore warned on most clips
+        // under a couple of seconds — a warning that fires on healthy output
+        // teaches operators to ignore it. Gate on duration and say what the
+        // number means. See crispasr_watermark_stats.h.
+        if (!crispasr_wm_dispatch::is_disabled() && crispasr_wm_dispatch::get_ctx() == nullptr) {
+            const double dur_s = sr_in > 0 ? (double)audio.size() / (double)sr_in : 0.0;
+            const float conf = crispasr_wm_dispatch::detect(audio.data(), (int)audio.size(), sr_in);
+            const bool frames = crispasr_watermark_detect_uses_frames();
+            const auto verdict = frames ? crispasr_wm_stats::classify_frames(conf)
+                                        : crispasr_wm_stats::classify(conf, CRISPASR_WATERMARK_NBINS);
+            // The per-frame statistic finds a fresh embed on ~100% of clips at
+            // 2.5 s and up, so the 5 s guard it needed is only about the legacy
+            // path. Keep it there; the self-check is a diagnostic either way and
+            // must never be read as the marking gate (embedding is unconditional).
+            const double min_dur = frames ? 2.5 : 5.0;
+            if (dur_s >= min_dur && verdict == crispasr_wm_stats::Verdict::NotDetected) {
+                if (frames) {
+                    fprintf(stderr,
+                            "crispasr: warning: watermark self-check did not find the mark it just embedded "
+                            "(score=%.3f over %.1fs). The file is still marked if C2PA signing succeeded; "
+                            "re-run --detect-watermark to confirm.\n",
+                            conf, dur_s);
+                } else {
+                    fprintf(stderr,
+                            "crispasr: warning: watermark self-check did not find the mark it just embedded "
+                            "(score=%.3f over %.1fs, p=%.2g). The file is still marked if C2PA signing "
+                            "succeeded; re-run --detect-watermark to confirm.\n",
+                            conf, dur_s, crispasr_wm_stats::p_value(conf, CRISPASR_WATERMARK_NBINS));
+                }
             }
+        }
+
+        // Close the loop on the consent record: the same run_id appears on the
+        // [CONSENT] line above, so a disputed clip can be walked back to the
+        // attestation that authorised it. Emitted for CLONES only — a preset
+        // needs no attestation, so there would be nothing to correlate to.
+        // out_sha256 is of the file as WRITTEN (watermarked, C2PA-signed), which
+        // is the artefact that leaves the machine.
+        if (is_voice_clone) {
+            auto now = std::chrono::system_clock::now();
+            auto t = std::chrono::system_clock::to_time_t(now);
+            char ts[64];
+            std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S%z", std::localtime(&t));
+            std::string out_hash = crispasr_consent::file_sha256(out_path);
+            crispasr_consent::emit("CONSENT-OUTPUT", ts,
+                                   {{"output", out_path},
+                                    {"out_sha256", out_hash.empty() ? "none" : out_hash},
+                                    {"seconds", std::to_string((double)audio.size() / (double)sr_in)}});
         }
 
         if (!params.no_prints)
@@ -3466,6 +4152,38 @@ int crispasr_run_backend(const whisper_params& params_in) {
         std::string last_partial_text; // dedupe key + prefix-mode tail
         int64_t last_partial_decode_sample = -1;
         int64_t cumulative_samples = 0;
+        // --stream-partial-tail-sec (#404): per-utterance tail-cap state.
+        // `tail_anchor_abs` is the absolute sample the next partial decode
+        // starts from; `tail_committed` is the post-processed text of
+        // everything decoded ahead of it. Both reset when an utterance
+        // finalizes. See crispasr::plan_partial_tail for the policy.
+        const int tail_cap_samples =
+            params.stream_partial_tail_sec > 0
+                ? std::max(params.stream_partial_tail_sec * SR, 2 * crispasr::kStreamRedecodeMinSamples)
+                : 0;
+        const int tail_slack_samples = std::max(tail_cap_samples / 2, crispasr::kStreamRedecodeMinSamples);
+        int64_t tail_anchor_abs = -1;
+        std::string tail_committed;
+        // CRISPASR_STREAM_SLICE_MEMO (#404): memoize per-slice partial
+        // decodes by their ABSOLUTE sample range. A VAD-closed slice keeps the
+        // same (start, end) while it stays in the rolling window, and the
+        // decode is deterministic, so re-decoding it every step repeats
+        // byte-identical work — the bulk of the RFC's "194 full transcribes".
+        // The still-growing slice changes its end every step and always
+        // misses. Exact by construction. DEFAULT ON since the quiet-box A/B
+        // (chr1str/crispasr-stream404-ab, P100 + Xeon): finals byte-equal in
+        // every arm, wall −12.2 % (multi-utterance CPU) / −5.9 % (GPU), never
+        // a regression beyond noise. Set =0 to restore the re-decode path
+        // (the gate stays per the never-remove-gates rule).
+        struct StreamSliceMemo {
+            int64_t s = 0, e = 0;
+            std::vector<crispasr_segment> segs; // pristine, pre-post-chain
+        };
+        std::vector<StreamSliceMemo> slice_memo;
+        const bool slice_memo_on = [] {
+            const char* e = getenv("CRISPASR_STREAM_SLICE_MEMO");
+            return !e || !*e || *e != '0';
+        }();
         const int64_t utterance_max_samples = (int64_t)params.stream_utterance_max_sec * SR;
         const int64_t partial_decode_interval_samples =
             crispasr_stream_partial_decode_interval_samples(params.stream_partial_decode_ms, params.stream_step_ms, SR);
@@ -3557,6 +4275,14 @@ int crispasr_run_backend(const whisper_params& params_in) {
                         // trim finalized rolling-window slices before decode;
                         // plain-text mode below still decodes full slices.
                         std::vector<crispasr_segment> sl_for_text;
+                        // #404: how many leading segments of sl_for_text came
+                        // from a tail-cap COMMIT decode. Their post-processed
+                        // text is promoted into `tail_committed` after the
+                        // post chain below. `tail_stitch` marks the one slice
+                        // (the growing one, under an active cap) whose emitted
+                        // text must be prefixed with `tail_committed`.
+                        size_t tail_commit_seg_count = 0;
+                        bool tail_stitch = false;
 
                         // Round 3 (CKwasd #1 corner): if the VAD slice
                         // straddles a previously-finalized boundary
@@ -3603,9 +4329,78 @@ int crispasr_run_backend(const whisper_params& params_in) {
                             // step once the subrange exceeds the min.
                         } else {
                             partial_decode_attempted_this_step = true;
-                            const int64_t abs_t0_cs = window_start_sample_now * 100 / SR + sl.t0_cs;
-                            sl_for_text =
-                                backend->transcribe(pcm_window.data() + sl.start, sl.end - sl.start, abs_t0_cs, params);
+                            const int64_t abs_s = window_start_sample_now + (int64_t)sl.start;
+                            const int64_t abs_e = window_start_sample_now + (int64_t)sl.end;
+                            // The still-growing slice is the one whose end
+                            // rides the window edge; VAD-closed slices keep a
+                            // fixed absolute range while the window holds them.
+                            const bool slice_growing = sl.end >= (int)pcm_window.size() - step_samples;
+                            bool served = false;
+                            if (slice_memo_on && !slice_growing) {
+                                for (const auto& m : slice_memo) {
+                                    if (m.s == abs_s && m.e == abs_e) {
+                                        sl_for_text = m.segs; // copy: post chain mutates
+                                        served = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            // #404: tail-cap the live partial decode of the
+                            // GROWING slice only. The plan either says "decode
+                            // the whole range" (cap off / slice short / stale
+                            // anchor), or first commits [commit_start,
+                            // commit_end) — one decode, its post-processed
+                            // text promoted into `tail_committed` below — and
+                            // starts this step's decode at the energy-min cut,
+                            // keeping per-step cost O(tail).
+                            if (!served) {
+                                const int cap_here = slice_growing ? tail_cap_samples : 0;
+                                const auto tail_plan = crispasr::plan_partial_tail(
+                                    pcm_window.data(),
+                                    tail_anchor_abs < 0 ? sl.start : (int)(tail_anchor_abs - window_start_sample_now),
+                                    sl.start, sl.end, cap_here, tail_slack_samples, kStraddleMinSamples);
+                                if (getenv("CRISPASR_STREAM_TAIL_DEBUG")) {
+                                    fprintf(stderr,
+                                            "stream-tail: t=%.2f grow=%d anchor_abs=%lld range=[%d,%d) plan{start=%d "
+                                            "commit=%d [%d,%d)} committed=%zuB\n",
+                                            (double)cumulative_samples / SR, (int)slice_growing,
+                                            (long long)tail_anchor_abs, sl.start, sl.end, tail_plan.decode_start,
+                                            (int)tail_plan.commit, tail_plan.commit_start, tail_plan.commit_end,
+                                            tail_committed.size());
+                                }
+                                if (tail_plan.commit) {
+                                    whisper_params commit_params = params;
+                                    commit_params.vad = false;
+                                    commit_params.vad_model.clear();
+                                    const int64_t commit_cs =
+                                        (window_start_sample_now + (int64_t)tail_plan.commit_start) * 100 / SR;
+                                    sl_for_text = backend->transcribe(pcm_window.data() + tail_plan.commit_start,
+                                                                      tail_plan.commit_end - tail_plan.commit_start,
+                                                                      commit_cs, commit_params);
+                                }
+                                tail_commit_seg_count = sl_for_text.size();
+                                if (cap_here > 0) {
+                                    tail_anchor_abs = window_start_sample_now + (int64_t)tail_plan.decode_start;
+                                    tail_stitch = true;
+                                }
+                                const int64_t abs_t0_cs =
+                                    (window_start_sample_now + (int64_t)tail_plan.decode_start) * 100 / SR;
+                                auto tail_segs =
+                                    backend->transcribe(pcm_window.data() + tail_plan.decode_start,
+                                                        sl.end - tail_plan.decode_start, abs_t0_cs, params);
+                                sl_for_text.insert(sl_for_text.end(), std::make_move_iterator(tail_segs.begin()),
+                                                   std::make_move_iterator(tail_segs.end()));
+                                // Memoize only complete, uncapped decodes of a
+                                // CLOSED slice — its range is stable, so later
+                                // steps replay this result instead of paying
+                                // an identical encoder pass.
+                                if (slice_memo_on && !slice_growing && tail_commit_seg_count == 0 &&
+                                    tail_plan.decode_start == sl.start) {
+                                    if (slice_memo.size() >= 8)
+                                        slice_memo.erase(slice_memo.begin());
+                                    slice_memo.push_back({abs_s, abs_e, sl_for_text});
+                                }
+                            }
                         }
                         if (!sl_for_text.empty())
                             decoded_segments_this_step = true;
@@ -3619,9 +4414,29 @@ int crispasr_run_backend(const whisper_params& params_in) {
                             for (auto& seg : sl_for_text)
                                 crispasr_strip_punctuation(seg);
                         }
+                        // #404: promote this step's commit-decode text (the
+                        // first tail_commit_seg_count segments, now post-
+                        // processed) into the per-utterance committed prefix,
+                        // then emit committed + tail so partial.text still
+                        // covers the whole utterance under the tail cap.
                         std::string sl_text;
-                        for (const auto& s : sl_for_text)
-                            sl_text += s.text;
+                        for (size_t si = 0; si < sl_for_text.size(); ++si) {
+                            if (si < tail_commit_seg_count) {
+                                // Successive commit decodes are independent
+                                // clips whose texts rarely carry boundary
+                                // whitespace — join with a space like the
+                                // stitcher does, or words fuse at the seam.
+                                const std::string& t = sl_for_text[si].text;
+                                if (!tail_committed.empty() && !t.empty() && tail_committed.back() != ' ' &&
+                                    t.front() != ' ')
+                                    tail_committed += ' ';
+                                tail_committed += t;
+                            } else {
+                                sl_text += sl_for_text[si].text;
+                            }
+                        }
+                        if (tail_stitch && !tail_committed.empty())
+                            sl_text = crispasr::stitch_partial_accumulator(tail_committed, sl_text);
                         step_slice_text.emplace_back(sl, std::move(sl_text));
                     } else {
                         const int64_t abs_t0_cs = window_start_sample_now * 100 / SR + sl.t0_cs;
@@ -3780,6 +4595,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
                     utterance_pcm.clear();
                     prefix_committed.clear();
                     last_partial_text.clear();
+                    tail_anchor_abs = -1; // #404: tail-cap state is per-utterance
+                    tail_committed.clear();
                 };
 
                 auto open_utterance_at = [&](int window_offset, int64_t stream_start) {
@@ -3794,6 +4611,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
                     utterance_pcm.assign(pcm_window.begin() + window_offset, pcm_window.end());
                     prefix_committed.clear();
                     last_partial_text.clear();
+                    tail_anchor_abs = -1; // #404: fresh utterance, fresh tail state
+                    tail_committed.clear();
                 };
 
                 auto on_partial_text = [&](const std::string& new_text) {
@@ -4225,7 +5044,12 @@ int crispasr_run_backend(const whisper_params& params_in) {
                                     params.lid_backend == "none";
         if (want_auto_lang && !has_native_lid && !lid_disabled) {
             crispasr_lid_result lid;
-            if (crispasr_detect_language_cli(samples.data(), (int)samples.size(),
+            // Backend self-probe first (see crispasr_lid_cli.h); external LID
+            // only when it declines.
+            const bool probed = crispasr_backend_probe_language(*backend, samples.data(),
+                                                                (int)samples.size(), params, lid);
+            if (probed ||
+                crispasr_detect_language_cli(samples.data(), (int)samples.size(),
                                           params, lid)) {
                 params.language = lid.lang_code;
                 if (params.source_lang.empty()) {
@@ -4299,21 +5123,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
                         want_align ? 1 : 0);
             }
             if (want_align) {
-                for (auto & seg : segs) {
-                    if (!seg.words.empty() && !params.force_aligner) continue; // already aligned
-                    auto words = crispasr_ctc_align(
-                        params.aligner_model,
-                        seg.text,
-                        samples.data() + sl.start,
-                        sl.end - sl.start,
-                        sl.t0_cs,
-                        params.n_threads);
-                    if (crispasr_words_have_positive_span(words)) {
-                        seg.t0 = words.front().t0;
-                        seg.t1 = words.back().t1;
-                        seg.words = std::move(words);
-                    }
-                }
+                crispasr_align_slice_segments(params.aligner_model, samples, sl.start, sl.end, sl.t0_cs,
+                                               params.n_threads, params.force_aligner, segs);
             }
 
             // Issue #267: diarize AFTER alignment so word timestamps

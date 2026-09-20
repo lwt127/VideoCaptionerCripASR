@@ -6,7 +6,9 @@ Downloads one model at a time, benchmarks, cleans up before the next.
 
 Known constraints:
   - mimo-asr default path (mixed CPU+CUDA sched) hangs on CUDA —
-    only test pure-CPU and FORCE_GPU (GPU-only sched, fix 3ef9f87e).
+    only test pure-CPU (CRISPASR_MIMO_FORCE_CPU=1) and the GPU default
+    (GPU-only sched became the default after fix 3ef9f87e; the old
+    opt-in CRISPASR_MIMO_FORCE_GPU is no longer read).
   - funasr-mlt-nano F16 hits CUDA F16xF32 !-loop (issue #125) —
     use Q8_0 for GPU testing.
 
@@ -211,9 +213,9 @@ bench("mimo Q4_K CPU-forced",
       extra_env={"GGML_CUDA_DISABLE": "1"},
       timeout=420)
 
-bench("mimo Q4_K GPU-only (FORCE_GPU)",
+bench("mimo Q4_K GPU-only (default)",
       "mimo-asr",
-      extra_env={"CRISPASR_MIMO_FORCE_GPU": "1"},
+      extra_env={},
       timeout=120)
 
 # ── funasr-mlt-nano: F16 on CPU, Q8_0 on CPU, Q8_0 with LLM on GPU

@@ -6,6 +6,13 @@
 #include <cstdint>
 #include <vector>
 
+// Dev harness: every input path is env-overridable so this file carries no
+// machine-specific absolute paths. Defaults are plain relative filenames.
+static const char* env_or(const char* name, const char* fallback) {
+    const char* v = std::getenv(name);
+    return (v && *v) ? v : fallback;
+}
+
 static void write_wav(const char* path, const float* data, int n_samples, int sample_rate) {
     FILE* f = fopen(path, "wb");
     if (!f)
@@ -46,14 +53,15 @@ static void write_wav(const char* path, const float* data, int n_samples, int sa
 }
 
 int main() {
-    auto* ctx = chatterbox_s3gen_init_from_file("/mnt/storage/chatterbox/chatterbox-s3gen-f16.gguf", 4, 2, false);
+    auto* ctx =
+        chatterbox_s3gen_init_from_file(env_or("CHATTERBOX_S3GEN_GGUF", "chatterbox-s3gen-f16.gguf"), 4, 2, false);
     if (!ctx) {
         fprintf(stderr, "Failed to load model\n");
         return 1;
     }
 
     std::vector<float> mel(80 * 62);
-    FILE* f = fopen("/mnt/storage/chatterbox/ref_mel_80x62.bin", "rb");
+    FILE* f = fopen(env_or("CHATTERBOX_REF_MEL", "ref_mel_80x62.bin"), "rb");
     fread(mel.data(), 4, mel.size(), f);
     fclose(f);
 
@@ -61,8 +69,9 @@ int main() {
     float* pcm = chatterbox_s3gen_vocode(ctx, mel.data(), 62, &n_samples);
     fprintf(stderr, "Produced %d samples at 24 kHz (%.2f sec)\n", n_samples, n_samples / 24000.0f);
 
-    write_wav("/mnt/storage/chatterbox/cpp_voc_fixed.wav", pcm, n_samples, 24000);
-    fprintf(stderr, "Wrote /mnt/storage/chatterbox/cpp_voc_fixed.wav\n");
+    const char* out_wav = env_or("CHATTERBOX_OUT_WAV", "cpp_voc_fixed.wav");
+    write_wav(out_wav, pcm, n_samples, 24000);
+    fprintf(stderr, "Wrote %s\n", out_wav);
 
     free(pcm);
     chatterbox_s3gen_free(ctx);

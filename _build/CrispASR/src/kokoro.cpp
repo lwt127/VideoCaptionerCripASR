@@ -61,6 +61,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifdef CRISPASR_HAVE_ESPEAK_NG
 #include <espeak-ng/speak_lib.h>
@@ -2577,6 +2578,13 @@ extern "C" struct kokoro_context_params kokoro_context_default_params(void) {
     return p;
 }
 
+extern "C" struct kokoro_context* kokoro_context_create_for_testing(struct kokoro_context_params params) {
+    auto* c = new kokoro_context();
+    c->params = params;
+    c->n_threads = params.n_threads > 0 ? params.n_threads : 4;
+    return c;
+}
+
 extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, struct kokoro_context_params params) {
     if (!path_model) {
         fprintf(stderr, "kokoro: null model path\n");
@@ -2673,13 +2681,13 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, 
     }
 
     // ---- Backends ----
-    c->backend_cpu = ggml_backend_cpu_init();
+    c->backend_cpu = core_cpu_backend::init();
     if (!c->backend_cpu) {
         fprintf(stderr, "kokoro: failed to init CPU backend\n");
         delete c;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(c->backend_cpu, c->n_threads);
+    core_cpu_backend::set_n_threads(c->backend_cpu, c->n_threads);
     c->backend = params.use_gpu ? crispasr_init_gpu_backend() : c->backend_cpu;
     if (!c->backend)
         c->backend = c->backend_cpu;
@@ -2844,7 +2852,7 @@ extern "C" int kokoro_load_voice_pack(struct kokoro_context* ctx, const char* pa
 
         // Replace any previously-loaded pack.
         if (ctx->vp.vp_buf_w)
-            ggml_backend_buffer_free(ctx->vp.vp_buf_w);
+            core_gguf::release_weight_buffer(ctx->vp.vp_buf_w);
         if (ctx->vp.vp_ctx_w)
             ggml_free(ctx->vp.vp_ctx_w);
         ctx->vp = std::move(vp);
@@ -2863,7 +2871,7 @@ extern "C" int kokoro_load_voice_pack(struct kokoro_context* ctx, const char* pa
     auto it = wl.tensors.find("voice.pack");
     if (it == wl.tensors.end() || !it->second) {
         fprintf(stderr, "kokoro: voice pack '%s' missing 'voice.pack' tensor\n", path);
-        ggml_backend_buffer_free(wl.buf);
+        core_gguf::release_weight_buffer(wl.buf);
         ggml_free(wl.ctx);
         return -1;
     }
@@ -3247,6 +3255,18 @@ bool phonemize_cached(kokoro_context* ctx, const std::string& lang, const std::s
     static const bool skip_builtin = g2p_strategy && strcmp(g2p_strategy, "espeak-only") == 0;
     static const bool skip_espeak = g2p_strategy && strcmp(g2p_strategy, "builtin-only") == 0;
 
+    // #316 round 2: keep punctuation in the phoneme string for the non-English
+    // built-in G2Ps. English is settled — misaki emits the marks and the ASR
+    // round-trip proves the difference. de/fr/es have no equivalent reference,
+    // so this is A/B'd by round-trip on kokoro-de-hui-base and gated:
+    // CRISPASR_KOKORO_PUNCT=0 restores the old drop-everything behaviour.
+    // Never remove the gate — it is the bisection mechanism.
+    static const bool kokoro_punct = [] {
+        const char* v = crispasr_env::get("CRISPASR_KOKORO_PUNCT");
+        return !(v && *v && strcmp(v, "0") == 0);
+    }();
+    auto kokoro_punctuation = [] { return kokoro_punct; };
+
     // Lambda: try builtin phonemizers for the given language.
     auto try_builtin = [&]() -> bool {
         if (skip_builtin)
@@ -3259,13 +3279,13 @@ bool phonemize_cached(kokoro_context* ctx, const std::string& lang, const std::s
             // when the lexicon is not installed.
             ok = crispasr::phonemize_misaki_en(lang, text, out);
             if (!ok)
-                ok = crispasr::phonemize_builtin_en(lang, text, out);
+                ok = crispasr::phonemize_builtin_en(lang, text, out, /*misaki_style=*/true);
         } else if (lang == "de")
-            ok = crispasr::phonemize_builtin_de(lang, text, out);
+            ok = crispasr::phonemize_builtin_de(lang, text, out, kokoro_punctuation());
         else if (lang == "fr" || lang == "fr-fr")
-            ok = crispasr::phonemize_builtin_fr(lang, text, out);
+            ok = crispasr::phonemize_builtin_fr(lang, text, out, kokoro_punctuation());
         else if (lang == "es" || lang == "es-es")
-            ok = crispasr::phonemize_builtin_es(lang, text, out);
+            ok = crispasr::phonemize_builtin_es(lang, text, out, kokoro_punctuation());
         return ok && !out.empty();
     };
 
@@ -3312,6 +3332,29 @@ bool phonemize_cached(kokoro_context* ctx, const std::string& lang, const std::s
         const bool is_en = lang.empty() || lang.rfind("en", 0) == 0;
         if (is_en && misaki_ipa)
             out = core_phoneme::convert(out, core_phoneme::Dialect::Misaki);
+        // #316 German. Two separate things, and only the first is on:
+        //
+        // (a) VOCABULARY FIXUPS — always. `ʏ` is not in the German model's
+        //     178-token vocabulary, and a missing symbol is DROPPED, not
+        //     approximated, so we were deleting the vowel out of every
+        //     München, Frühstück, fünf, Glück and zurück. dida-80b's own
+        //     dataset script makes the same `ʏ`→`y` substitution.
+        //
+        // (b) misaki's TIED-SEQUENCE COLLAPSE (`ʦvˈI` for `tsvˈaɪ`) — opt-in,
+        //     CRISPASR_KOKORO_DE_MISAKI_ALPHABET=1. It is what the published
+        //     training recipe does and it moves our phonemes measurably closer
+        //     to it, but on the hui base we ship it made the ASR round-trip
+        //     WORSE, so it does not get the default on evidence we have.
+        //     See PLAN.md — this needs a listening test, and it is likely to
+        //     be right for the newer kikiri-tts models.
+        if (lang.rfind("de", 0) == 0) {
+            static const bool de_alphabet = [] {
+                const char* v = crispasr_env::get("CRISPASR_KOKORO_DE_MISAKI_ALPHABET");
+                return v && *v && strcmp(v, "0") != 0;
+            }();
+            out = core_phoneme::convert(out,
+                                        de_alphabet ? core_phoneme::Dialect::MisakiDe : core_phoneme::Dialect::DeVocab);
+        }
         ctx->phon_cache.insert(key, out);
         return true;
     }
@@ -3559,7 +3602,7 @@ extern "C" void kokoro_set_n_threads(struct kokoro_context* ctx, int n_threads) 
         return;
     ctx->n_threads = n_threads;
     if (ctx->backend_cpu)
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, n_threads);
 }
 
 // Runtime length-scale setter (PLAN #88). The duration-predictor
@@ -3570,11 +3613,25 @@ extern "C" void kokoro_set_n_threads(struct kokoro_context* ctx, int n_threads) 
 extern "C" void kokoro_set_length_scale(struct kokoro_context* ctx, float scale) {
     if (!ctx)
         return;
+    // NaN is not a speed request, it is malformed input — so it must land on
+    // the NEUTRAL value, not inside the clamp range. length_scale is 1/speed,
+    // so the 0.25 floor is the FASTEST setting (4x) and the most degraded
+    // output; folding NaN into it would mean the input path least likely to be
+    // deliberate silently selects the worst-sounding extreme. Fall back to the
+    // no-op instead, and leave the clamp to handle values that are real.
+    if (std::isnan(scale))
+        scale = 1.0f;
     if (scale < 0.25f)
         scale = 0.25f;
     if (scale > 4.0f)
         scale = 4.0f;
     ctx->params.length_scale = scale;
+}
+
+extern "C" float kokoro_get_length_scale(const struct kokoro_context* ctx) {
+    if (!ctx)
+        return 1.0f;
+    return ctx->params.length_scale;
 }
 
 extern "C" void kokoro_free(struct kokoro_context* ctx) {
@@ -3586,7 +3643,7 @@ extern "C" void kokoro_free(struct kokoro_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->vp.vp_buf_w)
-        ggml_backend_buffer_free(ctx->vp.vp_buf_w);
+        core_gguf::release_weight_buffer(ctx->vp.vp_buf_w);
     if (ctx->vp.vp_ctx_w)
         ggml_free(ctx->vp.vp_ctx_w);
     if (ctx->buf_perm)
@@ -3594,7 +3651,7 @@ extern "C" void kokoro_free(struct kokoro_context* ctx) {
     if (ctx->ctx_perm)
         ggml_free(ctx->ctx_perm);
     if (ctx->buf_w)
-        ggml_backend_buffer_free(ctx->buf_w);
+        core_gguf::release_weight_buffer(ctx->buf_w);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)

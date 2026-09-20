@@ -20,6 +20,18 @@
 
 CRISPASR="${1:-${CRISPASR_BIN:-build/bin/crispasr}}"
 SRC_DIR="${2:-.}"
+# Tier selector, same split as test_vad_export_live.sh and for the same reason:
+# labelled `unit`, this script reported green in CI while SKIPPING the
+# model-gated A/B that is the part actually worth running. `unit` runs the
+# model-free half only; `live`/`all` run everything.
+TIER="${3:-all}"
+case "$TIER" in
+    unit | live | all) ;;
+    *)
+        echo "unknown tier '$TIER' (expected unit, live or all)" >&2
+        exit 2
+        ;;
+esac
 JFK_WAV="$SRC_DIR/samples/jfk.wav"
 TMPDIR="$(mktemp -d "${TMPDIR_BASE:-/tmp}/test311.XXXXXX")"
 BOGUS="$TMPDIR/not-a-real-model.gguf"
@@ -65,6 +77,14 @@ for flag in -- --strict-pipeline --require-vad --require-word-timestamps --requi
     [ "$flag" = "--" ] && continue
     if echo "$HELP" | grep -q -- "$flag"; then pass "help lists $flag"; else fail "help lists $flag"; fi
 done
+
+if [ "$TIER" = "unit" ]; then
+    echo ""
+    echo "=== Results (unit tier): $PASS passed, $FAIL failed, $SKIP skipped ==="
+    rm -rf "$TMPDIR"
+    [ "$FAIL" -eq 0 ] || exit 1
+    exit 0
+fi
 
 # ─── Model-gated A/B ────────────────────────────────────────────────────────
 MODEL="${CRISPASR_MODEL_WHISPER:-}"

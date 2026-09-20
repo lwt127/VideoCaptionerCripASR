@@ -2,7 +2,7 @@
 CrispASR — Nemotron GGUF quantization + HF upload
 
 Downloads the F16 GGUF, quantizes to Q8_0 and Q4_K using crispasr-quantize,
-and uploads all three to cstr/nemotron-3.5-asr-streaming-GGUF.
+and uploads all three to cstr/nemotron-3.5-asr-streaming-0.6b-GGUF.
 
 CPU kernel (no GPU needed, just disk + RAM for quantization).
 """
@@ -49,7 +49,7 @@ with kh.build_heartbeat("cmake.build"):
     subprocess.check_call([
         "cmake", "--build", str(BUILD),
         "--target", "crispasr-quantize",
-        f"-j{kh.safe_build_jobs(gpu=False)}",
+        f"-j{os.cpu_count()}",
     ], cwd=str(REPO), timeout=600)
 kh.step("built")
 
@@ -62,7 +62,7 @@ if hf_token:
 from huggingface_hub import hf_hub_download, HfApi
 f16_path = WORK / "nemotron-3.5-asr-streaming-0.6b-f16.gguf"
 src = hf_hub_download(
-    repo_id="cstr/nemotron-3.5-asr-streaming-GGUF",
+    repo_id="cstr/nemotron-3.5-asr-streaming-0.6b-GGUF",
     filename="nemotron-3.5-asr-streaming-0.6b-f16.gguf",
     cache_dir=str(WORK / "hf_cache"),
 )
@@ -109,7 +109,7 @@ for qtype, out_path in quants.items():
             api.upload_file(
                 path_or_fileobj=str(out_path),
                 path_in_repo=out_path.name,
-                repo_id="cstr/nemotron-3.5-asr-streaming-GGUF",
+                repo_id="cstr/nemotron-3.5-asr-streaming-0.6b-GGUF",
                 repo_type="model",
                 commit_message=f"Add {qtype.upper()} quantization",
             )

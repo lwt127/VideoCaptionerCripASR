@@ -133,5 +133,13 @@
 #define CT_KEY_AUDIO_N_FFT      "cohere_transcribe.audio.n_fft"
 #define CT_KEY_AUDIO_HOP        "cohere_transcribe.audio.hop_length"
 #define CT_KEY_AUDIO_WIN        "cohere_transcribe.audio.win_length"
+// String array, from config.json's `supported_languages`. The base model lists
+// 14 codes, the Arabic finetune only {en, ar} — and since the finetune SHARES
+// the base tokenizer, the vocab cannot tell them apart. Absent in GGUFs
+// converted before this key existed; treat absent as "unknown", not as empty.
+#define CT_KEY_SUPPORTED_LANGS  "cohere_transcribe.supported_languages"
+// Longest audio window the model was trained on, in seconds (config.json
+// `max_audio_clip_s` = 35). Our chunker stays below it at 30 s.
+#define CT_KEY_MAX_AUDIO_CLIP_S "cohere_transcribe.audio.max_clip_s"
 
 // clang-format on

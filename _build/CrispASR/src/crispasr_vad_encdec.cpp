@@ -26,6 +26,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -295,9 +296,9 @@ extern "C" struct whisper_vad_encdec_context* whisper_vad_encdec_init(const char
     if (!getenv("CRISPASR_VAD_ENCDEC_CPU"))
         ctx->backend = crispasr_init_gpu_backend();
     if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
-    if (ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+        ctx->backend = core_cpu_backend::init();
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
     fprintf(stderr, "whisper_vad_encdec: backend = %s\n", ggml_backend_name(ctx->backend));
 
     // Load weights
@@ -444,9 +445,9 @@ extern "C" struct whisper_vad_encdec_context* whisper_vad_encdec_init(const char
     ggml_backend_t backends[2];
     int n_backends = 0;
     backends[n_backends++] = ctx->backend;
-    if (!ggml_backend_is_cpu(ctx->backend)) {
-        ctx->backend_cpu = ggml_backend_cpu_init();
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    if (!core_cpu_backend::is_cpu(ctx->backend)) {
+        ctx->backend_cpu = core_cpu_backend::init();
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
         backends[n_backends++] = ctx->backend_cpu;
     }
     ctx->sched = ggml_backend_sched_new(backends, nullptr, n_backends, 32768, false, false);

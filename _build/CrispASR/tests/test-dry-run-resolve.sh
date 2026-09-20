@@ -12,15 +12,35 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-CRISPASR=""
-for cand in build/bin/crispasr build-ninja-compile/bin/crispasr ./bin/crispasr; do
-    if [ -x "$cand" ]; then CRISPASR="$cand"; break; fi
-done
+CRISPASR="${1:-}"
+if [ -z "$CRISPASR" ]; then
+    for cand in build/bin/crispasr build-ninja-compile/bin/crispasr ./bin/crispasr; do
+        if [ -x "$cand" ]; then CRISPASR="$cand"; break; fi
+    done
+fi
 if [ -z "$CRISPASR" ]; then
     echo "SKIP: crispasr binary not found (build first)"; exit 0
 fi
 
 PASS=0; FAIL=0
+
+# #397: a downloaded community Piper voice is not necessarily a registry row.
+# A bare explicit filename must resolve from CRISPASR_MODELS_DIR as that exact
+# voice, before the backend fallback offers the unrelated US Lessac default.
+PIPER_CACHE=$(mktemp -d "${CRISPASR_TEST_TMPDIR:-$PWD}/.piper-resolve.XXXXXX")
+trap 'rm -rf "$PIPER_CACHE"' EXIT
+PIPER_NAME=piper-en_GB-cori-medium-f16.gguf
+printf 'test fixture' > "$PIPER_CACHE/$PIPER_NAME"
+got=$(CRISPASR_MODELS_DIR="$PIPER_CACHE" "$CRISPASR" -m "$PIPER_NAME" \
+    --dry-run-resolve 2>&1 | sed -n 's/^  path:[[:space:]]*//p' | head -1)
+if [ "$got" = "$PIPER_CACHE/$PIPER_NAME" ]; then
+    echo "  ✓ bare Piper community voice → exact CRISPASR_MODELS_DIR file"
+    PASS=$((PASS+1))
+else
+    echo "  ✗ bare Piper community voice → '$got' (expected '$PIPER_CACHE/$PIPER_NAME')"
+    FAIL=$((FAIL+1))
+fi
+
 # arg|expected-registry-filename
 CASES="
 parakeet-tdt_ctc-110m|parakeet-tdt_ctc-110m-q4_k.gguf

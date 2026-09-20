@@ -19,6 +19,7 @@
 #pragma once
 
 #include <climits>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -285,6 +286,156 @@ inline std::vector<int32_t> tokenize_simple(const std::unordered_map<std::string
         std::string encoded = bytes_to_unicode(word.data(), word.size());
         bpe_one(token_to_id, merge_rank, encoded, result);
         i = j;
+    }
+    return result;
+}
+
+// SentencePiece-style BPE, as Gemma / T5Gemma2 use it. NOT the GPT-2
+// byte-level scheme that tokenize_simple() implements.
+//
+// The two differ at the very first step and therefore everywhere after it:
+//
+//   GPT-2 (tokenize_simple): whitespace-split, prepend " " to later words,
+//       then map every raw byte through bytes_to_unicode() before merging.
+//   SentencePiece BPE (here): replace each space with U+2581 (▁), NO byte
+//       encoding at all, then merge across the WHOLE string — word boundaries
+//       are carried by the ▁ marker, not by splitting.
+//
+// tokenizer.json for Gemma states this directly:
+//   normalizer    {"type":"Replace","pattern":{"String":" "},"content":"▁"}
+//   model.type    "BPE", byte_fallback true, 514906 merges
+//
+// Verified against the Breeze TTS 2 reference fixture (#412): this algorithm
+// reproduces the oracle's prompt segment 0 exactly, 27 ids for 27, where
+// tokenize_simple() inflated the same text from 39 true tokens to about 69.
+//
+// One known deviation, benign for these vocabularies: Gemma's byte_fallback
+// emits "<0xXX>" tokens for anything outside the vocab, while bpe_one() falls
+// back to per-codepoint lookup. A 262k-entry vocab covers essentially every
+// codepoint, so the paths coincide in practice; text that exercises the
+// difference would be text the model has no embedding for either way.
+inline std::vector<int32_t> tokenize_spm_bpe(const std::unordered_map<std::string, int32_t>& token_to_id,
+                                             const std::unordered_map<std::string, int32_t>& merge_rank,
+                                             const std::string& text) {
+    std::vector<int32_t> result;
+    if (text.empty())
+        return result;
+    std::string norm;
+    norm.reserve(text.size() + text.size() / 4);
+    for (char ch : text) {
+        if (ch == ' ')
+            norm += "\xe2\x96\x81"; // U+2581 LOWER ONE EIGHTH BLOCK
+        else
+            norm.push_back(ch);
+    }
+    bpe_one(token_to_id, merge_rank, norm, result);
+    return result;
+}
+
+// Qwen2/3's GPT-2 regex pre-tokenizer, with non-ASCII UTF-8 bytes kept in
+// letter runs. Unlike tokenize_simple(), this preserves terminal newlines and
+// splits punctuation/digits exactly where Qwen's tokenizer does.
+inline std::vector<std::string> qwen_pretokenize(const std::string& text) {
+    std::vector<std::string> out;
+    const size_t n = text.size();
+    auto is_letter = [](unsigned char c) { return std::isalpha(c) != 0 || c >= 0x80; };
+    auto is_digit = [](unsigned char c) { return std::isdigit(c) != 0; };
+    auto is_space = [](unsigned char c) { return std::isspace(c) != 0; };
+    auto is_nl = [](unsigned char c) { return c == '\r' || c == '\n'; };
+    size_t i = 0;
+    while (i < n) {
+        const unsigned char c = (unsigned char)text[i];
+        if (c == '\'' && i + 1 < n) {
+            static const char* contractions[] = {"'s", "'t", "'re", "'ve", "'m", "'ll", "'d"};
+            bool matched = false;
+            for (const char* contraction : contractions) {
+                const size_t len = std::strlen(contraction);
+                if (i + len > n)
+                    continue;
+                bool equal = true;
+                for (size_t k = 0; k < len; ++k) {
+                    if (std::tolower((unsigned char)text[i + k]) != std::tolower((unsigned char)contraction[k])) {
+                        equal = false;
+                        break;
+                    }
+                }
+                if (equal) {
+                    out.push_back(text.substr(i, len));
+                    i += len;
+                    matched = true;
+                    break;
+                }
+            }
+            if (matched)
+                continue;
+        }
+        {
+            size_t j = i;
+            if (j < n && !is_nl((unsigned char)text[j]) && !is_letter((unsigned char)text[j]) &&
+                !is_digit((unsigned char)text[j]))
+                ++j;
+            if (j < n && is_letter((unsigned char)text[j])) {
+                while (j < n && is_letter((unsigned char)text[j]))
+                    ++j;
+                out.push_back(text.substr(i, j - i));
+                i = j;
+                continue;
+            }
+        }
+        if (is_digit(c)) {
+            out.push_back(text.substr(i, 1));
+            ++i;
+            continue;
+        }
+        {
+            size_t j = i;
+            if (text[j] == ' ')
+                ++j;
+            const size_t punctuation_start = j;
+            while (j < n && !is_space((unsigned char)text[j]) && !is_letter((unsigned char)text[j]) &&
+                   !is_digit((unsigned char)text[j]))
+                ++j;
+            if (j > punctuation_start) {
+                while (j < n && is_nl((unsigned char)text[j]))
+                    ++j;
+                out.push_back(text.substr(i, j - i));
+                i = j;
+                continue;
+            }
+        }
+        {
+            size_t j = i;
+            while (j < n && is_space((unsigned char)text[j]) && !is_nl((unsigned char)text[j]))
+                ++j;
+            if (j < n && is_nl((unsigned char)text[j])) {
+                while (j < n && is_nl((unsigned char)text[j]))
+                    ++j;
+                out.push_back(text.substr(i, j - i));
+                i = j;
+                continue;
+            }
+        }
+        if (is_space(c)) {
+            size_t j = i;
+            while (j < n && is_space((unsigned char)text[j]))
+                ++j;
+            out.push_back(text.substr(i, j - i));
+            i = j;
+            continue;
+        }
+        out.push_back(text.substr(i, 1));
+        ++i;
+    }
+    return out;
+}
+
+inline std::vector<int32_t> tokenize_qwen(const std::unordered_map<std::string, int32_t>& token_to_id,
+                                          const std::unordered_map<std::string, int32_t>& merge_rank,
+                                          const std::string& text) {
+    std::vector<int32_t> result;
+    for (const std::string& pretoken : qwen_pretokenize(text)) {
+        const std::string encoded = bytes_to_unicode(pretoken.data(), pretoken.size());
+        bpe_one(token_to_id, merge_rank, encoded, result);
     }
     return result;
 }

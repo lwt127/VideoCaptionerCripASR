@@ -24,6 +24,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -307,12 +308,12 @@ extern "C" struct ecapa_lid_context* ecapa_lid_init(const char* model_path, int 
     // produces garbage embeddings. Use the CPU backend: it's fast enough for a
     // 43 MB model, is correct, and keeps the sched's last backend CPU (ggml
     // asserts on a GPU-only sched). The ASP head is Accelerate-GEMM'd below.
-    ctx->backend = ggml_backend_cpu_init();
+    ctx->backend = core_cpu_backend::init();
     if (!ctx->backend) {
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
 
     core_gguf::WeightLoad wl;
     if (!core_gguf::load_weights(model_path, ctx->backend, "ecapa-tdnn-lid", wl)) {
@@ -350,7 +351,7 @@ extern "C" void ecapa_lid_free(struct ecapa_lid_context* ctx) {
     if (ctx->weight_ctx)
         ggml_free(ctx->weight_ctx);
     if (ctx->buf)
-        ggml_backend_buffer_free(ctx->buf);
+        core_gguf::release_weight_buffer(ctx->buf);
     if (ctx->backend)
         ggml_backend_free(ctx->backend);
     delete ctx;

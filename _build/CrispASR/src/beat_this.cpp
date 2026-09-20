@@ -10,6 +10,7 @@
 
 #include "beat_this.h"
 
+#include "core/quant_bcast.h"
 #include "core/crispasr_env.h"
 #include "core/fft.h"
 #include "core/gguf_loader.h"
@@ -26,6 +27,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // One roformer Attention sub-block (§251b-1). NOTE the bias asymmetry, which
 // is not a transcription slip: to_qkv and to_out are bias-free, to_gates has a
@@ -154,6 +156,24 @@ ggml_tensor* bt_norm(ggml_context* c, ggml_tensor* x, ggml_tensor* gamma) {
     return ggml_mul(c, ggml_rms_norm(c, x, 1e-12f), gamma);
 }
 
+// #416: these matmuls pair a quantized weight (ne2=1) with an activation
+// whose ne2 is the folded time axis (see the einops note above), so ggml
+// broadcasts src0 across it. Gated OFF — see src/core/quant_bcast.h.
+static inline ggml_tensor* MM(ggml_context* c, ggml_tensor* w, ggml_tensor* x) {
+    // Default ON: verified on a locally-quantized q8_0 build — the detector
+    // reports 29 broadcasting quantized matmuls without the fold and 0 with it,
+    // and the emitted beats are byte-identical either way. Set
+    // CRISPASR_BEATTHIS_FOLD_BCAST=0 to restore the legacy path.
+    // Read per call, NOT cached in a function-local static. A cached static is
+    // immutable for the process, so any in-process A/B of this gate silently
+    // compares one path against ITSELF and passes by construction — the exact
+    // bug found in the sidon RPE test, where parse_rpe_mode() ran once at init
+    // while the test flipped the env per iteration. This is a getenv on a
+    // graph-build path, not a hot loop, so the cost is not worth the hazard.
+    const bool fold = core_quant_bcast::fold_enabled("CRISPASR_BEATTHIS_FOLD_BCAST", true);
+    return fold ? core_quant_bcast::mul_mat_fold_batch(c, w, x) : ggml_mul_mat(c, w, x);
+}
+
 // Attention branch. `x` is ne (C, N, B); returns the BRANCH, ne (C, N, B) —
 // the caller adds the residual. `pos` is an I32 vector 0..N-1.
 ggml_tensor* bt_attention(ggml_context* c, const bt_attn& a, ggml_tensor* x, ggml_tensor* pos) {
@@ -164,7 +184,7 @@ ggml_tensor* bt_attention(ggml_context* c, const bt_attn& a, ggml_tensor* x, ggm
     // `x = self.norm(x)` before computing both qkv and gates.
     ggml_tensor* xn = bt_norm(c, x, a.gamma);
 
-    ggml_tensor* qkv = ggml_mul_mat(c, a.qkv_w, xn); // (3*H*D, N, B)
+    ggml_tensor* qkv = MM(c, a.qkv_w, xn); // (3*H*D, N, B)
     const size_t esz = ggml_element_size(qkv);
 
     // to_qkv's output is packed "(qkv h d)" with d fastest, so q/k/v are three
@@ -211,23 +231,23 @@ ggml_tensor* bt_attention(ggml_context* c, const bt_attn& a, ggml_tensor* x, ggm
     // per head, broadcast over that head's head_dim and over the sequence, and
     // applied BEFORE to_out. Dropping it leaves output that is plausible and
     // wrong — it scales rather than reshapes the activation.
-    ggml_tensor* g = ggml_add(c, ggml_mul_mat(c, a.gates_w, xn), a.gates_b); // (H, N, B)
+    ggml_tensor* g = ggml_add(c, MM(c, a.gates_w, xn), a.gates_b); // (H, N, B)
     g = ggml_sigmoid(c, g);
     out = ggml_mul(c, out, ggml_reshape_4d(c, g, 1, H, N, B)); // broadcasts over head_dim
 
     // "b h n d -> b n (h d)": D is fastest and H next, so the flattened row is
     // already (h d) per token and this is a pure reshape.
     out = ggml_reshape_3d(c, out, D * H, N, B);
-    return ggml_mul_mat(c, a.out_w, out);
+    return MM(c, a.out_w, out);
 }
 
 // FeedForward branch. GELU is the EXACT erf form: torch nn.GELU defaults to
 // approximate='none'. ggml_gelu is the tanh approximation and drifts.
 ggml_tensor* bt_feedforward(ggml_context* c, const bt_ff& f, ggml_tensor* x) {
     ggml_tensor* h = bt_norm(c, x, f.gamma);
-    h = ggml_add(c, ggml_mul_mat(c, f.w1, h), f.b1);
+    h = ggml_add(c, MM(c, f.w1, h), f.b1);
     h = ggml_gelu_erf(c, h);
-    return ggml_add(c, ggml_mul_mat(c, f.w2, h), f.b2);
+    return ggml_add(c, MM(c, f.w2, h), f.b2);
 }
 
 // Named intermediates, so one graph can serve every parity stage without the
@@ -393,7 +413,7 @@ extern "C" struct beat_this_context* beat_this_init(const char* model_path, int 
     ctx->log_multiplier = core_gguf::kv_f32(gctx, "beat-this.log_multiplier", 1000.0f);
     core_gguf::free_metadata(gctx);
 
-    ctx->backend = ggml_backend_cpu_init();
+    ctx->backend = core_cpu_backend::init();
     if (!ctx->backend) {
         delete ctx;
         return nullptr;
@@ -656,6 +676,7 @@ static bool bt_run(struct beat_this_context* ctx, const float* logmel, int T, co
         fill_pos(pos_t);
         for (int i = 0; i < 3; i++)
             fill_pos(pos_f[i]);
+        core_quant_bcast::audit(gf, "beat-this");
         ok = ggml_backend_graph_compute(ctx->backend, gf) == GGML_STATUS_SUCCESS;
     }
     if (ok) {

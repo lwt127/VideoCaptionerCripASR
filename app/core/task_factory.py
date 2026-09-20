@@ -62,6 +62,12 @@ class TaskFactory:
             need_word_time_stamp = False
             output_path = str(Path(file_path).parent / f"{file_name}.srt")
 
+        from app.core.bk_asr.crisp_asr_catalog import normalize_selection
+
+        backend, model, vad, lid = normalize_selection(
+            cfg.crisp_asr_backend.value, cfg.crisp_asr_model.value,
+            cfg.crisp_asr_vad_method.value, cfg.crisp_asr_lid_method.value,
+        )
         config = TranscribeConfig(
             transcribe_model=cfg.transcribe_model.value,
             transcribe_language=LANGUAGES[cfg.transcribe_language.value.value],
@@ -70,12 +76,20 @@ class TaskFactory:
             # Whisper Cpp 配置
             whisper_model=cfg.whisper_model.value.value,
             # CrispASR 配置（多后端 ASR 引擎）
-            crisp_asr_backend=cfg.crisp_asr_backend.value,
-            crisp_asr_model=cfg.crisp_asr_model.value,
-            crisp_asr_vad_method=cfg.crisp_asr_vad_method.value,
-            crisp_asr_lid_method=cfg.crisp_asr_lid_method.value,
+            crisp_asr_backend=backend,
+            crisp_asr_model=model,
+            crisp_asr_vad_method=vad,
+            crisp_asr_lid_method=lid,
             crisp_asr_use_gpu=cfg.crisp_asr_use_gpu.value,
             crisp_asr_use_vad=cfg.crisp_asr_use_vad.value,
+            crisp_asr_engine_flavor=cfg.crisp_asr_engine_flavor.value,
+            crisp_asr_alignment_mode=cfg.crisp_asr_alignment_mode.value,
+            crisp_asr_aligner=cfg.crisp_asr_aligner.value,
+            crisp_asr_word_timestamps=cfg.crisp_asr_word_timestamps.value,
+            crisp_asr_license_acceptances=tuple(
+                cfg.crisp_asr_license_acceptances.value
+                if isinstance(cfg.crisp_asr_license_acceptances.value, list) else []
+            ),
             # Whisper API 配置
             whisper_api_key=cfg.whisper_api_key.value,
             whisper_api_base=cfg.whisper_api_base.value,

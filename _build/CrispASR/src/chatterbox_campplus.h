@@ -48,6 +48,8 @@
 
 #pragma once
 
+#include "core/campplus_segpool.h"
+
 #include "ggml-backend.h"
 #include "ggml.h"
 
@@ -200,12 +202,18 @@ std::vector<float> compute_fbank(const float* pcm_16k, int n_samples, int& T_fra
 // chatterbox/CosyVoice behaviour; 1e-2 = 3D-Speaker masked stats pooling (dots.tts).
 // The embedding dimension (192 chatterbox / 512 dots) is inferred from the bound
 // dense weight, so no separate parameter is needed.
+// `tail` names WHICH UPSTREAM this consumer must match on the partial tail
+// window (see core/campplus_segpool.h). torch for chatterbox/confucius4/dots/
+// fireredtts3; ONNX for cosyvoice3, whose reference implementation and whose
+// baked voice bank were both produced by campplus.onnx.
 std::vector<float> compute_xvector(const cb_campplus_model& m, cb_campplus_runtime& cache, const float* feat_t_80,
-                                   int T, float stats_var_floor = 0.0f);
+                                   int T, float stats_var_floor = 0.0f,
+                                   campplus_segpool::tail_divisor tail = campplus_segpool::tail_divisor::window_width);
 
 // Convenience: PCM → fbank → xvector.
 std::vector<float> embed_speaker(const cb_campplus_model& m, cb_campplus_runtime& cache, const float* pcm_16k,
-                                 int n_samples, float stats_var_floor = 0.0f);
+                                 int n_samples, float stats_var_floor = 0.0f,
+                                 campplus_segpool::tail_divisor tail = campplus_segpool::tail_divisor::window_width);
 
 // Module 4 phase 3 — 24 kHz Matcha-TTS prompt mel for `gen.prompt_feat`.
 // Mirrors `chatterbox.models.s3gen.utils.mel.mel_spectrogram` with
@@ -219,5 +227,12 @@ std::vector<float> embed_speaker(const cb_campplus_model& m, cb_campplus_runtime
 // (`prepare_conditionals` truncates to DEC_COND_LEN = 10 * S3GEN_SR =
 // 240000 samples before computing the mel).
 std::vector<float> compute_prompt_feat_24k(const float* pcm_24k, int n_samples, int max_samples, int& T_mel_out);
+
+// Generic form of the same HiFi-GAN-style magnitude mel (sqrt(power+1e-9),
+// librosa Slaney basis, log(clamp(mel, 1e-5)), center=False with manual
+// reflect pad of (n_fft-hop)/2). Confucius4-TTS uses it at
+// 22050/1024/256/1024, fmax = sr/2. Returns row-major (T_mel, n_mels).
+std::vector<float> compute_prompt_feat(const float* pcm, int n_samples, int sample_rate, int n_fft, int hop, int win,
+                                       int n_mels, float fmin, float fmax, int max_samples, int& T_mel_out);
 
 } // namespace chatterbox_campplus

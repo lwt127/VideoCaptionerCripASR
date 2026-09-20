@@ -1,8 +1,8 @@
 # CrispASR
 
-**One C++ binary, 54 ASR backends + 52 TTS engines + multilingual text translation, zero Python dependencies.**
+**One C++ binary, 119 backends — 62 of them TTS engines — plus multilingual text translation, zero Python dependencies.**
 
-CrispASR started as a fork of [whisper.cpp](https://github.com/ggml-org/whisper.cpp) and extends that base into a **unified speech engine** called `crispasr`, backed by full ggml C++ runtimes for major open-weights ASR *and* TTS architectures. One build, one binary, one consistent CLI — pick the backend at the command line or let CrispASR auto-detect it from your GGUF file. See [Text-to-Speech](#text-to-speech-tts) for the TTS side.
+CrispASR started as a fork of [whisper.cpp](https://github.com/ggml-org/whisper.cpp) and extends that base into a **unified speech engine** called `crispasr`, backed by full ggml C++ runtimes for major open-weights ASR *and* TTS architectures. One build, one binary, one consistent CLI — pick the backend at the command line or let CrispASR auto-detect it from your GGUF file. See [Text-to-Speech](#text-to-speech-models) for the TTS side.
 
 ```console
 $ crispasr -m ggml-base.en.bin          -f samples/jfk.wav                    # OpenAI Whisper
@@ -25,20 +25,22 @@ live transcription + TTS + language detection, auto-deployed from `hf-space/`.
 
 | Project | What it does |
 |---|---|
-| **[CrispASR](https://github.com/CrispStrobe/CrispASR)** | This repo — C++ speech engine. 54 ASR + 52 TTS backends, CLI + HTTP server + C-ABI + Python/Rust/Dart/Go/Ruby/Java bindings. |
-| **[CrisperWeaver](https://github.com/CrispStrobe/CrisperWeaver)** | Cross-platform Flutter transcription app built on CrispASR. Desktop + mobile, all 10 backends, model browser with download queue, mic capture, SRT/VTT/JSON export, diarization, batch processing. Fully offline. |
-| **[CrispEmbed](https://github.com/CrispStrobe/CrispEmbed)** | Text embedding engine via ggml — same philosophy as CrispASR but for retrieval. 10 architectures (XLM-R, Qwen3-Embed, Gemma3, ModernBERT, ...), dense + sparse + ColBERT + reranking. 9.5x faster than ONNX on CPU, GPU via CUDA/Metal/Vulkan. Python/Rust/Dart bindings. |
+| **[CrispASR](https://github.com/CrispStrobe/CrispASR)** | This repo — C++ speech engine. 119 backends (62 TTS), CLI + HTTP server + C-ABI + Python/Rust/Dart/Go/Ruby/Java bindings. |
+| **[CrisperWeaver](https://github.com/CrispStrobe/CrisperWeaver)** | Cross-platform Flutter transcription app built on CrispASR. Desktop + mobile,  model browser with download queue, mic capture, SRT/VTT/JSON export, diarization, batch processing. Fully offline. |
+| **[CrispEmbed](https://github.com/CrispStrobe/CrispEmbed)** | Text-related engine via ggml — same philosophy as CrispASR but for embeddings, retrieval, OCR and OMR, Math and Music Notation. Numerous architectures (XLM-R, Qwen3-Embed, Gemma3, ModernBERT, ...), dense + sparse + ColBERT + reranking. PP-OCR, Tesseract, EasyOCR, InternVL2, etc. Python/Rust/Dart bindings. |
 | **[Susurrus](https://github.com/CrispStrobe/Susurrus)** | Python ASR GUI with 9 backends (faster-whisper, mlx-whisper, voxtral, insanely-fast-whisper, ...). The Python counterpart to CrispASR's C++ approach. |
 
 ---
 
 ## Table of contents
 
+- [**Start here**](#start-here) — new to CrispASR? Two commands to your first working audio, no repo clone needed
 - [Supported backends](#supported-backends) — [ASR](#asr-backends) + [TTS](#text-to-speech-models) + [translation](#translation) + [post-processing](#post-processing-models) + [music & audio analysis](#music--audio-analysis)
 - [Feature matrix](#feature-matrix)
-- [Install & build](#install--build) — quick install (full guide in [docs/install.md](docs/install.md))
+- [Install & build](#install--build) — quick install (full guide in [docs/install.md](docs/install.md)); **[which prebuilt Linux tarball to download](docs/install.md#prebuilt-linux-tarballs--which-one-to-download-355)** — the `-hip` / `-vulkan` builds require the matching GPU driver and do **not** fall back to CPU (the `-cuda` tarballs do, since v0.8.30)
 - [Quick start — ASR](#quick-start)
-- [**Text-to-Speech (TTS)**](docs/tts.md) — 51 engines: Kokoro, Qwen3-TTS, VibeVoice, dots.tts, Orpheus, Chatterbox, IndexTTS, Irodori, VoxCPM2, CosyVoice3, CSM, Dia, Zonos, Bark, Piper, MeloTTS, and more
+- [Troubleshooting](docs/troubleshooting.md) — it printed the banner and stopped, reading the exit code, `--no-gpu` bisect, which Windows zip
+- [**Text-to-Speech (TTS)**](docs/tts.md) — 52 engines: Kokoro, Qwen3-TTS, VibeVoice, dots.tts, Orpheus, Chatterbox, IndexTTS, Irodori, VoxCPM2, CosyVoice3, CSM, Dia, Zonos, Bark, Piper, MeloTTS, and more
 - [Streaming & live transcription](docs/streaming.md)
 - [Server mode (HTTP API)](docs/server.md)
 - [Concurrency, parallelism & scaling](docs/concurrency.md) — how one transcription uses multiple cores, concurrent server requests (`--server-workers`), bulk offline transcription, replicas behind a load balancer
@@ -49,6 +51,7 @@ live transcription + TTS + language detection, auto-deployed from `hf-space/`.
 - [Architecture](docs/architecture.md) — layered layout, `src/core/` primitives, regression discipline
 - [Contributing — adding a new backend](docs/contributing.md) — 5-file recipe, ground-truth diff workflow
 - [Regression matrix](docs/regression-matrix.md) — `tools/test-all-backends.py` capability tiers
+- [**EU AI Act**](docs/eu-ai-act.md) — synthetic-audio marking (watermark + C2PA + spoken disclaimer), what counts as a voice clone, the speaker-biometrics boundary, why there is no emotion recognition, and what stays your duty as deployer
 - [Quantize models](docs/quantize.md) — `crispasr-quantize` for all backends
 - [GPU backend selection](#gpu-backend-selection)
 - [Debugging & profiling](#debugging--profiling)
@@ -56,10 +59,93 @@ live transcription + TTS + language detection, auto-deployed from `hf-space/`.
 
 ---
 
+## Start here
+
+Everything below this section is a catalogue — 100+ backends, browse it when you
+need one. If you just want CrispASR *working*, this is the whole path. No repo
+clone, no Python, no model hunting.
+
+New to the project? **[docs/getting-started.md](docs/getting-started.md)** walks
+the same path step by step, with the expected output and the three usual
+first-run failures.
+
+### 1. Get the binary
+
+Download one file from [**Releases**](https://github.com/CrispStrobe/CrispASR/releases/latest)
+and unzip it:
+
+| Platform | Download | Notes |
+|---|---|---|
+| **Windows** | `crispasr-windows-x86_64-cpu.zip` | Needs AVX2 (2013+ Intel / 2015+ AMD). Older CPU → `…-cpu-legacy.zip` |
+| **Windows + NVIDIA** | `crispasr-windows-x86_64-cuda.zip` | Self-contained; a CUDA Toolkit install is **not** required. CUDA-13-native build: `…-cuda13.zip` (Turing+) |
+| **macOS** | `crispasr-macos.tar.gz` | Metal GPU support built in |
+| **Linux** | `crispasr-linux-x86_64.tar.gz` | `…-cuda.tar.gz` / `…-vulkan.tar.gz` for GPU |
+
+Prefer to build it yourself? See [Install & build](#install--build). The `-hip`
+and `-vulkan` builds require the matching driver and do **not** fall back to CPU;
+the Linux `-cuda` tarballs do fall back.
+
+Check it runs — this should print a version banner and exit:
+
+```bash
+crispasr --version          # Windows: .\crispasr.exe --version
+```
+
+CUDA builds also print `cuda toolkit` and `cuda runtime ABI`, so this command
+distinguishes the CUDA 12 and CUDA 13 packages without inspecting DLLs.
+
+### 2. Make it speak
+
+`-m auto` downloads the model on first use (~135 MB here) and reuses it
+afterwards — nothing to find or install. It lands in `~/.cache/crispasr/`
+(`%USERPROFILE%\.cache\crispasr` on Windows).
+
+```bash
+crispasr --backend kokoro -m auto --tts "The quick brown fox jumps over the lazy dog." --tts-output hello.wav
+# crispasr: TTS output written to 'hello.wav' (78000 samples @ 24000 Hz, 3.25 sec)
+```
+
+Play `hello.wav`. That is the TTS half working.
+
+### 3. Transcribe it back
+
+```bash
+crispasr --backend parakeet -m auto -f hello.wav -l en
+# crispasr: transcribed 3.2s audio in 0.32s (10.1x realtime)
+# The quick brown fox jumps over the lazy dog.
+```
+
+(~467 MB on first run. `-l en` skips language auto-detection, which would
+otherwise fetch a small extra model.) Both halves now work — swap in your own
+`.wav` and you are running.
+
+### Where to go next
+
+| You want to… | Go to |
+|---|---|
+| Clone a voice from a recording | [docs/tts.md](docs/tts.md) — and read [the consent rules](docs/eu-ai-act.md) first; cloning requires `--i-have-rights` |
+| Pick a better ASR model | [Which backend should I pick?](#which-backend-should-i-pick) |
+| Transcribe with word timestamps, SRT/VTT | [docs/cli.md](docs/cli.md) |
+| Live mic / streaming | [docs/streaming.md](docs/streaming.md) |
+| Run it as an HTTP server | [docs/server.md](docs/server.md) |
+| See every backend this binary has | `crispasr --list-backends` |
+
+### If nothing happened
+
+Add `-v` to any command for verbose progress, and `--dry-run-resolve` to print
+which model files it would open (and whether they're on disk) without loading
+anything.
+
+If a command printed its banner and then simply stopped — no error, no output
+file — that is a crash, not a refusal, and the exit code identifies it in one
+step. See **[docs/troubleshooting.md](docs/troubleshooting.md)**.
+
+---
+
 ## Supported backends
 
-CrispASR ships **54 ASR backends** for transcription/translation and
-**51 TTS engines** for synthesis. It also ships audio-to-audio S2S backends,
+CrispASR ships **119 backends** (see the [generated feature matrix](docs/feature-matrix.md) for the authoritative, auto-counted list) — the majority for transcription/translation, and
+**62 TTS engines** for synthesis. It also ships audio-to-audio S2S backends,
 including Sidon restoration and the VoxCPM2 AudioVAE speech upscaler; see the [feature matrix](docs/feature-matrix.md)
 for the complete capability list.
 Pick at the CLI with `--backend NAME`, or omit it to let the binary auto-detect
@@ -118,6 +204,7 @@ from the GGUF metadata. Jump to the [TTS table](#text-to-speech-models) for the 
 | **omniasr-llm** | [`omniASR-LLM-300M-v2`](https://huggingface.co/cstr/omniasr-llm-300m-v2-GGUF) | Same encoder + 12L LLaMA decoder ([more](docs/architecture.md#omniasr-ctc--llm--unlimited)) | **1600+** | Apache-2.0 |
 | **omniasr-llm** | [`omniASR-LLM-Unlimited-300M-v2`](https://huggingface.co/cstr/omniasr-llm-unlimited-300m-v2-GGUF) | Streaming: 15s segment protocol, unlimited audio ([more](docs/architecture.md#omniasr-ctc--llm--unlimited)) | **1600+** | Apache-2.0 |
 | **vibevoice** | [`microsoft/VibeVoice-ASR`](https://huggingface.co/cstr/vibevoice-asr-GGUF) | σ-VAE ConvNeXt + Qwen2.5-7B ([more](docs/architecture.md#vibevoice)) | 50+ | MIT |
+| **vibevoice-streaming** | [`microsoft/VibeVoice-ASR-Streaming-1.5B`](https://huggingface.co/microsoft/VibeVoice-ASR-Streaming-1.5B) | σ-VAE ConvNeXt + Qwen2.5-1.5B; persistent-KV 2.93 s chunks with 0.53 s lookahead ([more](docs/architecture.md#vibevoice)) | multilingual | MIT |
 | **vibevoice-bitnet** | [`VibeVoice-ASR-BitNet`](https://huggingface.co/cstr/vibevoice-asr-bitnet-GGUF) | Same arch, TQ2_0 ternary LM (1.6 GB) ([more](docs/architecture.md#vibevoice)) | 7+ | MIT |
 | **mimo-asr** | [`XiaomiMiMo/MiMo-V2.5-ASR`](https://huggingface.co/cstr/mimo-asr-GGUF) | 6L transformer + 36L Qwen2 LM + RVQ codec ([more](docs/architecture.md#mimo-asr)) | Mandarin + dialects + English | MIT |
 | **ark-asr** ⚠️*experimental/WIP* | [`cstr/ark-asr-3b-GGUF`](https://huggingface.co/cstr/ark-asr-3b-GGUF) (base [`AutoArk-AI/ARK-ASR-3B`](https://huggingface.co/AutoArk-AI/ARK-ASR-3B)) | Whisper-large-v3 enc (partial RoPE) + Qwen2.5-3B LM ([more](docs/architecture.md#ark-asr)) | 19 (zh, en, de, ja, fr, ko, es, pl, it, ro, hu, cs, nl, fi, hr, sk, sl, et, lt) | see base |
@@ -130,7 +217,7 @@ from the GGUF metadata. Jump to the [TTS table](#text-to-speech-models) for the 
 | **paraformer** | [`funasr/paraformer-zh`](https://huggingface.co/cstr/paraformer-zh-GGUF) | 50-block SANM encoder + CIF predictor + 16-block NAR decoder (single-pass, non-autoregressive); character-level vocab (8404); 220M params | zh, en | FunASR Model License (commercial OK w/ attribution) |
 | **foxnose** *(speaker diarization)* | [`Wespeaker/wespeaker-voxceleb-resnet34-LM`](https://huggingface.co/cstr/wespeaker-resnet34-lm-GGUF) | Speaker diarization via `--diarize-method foxnose`: WeSpeaker ResNet34-LM 256-d embeddings + GMM/BIC speaker counting + spectral clustering + Viterbi temporal smoothing ([more](docs/architecture.md#foxnose-diarize)). 3.18 % DER on VoxConverse dev vs the upstream reference implementation's 3.07 % | any | weights CC-BY-4.0 |
 | **gigaam** | [`ai-sage/GigaAM-v3`](https://huggingface.co/cstr/gigaam-v3-GGUF) (base [`ai-sage/GigaAM-v3`](https://huggingface.co/ai-sage/GigaAM-v3)) | 16-layer rotary Conformer (220M) + CTC or RNN-T head; four revisions — `e2e_rnnt` / `e2e_ctc` emit punctuation + casing + ITN from a SentencePiece vocab, `rnnt` / `ctc` emit bare lowercase Cyrillic ([more](docs/architecture.md#gigaam)) | en ru | MIT |
-| **sensevoice** | [`FunAudioLLM/SenseVoiceSmall`](https://huggingface.co/cstr/sensevoice-small-GGUF) | 70-block SANM encoder + CTC head; emits transcript + language ID + emotion + audio-event in one forward pass (non-AR, 15× faster than Whisper-Large); structured C ABI + `-oj` JSON expose the four tags as separate fields | 50+ langs; native LID + emotion + audio-event tags | FunASR Model License v1.1 |
+| **sensevoice** | [`FunAudioLLM/SenseVoiceSmall`](https://huggingface.co/cstr/sensevoice-small-GGUF) | 70-block SANM encoder + CTC head; emits transcript + language ID + audio-event in one forward pass (non-AR, 15× faster than Whisper-Large); structured C ABI + `-oj` JSON expose the tags as separate fields. Upstream's emotion classifier is **not exposed** — see [EU AI Act](docs/eu-ai-act.md#41-emotion-recognition--removed-not-gated) | 50+ langs; native LID + audio-event tags | FunASR Model License v1.1 |
 
 ### Speech-to-speech audio upscaling and restoration
 
@@ -152,11 +239,12 @@ crispasr -m models/voxcpm2-vae-f32.gguf -f input.wav --s2s \
 ### Text-to-Speech models
 
 Synthesis backends, driven by the `--tts` flag and a `--tts-output PATH.wav`.
-See the dedicated [Text-to-Speech](#text-to-speech-tts) section below for
+See the dedicated [Text-to-Speech](#text-to-speech-models) section below for
 quick-start commands and engine selection guidance.
 
 | Backend | Models | Architecture | Languages | License |
 |---------|--------|-------------|-----------|---------|
+| **bt2-tts** | [`breeze-tts-2`](https://huggingface.co/cstr/breeze-tts-2-GGUF) | T5Gemma2 text encoder + Qwen3 backbone + 12L depth decoder over 16 codebooks @ 12.5 Hz; voice cloning. Codec companion is the shipped qwen3-tts tokenizer. **NON-COMMERCIAL weights** — needs `--accept-license other`. Derived from Breeze TTS 2 by BreezeBlue and licensed for research and non-commercial use only. | en, zh | other (BreezeBlue Research & Non-Commercial) |
 | **miotts** | [`MioTTS-0.6B`](https://huggingface.co/cstr/miotts-0.6b-GGUF) | Qwen3 LLM + MioCodec-v2 FSQ codec (25 Hz, 44.1 kHz output) | ja, en | Apache-2.0 |
 | **vibevoice-tts** | [`VibeVoice-Realtime-0.5B`](https://huggingface.co/cstr/vibevoice-realtime-0.5b-GGUF), [`VibeVoice-1.5B`](https://huggingface.co/cstr/vibevoice-1.5b-GGUF) | DPM-Solver++ + σ-VAE decoder; voice presets or cloning | en, zh | MIT |
 | **kugelaudio** | [`kugelaudio-0-open`](https://huggingface.co/cstr/kugelaudio-0-open-GGUF) | Qwen2.5-7B LM + 4L DiT diffusion + acoustic VAE decoder; voice cloning | multilingual | Apache-2.0 |
@@ -166,14 +254,14 @@ quick-start commands and engine selection guidance.
 | **moss-tts-local** | [`OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5`](https://huggingface.co/cstr/moss-tts-local-v1.5-GGUF) | Qwen3-4B backbone; a 1-layer local/depth transformer autoregressively emits 12 RVQ codebooks per frame (RQ-Transformer, no delay), decoded to 48 kHz by MOSS-Audio-Tokenizer-v2 (downmixed to mono); `--backend moss-tts-local -m <backbone> --codec-model <codec>` | multilingual | Apache-2.0 |
 | **omnivoice** | [`k2-fsa/OmniVoice`](https://huggingface.co/cstr/omnivoice-GGUF) | Qwen3-0.6B + masked iterative 8-codebook TTS (SoundStorm-style); voice cloning; 600+ languages ([more](docs/architecture.md#omnivoice)) | 600+ langs | Apache-2.0 |
 | **melotts** | [`myshell-ai/MeloTTS`](https://github.com/myshell-ai/MeloTTS) EN_V2 | VITS2 (6L transformer + SDP/DP + transformer coupling flow + HiFi-GAN); 44.1 kHz, 102 MB + 52 MB BERT Q4_K companion (154 MB total); neural G2P; 4 EN speakers ([more](docs/architecture.md#melotts)) | en | MIT |
-| **piper** | [`rhasspy/piper`](https://github.com/rhasspy/piper) community voices | VITS (6L transformer + SDP + 4-block coupling flow + HiFi-GAN); 22 kHz mono, 30 MB F16 per voice; built-in G2P for EN/DE/FR/ES (`--g2p-dict`) | 30+ langs (built-in + espeak dlopen) | MIT |
+| **piper** | [`rhasspy/piper`](https://github.com/rhasspy/piper) community voices | VITS (6L transformer + SDP + 4-block coupling flow + HiFi-GAN); 22 kHz mono, 30 MB F16 per voice; built-in G2P for EN/DE/FR/ES/RU (`--g2p-dict`) | 30+ langs (built-in + espeak dlopen) | MIT |
 | **kokoro** | [`hexgrad/Kokoro-82M`](https://huggingface.co/hexgrad/Kokoro-82M) + German backbones | StyleTTS2 / iSTFTNet (82M); per-voice GGUF ([more](docs/architecture.md#kokoro)) | en, es, fr, hi, it, ja, pt, zh, de | Apache-2.0 |
-| **orpheus** | [`Orpheus-3B-FT`](https://huggingface.co/cstr/orpheus-3b-0.1-ft-GGUF) + [`SNAC 24 kHz`](https://huggingface.co/cstr/snac-24khz-GGUF) | Llama-3.2-3B + SNAC RVQ codec; 8 speakers ([more](docs/architecture.md#orpheus)) | en, de | Llama / MIT |
-| **chatterbox** | [`cstr/chatterbox-GGUF`](https://huggingface.co/cstr/chatterbox-GGUF) + turbo/kartoffelbox/lahgtna variants | T3 AR + S3Gen flow-matching ([more](docs/architecture.md#chatterbox--chatterbox-turbo--kartoffelbox-turbo--lahgtna-chatterbox)) | 23 multilingual; separate Arabic (`lahgtna-chatterbox`) and German turbo (`kartoffelbox-turbo`) fine-tunes | MIT |
+| **orpheus** | [`Orpheus-3B-FT`](https://huggingface.co/cstr/orpheus-3b-0.1-ft-GGUF) + [`SNAC 24 kHz`](https://huggingface.co/cstr/snac-24khz-GGUF) | Llama-3.2-3B + SNAC RVQ codec; 8 speakers ([more](docs/architecture.md#orpheus)) | en, de | Llama 3.2 Community License / MIT |
+| **chatterbox** | [`cstr/chatterbox-GGUF`](https://huggingface.co/cstr/chatterbox-GGUF) + Nano/turbo/fine-tune variants | T3 AR + S3Gen flow-matching ([more](docs/architecture.md#chatterbox--chatterbox-turbo--chatterbox-nano--chatterbox-finnish-nano--kartoffelbox-turbo--lahgtna-chatterbox)) | 23 multilingual; separate Arabic, German, and Finnish (`chatterbox-finnish-nano`) fine-tunes | MIT |
 | **indextts** | [`cstr/indextts-1.5-GGUF`](https://huggingface.co/cstr/indextts-1.5-GGUF) | GPT-2 AR (24L/1280d) + Conformer conditioning + BigVGAN vocoder; voice cloning via reference audio | zh, en | Apache-2.0 |
 | **voxcpm2-tts** | [`cstr/voxcpm2-GGUF`](https://huggingface.co/cstr/voxcpm2-GGUF) | Tokenizer-free CFM diffusion AR (TSLM + RALM + LocDiT) at 48 kHz native; zero-shot + voice cloning via `--voice <wav>` | 30 languages | Apache-2.0 |
 | **voxtral-tts** | [`mistralai/Voxtral-4B-TTS-2603`](https://huggingface.co/mistralai/Voxtral-4B-TTS-2603) | Ministral-3B AR (26L GQA) + 3L FM acoustic transformer (7-step Euler ODE) + Voxtral codec decoder at 24 kHz; 20 preset voices; SOTA French technical text | en, fr, de, es, it, pt, nl, ar, hi | CC&#8209;BY&#8209;NC&#8209;4.0 |
-| **cosyvoice3-tts** | [`cstr/cosyvoice3-0.5b-2512-GGUF`](https://huggingface.co/cstr/cosyvoice3-0.5b-2512-GGUF) | Qwen2-0.5B AR speech-token LM + DiT-CFM (10-step Euler) + HiFT (NSF + iSTFT) at 24 kHz; baked-voice zero-shot cloning via `--voice <name>` | 9 langs + 18 zh dialects | Apache-2.0 |
+| **cosyvoice3-tts** | [`cstr/cosyvoice3-0.5b-2512-GGUF`](https://huggingface.co/cstr/cosyvoice3-0.5b-2512-GGUF) | Qwen2-0.5B AR speech-token LM + DiT-CFM (10-step Euler) + HiFT (NSF + iSTFT) at 24 kHz; baked-voice zero-shot cloning via `--voice <name>`, or any WAV via `--voice ref.wav --ref-text "<exact transcript>"`. `--backend cosyvoice3-tts-rl` selects upstream's RL-tuned talker (same companions) | 9 langs + 18 zh dialects | Apache-2.0 |
 | **csm** | [`cstr/csm-1b-GGUF`](https://huggingface.co/cstr/csm-1b-GGUF) | Sesame CSM-1B conversational TTS: Llama-3.2 1B backbone + 100M depth decoder (32-codebook RVQ) + Kyutai Mimi codec at 24 kHz ([more](docs/architecture.md#csm)) | en | Apache-2.0 |
 | **lfm2-audio** | [`cstr/lfm2-audio-1.5b-GGUF`](https://huggingface.co/cstr/lfm2-audio-1.5b-GGUF) + [`jp`](https://huggingface.co/cstr/lfm2-audio-1.5b-jp-GGUF) | LFM2.5-Audio ASR+TTS+S2S: FastConformer enc + LFM2 hybrid backbone + depthformer (8-codebook Mimi) + ISTFT detokenizer at 24 kHz; interleaved text+audio generation | en, ja | LFM Open v1.0 |
 | **dia** | [`nari-labs/Dia-1.6B`](https://huggingface.co/cstr/dia-1.6b-GGUF) | Byte-level text encoder (12L) + AR audio decoder (18L GQA + CFG) → 9 delayed DAC codebooks + 44.1 kHz DAC codec; dialogue style with `[S1]`/`[S2]` tags (use >100-char prompts) | en | Apache-2.0 |
@@ -183,9 +271,9 @@ quick-start commands and engine selection guidance.
 | **fastpitch** | [`cstr/fastpitch-en-GGUF`](https://huggingface.co/cstr/fastpitch-en-GGUF) | NVIDIA FastPitch 60M: non-autoregressive parallel TTS — 6L encoder + duration/pitch predictors + 6L decoder + HiFi-GAN at 22 kHz; deterministic, single forward pass ([more](docs/architecture.md#fastpitch)) | en | CC-BY-4.0 |
 | **bananamind-tts** | `Banaxi-Tech/BananaMind-TTS-V2.1-Preview` | BananaMind-TTS 13M: Tacotron-lite char-level encoder (Conv+BN+BiLSTM) + AR GRU decoder with location-sensitive attention + postnet + HiFi-GAN at 22 kHz; fixed voice per locale ([more](docs/architecture.md#bananamind-tts)) | en, de | Apache-2.0 |
 | **parler-tts** | [`cstr/parler-tts-mini-v1.1-GGUF`](https://huggingface.co/cstr/parler-tts-mini-v1.1-GGUF) | Parler TTS Mini v1.1 (~900M): T5 encoder + MusicGen decoder + DAC 44.1 kHz; prompt-conditioned (describe voice in text via `--instruct`) | en | Apache-2.0 |
-| **outetts** | [`cstr/outetts-0.3-1b-GGUF`](https://huggingface.co/cstr/outetts-0.3-1b-GGUF) | OLMo-1B talker + WavTokenizer single-codebook VQ-GAN at 24 kHz; voice cloning via speaker profile JSON (`--voice <speaker.json>`) | en | CC-BY-4.0 |
-| **pocket-tts** | [`cstr/pocket-tts-GGUF`](https://huggingface.co/cstr/pocket-tts-GGUF) | Kyutai Pocket TTS 100M: continuous-latent AR at 12.5 Hz + one-step LSD flow + Mimi VAE 24 kHz; voice cloning via ref audio ([more](docs/architecture.md#pocket-tts)) | en | MIT / CC-BY-4.0 |
-| **tada** | [`cstr/tada-tts-1b-GGUF`](https://huggingface.co/cstr/tada-tts-1b-GGUF) + `HumeAI/tada-3b-ml` | Llama-3.2 1B/3B backbone + per-token FM diffusion head + TADA codec at 24 kHz; 1:1 text-to-acoustic alignment; default prompt via `tada-ref.gguf`, custom voices via `--voice <tada-ref.gguf>` built with `models/convert-tada-ref-to-gguf.py` ([more](docs/architecture.md#tada)) | en | — |
+| **outetts** | [`cstr/outetts-0.3-1b-GGUF`](https://huggingface.co/cstr/outetts-0.3-1b-GGUF) | OLMo-1B talker + WavTokenizer single-codebook VQ-GAN at 24 kHz; voice cloning via speaker profile JSON (`--voice <speaker.json>`) | en | CC-BY-NC-SA-4.0 |
+| **pocket-tts** | [`cstr/pocket-tts-GGUF`](https://huggingface.co/cstr/pocket-tts-GGUF) | Kyutai Pocket TTS 100M: continuous-latent AR at 12.5 Hz + one-step LSD flow + Mimi VAE 24 kHz; voice cloning via ref audio or official prepared `.safetensors` voices ([more](docs/architecture.md#pocket-tts)) | en, de, es, it, pt; fr (24L preview) | CC-BY-4.0 + gated-use conditions |
+| **tada** | [`cstr/tada-tts-1b-GGUF`](https://huggingface.co/cstr/tada-tts-1b-GGUF) + `HumeAI/tada-3b-ml` | Llama-3.2 1B/3B backbone + per-token FM diffusion head + TADA codec at 24 kHz; 1:1 text-to-acoustic alignment; default prompt via `tada-ref.gguf`, custom voices via `--voice <tada-ref.gguf>` built with `models/convert-tada-ref-to-gguf.py` ([more](docs/architecture.md#tada)) | en | Llama 3.2 Community License |
 
 <details>
 <summary><b>TTS feature matrix</b></summary>
@@ -204,6 +292,7 @@ quick-start commands and engine selection guidance.
 | cosyvoice3-tts | yes | temp | 24 | yes | yes |
 | f5-tts | yes | — | 24 | yes | — |
 | irodori-tts | yes (WAV) | VoiceDesign: `--instruct` | 48 | yes | — |
+| supertonic | presets F1-F5/M1-M5 | `--tts-speed`, `--tts-steps` | 44.1 | yes | — |
 | csm | — | temp | 24 | yes | — |
 | dia | — | temp | 44 | yes | — |
 | bark | yes (.npz) | temp | 24 | yes | — |
@@ -214,8 +303,18 @@ quick-start commands and engine selection guidance.
 | pocket-tts | yes | temp | 24 | yes | — |
 | tada | yes | temp | 24 | yes | — |
 | dots-tts | yes (`--voice ref.wav`) | 16-step CFG Euler | 48 | yes | — |
+| fireredtts3 | yes (`--voice ref.wav --ref-text "..."`) | 10-step CFG Euler | 24 | yes | — |
+| confucius4-tts | yes (`--voice ref.wav`) | 25-step CFG Euler | 22.05 | yes | — |
 
 \* CustomVoice variant only; Base uses baked speakers via `--voice <name>`.
+
+**Output language.** `-tl <lang>` (or `-l`) selects the language to speak;
+`cosyvoice3-tts`, `qwen3-tts` and `moss-tts` act on it natively. For
+cross-lingual **cloning** — an English reference clip speaking German, the
+subtitle-dubbing case — also pass `-sl <lang>` for the language the reference is
+spoken in, so cosyvoice3 drops the reference transcript instead of carrying its
+accent. Over HTTP: `"language"` + `"source_lang"` on `POST /v1/audio/speech`.
+See [`docs/tts.md`](docs/tts.md#output-language-and-cross-lingual-cloning--tl---sl).
 
 </details>
 
@@ -276,7 +375,7 @@ Work with all backends.
 | **truecaser&#8209;de** | German truecasing (simple) | Statistical word-frequency (71K entries, 1.7 MB) | German | MIT | `--truecase-model auto` |
 | **CLD3** | Text language ID | Embedding-bag → FC + ReLU → softmax (~1.5 MB F32) | 109 ISO 639-1 | Apache-2.0 | [`cstr/cld3-GGUF`](https://huggingface.co/cstr/cld3-GGUF) |
 | **GlotLID-V3** | Text language ID | fastText supervised, flat softmax | 2102 ISO 639-3 + script | Apache-2.0 | [`cstr/glotlid-GGUF`](https://huggingface.co/cstr/glotlid-GGUF) |
-| **LID-176** | Text language ID | fastText supervised, hierarchical softmax | 176 ISO 639-1 | CC-BY-SA-3.0 | [`cstr/fasttext-lid176-GGUF`](https://huggingface.co/cstr/fasttext-lid176-GGUF) |
+| **LID-176** | Text language ID | fastText supervised, hierarchical softmax | 176 ISO 639-1 | CC-BY-NC-4.0 | [`cstr/fasttext-lid176-GGUF`](https://huggingface.co/cstr/fasttext-lid176-GGUF) |
 
 ### Audio codecs
 
@@ -299,8 +398,15 @@ for the per-task flags and output formats.
   (`<input>_<stem>.wav`) via **mel-band-roformer** (vocal/instrumental, MIT) or
   **htdemucs** (4-stem). `--stems vocals,drums` selects a subset;
   `--sep-output-dir` sets the output location.
-- **Piano transcription** (`--backend piano-transcription`) — piano audio → MIDI
+- **Piano transcription** (`--backend piano-transcription`) — piano audio →
   note events (88 keys @ 100 fps, ByteDance/Kong CRNN; F16 GGUF ≈ 77 MB).
+- **Polyphonic note events** (`--backend basic-pitch`) — Spotify Basic Pitch,
+  any instrument → note events (~110 KB model).
+- **Multi-instrument transcription** (`--backend mt3`, alias
+  `music-transcription`) — MT3's T5 encoder/decoder emits note events with
+  per-instrument programs (F16 GGUF ≈ 96 MB).
+- All three take `--piano-format text|json|midi`; `midi` writes a Standard
+  MIDI File.
 - **Guitar tablature** (`--tab`) — per-frame fret-per-string grid via **TabCNN**
   (Wiggins & Kim, ISMIR 2019; CC BY 4.0 weights). The backend emits per-string
   emission scores, not a decided tablature — run your own constrained Viterbi via
@@ -317,7 +423,7 @@ Run `crispasr --list-backends` to see it live. Each backend declares capabilitie
 
 **Sortable / filterable view:** [`docs/feature-matrix.html`](docs/feature-matrix.html) — click any column header to sort, type to filter rows, click cap pills to require a capability. Generated from `crispasr --list-backends-json` (single source of truth — drift impossible). Regenerate via `python tools/gen-feature-matrix.py`. A Markdown twin lives at [`docs/feature-matrix.md`](docs/feature-matrix.md).
 
-The static table below is a curated subset focusing on the ASR backends and the cross-cutting features that matter for ASR pipelines. The full 105-backend × 27-cap surface is in the generated views.
+The static table below is a curated subset focusing on the ASR backends and the cross-cutting features that matter for ASR pipelines. The full 119-backend × 27-cap surface is in the generated views.
 
 <!-- Generated from `crispasr --list-backends` + cross-cutting features. -->
 
@@ -344,7 +450,7 @@ The static table below is a curated subset focusing on the ASR backends and the 
 | mmap weights (`CRISPASR_GGUF_MMAP`) | | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
 | TTS | | | | | | | | | | | | | | | | | | | ✔ | | | | | |
 
-The matrix above covers 24 ASR backends. **Additional ASR backends** not shown: `nemotron` (39-lang streaming ASR with cache-aware FastConformer + RNN-T), `lfm2-audio` (ASR + TTS + S2S in one model), `moss-audio` (audio understanding + ASR), `moss-transcribe` (Qwen3-Omni encoder + Qwen3-1.7B ASR), `mini-omni2` (ASR + TTS + S2S), `kugelaudio` (7B audio understanding). See [`docs/feature-matrix.md`](docs/feature-matrix.md) for the full 106-backend matrix. **TTS-only backends** (`kokoro`, `qwen3-tts` + variants, `vibevoice-tts`, `orpheus` + DE variants, `chatterbox` / `chatterbox-turbo` / `kartoffelbox-turbo` / `lahgtna-chatterbox`, `dia`, `bark`, `outetts`, `zonos`, `csm`, `f5-tts`, `irodori-tts`, `parler-tts`, `speecht5`, `piper`, `fastpitch`, `pocket-tts`, `melotts`, `cosyvoice3`, `voxcpm2`, `tada-tts`) all carry the TTS, AUTO_DOWNLOAD, TEMPERATURE, and FLASH_ATTN caps; per-backend cloning + voice-pack support is documented in the [Text-to-Speech models](#text-to-speech-models) table above and [`docs/tts.md`](docs/tts.md). The vibevoice and lfm2-audio columns mark dual-mode (ASR + TTS) backends.
+The matrix above covers 24 ASR backends. **Additional ASR backends** not shown: `nemotron` (39-lang streaming ASR with cache-aware FastConformer + RNN-T), `lfm2-audio` (ASR + TTS + S2S in one model), `moss-audio` (audio understanding + ASR), `moss-transcribe` (Qwen3-Omni encoder + Qwen3-1.7B ASR), `mini-omni2` (ASR + TTS + S2S), `kugelaudio` (7B audio understanding). See [`docs/feature-matrix.md`](docs/feature-matrix.md) for the full 109-backend matrix. **TTS-only backends** (`kokoro`, `qwen3-tts` + variants, `vibevoice-tts`, `orpheus` + DE variants, `chatterbox` / `chatterbox-turbo` / `chatterbox-nano` / `kartoffelbox-turbo` / `lahgtna-chatterbox`, `dia`, `bark`, `outetts`, `zonos`, `csm`, `f5-tts`, `irodori-tts`, `supertonic`, `parler-tts`, `speecht5`, `piper`, `fastpitch`, `pocket-tts`, `melotts`, `cosyvoice3`, `voxcpm2`, `tada-tts`) all carry the TTS, AUTO_DOWNLOAD, TEMPERATURE, and FLASH_ATTN caps; per-backend cloning + voice-pack support is documented in the [Text-to-Speech models](#text-to-speech-models) table above and [`docs/tts.md`](docs/tts.md). The vibevoice and lfm2-audio columns mark dual-mode (ASR + TTS) backends.
 
 **Key:** ✔ = native/built-in, `-am` = via CTC forced aligner (`-am canary-ctc-aligner.gguf` or `-am qwen3-forced-aligner.gguf`), **LID** = via external language identification pre-step (`-l auto`), **pp** = via `--punc-model` post-processor (FireRedPunc or fullstop-punc), * = experimental or partial support, † = PLUS variant only (native `[T:N]` word timestamps with `-owts`; base uses `-am`). granite-4.1 covers both the regular and `-plus` variants; granite-4.1-nar is a non-autoregressive variant with encoder+projector only (no LLM decode features). The **KV quant** row marks backends that honor `CRISPASR_KV_QUANT={f16,q8_0,q4_0}` — CTC-style backends without a KV cache (parakeet, fc-ctc, wav2vec2, kyutai-stt, firered, moonshine variants, omniasr-CTC) don't apply. The same backends also honor the per-half `CRISPASR_KV_QUANT_K` / `CRISPASR_KV_QUANT_V` overrides (llama.cpp `--cache-type-k` / `--cache-type-v` parity) for asymmetric K-vs-V precision; common recipe `K=q8_0 V=q4_0` saves ~40 % more KV memory than symmetric Q8_0. The **mmap weights** row marks backends consuming `core_gguf::load_weights()` and therefore honoring `CRISPASR_GGUF_MMAP=1`; whisper itself uses upstream's loader and is unaffected. See [`docs/cli.md`](docs/cli.md) Memory footprint for usage + recommended combos.
 
@@ -365,7 +471,7 @@ Full reference + tuning knobs (cluster threshold, max speakers, pluggable embedd
 
 **Punctuation restoration** (`--punc-model`): CTC-based backends output lowercase without punctuation. Named shortcuts: `auto`/`firered` (Chinese+English), `fullstop` (EN/DE/FR/IT, XLM-R-large), `punctuate-all` (12 languages, XLM-R-base), `pcs` (47 languages, punc + truecasing + sentence boundary detection in one model). Or pass a GGUF path directly. Also available via Python/Rust/Dart wrappers (`crispasr.PuncModel`).
 
-**Truecasing** (`--truecase-model`): Restore German noun/name capitalization in lowercase ASR output. Three options in ascending quality: `auto` (statistical, 9 MB), `crf` (CRF with context, 24 MB), `lstm` (BiLSTM char-level, 3.2 MB, **recommended** — 97.9% F1, handles adjective/noun distinction and formal "Ihnen"). All auto-download from [`cstr/truecaser-de`](https://huggingface.co/cstr/truecaser-de). Or use `--punc-model pcs` for neural punc + truecasing in one pass (47 languages).
+**Truecasing** (`--truecase-model`): Restore German noun/name capitalization in lowercase ASR output. Three options in ascending quality: `auto` (statistical, 1.7 MB), `crf` (CRF with context, 8.5 MB), `lstm` (BiLSTM char-level, 3.2 MB, **recommended** — 97.9% F1, handles adjective/noun distinction and formal "Ihnen"). All auto-download from [`cstr/truecaser-de`](https://huggingface.co/cstr/truecaser-de). Or use `--punc-model pcs` for neural punc + truecasing in one pass (47 languages).
 
 <details>
 <summary>Which backends produce punctuation natively?</summary>
@@ -381,7 +487,7 @@ Full reference + tuning knobs (cluster threshold, max speakers, pluggable embedd
 | voxtral4b | ✔ | ✔ | LLM output |
 | qwen3 | ✔ | ✔ | LLM output |
 | funasr | ✔ | ✔ | LLM output (Qwen3-0.6B decoder). Chinese chars carry full-width period; mlt-nano variant adds Latin-script casing + punctuation. |
-| sensevoice | ✔ | ✔ | CTC output with native ITN — toggle via `--punctuation` / `--no-punctuation`, controls Arabic-digit vs spelled-out numerals + comma/period emission. |
+| sensevoice | ✔ | ✔ | CTC output with native ITN — toggle off via `--no-punctuation`, which controls Arabic-digit vs spelled-out numerals + comma/period emission. |
 | paraformer | **no** | **no** | NAR character-level output — add `--punc-model` |
 | gigaam | ✔ (`e2e_*`) | ✔ (`e2e_*`) | The `e2e_*` revisions carry punctuation + casing + inverse text normalization in the SentencePiece vocabulary. The charwise `ctc` / `rnnt` revisions emit lowercase Cyrillic with no punctuation — but auto-restoration is still suppressed for them, because the auto-enabled FireRedPunc is a Chinese/English model and injects full-width CJK punctuation into Russian. Use an `e2e_*` revision for punctuated output, or pass an explicit `--punc-model`. |
 | glm-asr | ✔ | ✔ | LLM output |
@@ -437,7 +543,7 @@ crispasr --backend parakeet -m parakeet.gguf --vad --flush-after 1 -osrt -f long
 | **Russian** | **gigaam** (`e2e_rnnt` — 8.4 % avg WER, punctuation + ITN), **whisper**, **qwen3** |
 | **Mandarin + Chinese dialects** | **firered-asr**, **qwen3**, **glm-asr**, **funasr**, **paraformer**, **sensevoice** |
 | **Multilingual (31 langs) speech-LLM** | **fun-asr-mlt-nano**, **qwen3**, **omniasr-llm**, **gemma4-e2b** |
-| **Multilingual (50+ langs) + LID + emotion + audio-event in one pass** | **sensevoice** (encoder-only CTC, non-AR, 15× faster than Whisper-Large) |
+| **Multilingual (50+ langs) + LID + audio-event in one pass** | **sensevoice** (encoder-only CTC, non-AR, 15× faster than Whisper-Large) |
 
 ### CPU performance tips
 
@@ -478,6 +584,11 @@ These LID providers are available:
   - [`cstr/ecapa-lid-107-GGUF`](https://huggingface.co/cstr/ecapa-lid-107-GGUF) — VoxLingua107, 43 MB F16, 107 languages, ISO codes (en, de, ...). **Default.**
   - [`cstr/ecapa-lid-commonlanguage-GGUF`](https://huggingface.co/cstr/ecapa-lid-commonlanguage-GGUF) — CommonLanguage, 40 MB F16, 45 languages, full names (English, German, ...).
 - `--lid-backend firered` — FireRedLID (Conformer encoder + Transformer decoder). Q4_K (544 MB), 120 languages including Chinese dialects. Slower but covers more languages.
+- `--lid-backend probe` — no second model at all: ask the **ASR model itself**. Transcribes a 20 s clip once per language the model declares and keeps the best-scoring candidate (length × text-LID agreement × distinct-token ratio², the last term catching the repetitive output a wrong-language prompt produces). Currently implemented by **cohere**. The reason to prefer it is correctness, not just the saved download: an external detector knows 99 languages while Cohere Transcribe accepts 14 — and its Arabic finetune only `en`/`ar` — so external LID regularly returns a language the model was never trained on, and Cohere answers a wrong language *fluently* rather than failing. The probe cannot. Cost is one encode + one short decode per candidate, so it runs automatically only for a model with ≤ 4 languages (`CRISPASR_COHERE_PROBE_MAX_LANGS`); `CRISPASR_COHERE_PROBE_TEXTLID=0` drops the text-LID agreement term.
+
+  **The ceiling is about cost, not accuracy.** Measured on the real models: the two-language Arabic finetune picks `ar` for an Arabic clip (p=0.675) and `en` for `samples/jfk.wav` (p=0.647); the 14-language base model, probed across all 14, also gets both right (`en` p=0.169, `ar` p=0.254) — it is simply slower than an external detector. The encoder output is language-independent, so the probe encodes **once** and decodes per candidate (encode is ~87 % of a pass); a 14-candidate probe measured **12 s → 4-5 s** against one-encode-per-candidate, byte-identical output. `CRISPASR_COHERE_PROBE_REUSE_ENC=0` restores the naive path.
+
+  The one soft spot worth knowing: asking the model for a language it was *not* trained on can yield a clean translation rather than garbage, which a text LID then confirms — "fluent French out" is not evidence of French in. That is what makes a mismatched whitelist dangerous, and it is measurable: force a 14-language list onto the two-language Arabic finetune and its `fr` probe returns real French and wins. The real base model's `fr` probe instead code-switches ("Et so, my fellow Americans…", agreement 0.00) and loses, as it should.
 
 These VAD providers are available:
 
@@ -500,13 +611,13 @@ one binary — the dispatcher picks by `general.architecture`:
 |---|---:|---:|---|---|
 | **CLD3** (Google compact language detector v3) | 109 ISO 639-1 | **440 KB** | Apache-2.0 | [`cstr/cld3-GGUF`](https://huggingface.co/cstr/cld3-GGUF) |
 | **GlotLID-V3** (cis-lmu fastText) | 2102 ISO 639-3 + script | 250 MB | Apache-2.0 | [`cstr/glotlid-GGUF`](https://huggingface.co/cstr/glotlid-GGUF) |
-| **LID-176** (Facebook fastText) | 176 ISO 639-1 | 63 MB | CC-BY-SA-3.0¹ | [`cstr/fasttext-lid176-GGUF`](https://huggingface.co/cstr/fasttext-lid176-GGUF) |
+| **LID-176** (Facebook fastText) | 176 ISO 639-1 | 63 MB | CC-BY-NC-4.0¹ | [`cstr/fasttext-lid176-GGUF`](https://huggingface.co/cstr/fasttext-lid176-GGUF) |
 
-¹ LID-176 is **CC-BY-SA-3.0 (viral)** — redistributors of the GGUF
-inherit ShareAlike. CLD3 + GlotLID-V3 are Apache-2.0 with no such
-constraint. Pick CLD3 for the smallest, fastest path; GlotLID for
-maximum coverage (low-resource languages); LID-176 only if you need
-its specific 176-label space and accept the SA obligation.
+¹ LID-176 is **CC-BY-NC-4.0** — non-commercial use only. CLD3 +
+GlotLID-V3 are Apache-2.0 with no such constraint. Pick CLD3 for the
+smallest, fastest path; GlotLID for maximum coverage (low-resource
+languages); LID-176 only if you need its specific 176-label space and
+accept its non-commercial terms.
 
 **Standalone CLI** — auto-routes by GGUF arch, with auto-download:
 
@@ -538,6 +649,11 @@ green at cos≥0.999 across 8 multilingual smoke samples.
 
 ## Install & build
 
+**Don't want to build?** Prebuilt binaries for Windows, macOS and Linux are on
+the [releases page](https://github.com/CrispStrobe/CrispASR/releases/latest) —
+see [Start here](#start-here) for which file to take. The rest of this section
+is for building from source.
+
 ```bash
 git clone --recursive https://github.com/CrispStrobe/CrispASR
 cd CrispASR
@@ -568,11 +684,17 @@ all GPU backends (CUDA / Metal / Vulkan / MUSA / SYCL), Windows
 convenience scripts, ffmpeg ingestion, optional BLAS, glibc notes,
 and the `scripts/dev-build.sh` wrapper.
 
+If a build runs but the binary exits with no output, see
+[`docs/troubleshooting.md`](docs/troubleshooting.md).
+
 ---
 
 ## Quick start
 
-ASR examples below; for TTS see the [Text-to-Speech](#text-to-speech-tts) section.
+Deeper ASR examples below. If this is your first run, use
+[Start here](#start-here) instead. For TTS, the runnable guide is
+[docs/tts.md](docs/tts.md) ([Text-to-Speech](#text-to-speech-models) below is
+the model catalogue).
 
 ### Whisper (historical path, byte-identical to upstream whisper.cpp)
 
@@ -906,7 +1028,7 @@ HF_TOKEN=hf_xxx crispasr -m auto --backend gemma4-e2b -f audio.wav
 ```
 
 The server has its own auth env: `CRISPASR_API_KEYS` (see
-[Server mode](#server-mode-persistent-model-http-api)).
+[Server mode](docs/server.md)).
 
 <details>
 <summary><b>Per-backend debug / bench / dump-dir env vars (developer)</b></summary>
@@ -915,7 +1037,7 @@ These are useful when porting a new backend or chasing a regression.
 The `*_BENCH=1` toggles emit per-stage timings even without `-v`; the
 `*_DEBUG=1` toggles emit per-step diagnostic prints; the `*_DUMP_DIR=`
 paths write per-stage F32 tensors for diff-testing against a PyTorch
-reference (see [Debug a new backend against PyTorch ground truth](#debug-a-new-backend-against-pytorch-ground-truth)).
+reference (see [Debug a new backend against PyTorch ground truth](docs/contributing.md#debug-a-new-backend-against-pytorch-ground-truth)).
 
 | Env var | Purpose |
 | --- | --- |
@@ -937,7 +1059,7 @@ reference (see [Debug a new backend against PyTorch ground truth](#debug-a-new-b
 | `VIBEVOICE_REF_FEATURES=path` | Replace the live encoder with a saved feature tensor (regression harness). |
 | `VIBEVOICE_TTS_DUMP=path/` | VibeVoice TTS per-stage dumps (token IDs, base/TTS hidden, neg condition, frame-0 noise/v_cfg/latent/acoustic_embed) for the diff harness. |
 | `VIBEVOICE_TTS_DUMP_PERFRAME=1` | Per-frame VibeVoice TTS dumps written as `perframe_<stage>_f<NNN>.bin`. Pair with `VIBEVOICE_TTS_DUMP=path/` and `VIBEVOICE_TTS_NOISE=path` for stage-by-stage AR diff against `tools/run_official_vibevoice.py`. |
-| `VIBEVOICE_TTS_TRACE=1` | Extra one-line traces (negative-condition prefill rms, scaling/bias factors loaded). Same effect as `-vv`. |
+| `VIBEVOICE_TTS_TRACE=1` | Extra one-line traces (negative-condition prefill rms, scaling/bias factors loaded). Same effect as library verbosity ≥ 2; there is no CLI flag for it (`-v` caps verbosity at 1). |
 | `VIBEVOICE_VOICE_AUDIO=path.wav` | Reference voice WAV for 1.5B-base TTS without a `.gguf` voice cache. |
 | `VIBEVOICE_TTS_NOISE=path` | Override the per-frame Gaussian init noise. Flat little-endian float32 `[N_frames, vae_dim]` — typically the `noise.bin` written by `tools/run_official_vibevoice.py`. |
 | `VIBEVOICE_VAE_BACKEND=cpu\|metal\|cuda\|vulkan` | Pin the VAE decoder onto a specific backend. |

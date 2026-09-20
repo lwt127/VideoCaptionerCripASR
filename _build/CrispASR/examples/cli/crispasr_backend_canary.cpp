@@ -15,6 +15,7 @@
 #include "whisper_params.h"
 
 #include "canary.h"
+#include "core/script_mismatch.h" // #419 wrong-script warning
 
 #include <algorithm>
 #include <cstdio>
@@ -133,31 +134,37 @@ public:
             return out;
         }
 
-        // PLAN #114 P3 second half: route to canary_transcribe_streamed
-        // for all audio (matches the parakeet backend default). Single-pass
-        // over a long buffer lets the bidirectional Conformer attention
-        // amplify acoustic noise past the ~30 s training window. The
-        // streamed path (per-chunk AED decode with prompt re-injection
-        // + LCS-merge boundary dedup + splice-punctuation cleanup) is
-        // semantically equivalent to single-pass on short audio — JFK
-        // single-pass is "...for you, ask..." and JFK streamed is
-        // "...for you. Ask..." (LCS-dedup correctly converts the
-        // mid-sentence comma to a sentence boundary at the chunk
-        // splice). Set CANARY_STREAM_THRESHOLD_S=N to force single-pass
-        // for inputs ≤ N seconds.
+        // Issue #419: print the EFFECTIVE language conditioning once. Canary
+        // conditioned on the wrong language transliterates rather than
+        // failing (Russian through <|en|> → "vikingi, otvazhnye voyny"), and
+        // the reported case pointed at a frontend whose -l/--source-lang may
+        // never have reached this process — one stderr line makes that
+        // diagnosable from any log.
+        static bool s_lang_logged = false;
+        if (!params.no_prints && !s_lang_logged) {
+            s_lang_logged = true;
+            fprintf(stderr, "canary: languages src='%s' tgt='%s'\n", src.c_str(), tgt.c_str());
+        }
+
+        // Long-form handling follows canary-1b-v2's own `.transcribe()`
+        // dynamic chunking (blueprint port in src/canary.cpp): audio that
+        // fits one 40 s chunk is a single pass; longer audio is split into
+        // dynamically sized 30..40 s raw-waveform chunks with a 1 s overlap
+        // and merged by the reference's LCS alignment. Passing 0 / -1 lets
+        // the library pick the reference's sizes.
+        // CRISPASR_CANARY_STREAM_THRESHOLD_S=N forces single-pass for
+        // inputs ≤ N seconds (debug/A-B); CRISPASR_CANARY_LEGACY_STREAM=1
+        // selects the pre-blueprint 8 s / 2 s machinery inside the library.
         int stream_threshold_s = 0;
         if (const char* e = crispasr_env::get("CRISPASR_CANARY_STREAM_THRESHOLD_S")) {
             stream_threshold_s = std::max(0, atoi(e));
         }
-        const int stream_chunk_s = 8;
-        const int stream_overlap_s = 2;
-        const bool use_streamed = stream_threshold_s == 0 || n_samples > stream_threshold_s * 16000;
+        const bool force_single = stream_threshold_s > 0 && n_samples <= stream_threshold_s * 16000;
 
-        canary_result* r =
-            use_streamed ? canary_transcribe_streamed(ctx_, samples, n_samples, src.c_str(), tgt.c_str(),
-                                                      params.punctuation, t_offset_cs, stream_chunk_s, stream_overlap_s)
-                         : canary_transcribe_ex(ctx_, samples, n_samples, src.c_str(), tgt.c_str(), params.punctuation,
-                                                t_offset_cs);
+        canary_result* r = force_single ? canary_transcribe_ex(ctx_, samples, n_samples, src.c_str(), tgt.c_str(),
+                                                               params.punctuation, t_offset_cs)
+                                        : canary_transcribe_streamed(ctx_, samples, n_samples, src.c_str(), tgt.c_str(),
+                                                                     params.punctuation, t_offset_cs, 0, -1);
         if (!r)
             return out;
 
@@ -197,6 +204,28 @@ public:
         }
 
         canary_result_free(r);
+
+        // Issue #419: canary conditioned on the WRONG language renders speech
+        // in the wrong SCRIPT — Russian decoded as <|en|> comes out as Latin
+        // transliteration ("vikingi, otvazhnye voyny"), silently. With the
+        // language tokens actually set to ru, every backend produces proper
+        // Cyrillic (verified CPU / CUDA / Vulkan, single + streamed + short
+        // slices). So a script contradiction means the conditioning did not
+        // arrive — say so, name the effective langs and the model, and give
+        // the user something actionable instead of translit subtitles.
+        if (!params.no_prints && core_script::mismatch(tgt, seg.text)) {
+            core_script::ScriptCounts sc;
+            core_script::mismatch(tgt, seg.text, &sc);
+            fprintf(stderr,
+                    "canary: WARNING: target language '%s' expects %s but the transcript is "
+                    "Latin-dominated (%d Latin vs %d %s letters). The model was likely "
+                    "conditioned on the wrong language: verify -l/--source-lang actually reach "
+                    "this process (frontends sometimes drop them) and that the model resolved to "
+                    "canary-1b-v2 (run with -v to see the path). See issue #419.\n",
+                    tgt.c_str(), tgt == "el" ? "Greek" : "Cyrillic", sc.latin, tgt == "el" ? sc.greek : sc.cyrillic,
+                    tgt == "el" ? "Greek" : "Cyrillic");
+        }
+
         out.push_back(std::move(seg));
         return out;
     }

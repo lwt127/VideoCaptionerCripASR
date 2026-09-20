@@ -64,6 +64,13 @@ DEFAULT_STAGES = [
     "talker_layer_27_out",
     "talker_output_norm",
     "generated_codes",
+    # Per-step talker logits. `talker_logits` alone is the PREFILL only; these
+    # are the AR steps, and they are the half that validates the decode loop
+    # rather than the prompt. Only comparable against a runtime that REPLAYS
+    # `generated_codes` (crispasr: CRISPASR_QWEN3_TTS_REPLAY_CODES) — free
+    # running, the two implementations diverge as soon as one picks a different
+    # id and every later step measures that instead of the arithmetic.
+    *[f"talker_logits_step{i}" for i in range(16)],
     # Per-step code-predictor stages (frame 0 of generate_voice_clone).
     # cp_step{i}_input_embed is the (T, cp_d_model) tensor fed to the
     # code_predictor's small_to_mtp_projection at AR step i — T=2 for
@@ -197,6 +204,13 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
         ("talker_logits",       talker.codec_head),
     ]
     hook_stage_names = [name for name, _mod in layer_hook_map]
+    # Per-step codec_head outputs. `capture_modules(first_call_only=True)` above
+    # keeps the prefill; this keeps one capture per AR step under its own key.
+    if any(s_.startswith("talker_logits_step") for s_ in stages):
+        handles.extend(_hooks.capture_per_call(
+            captures, [("talker_logits", talker.codec_head)], max_calls=16,
+            name_fmt="{name}_step{idx}",
+        ))
     handles.extend(_hooks.capture_modules(
         captures,
         [(name, mod) for name, mod in layer_hook_map if name in stages],
@@ -401,6 +415,27 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
                                  *cp_in_names,
                                  *cp_out_names)):
         assert prompt_items is not None
+        # `generated_codes` has been in DEFAULT_STAGES since this backend was
+        # written and was never produced — the outer generate_voice_clone()
+        # returns audio, and the ids only exist inside it. Wrap the inner
+        # generate to keep them: they are what a runtime must replay for the
+        # per-step logits stages above to mean anything.
+        _gen_codes = {}
+        _orig_generate = tts.model.generate
+
+        def _capture_generate(*a, **kw):
+            res = _orig_generate(*a, **kw)
+            if "codes" not in _gen_codes:
+                codes = res[0] if isinstance(res, tuple) else res
+                if isinstance(codes, (list, tuple)) and codes:
+                    codes = codes[0]
+                if hasattr(codes, "detach"):
+                    _gen_codes["codes"] = codes.detach().cpu().numpy()
+                elif codes is not None:
+                    _gen_codes["codes"] = np.asarray(codes)
+            return res
+
+        tts.model.generate = _capture_generate
         with torch.no_grad():
             tts.generate_voice_clone(
                 text=syn_text,
@@ -411,6 +446,10 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
                 temperature=1.0,  # ignored when do_sample=False
                 top_k=1,
             )
+
+        tts.model.generate = _orig_generate
+        if "codes" in _gen_codes and "generated_codes" in stages:
+            out["generated_codes"] = np.asarray(_gen_codes["codes"], dtype=np.int32)
 
     _hooks.drop_hooks(handles)
 

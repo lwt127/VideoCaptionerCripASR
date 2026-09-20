@@ -152,3 +152,59 @@ TEST_CASE("a token straddling a boundary is claimed by both spans it covers", "[
     REQUIRE(a[0] == std::vector<int>{0, 1});
     REQUIRE(a[1] == std::vector<int>{1, 2});
 }
+
+// ── Non-speech markers (#369) ────────────────────────────────────────────────
+// "[Silence]" is CONTENT the model emits — it appears nowhere in this codebase.
+// It reached users' transcripts as literal text over plainly non-silent audio,
+// and because there WAS text the CLI's "no text produced for N s of non-silent
+// audio" warning could not fire, so it was invisible as well as wrong.
+TEST_CASE("vibevoice transcript: the model's own [Silence] is not transcript text",
+          "[unit][vibevoice]") {
+    REQUIRE(core_vibevoice::is_non_speech_marker("[Silence]"));
+    REQUIRE(core_vibevoice::is_non_speech_marker("  [silence]  "));
+    REQUIRE(core_vibevoice::is_non_speech_marker("[SILENCE]"));
+    REQUIRE(core_vibevoice::is_non_speech_marker("[Silence.]"));
+    REQUIRE(core_vibevoice::is_non_speech_marker("[BLANK_AUDIO]"));
+    REQUIRE(core_vibevoice::is_non_speech_marker("[Inaudible]"));
+}
+
+// Deliberately narrow: only a WHOLE bracketed token from the observed set. Over-
+// reaching here deletes real content, which is a worse failure than the one
+// being fixed.
+TEST_CASE("vibevoice transcript: real speech is never mistaken for a marker",
+          "[unit][vibevoice]") {
+    REQUIRE_FALSE(core_vibevoice::is_non_speech_marker("내일 오전에 회의 자료를 보내주세요."));
+    REQUIRE_FALSE(core_vibevoice::is_non_speech_marker("[Music]"));      // may be wanted
+    REQUIRE_FALSE(core_vibevoice::is_non_speech_marker("[Laughter]"));   // may be wanted
+    REQUIRE_FALSE(core_vibevoice::is_non_speech_marker("The silence was total."));
+    REQUIRE_FALSE(core_vibevoice::is_non_speech_marker("[Silence] and then she spoke."));
+    REQUIRE_FALSE(core_vibevoice::is_non_speech_marker(""));
+    REQUIRE_FALSE(core_vibevoice::is_non_speech_marker("[]"));
+}
+
+// The blob still has to PARSE — a response carrying only markers must be
+// distinguishable from one that was not a transcript at all, or the caller
+// falls back to handing over the raw JSON, which is exactly how "[Silence]"
+// reached the transcript.
+TEST_CASE("vibevoice transcript: a markers-only answer still parses", "[unit][vibevoice]") {
+    const auto utts = core_vibevoice::parse(
+        R"([{"Start time":0.0,"End time":6.01,"Speaker ID":0,"Content":"[Silence]"}])");
+    REQUIRE(utts.size() == 1);
+    REQUIRE(core_vibevoice::is_non_speech_marker(utts[0].text));
+    REQUIRE_FALSE(core_vibevoice::parse("the model answered in prose").size() > 0);
+}
+
+// A marker between two real utterances must not take them with it.
+TEST_CASE("vibevoice transcript: a marker between utterances drops only itself",
+          "[unit][vibevoice]") {
+    const auto utts = core_vibevoice::parse(
+        R"([{"Start":0.0,"End":1.0,"Speaker":0,"Content":"hello"},)"
+        R"({"Start":1.0,"End":2.0,"Speaker":0,"Content":"[Silence]"},)"
+        R"({"Start":2.0,"End":3.0,"Speaker":1,"Content":"world"}])");
+    REQUIRE(utts.size() == 3);
+    int kept = 0;
+    for (const auto& u : utts)
+        if (!core_vibevoice::is_non_speech_marker(u.text))
+            kept++;
+    REQUIRE(kept == 2);
+}

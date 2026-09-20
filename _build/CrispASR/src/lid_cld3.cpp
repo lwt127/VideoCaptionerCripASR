@@ -7,7 +7,7 @@
 // the RAM hit is trivial).
 //
 // All algorithms below are byte-faithful ports of the upstream sources
-// at /Volumes/backups/ai/upstream/cld3/src/. Cross-validated against
+// of google/cld3 (src/). Cross-validated against
 // pycld3 + the Python reference dumper at
 // tools/reference_backends/lid_cld3.py.
 
@@ -78,7 +78,7 @@ constexpr FeatureKind kFeatureKinds[kNFeatures] = {
 };
 
 // ULScript values — verified against
-// /Volumes/backups/ai/upstream/cld3/src/script_span/generated_ulscript.h.
+// google/cld3 src/script_span/generated_ulscript.h.
 // Hiragana / Katakana / Hangul are NOT separate scripts; they all return
 // Hani. ScriptFeature::Compute then runs a secondary Hangul-vs-Hani
 // codepoint count and returns NUM_ULSCRIPTS (= kHangulSentinel) when
@@ -131,7 +131,7 @@ struct lid_cld3_context {
     // names) is held by the ggml_context.
     ggml_context* gctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
-    std::map<std::string, ggml_tensor*> tensors;
+    core_gguf::tensor_map tensors; // alias tracks the per-repo map choice (see gguf_loader.h)
 };
 
 // ===========================================================================
@@ -699,7 +699,7 @@ static bool tensor_to_f32(const ggml_tensor* t, std::vector<float>& out, size_t 
     return true;
 }
 
-static ggml_tensor* lid_get(const std::map<std::string, ggml_tensor*>& m, const std::string& name) {
+static ggml_tensor* lid_get(const core_gguf::tensor_map& m, const std::string& name) {
     auto it = m.find(name);
     return it != m.end() ? it->second : nullptr;
 }
@@ -804,7 +804,7 @@ extern "C" void lid_cld3_free(lid_cld3_context* ctx) {
     if (!ctx)
         return;
     if (ctx->buf)
-        ggml_backend_buffer_free(ctx->buf);
+        core_gguf::release_weight_buffer(ctx->buf);
     if (ctx->gctx)
         ggml_free(ctx->gctx);
     delete ctx;

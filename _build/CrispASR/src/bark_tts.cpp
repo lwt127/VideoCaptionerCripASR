@@ -55,6 +55,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ---------------------------------------------------------------------------
 // Internal types
@@ -244,7 +245,7 @@ struct bark_context {
         if (ctx_w)
             ggml_free(ctx_w);
         if (buf_w)
-            ggml_backend_buffer_free(buf_w);
+            core_gguf::release_weight_buffer(buf_w);
         if (backend && backend != backend_cpu)
             ggml_backend_free(backend);
         if (backend_cpu)
@@ -1900,13 +1901,13 @@ struct bark_context* bark_init_from_file(const char* path_model, struct bark_con
     ctx->rng.seed(seed);
 
     // Backend setup
-    ctx->backend_cpu = ggml_backend_cpu_init();
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    ctx->backend_cpu = core_cpu_backend::init();
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (!ctx->backend)
         ctx->backend = ctx->backend_cpu;
-    if (ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
 
     // Load GGUF
     core_gguf::WeightLoad wl;
@@ -2393,9 +2394,9 @@ void bark_set_n_threads(struct bark_context* ctx, int n) {
     if (!ctx)
         return;
     ctx->n_threads = n > 0 ? n : 1;
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
-    if (ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
 }
 
 void bark_set_temperature_semantic(struct bark_context* ctx, float t) {

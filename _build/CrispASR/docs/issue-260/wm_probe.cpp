@@ -1,7 +1,7 @@
 // wm_probe.cpp — isolate the CrispASR spread-spectrum watermark (#260).
 // Feeds a clean synthetic-speech signal through the exact watermark header
 // and writes clean / alpha=0.005 / alpha=0.08 WAVs plus the injected delta.
-#include "crispasr_watermark.h"
+#include "core/crispasr_watermark.h"
 #include <cmath>
 #include <cstdint>
 #include <cstdio>

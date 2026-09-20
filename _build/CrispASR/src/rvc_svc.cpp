@@ -23,6 +23,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ---------------------------------------------------------------------------
 // Hyperparameters
@@ -189,7 +190,7 @@ rvc_svc_context* rvc_svc_init_from_file(const char* model_path, rvc_svc_params p
 
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : nullptr;
     if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
 
     core_gguf::WeightLoad wl;
     if (!core_gguf::load_weights(model_path, ctx->backend, "rvc", wl)) {
@@ -232,7 +233,7 @@ void rvc_svc_free(rvc_svc_context* ctx) {
     if (!ctx)
         return;
     if (ctx->buf_w)
-        ggml_backend_buffer_free(ctx->buf_w);
+        core_gguf::release_weight_buffer(ctx->buf_w);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
     if (ctx->backend)

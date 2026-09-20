@@ -43,6 +43,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `SPEECHT5_TTS_BENCH=1` for per-stage timings.
@@ -1313,19 +1314,19 @@ struct speecht5_tts_context* speecht5_tts_init(const char* path, struct speecht5
     // Backend — prefer GPU (CUDA/Metal/Vulkan) when available + requested
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : nullptr;
     if (!ctx->backend) {
-        ctx->backend = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
     }
     if (!ctx->backend) {
         fprintf(stderr, "speecht5: failed to init any backend\n");
         delete ctx;
         return nullptr;
     }
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (ctx->backend_cpu) {
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, params.n_threads);
     }
-    if (ggml_backend_is_cpu(ctx->backend)) {
-        ggml_backend_cpu_set_n_threads(ctx->backend, params.n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend)) {
+        core_cpu_backend::set_n_threads(ctx->backend, params.n_threads);
     }
 
     // Create backend scheduler

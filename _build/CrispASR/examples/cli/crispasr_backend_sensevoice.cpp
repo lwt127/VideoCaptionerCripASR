@@ -1,6 +1,6 @@
 // crispasr_backend_sensevoice.cpp — FunAudioLLM/SenseVoiceSmall adapter.
 //
-// Encoder-only multi-task ASR (transcript + LID + emotion + audio-event
+// Encoder-only multi-task ASR (transcript + LID + audio-event
 // tags in one CTC forward pass). Output includes a 4-token rich-annotation
 // prefix from the model's special-token vocab before the transcript.
 
@@ -65,8 +65,6 @@ public:
         seg.text = r->text ? r->text : "";
         if (r->language)
             seg.lang_id = r->language;
-        if (r->emotion)
-            seg.emotion = r->emotion;
         if (r->audio_event)
             seg.audio_event = r->audio_event;
         if (r->itn)

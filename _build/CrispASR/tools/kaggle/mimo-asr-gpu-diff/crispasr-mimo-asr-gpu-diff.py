@@ -11,8 +11,10 @@ on a Kaggle GPU box, mirroring the funasr-cuda-debug kernel.
 Plan (same shape as crispasr-funasr-cuda-debug):
   1. CUDA build of crispasr-cli.
   2. mimo-asr on jfk.wav, two runs, MIMO_ASR_DUMP_STAGES=1 on both:
-       cpu  — default (force-CPU, option A). Ground truth.
-       gpu  — CRISPASR_MIMO_FORCE_GPU=1 (weights+compute on GPU). The bug.
+       cpu  — CRISPASR_MIMO_FORCE_CPU=1 (GPU became the default once the
+              bug was fixed; the old opt-in CRISPASR_MIMO_FORCE_GPU is no
+              longer read). Ground truth.
+       gpu  — default (weights+compute on GPU).
   3. Parse the `mimo_dump: <stage> ... nan= inf=` lines and compare the two
      runs stage-by-stage. The first stage where GPU NaNs / diverges from CPU
      localises the broken op in mimo_asr_build_prefill_graph.
@@ -158,11 +160,11 @@ def run_mimo(label: str, extra_env: dict, timeout: int = 900, gdb: bool = False)
 
 
 subprocess.run("apt-get install -y -q gdb >/dev/null 2>&1 || true", shell=True)
-cpu = run_mimo("cpu", {})
+cpu = run_mimo("cpu", {"CRISPASR_MIMO_FORCE_CPU": "1"})
 # Validation: the fix keeps the Q4_K embed/audio.emb tables on CPU (CUDA
 # get_rows can't gather Q4_K) while the matmul weights stay GPU-resident.
 # Expect GPU == PASS now. gdb stays on to catch any residual crash.
-gpu = run_mimo("gpu", {"CRISPASR_MIMO_FORCE_GPU": "1"}, gdb=True)
+gpu = run_mimo("gpu", {}, gdb=True)
 
 # ── Compare CPU vs GPU per stage — find the first divergence ──────────────
 print("\n" + "=" * 64, flush=True)

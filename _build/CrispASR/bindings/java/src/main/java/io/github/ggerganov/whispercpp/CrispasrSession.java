@@ -39,26 +39,38 @@ public final class CrispasrSession implements AutoCloseable {
         int     crispasr_session_set_speaker_id(Pointer session, int id);
         int     crispasr_session_set_punc_model(Pointer session, String puncModel);
         int     crispasr_session_set_hotwords(Pointer session, String hotwords, float boost);
+        int     crispasr_session_set_sensitivity(Pointer session, String preset);
         int     crispasr_session_set_g2p_dict(Pointer session, String source);
         int     crispasr_session_n_speakers(Pointer session);
         String  crispasr_session_get_speaker_name(Pointer session, int i);
         int     crispasr_session_set_instruct(Pointer session, String instruct);
         // #316: synthesize these phonemes verbatim, skipping the G2P. Empty clears. kokoro and piper only (rc=-2 otherwise).
         int          crispasr_session_set_tts_phonemes(Pointer session, String phonemes);
+        void         crispasr_session_set_tts_pad_silence_ms(Pointer session, int ms);
         int     crispasr_session_is_custom_voice(Pointer session);
         int     crispasr_session_is_voice_design(Pointer session);
         Pointer crispasr_session_synthesize(Pointer session, String text, IntByReference outNSamples);
         // UNMARKED synthesis — refused unless crispasr_session_accept_marking_responsibility() was called first.
         Pointer crispasr_session_synthesize_raw(Pointer session, String text, IntByReference outNSamples);
         int     crispasr_session_accept_marking_responsibility(Pointer session, String attestation);
+        // Whose voice a PRESET voice is (EU AI Act Art. 50(4)); -2 on a bad value.
+        int     crispasr_session_set_speaker_identity(Pointer session, String identity);
         // Speech-to-speech (lfm2-audio, mini-omni2, sidon, voxcpm2-vae). outText receives the intermediate transcript.
         Pointer crispasr_session_speech_to_speech(Pointer session, float[] inSamples, int nInSamples,
                                                   PointerByReference outText, IntByReference outNSamples);
         int     crispasr_session_input_sample_rate(Pointer session);
+        // #332: output-side counterparts (rate of synthesize/s2s PCM; mono channels).
+        int     crispasr_session_output_sample_rate(Pointer session);
+        int     crispasr_session_input_channels(Pointer session);
+        int     crispasr_session_output_channels(Pointer session);
         void    crispasr_pcm_free(Pointer pcm);
+        // AI-content marking (EU AI Act Art. 50(2)) — the other half of synthesize_raw.
+        void    crispasr_watermark_embed(float[] pcm, int nSamples, float alpha);
+        float   crispasr_watermark_detect(float[] pcm, int nSamples);
         int     crispasr_session_kokoro_clear_phoneme_cache(Pointer session);
         int     crispasr_session_set_source_language(Pointer session, String lang);
         int     crispasr_session_set_target_language(Pointer session, String lang);
+        int     crispasr_session_set_tts_reference_language(Pointer session, String lang);
         int     crispasr_session_set_punctuation(Pointer session, int enable);
         int     crispasr_session_set_translate(Pointer session, int enable);
         int     crispasr_session_set_temperature(Pointer session, float temperature, long seed);
@@ -76,6 +88,7 @@ public final class CrispasrSession implements AutoCloseable {
         int     crispasr_session_set_tts_noise_temp(Pointer session, float noiseTemp);
         int     crispasr_session_set_exaggeration(Pointer session, float exaggeration);
         int     crispasr_session_set_max_speech_tokens(Pointer session, int n);
+        int     crispasr_session_set_min_speech_tokens(Pointer session, int n);
         int     crispasr_session_set_length_scale(Pointer session, float scale);
         int     crispasr_session_set_best_of(Pointer session, int n);
         int     crispasr_session_set_beam_size(Pointer session, int n);
@@ -302,6 +315,9 @@ public final class CrispasrSession implements AutoCloseable {
         // Diarization
         int crispasr_diarize_segments_abi(float[] leftPcm, float[] rightPcm, int nSamples,
                                           int isStereo, Pointer segs, int nSegs, Pointer opts);
+        int crispasr_diarize_segments_turns_abi(float[] leftPcm, float[] rightPcm, int nSamples,
+                                                int isStereo, Pointer segs, int nSegs, Pointer opts,
+                                                Pointer outTurns, int turnsCap, IntByReference outNTurns);
 
         // Text-LID
         int crispasr_text_detect_language(String text, String modelPath, int nThreads,
@@ -394,6 +410,18 @@ public final class CrispasrSession implements AutoCloseable {
     public void setTargetLanguage(String lang) {
         int rc = Lib.INSTANCE.crispasr_session_set_target_language(handle, lang == null ? "" : lang);
         if (rc != 0) throw new IllegalStateException("set_target_language failed (rc=" + rc + ")");
+    }
+
+    /**
+     * Language a voice-cloning REFERENCE clip is spoken in (#329). Cross-lingual TTS backends
+     * (cosyvoice3) drop the reference transcript when it differs from the requested output
+     * language, so the clone speaks that language rather than carrying the reference's accent.
+     * Optional — otherwise inferred from the voice bank or the reference transcript, and that
+     * inference declines rather than guesses on a short transcript.
+     */
+    public void setTtsReferenceLanguage(String lang) {
+        int rc = Lib.INSTANCE.crispasr_session_set_tts_reference_language(handle, lang == null ? "" : lang);
+        if (rc != 0) throw new IllegalStateException("set_tts_reference_language failed (rc=" + rc + ")");
     }
 
     /** Toggle punctuation + capitalisation. Default true. */
@@ -496,6 +524,12 @@ public final class CrispasrSession implements AutoCloseable {
     public void setMaxSpeechTokens(int n) {
         int rc = Lib.INSTANCE.crispasr_session_set_max_speech_tokens(handle, n);
         if (rc != 0 && rc != -2) throw new IllegalStateException("set_max_speech_tokens failed (rc=" + rc + ")");
+    }
+
+    /** Floor on generated audio length (MOSS TTS). Units are codec frames at 12.5 Hz (80 ms each), so n=25 floors at ~2 s. Other backends no-op (rc=-2). */
+    public void setMinSpeechTokens(int n) {
+        int rc = Lib.INSTANCE.crispasr_session_set_min_speech_tokens(handle, n);
+        if (rc != 0 && rc != -2) throw new IllegalStateException("set_min_speech_tokens failed (rc=" + rc + ")");
     }
 
     /** Per-phoneme length-scale / speaking-rate scalar. Honoured by kokoro today; other backends no-op. */
@@ -643,6 +677,28 @@ public final class CrispasrSession implements AutoCloseable {
         if (rc != 0) throw new IllegalStateException("set_hotwords failed (rc=" + rc + ")");
     }
 
+    /**
+     * Apply a named bundle of the four decoder fallback thresholds:
+     * {@code "conservative"}, {@code "balanced"} (the shipped defaults, a no-op)
+     * or {@code "aggressive"}. {@code "strict"}/{@code "default"}/{@code "loose"}
+     * are aliases. Mirrors the CLI's {@code --sensitivity}.
+     *
+     * <p>The four thresholds interact — a decode is only retried when the logprob
+     * <em>and</em> no-speech bars are both crossed — so they move as a set. A later
+     * {@link #setFallbackThresholds} overrides this.
+     *
+     * @throws IllegalArgumentException if the preset is unrecognised; a typo is
+     *     never silently treated as {@code "balanced"}.
+     */
+    public void setSensitivity(String preset) {
+        int rc = Lib.INSTANCE.crispasr_session_set_sensitivity(handle, preset);
+        if (rc == -2) {
+            throw new IllegalArgumentException(
+                "unknown sensitivity preset '" + preset + "' (expected: conservative, balanced, aggressive)");
+        }
+        if (rc != 0) throw new IllegalStateException("set_sensitivity failed (rc=" + rc + ")");
+    }
+
     /** Select the G2P pronunciation dictionary for TTS ({@code olaph}/{@code open-dict}/path). */
     public void setG2pDict(String source) {
         int rc = Lib.INSTANCE.crispasr_session_set_g2p_dict(handle, source);
@@ -683,6 +739,11 @@ public final class CrispasrSession implements AutoCloseable {
         int rc = Lib.INSTANCE.crispasr_session_set_tts_phonemes(handle, phonemes == null ? "" : phonemes);
         if (rc == -2) throw new RuntimeException("backend has no phonemes-in entry point (kokoro and piper do)");
         if (rc != 0) throw new RuntimeException("set_tts_phonemes failed (rc=" + rc + ")");
+    }
+
+    /** Pad N ms of silence at the beginning of TTS output. Useful to bypass VLC playback bugs where it drops the first ~1.5s of audio while parsing a large C2PA chunk. */
+    public void setTtsPadSilenceMs(int ms) {
+        Lib.INSTANCE.crispasr_session_set_tts_pad_silence_ms(handle, ms);
     }
 
     /**
@@ -753,6 +814,71 @@ public final class CrispasrSession implements AutoCloseable {
         }
     }
 
+    /**
+     * Declare whose voice a PRESET voice is: {@code "real_person"},
+     * {@code "synthetic"} or {@code "unknown"}.
+     *
+     * <p>Cloning is not the only way to produce a deep fake: a preset voice
+     * shipped inside a model can be an identifiable individual — a named donor,
+     * or a corpus speaker such as VCTK's {@code p225} — and EU AI Act
+     * Art. 3(60) attaches to the audio resembling that person, not to which
+     * pipeline produced it. Setting {@code real_person} makes the Art. 50(4)
+     * reminder fire for a non-cloned voice.
+     *
+     * <p>It does <b>not</b> require a consent attestation: whether that donor
+     * agreed to the model being trained is a licensing matter settled upstream
+     * that you cannot attest to.
+     *
+     * @throws IllegalArgumentException on an unrecognised value, rather than
+     *         silently downgrading it to {@code unknown}.
+     */
+    public void setSpeakerIdentity(String identity) {
+        int rc = Lib.INSTANCE.crispasr_session_set_speaker_identity(
+                handle, identity == null ? "" : identity);
+        if (rc == -2) {
+            throw new IllegalArgumentException(
+                    "unrecognised speaker_identity '" + identity
+                            + "' (expected real_person, synthetic or unknown)");
+        }
+        if (rc != 0) {
+            throw new IllegalStateException("set_speaker_identity failed (rc=" + rc + ")");
+        }
+    }
+
+    /**
+     * Embed the AI-content watermark into mono float32 PCM, in place.
+     *
+     * <p>The other half of {@link #synthesizeRaw(String)}: opting out of
+     * automatic marking makes marking the result the integrator's duty under
+     * EU AI Act Art. 50(2), and this is what discharges it. Do the
+     * post-processing you opted out for — resample, mix, concatenate — then
+     * mark the finished buffer.
+     *
+     * <p>Uses the robust, reliably detectable default strength; AudioSeal
+     * instead when a model has been loaded. Static because marking is a
+     * property of the samples, not of the session that produced them.
+     */
+    public static void watermarkEmbed(float[] pcm) {
+        if (pcm == null || pcm.length == 0) {
+            return;
+        }
+        Lib.INSTANCE.crispasr_watermark_embed(pcm, pcm.length, -1.0f);
+    }
+
+    /**
+     * Confidence in [0, 1] that {@code pcm} carries the watermark.
+     *
+     * <p>A weak diagnostic, not proof: the spread-spectrum detector's null mean
+     * is 0.5, not 0, and a negative result on a short clip is mostly evidence
+     * that the clip was short. See {@code docs/eu-ai-act.md} §6.7.
+     */
+    public static float watermarkDetect(float[] pcm) {
+        if (pcm == null || pcm.length == 0) {
+            return 0.0f;
+        }
+        return Lib.INSTANCE.crispasr_watermark_detect(pcm, pcm.length);
+    }
+
     /** Result of {@link #speechToSpeech(float[])}: output PCM plus the intermediate transcript. */
     public static final class SpeechToSpeechResult {
         /** 24 kHz mono float32 PCM produced by the backend. */
@@ -801,6 +927,31 @@ public final class CrispasrSession implements AutoCloseable {
      */
     public int inputSampleRate() {
         return Lib.INSTANCE.crispasr_session_input_sample_rate(handle);
+    }
+
+    /**
+     * Sample rate of the PCM synthesize/speechToSpeech produce for this
+     * backend. Returns 0 when the backend has no audio output (ASR-only). (#332)
+     */
+    public int outputSampleRate() {
+        return Lib.INSTANCE.crispasr_session_output_sample_rate(handle);
+    }
+
+    /**
+     * Channel count for audio input: 1 (mono) for every current backend,
+     * 0 on error. Source separation is the stereo exception and has its own
+     * surface. (#332)
+     */
+    public int inputChannels() {
+        return Lib.INSTANCE.crispasr_session_input_channels(handle);
+    }
+
+    /**
+     * Channel count for synthesized / s2s output audio: 1 (mono), or 0 when
+     * the backend has no audio output. (#332)
+     */
+    public int outputChannels() {
+        return Lib.INSTANCE.crispasr_session_output_channels(handle);
     }
 
     /**

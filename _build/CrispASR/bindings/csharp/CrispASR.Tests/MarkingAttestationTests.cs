@@ -21,16 +21,10 @@ namespace CrispASR.Tests
     /// </summary>
     public class MarkingAttestationTests
     {
-        private static bool CanLoadLibrary()
-        {
-            try
-            {
-                _ = Session.AvailableBackends();
-                return true;
-            }
-            catch (DllNotFoundException) { return false; }
-            catch (EntryPointNotFoundException) { return false; }
-        }
+        // Routed through Live so CRISPASR_CS_REQUIRE_LIVE can turn a silent
+        // skip into a failure (issue #291 — nothing in CI ever loaded the
+        // library, so the suite was green either way).
+        private static bool CanLoadLibrary() => Live.LibraryLoadable();
 
         [Fact]
         public void AcceptMarkingResponsibility_NativeEntryPoint_ResolvesAndIsNullSafe()
@@ -69,7 +63,7 @@ namespace CrispASR.Tests
         {
             if (!CanLoadLibrary()) return;
             var modelPath = Environment.GetEnvironmentVariable("CRISPASR_MODEL_TTS");
-            if (string.IsNullOrEmpty(modelPath) || !System.IO.File.Exists(modelPath)) return; // skip
+            if (!Live.Model(modelPath, "CRISPASR_MODEL_TTS")) return;
 
             using var s = Session.Open(modelPath);
             // Without an attestation the unmarked path must be hard-refused.

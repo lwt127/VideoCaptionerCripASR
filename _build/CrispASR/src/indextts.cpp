@@ -47,6 +47,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // External text-normalizer hook is available on macOS host + Linux only:
 //   * iOS / tvOS / watchOS / visionOS: system() is __API_UNAVAILABLE(ios)
@@ -725,7 +726,7 @@ struct indextts_context {
             ggml_free(ctx_w);
         }
         if (buf_w) {
-            ggml_backend_buffer_free(buf_w);
+            core_gguf::release_weight_buffer(buf_w);
         }
         if (backend && backend != backend_cpu) {
             ggml_backend_free(backend);
@@ -2326,7 +2327,7 @@ extern "C" struct indextts_context* indextts_init_from_file(const char* path_mod
     }
 
     // Backend
-    c->backend_cpu = ggml_backend_cpu_init();
+    c->backend_cpu = core_cpu_backend::init();
     if (!c->backend_cpu) {
         fprintf(stderr, "indextts: failed to init CPU backend\n");
         delete c;

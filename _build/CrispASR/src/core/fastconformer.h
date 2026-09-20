@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 namespace core_conformer {
 
@@ -78,7 +79,7 @@ static inline bool fc_gpu_manual_attn(ggml_backend_t backend) {
         const char* e = std::getenv("CRISPASR_FC_GPU_MANUAL_ATTN");
         v = (!e || !*e) ? -1 : (*e != '0' ? 1 : 0);
     }
-    if (v == 0 || !backend || ggml_backend_is_cpu(backend))
+    if (v == 0 || !backend || core_cpu_backend::is_cpu(backend))
         return false;
     if (v == 1)
         return true;

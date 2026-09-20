@@ -59,9 +59,15 @@ crispasr -m auto --backend cohere -f meeting.wav \
 `--diarize-speakers` is shorthand for `--diarize --diarize-method pyannote
 --diarize-embedder auto` (it only fills in fields you didn't set explicitly):
 the pyannote segmenter gives proper speaker-turn boundaries and the embedder
-clusters them into stable per-recording labels. Tune clustering with
-`--diarize-cluster-threshold` (default `0.5`; higher = more distinct clusters)
-and `--diarize-max-speakers` (default `8`). The first run auto-downloads the
+clusters them into stable per-recording labels. By default the embedding stage
+**estimates the speaker count itself** (`core_spectral::cluster_speakers` —
+PCA + GMM/BIC, then spectral clustering), bounded above by
+`--diarize-max-speakers` (default `8`) and, when you know it, pinned by
+`--diarize-num-speakers`. Passing `--diarize-cluster-threshold` *explicitly*
+(default `0.5`; higher = more distinct clusters) switches that stage to the
+legacy agglomerative single-linkage clusterer instead — the threshold is
+meaningless to the spectral path, so its default value is never applied.
+The first run auto-downloads the
 pyannote segmentation GGUF (~6 MB) and the TitaNet embedder (~46 MB).
 
 The output uses generic labels:
@@ -236,14 +242,20 @@ path commercially.
 
 To stay clearly on the safe side, prefer **section 1** and rename manually.
 
+The full AI Act position — including why the constraints above keep this
+outside Annex III(1)(a), and what the Act requires of you as deployer — is in
+[`eu-ai-act.md`](eu-ai-act.md).
+
 ---
 
 ## Implementation notes
 
 - Session clustering: `crispasr_remap_speakers_via_embeddings()` in
   `examples/cli/crispasr_diarize_cli.cpp` — per-recording embedding extraction
-  + agglomerative clustering (`src/crispasr_speaker_cluster.cpp`). No
-  persistence.
+  + `core_spectral::cluster_speakers()` (`src/core/spectral_diarize.h`, the
+  count-estimating spectral clusterer foxnose also uses), falling back to
+  `crispasr_agglomerative_cluster()` (`src/crispasr_speaker_cluster.cpp`) only
+  when `--diarize-cluster-threshold` was passed explicitly. No persistence.
 - Embedder adapters (pluggable): `src/crispasr_speaker_embedder.{h,cpp}`
   (TitaNet-Large 192-d default; IndexTTS-BigVGAN ECAPA-TDNN 512-d).
 - Named profiles: `src/speaker_db.{h,cpp}` — the `.spkr` on-disk format
@@ -261,6 +273,60 @@ To stay clearly on the safe side, prefer **section 1** and rename manually.
   points; the pre-#266 ungated `_load`/`_enroll` symbols refuse at runtime.
 
 See [`cli.md`](cli.md#diarization) for the full diarization flag reference.
+
+## Splitting a segment that spans two speakers (#395)
+
+Diarization **labels** the segments you hand it. That means the label
+resolution can never be finer than your own segment grid: a segment that
+straddles a speaker change is awarded to whoever holds the majority of it, and
+the other speaker's words are silently absorbed. It is not a clustering
+failure — FoxNose finds the boundary, the caller's grid just cannot express it.
+
+You cannot fix this by sending a finer grid, either. FoxNose skips any span
+shorter than `kMinSegmentSeconds = 0.4 s`
+(`src/core/foxnose_pipeline.h`), so a per-word grid starves the embedder and
+the clusterer under-counts speakers. Coarse segments cluster well and label
+coarsely; fine segments cluster badly. The way out is the third option: label
+coarse, then **split on the turns the method derived from the audio**.
+
+FoxNose produces those turns anyway — they are what the labelling reads. Ask
+for them and you get the audio's own boundaries, independent of your grid:
+
+| Surface | Entry point |
+|---|---|
+| C++ | `crispasr_diarize_segments(..., std::vector<CrispasrDiarizeTurn>* out_turns)` |
+| C ABI | `crispasr_diarize_segments_turns_abi(...)` (0.8.30+) |
+| Rust | `crispasr::diarize_segments_with_turns(...) -> Result<Vec<DiarizeTurn>, String>` |
+| Go | `whisper.DiarizeSegmentsWithTurns(...) ([]DiarizeTurn, error)` |
+| Python | `diarize_segments_with_turns(...) -> (bool, list[DiarizeTurn])` |
+| Dart | `diarizeSegments(..., outTurns: turns)` |
+| Java/JNA | `Lib.crispasr_diarize_segments_turns_abi(...)` |
+
+All surfaces are additive: the segments come back labelled exactly as they would
+without the turns, and every other method reports zero turns rather than an
+error. Turn timestamps are on the **same absolute timeline as your segments**
+(the ABI adds `slice_t0_cs` back on the way out), so they compare directly.
+
+With word timings, the recipe is: merge words into utterance-length spans,
+then cut each merged run wherever the turn id changes rather than only at a
+gap threshold, re-merging within those bounds so every piece still clears the
+0.4 s floor — a piece that cannot reach it joins the neighbour it overlaps
+most instead of being dropped.
+
+The C ABI is a **new symbol**, not a signature change, so existing callers are
+untouched (the same append-only convention as `crispasr_diarize_opts_abi`).
+Its turn buffer is caller-allocated: pass `out_n_turns` to learn the count,
+`out_turns` + `n_turns_cap` to receive them, and expect `2` when the buffer
+was short — the segments are still labelled, `*out_n_turns` holds the required
+capacity, and a retry costs a second full pass because the ABI keeps no state
+between calls. The Rust, Go, Python, and Dart wrappers size the buffer from
+the audio length
+(one slot per 0.5 s, above FoxNose's 0.6 s embedding hop) and retry once on
+`2`, so their callers never see any of that.
+
+Java exposes both calls at its low-level JNA surface. JavaScript and Ruby do
+not currently expose standalone diarization; their unused native declarations
+are not public binding APIs.
 
 ## pyannote segmentation: chunked inference and the powerset layout (#326)
 
@@ -310,15 +376,27 @@ Two properties worth relying on:
   | path | mean DER |
   |---|---|
   | raw posteriors, no clustering (the A/B harness above) | 33.37% |
-  | `--diarize-method pyannote --diarize-embedder auto` | **15.74%** |
+  | `--diarize-method pyannote --diarize-embedder auto` | **7.81%** |
   | `--diarize-method foxnose` (#324) | **7.32%** |
 
-  foxnose is the one to reach for. The pyannote+TitaNet path over-clusters: it
-  hit the `--diarize-max-speakers 8` cap on 4 of the 8 files (esrit 8 vs 5 real,
-  mesob 8 vs 4, nnqfq 8 vs 5), which is where most of its remaining DER lives.
+  The two shipped paths are now within half a point of each other. The
+  pyannote+TitaNet figure was **15.74%** until `a719c89d`: it over-clustered,
+  pinning to the `--diarize-max-speakers 8` cap on 4 of the 8 files (esrit 8 vs
+  5 real, mesob 8 vs 4, nnqfq 8 vs 5, fsaal 8 vs 7), because single-linkage at a
+  fixed 0.5 threshold never reached the threshold and the cap became the answer.
+  Routing it through the same `core_spectral::cluster_speakers` that foxnose
+  uses — which ESTIMATES the count — closed most of the gap.
   (The 7.32% here is foxnose labelling whisper-tiny's ASR segments; #324's
   3.18% scored foxnose's own turns directly, without ASR segmentation as a
   ceiling. Different measurement, not a regression.)
+
+  Both rows are reproducible from a clean corpus extraction with
+  `tools/der_voxconverse.py` (`--prepare` pulls the 8 dev files and their human
+  labels straight out of the HuggingFace parquet shards). Re-measured that way
+  on 2026-08-03: mean 7.81%, per-file counts 5/6/3/4/5/4/3/3 against ground
+  truth 5/7/4/4/5/4/5/2 — the counts no longer pin to the cap, but the
+  estimator now UNDER-counts on 3 of 8. That is the remaining accuracy item
+  (root `PLAN.md` NOW §2).
 
 This also moves toward pyannote's own design rather than away from it:
 upstream infers on a sliding 10 s window, and one continuous 48-minute scan

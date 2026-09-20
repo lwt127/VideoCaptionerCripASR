@@ -38,24 +38,35 @@ extern int crispasr_session_set_speaker_name(struct CrispasrSession* s, const ch
 extern int crispasr_session_set_speaker_id(struct CrispasrSession* s, int id);
 extern int crispasr_session_set_punc_model(struct CrispasrSession* s, const char* punc_model);
 extern int crispasr_session_set_hotwords(struct CrispasrSession* s, const char* hotwords, float boost);
+extern int crispasr_session_set_sensitivity(struct CrispasrSession* s, const char* preset);
 extern int crispasr_session_set_g2p_dict(struct CrispasrSession* s, const char* source);
 extern int crispasr_session_n_speakers(struct CrispasrSession* s);
 extern const char* crispasr_session_get_speaker_name(struct CrispasrSession* s, int i);
 extern int crispasr_session_set_instruct(struct CrispasrSession* s, const char* instruct);
 /* #316: synthesize these phonemes verbatim, skipping the G2P. Empty clears. kokoro and piper only (rc=-2 otherwise). */
 extern int crispasr_session_set_tts_phonemes(struct CrispasrSession* s, const char* phonemes);
+extern void crispasr_session_set_tts_pad_silence_ms(struct CrispasrSession* s, int ms);
 extern int crispasr_session_is_custom_voice(struct CrispasrSession* s);
 extern int crispasr_session_is_voice_design(struct CrispasrSession* s);
 extern float* crispasr_session_synthesize(struct CrispasrSession* s, const char* text, int* out_n_samples);
 extern float* crispasr_session_synthesize_raw(struct CrispasrSession* s, const char* text, int* out_n_samples);
 extern int crispasr_session_accept_marking_responsibility(struct CrispasrSession* s, const char* attestation);
+extern int crispasr_session_set_speaker_identity(struct CrispasrSession* s, const char* identity);
 extern float* crispasr_session_speech_to_speech(struct CrispasrSession* s, const float* in_samples, int n_in_samples,
                                                 char** out_text, int* out_n_samples);
 extern int crispasr_session_input_sample_rate(struct CrispasrSession* s);
+/* #332: output-side counterparts (rate of synthesize/s2s PCM; mono channels). */
+extern int crispasr_session_output_sample_rate(struct CrispasrSession* s);
+extern int crispasr_session_input_channels(struct CrispasrSession* s);
+extern int crispasr_session_output_channels(struct CrispasrSession* s);
 extern void crispasr_pcm_free(float* pcm);
+/* AI-content marking (EU AI Act Art. 50(2)) — the other half of synthesize_raw. */
+extern void crispasr_watermark_embed(float* pcm, int n_samples, float alpha);
+extern float crispasr_watermark_detect(const float* pcm, int n_samples);
 extern int crispasr_session_kokoro_clear_phoneme_cache(struct CrispasrSession* s);
 extern int crispasr_session_set_source_language(struct CrispasrSession* s, const char* lang);
 extern int crispasr_session_set_target_language(struct CrispasrSession* s, const char* lang);
+extern int crispasr_session_set_tts_reference_language(struct CrispasrSession* s, const char* lang);
 extern int crispasr_session_set_punctuation(struct CrispasrSession* s, int enable);
 extern int crispasr_session_set_translate(struct CrispasrSession* s, int enable);
 extern int crispasr_session_set_temperature(struct CrispasrSession* s, float temperature, unsigned long long seed);
@@ -73,6 +84,7 @@ extern int crispasr_session_set_cfg_weight(struct CrispasrSession* s, float cfg_
 extern int crispasr_session_set_tts_noise_temp(struct CrispasrSession* s, float noise_temp);
 extern int crispasr_session_set_exaggeration(struct CrispasrSession* s, float exaggeration);
 extern int crispasr_session_set_max_speech_tokens(struct CrispasrSession* s, int n);
+extern int crispasr_session_set_min_speech_tokens(struct CrispasrSession* s, int n);
 extern int crispasr_session_set_length_scale(struct CrispasrSession* s, float scale);
 extern int crispasr_session_set_best_of(struct CrispasrSession* s, int n);
 extern int crispasr_session_set_beam_size(struct CrispasrSession* s, int n);
@@ -389,6 +401,19 @@ static VALUE rb_session_set_target_language(VALUE self, VALUE handle, VALUE lang
     return Qnil;
 }
 
+/* #329: the language a voice-cloning REFERENCE clip is spoken in. Cross-lingual
+ * TTS backends (cosyvoice3) drop the reference transcript when it differs from
+ * the requested output language, so the clone speaks that language instead of
+ * carrying the reference's accent. Optional — otherwise inferred from the voice
+ * bank or the reference transcript. */
+static VALUE rb_session_set_tts_reference_language(VALUE self, VALUE handle, VALUE lang) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_tts_reference_language(s, NIL_P(lang) ? "" : StringValueCStr(lang));
+    if (rc != 0)
+        rb_raise(rb_eRuntimeError, "set_tts_reference_language failed (rc=%d)", rc);
+    return Qnil;
+}
+
 static VALUE rb_session_set_punctuation(VALUE self, VALUE handle, VALUE enable) {
     struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
     int rc = crispasr_session_set_punctuation(s, RTEST(enable) ? 1 : 0);
@@ -523,6 +548,14 @@ static VALUE rb_session_set_max_speech_tokens(VALUE self, VALUE handle, VALUE n)
     int rc = crispasr_session_set_max_speech_tokens(s, NUM2INT(n));
     if (rc != 0 && rc != -2)
         rb_raise(rb_eRuntimeError, "set_max_speech_tokens failed (rc=%d)", rc);
+    return Qnil;
+}
+
+static VALUE rb_session_set_min_speech_tokens(VALUE self, VALUE handle, VALUE n) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_min_speech_tokens(s, NUM2INT(n));
+    if (rc != 0 && rc != -2)
+        rb_raise(rb_eRuntimeError, "set_min_speech_tokens failed (rc=%d)", rc);
     return Qnil;
 }
 
@@ -683,6 +716,20 @@ static VALUE rb_session_set_hotwords(VALUE self, VALUE handle, VALUE hotwords, V
     return Qnil;
 }
 
+/* Named bundle of the four decoder fallback thresholds: "conservative",
+ * "balanced" (the shipped defaults, a no-op) or "aggressive". Mirrors the CLI's
+ * --sensitivity. rc=-2 is an unrecognised name, raised as ArgumentError so a
+ * typo is never silently treated as "balanced". */
+static VALUE rb_session_set_sensitivity(VALUE self, VALUE handle, VALUE preset) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_sensitivity(s, NIL_P(preset) ? "" : StringValueCStr(preset));
+    if (rc == -2)
+        rb_raise(rb_eArgError, "unknown sensitivity preset (expected: conservative, balanced, aggressive)");
+    if (rc != 0)
+        rb_raise(rb_eRuntimeError, "set_sensitivity failed (rc=%d)", rc);
+    return Qnil;
+}
+
 static VALUE rb_session_set_g2p_dict(VALUE self, VALUE handle, VALUE source) {
     struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
     int rc = crispasr_session_set_g2p_dict(s, NIL_P(source) ? "" : StringValueCStr(source));
@@ -722,6 +769,12 @@ static VALUE rb_session_set_tts_phonemes(VALUE self, VALUE handle, VALUE phoneme
                  "backend has no phonemes-in entry point; set_tts_phonemes applies to kokoro and piper");
     if (rc != 0)
         rb_raise(rb_eRuntimeError, "set_tts_phonemes failed (rc=%d)", rc);
+    return Qnil;
+}
+
+static VALUE rb_session_set_tts_pad_silence_ms(VALUE self, VALUE handle, VALUE ms) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    crispasr_session_set_tts_pad_silence_ms(s, NUM2INT(ms));
     return Qnil;
 }
 
@@ -779,6 +832,70 @@ static VALUE rb_session_accept_marking_responsibility(VALUE self, VALUE handle, 
     return INT2NUM(rc);
 }
 
+// CrispASR::Session.set_speaker_identity(handle, identity) -> Integer rc
+//   Declare whose voice a PRESET voice is: "real_person", "synthetic" or
+//   "unknown". A preset shipped inside a model can be an identifiable
+//   individual, which makes its output a deep fake under EU AI Act Art. 3(60)
+//   even though nothing was cloned. Setting real_person makes the Art. 50(4)
+//   reminder fire for a non-cloned voice; it does NOT require a consent
+//   attestation. Raises ArgumentError on an unrecognised value rather than
+//   silently downgrading it to "unknown".
+static VALUE rb_session_set_speaker_identity(VALUE self, VALUE handle, VALUE identity) {
+    (void)self;
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    int rc = crispasr_session_set_speaker_identity(s, NIL_P(identity) ? "" : StringValueCStr(identity));
+    if (rc == -2)
+        rb_raise(rb_eArgError, "unrecognised speaker_identity (expected real_person, synthetic or unknown)");
+    return INT2NUM(rc);
+}
+
+// CrispASR::Session.watermark_embed(pcm_array) -> Array<Float>
+//   The other half of synthesize_raw. Opting out of automatic marking makes
+//   marking the result the caller's duty under EU AI Act Art. 50(2), and this
+//   is what discharges it: post-process the unmarked PCM, then mark the
+//   finished buffer. Uses the robust, reliably detectable default strength
+//   (alpha <= 0); AudioSeal instead when a model is loaded.
+//   Returns a new marked array — Ruby Floats are boxed, so in-place would mean
+//   mutating boxed objects the caller may share.
+static VALUE rb_watermark_embed(VALUE self, VALUE pcm_arr) {
+    (void)self;
+    Check_Type(pcm_arr, T_ARRAY);
+    long n = RARRAY_LEN(pcm_arr);
+    if (n <= 0)
+        return rb_ary_new_capa(0);
+    float* buf = (float*)malloc(sizeof(float) * (size_t)n);
+    if (!buf)
+        rb_raise(rb_eNoMemError, "alloc failed");
+    for (long i = 0; i < n; i++)
+        buf[i] = (float)NUM2DBL(rb_ary_entry(pcm_arr, i));
+    crispasr_watermark_embed(buf, (int)n, -1.0f);
+    VALUE out = rb_ary_new_capa(n);
+    for (long i = 0; i < n; i++)
+        rb_ary_push(out, DBL2NUM((double)buf[i]));
+    free(buf);
+    return out;
+}
+
+// CrispASR::Session.watermark_detect(pcm_array) -> Float in [0, 1]
+//   A weak diagnostic, not proof: the spread-spectrum null mean is 0.5, not 0,
+//   and a negative result on a short clip is mostly evidence the clip was
+//   short. See docs/eu-ai-act.md §6.7 before reading anything into the number.
+static VALUE rb_watermark_detect(VALUE self, VALUE pcm_arr) {
+    (void)self;
+    Check_Type(pcm_arr, T_ARRAY);
+    long n = RARRAY_LEN(pcm_arr);
+    if (n <= 0)
+        return DBL2NUM(0.0);
+    float* buf = (float*)malloc(sizeof(float) * (size_t)n);
+    if (!buf)
+        rb_raise(rb_eNoMemError, "alloc failed");
+    for (long i = 0; i < n; i++)
+        buf[i] = (float)NUM2DBL(rb_ary_entry(pcm_arr, i));
+    float score = crispasr_watermark_detect(buf, (int)n);
+    free(buf);
+    return DBL2NUM((double)score);
+}
+
 // CrispASR::Session.speech_to_speech(handle, pcm_array)
 //   -> [Array<Float> pcm, String|nil transcript]. Speech-to-speech backends
 //   (lfm2-audio, mini-omni2): the input PCM is answered as spoken audio; the
@@ -821,6 +938,26 @@ static VALUE rb_session_speech_to_speech(VALUE self, VALUE handle, VALUE pcm_arr
 static VALUE rb_session_input_sample_rate(VALUE self, VALUE handle) {
     struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
     return INT2NUM(crispasr_session_input_sample_rate(s));
+}
+
+// CrispASR::Session.output_sample_rate(handle) -> Integer
+//   Sample rate of the PCM synthesize/speech_to_speech produce; 0 when the
+//   backend has no audio output (ASR-only). (#332)
+static VALUE rb_session_output_sample_rate(VALUE self, VALUE handle) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    return INT2NUM(crispasr_session_output_sample_rate(s));
+}
+
+// CrispASR::Session.input_channels(handle) / output_channels(handle) -> Integer
+//   1 (mono) for every current backend; output_channels is 0 for ASR-only. (#332)
+static VALUE rb_session_input_channels(VALUE self, VALUE handle) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    return INT2NUM(crispasr_session_input_channels(s));
+}
+
+static VALUE rb_session_output_channels(VALUE self, VALUE handle) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    return INT2NUM(crispasr_session_output_channels(s));
 }
 
 // --- ASR transcription (PLAN #59) ---
@@ -1744,10 +1881,12 @@ void init_ruby_crispasr_session(VALUE* mWhisper) {
     rb_define_singleton_method(mSession, "set_speaker_id", rb_session_set_speaker_id, 2);
     rb_define_singleton_method(mSession, "set_punc_model", rb_session_set_punc_model, 2);
     rb_define_singleton_method(mSession, "set_hotwords", rb_session_set_hotwords, 3);
+    rb_define_singleton_method(mSession, "set_sensitivity", rb_session_set_sensitivity, 2);
     rb_define_singleton_method(mSession, "set_g2p_dict", rb_session_set_g2p_dict, 2);
     rb_define_singleton_method(mSession, "speakers", rb_session_speakers, 1);
     rb_define_singleton_method(mSession, "set_instruct", rb_session_set_instruct, 2);
     rb_define_singleton_method(mSession, "set_tts_phonemes", rb_session_set_tts_phonemes, 2);
+    rb_define_singleton_method(mSession, "set_tts_pad_silence_ms", rb_session_set_tts_pad_silence_ms, 2);
     rb_define_singleton_method(mSession, "is_custom_voice", rb_session_is_custom_voice, 1);
     rb_define_singleton_method(mSession, "is_voice_design", rb_session_is_voice_design, 1);
     rb_define_singleton_method(mSession, "synthesize", rb_session_synthesize, 2);
@@ -1755,6 +1894,9 @@ void init_ruby_crispasr_session(VALUE* mWhisper) {
     rb_define_singleton_method(mSession, "accept_marking_responsibility", rb_session_accept_marking_responsibility, 2);
     rb_define_singleton_method(mSession, "speech_to_speech", rb_session_speech_to_speech, 2);
     rb_define_singleton_method(mSession, "input_sample_rate", rb_session_input_sample_rate, 1);
+    rb_define_singleton_method(mSession, "output_sample_rate", rb_session_output_sample_rate, 1);
+    rb_define_singleton_method(mSession, "input_channels", rb_session_input_channels, 1);
+    rb_define_singleton_method(mSession, "output_channels", rb_session_output_channels, 1);
     rb_define_singleton_method(mSession, "transcribe", rb_session_transcribe, 2);
     rb_define_singleton_method(mSession, "transcribe_with_logits", rb_session_transcribe_with_logits, 2);
     rb_define_singleton_method(mSession, "ctc_vocab", rb_session_ctc_vocab, 1);
@@ -1765,6 +1907,7 @@ void init_ruby_crispasr_session(VALUE* mWhisper) {
     rb_define_singleton_method(mSession, "clear_phoneme_cache", rb_session_clear_phoneme_cache, 1);
     rb_define_singleton_method(mSession, "set_source_language", rb_session_set_source_language, 2);
     rb_define_singleton_method(mSession, "set_target_language", rb_session_set_target_language, 2);
+    rb_define_singleton_method(mSession, "set_tts_reference_language", rb_session_set_tts_reference_language, 2);
     rb_define_singleton_method(mSession, "set_punctuation", rb_session_set_punctuation, 2);
     rb_define_singleton_method(mSession, "set_translate", rb_session_set_translate, 2);
     rb_define_singleton_method(mSession, "set_temperature", rb_session_set_temperature, 3);
@@ -1782,6 +1925,7 @@ void init_ruby_crispasr_session(VALUE* mWhisper) {
     rb_define_singleton_method(mSession, "set_tts_noise_temp", rb_session_set_tts_noise_temp, 2);
     rb_define_singleton_method(mSession, "set_exaggeration", rb_session_set_exaggeration, 2);
     rb_define_singleton_method(mSession, "set_max_speech_tokens", rb_session_set_max_speech_tokens, 2);
+    rb_define_singleton_method(mSession, "set_min_speech_tokens", rb_session_set_min_speech_tokens, 2);
     rb_define_singleton_method(mSession, "set_length_scale", rb_session_set_length_scale, 2);
     rb_define_singleton_method(mSession, "set_best_of", rb_session_set_best_of, 2);
     rb_define_singleton_method(mSession, "set_beam_size", rb_session_set_beam_size, 2);
@@ -1837,6 +1981,9 @@ void init_ruby_crispasr_session(VALUE* mWhisper) {
     rb_define_singleton_method(mSession, "speaker_db_count", rb_speaker_db_count, 1);
     rb_define_singleton_method(mSession, "speaker_db_match", rb_speaker_db_match, 3);
     rb_define_singleton_method(mSession, "speaker_db_enroll", rb_speaker_db_enroll, 4);
+    rb_define_singleton_method(mSession, "set_speaker_identity", rb_session_set_speaker_identity, 2);
+    rb_define_singleton_method(mSession, "watermark_embed", rb_watermark_embed, 1);
+    rb_define_singleton_method(mSession, "watermark_detect", rb_watermark_detect, 1);
 
     // Mic (PLAN #62d) — CrispASR::Mic.{open(rate, channels) { |pcm| ... }, start, stop, close, default_device_name}.
     mMic = rb_define_module_under(mCrispASR, "Mic");

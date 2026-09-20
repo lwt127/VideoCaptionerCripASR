@@ -10,6 +10,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "crispasr_aligner.h"
+#include "core/qwen3_forced_aligner.h"
 
 #include <chrono>
 #include <cstdio>
@@ -41,6 +42,32 @@ TEST_CASE("align-only: crispasr_align_words null/empty safety", "[unit][align]")
 TEST_CASE("align-only: crispasr_aligner_free_cache does not crash when empty", "[unit][align]") {
     crispasr_aligner_free_cache(); // must not crash
     crispasr_aligner_free_cache(); // double-free safety
+}
+
+TEST_CASE("align-only: each segment gets its own audio interval", "[unit][align][issue444]") {
+    constexpr int sr = 16000;
+    const int slice_start = 10 * sr;
+    const int slice_end = 100 * sr;
+
+    // Two segments in one VAD slice must not both restart at the slice origin.
+    const auto first = crispasr_alignment_audio_range(7197, 8509, slice_start, slice_end, sr);
+    const auto second = crispasr_alignment_audio_range(8893, 8901, slice_start, slice_end, sr);
+    REQUIRE(first.valid());
+    REQUIRE(second.valid());
+    CHECK(first.start == 7197 * sr / 100);
+    CHECK(first.end == 8509 * sr / 100);
+    CHECK(first.offset_cs == 7197);
+    CHECK(second.start >= first.end);
+    CHECK(second.offset_cs == 8893);
+
+    // Context-expanded timestamps are clipped to the actual slice samples.
+    const auto clipped = crispasr_alignment_audio_range(500, 12000, slice_start, slice_end, sr);
+    REQUIRE(clipped.valid());
+    CHECK(clipped.start == slice_start);
+    CHECK(clipped.end == slice_end);
+    CHECK(clipped.offset_cs == 1000);
+
+    CHECK_FALSE(crispasr_alignment_audio_range(5000, 5000, slice_start, slice_end, sr).valid());
 }
 
 // Join cue texts back into the flat transcript --align-only feeds the aligner.
@@ -117,6 +144,62 @@ TEST_CASE("align-only: SRT cue parsing", "[unit][align]") {
     }
 }
 
+TEST_CASE("align-only: JSON segment parsing (#317)", "[unit][align]") {
+    SECTION("CrispASR --output-json format") {
+        const char* json = R"({
+  "systeminfo": "...",
+  "model": {},
+  "transcription": [
+    {"timestamps": {"from": "00:00:00,400", "to": "00:00:02,160"}, "text": "And so my fellow Americans"},
+    {"timestamps": {"from": "00:00:03,520", "to": "00:00:07,280"}, "text": "ask not what your country can do for you"}
+  ]
+})";
+        auto segs = crispasr_parse_json_segments(json);
+        REQUIRE(segs.size() == 2);
+        CHECK(segs[0] == "And so my fellow Americans");
+        CHECK(segs[1] == "ask not what your country can do for you");
+    }
+
+    SECTION("align-only JSON output format (array of objects)") {
+        const char* json = R"([
+  {"text": "And so my fellow Americans", "start": 0.400, "end": 2.160},
+  {"text": "ask not what your country can do for you", "start": 3.520, "end": 7.280}
+])";
+        auto segs = crispasr_parse_json_segments(json);
+        REQUIRE(segs.size() == 2);
+        CHECK(segs[0] == "And so my fellow Americans");
+        CHECK(segs[1] == "ask not what your country can do for you");
+    }
+
+    SECTION("escaped characters in text") {
+        const char* json = R"({"transcription": [{"text": "He said \"hello\" and\\left"}]})";
+        auto segs = crispasr_parse_json_segments(json);
+        REQUIRE(segs.size() == 1);
+        CHECK(segs[0] == "He said \"hello\" and\\left");
+    }
+
+    SECTION("empty transcription array") {
+        auto segs = crispasr_parse_json_segments(R"({"transcription": []})");
+        CHECK(segs.empty());
+    }
+
+    SECTION("whitespace-only text is skipped") {
+        auto segs = crispasr_parse_json_segments(R"({"transcription": [{"text": "  "}, {"text": "real"}]})");
+        REQUIRE(segs.size() == 1);
+        CHECK(segs[0] == "real");
+    }
+
+    SECTION("no transcription key returns empty") {
+        auto segs = crispasr_parse_json_segments(R"({"something": "else"})");
+        CHECK(segs.empty());
+    }
+
+    SECTION("invalid JSON returns empty") {
+        auto segs = crispasr_parse_json_segments("not json at all");
+        CHECK(segs.empty());
+    }
+}
+
 TEST_CASE("align-only: tokenise_align_words", "[unit][align]") {
     SECTION("space-delimited") {
         auto w = crispasr_tokenise_align_words("Hello  world\tfoo\nbar");
@@ -125,7 +208,7 @@ TEST_CASE("align-only: tokenise_align_words", "[unit][align]") {
         CHECK(w[3] == "bar");
     }
     SECTION("CJK splits per character") {
-        auto w = crispasr_tokenise_align_words("你好world");
+        auto w = crispasr_tokenise_align_words("你好，world!");
         REQUIRE(w.size() == 3);
         CHECK(w[0] == "你");
         CHECK(w[1] == "好");
@@ -134,6 +217,19 @@ TEST_CASE("align-only: tokenise_align_words", "[unit][align]") {
     SECTION("empty") {
         CHECK(crispasr_tokenise_align_words("").empty());
         CHECK(crispasr_tokenise_align_words("  \n\t").empty());
+    }
+}
+
+TEST_CASE("align-only: Qwen3 timestamp repair matches Python blueprint", "[unit][align][issue444]") {
+    SECTION("first-maximum LIS tie and short anomaly snapping") {
+        std::vector<int> ts{0, 0, 1, 0};
+        core_qwen3_forced_aligner::fix_timestamps(ts);
+        CHECK(ts == std::vector<int>{0, 0, 1, 1});
+    }
+    SECTION("long anomaly run interpolates") {
+        std::vector<int> ts{0, 8, 7, 6, 5, 16};
+        core_qwen3_forced_aligner::fix_timestamps(ts);
+        CHECK(ts == std::vector<int>{0, 8, 10, 12, 14, 16});
     }
 }
 

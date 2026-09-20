@@ -186,10 +186,12 @@ def median(xs):
 # ─────────────────────────── cell 4 (code) — A/B matrix ───────────────────
 CONFIGS = [
     ("A_gpu8", {}),
-    ("B_cpu8", {"CRISPASR_VOXTRAL_TTS_FM_CPU": "1"}),
+    # B_cpu8 / E_cpu5 removed: CRISPASR_VOXTRAL_TTS_FM_CPU was dropped from
+    # the C++ side after this A/B concluded (current voxtral_tts.cpp reads
+    # only TIMING/FM_STEPS/DEBUG/...), so those arms would silently run the
+    # same GPU path as A/D and report a fabricated "CPU" result.
     ("C_gpu7", {"CRISPASR_VOXTRAL_TTS_FM_STEPS": "7"}),
     ("D_gpu5", {"CRISPASR_VOXTRAL_TTS_FM_STEPS": "5"}),
-    ("E_cpu5", {"CRISPASR_VOXTRAL_TTS_FM_CPU": "1", "CRISPASR_VOXTRAL_TTS_FM_STEPS": "5"}),
 ]
 
 summary = {"gpu": gpu_name, "cuda_arch": arch, "text": TEXT, "seed": SEED, "configs": {}}

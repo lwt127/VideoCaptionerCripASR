@@ -191,9 +191,6 @@ class VideoInfoCard(CardWidget):
             ]
             if need_language_settings and not self.show_language_settings():
                 return
-        self.progress_ring.show()
-        self.progress_ring.setValue(100)
-        self.start_button.setDisabled(True)
         self.start_transcription()
 
     def on_open_folder_clicked(self):
@@ -221,17 +218,29 @@ class VideoInfoCard(CardWidget):
 
     def start_transcription(self, need_create_task=True):
         """开始转录过程"""
-        self.transcription_interface.is_processing = True
-        self.start_button.setEnabled(False)
+        from app.components.crisp_asr_license_dialog import ensure_crispasr_license
 
         if need_create_task:
-            self.task = TaskFactory.create_transcribe_task(self.video_info.file_path)
+            self.task = TaskFactory.create_transcribe_task(
+                self.video_info.file_path,
+                need_next_task=bool(self.task and self.task.need_next_task),
+            )
 
+        if not ensure_crispasr_license(self, self.task.transcribe_config):
+            self.transcription_interface.is_processing = False
+            self.reset_ui()
+            return False
+
+        self.transcription_interface.is_processing = True
+        self.start_button.setEnabled(False)
+        self.progress_ring.show()
+        self.progress_ring.setValue(0)
         self.transcript_thread = TranscriptThread(self.task)
         self.transcript_thread.finished.connect(self.on_transcript_finished)
         self.transcript_thread.progress.connect(self.on_transcript_progress)
         self.transcript_thread.error.connect(self.on_transcript_error)
         self.transcript_thread.start()
+        return True
 
     def on_transcript_progress(self, value, message):
         """更新转录进度"""
@@ -424,8 +433,7 @@ class TranscriptionInterface(QWidget):
 
     def process(self):
         """主处理函数"""
-        self.is_processing = True
-        self.video_info_card.start_transcription(need_create_task=False)
+        return self.video_info_card.start_transcription(need_create_task=False)
 
     def dragEnterEvent(self, event):
         """拖拽进入事件处理"""

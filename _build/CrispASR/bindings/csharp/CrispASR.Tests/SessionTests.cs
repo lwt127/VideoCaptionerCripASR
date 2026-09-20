@@ -11,16 +11,10 @@ namespace CrispASR.Tests
     /// </summary>
     public class SessionTests
     {
-        private static bool CanLoadLibrary()
-        {
-            try
-            {
-                _ = Session.AvailableBackends();
-                return true;
-            }
-            catch (DllNotFoundException) { return false; }
-            catch (EntryPointNotFoundException) { return false; }
-        }
+        // Routed through Live so CRISPASR_CS_REQUIRE_LIVE can turn a silent
+        // skip into a failure (issue #291 — nothing in CI ever loaded the
+        // library, so the suite was green either way).
+        private static bool CanLoadLibrary() => Live.LibraryLoadable();
 
         // ---- AvailableBackends ----
 
@@ -96,7 +90,7 @@ namespace CrispASR.Tests
             if (!CanLoadLibrary()) return;
             // Use env var for model path, skip if not set
             var modelPath = Environment.GetEnvironmentVariable("CRISPASR_MODEL_WHISPER");
-            if (string.IsNullOrEmpty(modelPath)) return;
+            if (!Live.Model(modelPath, "CRISPASR_MODEL_WHISPER")) return;
             var backend = Session.DetectBackendFromGguf(modelPath);
             Assert.Equal("whisper", backend);
         }
@@ -111,12 +105,11 @@ namespace CrispASR.Tests
         private static string? WhisperModel =>
             Environment.GetEnvironmentVariable("CRISPASR_MODEL_WHISPER");
 
-        private static bool HasWhisper => !string.IsNullOrEmpty(WhisperModel);
-        private static bool CanLoadLibrary()
-        {
-            try { _ = Session.AvailableBackends(); return true; }
-            catch { return false; }
-        }
+        private static bool HasWhisper => Live.Model(WhisperModel, "CRISPASR_MODEL_WHISPER");
+        // Routed through Live so CRISPASR_CS_REQUIRE_LIVE can turn a silent
+        // skip into a failure (issue #291 — nothing in CI ever loaded the
+        // library, so the suite was green either way).
+        private static bool CanLoadLibrary() => Live.LibraryLoadable();
 
         [Fact]
         public void Open_WhisperModel_Succeeds()
@@ -311,7 +304,7 @@ namespace CrispASR.Tests
         [Fact]
         public void VadSegments_ReturnsSeconds_NotCentiseconds()
         {
-            if (!CanLoadLibrary() || string.IsNullOrEmpty(VadModel)) return;
+            if (!CanLoadLibrary() || !Live.Model(VadModel, "CRISPASR_VAD_MODEL")) return;
             const int sr = 16000;
             const int seconds = 4;
             var pcm = new float[sr * seconds];
@@ -356,7 +349,7 @@ namespace CrispASR.Tests
         [Fact]
         public void Tab_EmissionsHaveExpectedShape()
         {
-            if (!CanLoadLibrary() || string.IsNullOrEmpty(TabModel)) return;
+            if (!CanLoadLibrary() || !Live.Model(TabModel, "CRISPASR_MODEL_TABCNN")) return;
             using var s = Session.Open(TabModel!, "tabcnn", 2);
             const int sr = 22050;
             var pcm = new float[sr]; // 1 s of silence is enough to exercise the path

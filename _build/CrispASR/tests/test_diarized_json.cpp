@@ -201,3 +201,50 @@ TEST_CASE("diarized_json: single-pass run emits NO chunk_id", "[unit][diarized_j
     std::string out = crispasr_segments_to_diarized_json(segs, 5.0, "en", "transcribe", 0.0f);
     REQUIRE(out.find("chunk_id") == std::string::npos);
 }
+
+// =========================================================================
+// Issue #326: verbose_json dropped speaker labels entirely
+// =========================================================================
+//
+// #326 ran --diarize against the server and got back verbose_json with no
+// speaker anywhere. Diarization was the dominant cost of that request — on
+// their 48-minute file the embedder alone was 52.8 s — and this formatter threw
+// the entire result away. `diarized_json` carried it; `verbose_json`, which is
+// what every OpenAI-compatible client asks for, did not.
+//
+// The field is emitted only when non-empty, so a client that does not know it
+// still sees the exact schema it did before.
+
+TEST_CASE("verbose_json: speaker label is emitted when diarization produced one", "[unit][diarized_json][issue-326]") {
+    std::vector<crispasr_segment> segs = {make_seg("hello there", 0, 100, "(speaker 0) "),
+                                          make_seg("and hello to you", 100, 250, "(speaker 1) ")};
+    std::string out = crispasr_segments_to_openai_verbose_json(segs, 2.5, "en", "transcribe", 0.0f);
+    // Same normalisation diarized_json has always used: two formats of one API
+    // must not disagree about what a speaker is called. Not the raw internal
+    // "(speaker 0) ", which would put a trailing space in a public field.
+    REQUIRE(out.find("\"speaker\": \"A\"") != std::string::npos);
+    REQUIRE(out.find("\"speaker\": \"B\"") != std::string::npos);
+    REQUIRE(out.find("(speaker") == std::string::npos);
+}
+
+TEST_CASE("verbose_json: no speaker key when diarization did not run", "[unit][diarized_json][issue-326]") {
+    // The compatibility half. Without --diarize the output must be exactly the
+    // OpenAI schema, with no extra key for a client to trip over.
+    std::vector<crispasr_segment> segs = {make_seg("hello there", 0, 100), make_seg("nobody labelled this", 100, 250)};
+    std::string out = crispasr_segments_to_openai_verbose_json(segs, 2.5, "en", "transcribe", 0.0f);
+    REQUIRE(out.find("\"speaker\"") == std::string::npos);
+    // Still the fields the format promises.
+    REQUIRE(out.find("\"no_speech_prob\"") != std::string::npos);
+    REQUIRE(out.find("\"avg_logprob\"") != std::string::npos);
+}
+
+TEST_CASE("verbose_json: a partially diarized run labels only what was labelled", "[unit][diarized_json][issue-326]") {
+    // Diarization can leave a segment unassigned. That segment must carry no
+    // key at all rather than an empty string a consumer would read as a speaker
+    // named "".
+    std::vector<crispasr_segment> segs = {make_seg("labelled", 0, 100, "(speaker 0) "),
+                                          make_seg("unlabelled", 100, 250)};
+    std::string out = crispasr_segments_to_openai_verbose_json(segs, 2.5, "en", "transcribe", 0.0f);
+    REQUIRE(out.find("\"speaker\"") != std::string::npos);
+    REQUIRE(out.find("\"speaker\": \"\"") == std::string::npos);
+}

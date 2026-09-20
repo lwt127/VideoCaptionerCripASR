@@ -29,6 +29,23 @@ public:
 
     /// Human-readable adapter name, used in logs.
     virtual const char* name() const = 0;
+
+    /// A second, independent instance of the same model, or nullptr when the
+    /// adapter cannot provide one.
+    ///
+    /// Diarization embeds one segment per call, and on TitaNet those graphs do
+    /// not engage ggml's threads at all — measured on an M1, user CPU tracks
+    /// wall within 3% from `-t 1` to `-t 4`, for both 2 s and 10 s segments. So
+    /// intra-graph threading is not the parallelism this path has; running
+    /// several segments at once is. A ggml backend is not safe for concurrent
+    /// use, hence a whole instance per worker rather than a shared one.
+    ///
+    /// Cheap enough to be worth it: ~30 ms per extra TitaNet context after the
+    /// first, against ~60 ms *per segment* of work to divide up.
+    ///
+    /// Returning nullptr is not a failure — the caller embeds serially, exactly
+    /// as before.
+    virtual std::unique_ptr<CrispasrSpeakerEmbedder> clone() const { return nullptr; }
 };
 
 /// Build a speaker embedder from a CLI-supplied model spec.

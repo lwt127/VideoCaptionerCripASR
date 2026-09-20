@@ -16,6 +16,7 @@
 #include "moss_tts_local_codec.h"
 
 #include "core/attention.h"
+#include "core/audio_resample.h"
 #include "core/bpe.h"
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
@@ -38,6 +39,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Hyperparameters
@@ -1129,13 +1131,31 @@ static bool mtl_generate_grid(moss_tts_local_context* ctx, const char* text, con
     // ids in directly, mirroring the reference processor
     // (processing_moss_tts.py `_build_generation_or_voice_clone_codes`).
     std::vector<int32_t> id_vec;
+    std::vector<int> ref_row; // per row: index into the reference codes, -1 for text
+    // Cloning is only engaged when the reference actually matches this model's
+    // codebook count — a mismatched grid would be written into the code channels
+    // and read as speaker identity, producing confident nonsense rather than an
+    // error. Refuse it loudly instead.
+    bool has_ref = sp.ref_codes != nullptr && sp.ref_t_audio > 0 && sp.ref_n_vq > 0;
+    if (has_ref && sp.ref_n_vq != n_vq) {
+        fprintf(stderr, "moss_tts_local: reference has %d codebooks, model expects %d — ignoring the reference\n",
+                sp.ref_n_vq, n_vq);
+        has_ref = false;
+    }
     auto enc = [&](const std::string& s) {
         int n = 0;
         int32_t* p = moss_tts_local_tokenize(ctx, s.c_str(), &n);
         if (p) {
             id_vec.insert(id_vec.end(), p, p + n);
+            ref_row.insert(ref_row.end(), (size_t)n, -1);
             free(p);
         }
+    };
+    // Every text token is a row with audio_pad in the code channels; only the
+    // reference block below carries codes, so the two vectors move in lockstep.
+    auto push_tok = [&](uint32_t id) {
+        id_vec.push_back((int32_t)id);
+        ref_row.push_back(-1);
     };
     {
         const std::string instruction = sp.instruction ? std::string(sp.instruction) : "None";
@@ -1144,18 +1164,32 @@ static bool mtl_generate_grid(moss_tts_local_context* ctx, const char* text, con
                                       "\n- Tokens:\nNone\n- Quality:\nNone\n- Sound Event:\nNone"
                                       "\n- Ambient Sound:\nNone\n- Language:\n" +
                                       language + "\n- Text:\n";
-        id_vec.push_back((int32_t)hp.tok_im_start);
+        push_tok(hp.tok_im_start);
         enc("user\n");
         enc("<user_inst>\n- Reference(s):\n");
-        enc("None"); // text-only reference value, encoded alone
+        // Voice cloning: the reference processor replaces the literal "None"
+        // with <audio_start>, one row per reference frame carrying the codes
+        // under the USER slot token, then <audio_end>
+        // (processing_moss_tts.py::_build_generation_or_voice_clone_codes and
+        // _build_audio_rows). Without a reference the "None" text stands.
+        if (has_ref) {
+            push_tok(hp.tok_audio_start);
+            for (int t = 0; t < sp.ref_t_audio; t++) {
+                id_vec.push_back((int32_t)hp.tok_audio_user_slot);
+                ref_row.push_back(t);
+            }
+            push_tok(hp.tok_audio_end);
+        } else {
+            enc("None"); // text-only reference value, encoded alone
+        }
         enc(after_ref);
         enc(text ? text : ""); // the user's text, encoded ALONE (this is the boundary that drifted)
         enc("\n</user_inst>");
-        id_vec.push_back((int32_t)hp.tok_im_end);
+        push_tok(hp.tok_im_end);
         enc("\n");
-        id_vec.push_back((int32_t)hp.tok_im_start);
+        push_tok(hp.tok_im_start);
         enc("assistant\n");
-        id_vec.push_back((int32_t)hp.tok_audio_start);
+        push_tok(hp.tok_audio_start);
     }
     const int prompt_len = (int)id_vec.size();
     if (prompt_len <= 0)
@@ -1170,8 +1204,14 @@ static bool mtl_generate_grid(moss_tts_local_context* ctx, const char* text, con
         }
     }
     std::vector<int32_t> grid((size_t)prompt_len * stride, (int32_t)hp.audio_pad_code);
-    for (int r = 0; r < prompt_len; r++)
+    for (int r = 0; r < prompt_len; r++) {
         grid[(size_t)r * stride] = id_vec[r];
+        // Reference rows carry the cloned speaker's codes in channels 1..n_vq;
+        // every other row keeps audio_pad there.
+        if (ref_row[(size_t)r] >= 0)
+            for (int q = 0; q < n_vq; q++)
+                grid[(size_t)r * stride + 1 + q] = sp.ref_codes[(size_t)q * sp.ref_t_audio + ref_row[(size_t)r]];
+    }
 
     if (!mtl_kv_init(ctx, prompt_len + max_frames + 8))
         return false;
@@ -1231,7 +1271,10 @@ static bool mtl_generate_grid(moss_tts_local_context* ctx, const char* text, con
             fprintf(stderr, "moss_tts_local[dbg] frame %d: stop_head continue=%.4f stop=%.4f -> %s\n", f, tl[0], tl[1],
                     stop_idx == 1 ? "STOP" : "cont");
         free(tl);
-        if (stop_idx == 1 && forced.empty()) { // audio_end -> stop (ignored under teacher-forcing)
+        // audio_end -> stop (ignored under teacher-forcing). min_audio_frames
+        // overrides the stop head: keep generating until the floor is reached —
+        // paired with max_audio_frames it yields exact-duration synthesis.
+        if (stop_idx == 1 && forced.empty() && (int)frames.size() >= sp.min_audio_frames) {
             free(lh);
             if (dbg)
                 fprintf(stderr, "moss_tts_local[dbg] stop head fired at frame %d\n", f);
@@ -1342,6 +1385,9 @@ extern "C" moss_tts_local_synth_params moss_tts_local_synth_default_params(void)
     p.seed = 0;
     p.language = nullptr;
     p.instruction = nullptr;
+    p.ref_codes = nullptr;
+    p.ref_n_vq = 0;
+    p.ref_t_audio = 0;
     return p;
 }
 
@@ -1350,16 +1396,16 @@ extern "C" moss_tts_local_context* moss_tts_local_init_from_file(const char* pat
     moss_tts_local_context* ctx = new moss_tts_local_context();
     ctx->params = params;
     ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
-    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init();
     if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
-    ctx->backend_cpu = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (ctx->backend_cpu)
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
-    if (ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
     if (!mtl_load_model(ctx->model, ctx->vocab, path, ctx->backend)) {
-        delete ctx;
+        moss_tts_local_free(ctx); // frees the backends this ctx already owns
         return nullptr;
     }
     int n_be = 0;
@@ -1392,7 +1438,7 @@ extern "C" void moss_tts_local_free(moss_tts_local_context* ctx) {
     if (ctx->kv_ctx)
         ggml_free(ctx->kv_ctx);
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
@@ -1430,6 +1476,65 @@ extern "C" int moss_tts_local_sampling_rate(const moss_tts_local_context* ctx) {
 extern "C" bool moss_tts_local_codec_loaded(const moss_tts_local_context* ctx) {
     return ctx && ctx->codec_loaded;
 }
+extern "C" bool moss_tts_local_can_clone(const moss_tts_local_context* ctx) {
+    return ctx && ctx->codec_loaded && ctx->codec && moss_tts_local_codec::encoder_ready(ctx->codec);
+}
+
+extern "C" int32_t* moss_tts_local_encode_reference(moss_tts_local_context* ctx, const float* pcm_mono, int n_samples,
+                                                    int sample_rate, int* out_n_vq, int* out_t_audio) {
+    if (out_n_vq)
+        *out_n_vq = 0;
+    if (out_t_audio)
+        *out_t_audio = 0;
+    if (!moss_tts_local_can_clone(ctx) || !pcm_mono || n_samples <= 0 || sample_rate <= 0)
+        return nullptr;
+
+    // processing_moss_tts.py::encode_audios_from_wav — resample to the codec
+    // rate, loudness-normalise, then duplicate mono across the codec's channels.
+    const int target_sr = moss_tts_local_codec::sampling_rate(ctx->codec);
+    std::vector<float> mono(pcm_mono, pcm_mono + n_samples);
+    if (sample_rate != target_sr) {
+        mono = core_audio::resample_polyphase(mono.data(), (int)mono.size(), sample_rate, target_sr);
+        if (mono.empty())
+            return nullptr;
+    }
+
+    // loudness_normalize(target_dbfs=-20, gain_range=(-3,+3)) — RMS power dB.
+    // Duplicating mono across channels leaves the mean square unchanged, so the
+    // gain is the same computed here or after interleaving.
+    double sumsq = 0.0;
+    for (float v : mono)
+        sumsq += (double)v * (double)v;
+    const double cur_dbfs = 10.0 * std::log10(sumsq / (double)mono.size() + 1e-9);
+    double gain_db = -20.0 - cur_dbfs;
+    gain_db = std::max(-3.0, std::min(gain_db, 3.0));
+    const float gain = (float)std::pow(10.0, gain_db / 20.0);
+    for (float& v : mono)
+        v *= gain;
+
+    const int nch = moss_tts_local_codec::num_channels(ctx->codec);
+    std::vector<float> inter((size_t)mono.size() * (size_t)nch);
+    for (size_t i = 0; i < mono.size(); i++)
+        for (int c = 0; c < nch; c++)
+            inter[i * (size_t)nch + (size_t)c] = mono[i];
+
+    int n_vq = 0, t_audio = 0;
+    std::vector<int32_t> codes =
+        moss_tts_local_codec::encode(ctx->codec, inter.data(), (int64_t)inter.size(), n_vq, t_audio);
+    if (codes.empty() || n_vq <= 0 || t_audio <= 0)
+        return nullptr;
+
+    int32_t* out = (int32_t*)malloc(codes.size() * sizeof(int32_t));
+    if (!out)
+        return nullptr;
+    memcpy(out, codes.data(), codes.size() * sizeof(int32_t));
+    if (out_n_vq)
+        *out_n_vq = n_vq;
+    if (out_t_audio)
+        *out_t_audio = t_audio;
+    return out;
+}
+
 extern "C" void moss_tts_local_set_seed(moss_tts_local_context* ctx, uint32_t seed) {
     if (ctx)
         ctx->seed = seed;

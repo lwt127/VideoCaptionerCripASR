@@ -35,6 +35,7 @@
 #include <numeric>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // GGUF loading helpers
@@ -114,7 +115,7 @@ bool wav2vec2_load(const char* fname, wav2vec2_model& model) {
     // Phase 2: load tensors via core_gguf (backend-buffer-backed)
     // This puts all weights in a ggml_backend_buffer so the graph
     // scheduler can reference them without cross-context issues.
-    model.backend = ggml_backend_cpu_init();
+    model.backend = core_cpu_backend::init();
     if (!model.backend) {
         fprintf(stderr, "[wav2vec2] failed to init CPU backend\n");
         return false;
@@ -369,7 +370,7 @@ static void ggml_linear_f32(std::vector<uint8_t>& scratch, ggml_tensor* W, const
     ggml_tensor* out = ggml_mul_mat(ctx, W, xt);
     ggml_cgraph* gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, out);
-    ggml_graph_compute_with_ctx(ctx, gf, n_threads);
+    core_cpu_backend::compute(ctx, gf, n_threads);
 
     const float* od = (const float*)out->data;
     if (bias) {
@@ -602,7 +603,7 @@ static void wav2vec2_debug_attention(const wav2vec2_model& m, const float* hidde
     ggml_build_forward_expand(gf, res);
     fprintf(stderr, "[wav2vec2-dbg] graph built, computing...\n");
     fflush(stderr);
-    ggml_graph_compute_with_ctx(ctx, gf, 1);
+    core_cpu_backend::compute(ctx, gf, 1);
     fprintf(stderr, "[wav2vec2-dbg] graph computed, comparing...\n");
     fflush(stderr);
 
@@ -742,7 +743,7 @@ static void wav2vec2_debug_single_op(const wav2vec2_model & m,
     ggml_build_forward_expand(gf, fc1);
     ggml_free(ctx0);
 
-    // Use simple ggml_graph_compute_with_ctx (same as ggml_linear_f32 uses)
+    // Use simple core_cpu_backend::compute(same as ggml_linear_f32 uses)
     // to eliminate any backend-related differences
     {
         // Rebuild graph with no_alloc=false so tensors get memory
@@ -766,7 +767,7 @@ static void wav2vec2_debug_single_op(const wav2vec2_model & m,
 
         ggml_tensor * fc1_2 = ggml_add(ctx2, ggml_mul_mat(ctx2, e.fc1_w, x2), e.fc1_b);
         ggml_build_forward_expand(gf2, fc1_2);
-        ggml_graph_compute_with_ctx(ctx2, gf2, 1);
+        core_cpu_backend::compute(ctx2, gf2, 1);
 
         const float * fc1_data = (const float *)fc1_2->data;
         fprintf(stderr, "[dbg] simple fc1[t=0, 0:8]:");
@@ -967,7 +968,7 @@ std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m, const 
         std::vector<uint8_t> compute_meta;
         ggml_cgraph* gf = wav2vec2_build_transformer_graph(m, T, compute_meta);
         if (gf) {
-            ggml_backend_cpu_set_n_threads(m.backend, n_threads);
+            core_cpu_backend::set_n_threads(m.backend, n_threads);
             ggml_backend_t backends[1] = {m.backend};
             ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 1, 16384, false, false);
 
@@ -1095,13 +1096,13 @@ std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m, const 
         ggml_build_forward_expand(lgf, cur);
 
         // Compute — reuse pre-allocated work buffer
-        struct ggml_cplan cplan = ggml_graph_plan(lgf, n_threads, NULL);
+        struct ggml_cplan cplan = core_cpu_backend::plan(lgf, n_threads);
         if (cplan.work_size > 0) {
             if (work_buf.size() < cplan.work_size)
                 work_buf.resize(cplan.work_size);
             cplan.work_data = work_buf.data();
         }
-        ggml_graph_compute(lgf, &cplan);
+        core_cpu_backend::compute_planned(lgf, &cplan, n_threads);
 
         // Read output back into hidden_ht for the next layer
         ggml_tensor* lout = ggml_graph_get_tensor(lgf, "layer_out");

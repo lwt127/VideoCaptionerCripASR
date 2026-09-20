@@ -49,11 +49,40 @@ if(NOT MSVC)
     target_compile_options(crisp_audio PRIVATE -O3)
 endif()
 
+# GPU backend linkage.
+#
+# `crispasr_link_ggml_{metal,cuda}` are INTERFACE targets defined by CrispASR's
+# TOP-LEVEL CMakeLists (the #355 GGML_BACKEND_DL work: empty under DL, the real
+# backend otherwise). They do NOT exist when this directory is
+# add_subdirectory()'d into CrispEmbed — and CMake does not error on an unknown
+# name here, it degrades it to a raw `-lcrispasr_link_ggml_cuda`, so the failure
+# surfaces at LINK time as:
+#
+#     mold: library not found: crispasr_link_ggml_cuda
+#
+# That is CrispEmbed issue #50's defect class again, and it hid longer than the
+# others because it needs the sibling layout AND a GPU build: every CPU sibling
+# build passes, including the sibling-crispasr CI job, since GitHub runners have
+# no CUDA. It was caught on a Kaggle P100.
+#
+# So probe for the target rather than assuming the consumer defines it, and fall
+# back to the plain backend target. The `NOT GGML_BACKEND_DL` guard on the
+# fallback matters: under DL the backends are MODULE libraries, which CMake
+# refuses as link targets and which must not be linked anyway — a missing
+# backend is meant to be a runtime no-op, not a load-time abort.
 if(GGML_METAL)
     target_compile_definitions(crisp_audio PRIVATE GGML_USE_METAL)
-    target_link_libraries(crisp_audio PUBLIC ggml-metal)
+    if(TARGET crispasr_link_ggml_metal)
+        target_link_libraries(crisp_audio PUBLIC crispasr_link_ggml_metal)
+    elseif(TARGET ggml-metal AND NOT GGML_BACKEND_DL)
+        target_link_libraries(crisp_audio PUBLIC ggml-metal)
+    endif()
 endif()
 if(GGML_CUDA)
     target_compile_definitions(crisp_audio PRIVATE GGML_USE_CUDA)
-    target_link_libraries(crisp_audio PUBLIC ggml-cuda)
+    if(TARGET crispasr_link_ggml_cuda)
+        target_link_libraries(crisp_audio PUBLIC crispasr_link_ggml_cuda)
+    elseif(TARGET ggml-cuda AND NOT GGML_BACKEND_DL)
+        target_link_libraries(crisp_audio PUBLIC ggml-cuda)
+    endif()
 endif()

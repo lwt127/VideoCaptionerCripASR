@@ -231,6 +231,11 @@ std::string text_lid_resolve_path(const std::string& arg, const std::string& cac
             fprintf(stderr, "text_lid: backend '%s' not in registry\n", backend);
             return "";
         }
+        if (crispasr_license_requires_acceptance(entry.license) && !crispasr_license_accepted(entry.license, "")) {
+            fprintf(stderr, "text_lid: refusing restricted model '%s' without --accept-license %s\n",
+                    entry.filename.c_str(), crispasr_license_tag(entry.license).c_str());
+            return "";
+        }
         return crispasr_cache::ensure_cached_file(entry.filename, entry.url, quiet, "text-lid", cache_dir_override);
     }
 
@@ -243,6 +248,11 @@ std::string text_lid_resolve_path(const std::string& arg, const std::string& cac
     //    without first downloading. Same fallback the main `-m` path uses.
     CrispasrRegistryEntry entry;
     if (crispasr_registry_lookup_by_filename(basename_of(arg), entry)) {
+        if (crispasr_license_requires_acceptance(entry.license) && !crispasr_license_accepted(entry.license, "")) {
+            fprintf(stderr, "text_lid: refusing restricted model '%s' without --accept-license %s\n",
+                    entry.filename.c_str(), crispasr_license_tag(entry.license).c_str());
+            return "";
+        }
         std::string cached =
             crispasr_cache::ensure_cached_file(entry.filename, entry.url, quiet, "text-lid", cache_dir_override);
         if (!cached.empty())

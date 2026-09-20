@@ -15,6 +15,15 @@
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 
+// pcs.cpp is byte-shared with CrispEmbed (which has an imatrix collector). Feature-
+// detect so the SAME source compiles in both: CrispEmbed provides imatrix.h and
+// the hook fires; CrispASR lacks it and the hook compiles out. Do NOT let this
+// file diverge between the two repos — keep the __has_include guard intact.
+#if __has_include("imatrix.h")
+#include "imatrix.h"
+#define PCS_HAS_IMATRIX 1
+#endif
+
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -27,9 +36,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ---------------------------------------------------------------------------
 // SentencePiece tokenizer (greedy longest-match, same as fireredpunc SP path)
@@ -299,8 +310,8 @@ static bool pcs_load(pcs_context& ctx, const char* path) {
     // the ONNX/onnxruntime CPU reference without GPU float-noise on borderline logits).
     ctx.backend = std::getenv("PCS_FORCE_CPU") ? nullptr : crispasr_init_gpu_backend();
     if (!ctx.backend)
-        ctx.backend = ggml_backend_cpu_init();
-    ctx.backend_cpu = ggml_backend_cpu_init();
+        ctx.backend = core_cpu_backend::init();
+    ctx.backend_cpu = core_cpu_backend::init();
 
     core_gguf::WeightLoad wl;
     if (!core_gguf::load_weights(path, ctx.backend, "pcs", wl))
@@ -372,6 +383,10 @@ static bool pcs_load(pcs_context& ctx, const char* path) {
         backends[n_backends++] = ctx.backend_cpu;
     }
     ctx.sched = ggml_backend_sched_new(backends, nullptr, n_backends, 8192, false, false);
+
+#ifdef PCS_HAS_IMATRIX
+    crispembed_imatrix_install(ctx.sched); // no-op unless CRISPEMBED_IMATRIX_OUT is set
+#endif
 
     return true;
 }
@@ -608,6 +623,20 @@ static PCSResult pcs_run(pcs_context& ctx, const std::vector<int>& token_ids) {
     {
         std::vector<float> buf(ctx.n_post_labels * N);
         ggml_backend_tensor_get(post_logits, buf.data(), 0, buf.size() * sizeof(float));
+        // Diff harness: append per-token post-punc logits to $PCS_DUMP_LOGITS so a
+        // quant A/B can measure the pre-argmax distribution (prob-cosine/KL), not
+        // just the thresholded restored string. Plain fprintf — no imatrix dep, so
+        // it stays identical in the CrispEmbed copy.
+        if (const char* dp = std::getenv("PCS_DUMP_LOGITS")) {
+            if (FILE* fp = fopen(dp, "a")) {
+                for (int t = 0; t < N; t++) {
+                    for (int c = 0; c < ctx.n_post_labels; c++)
+                        fprintf(fp, "%s%.7g", c ? " " : "", buf[t * ctx.n_post_labels + c]);
+                    fputc('\n', fp);
+                }
+                fclose(fp);
+            }
+        }
         for (int t = 0; t < N; t++) {
             int best = 0;
             float best_val = buf[t * ctx.n_post_labels];
@@ -766,6 +795,60 @@ static PCSResult pcs_run(pcs_context& ctx, const std::vector<int>& token_ids) {
                 result.cap_preds[t][c] = logit > 0;
             }
         }
+    }
+
+    // Diff harness for the three heads PCS_DUMP_LOGITS does not reach.
+    //
+    // That hook covers post-punc only, so the pre / sentence-boundary / truecase
+    // heads could previously be checked ONLY through their effect on the
+    // restored string. That is a real gap and it showed: plain q4_k gets all 67
+    // post-punc decisions right on the reference corpus and still turns
+    // "I'm OK" into "I'm ok" — a truecase-head regression that surfaced as a text
+    // diff, with nothing to say which head produced it.
+    //
+    // Written here, after every head has finished, so the four dumps are aligned
+    // by construction rather than by three call sites agreeing about ordering.
+    // Append mode matches PCS_DUMP_LOGITS — a consumer must delete the file
+    // first, or a stale run silently shifts every comparison.
+    //
+    // ⚠ The seg head yields TWO different quantities and both are dumped,
+    // because a bug in either produces wrong text and they disagree by design:
+    //   seg  = softmax(logits)[boundary] > 0.05, the ONNX `seg_preds` output —
+    //          a low tuned threshold, NOT argmax
+    //   arg  = the hard argmax, which is what conditions the truecase head
+    // Dumping only one of them would make a mismatch in the other invisible.
+    {
+        auto dump = [&](const char* env, const std::function<void(FILE*, int)>& row) {
+            const char* path = std::getenv(env);
+            if (!path)
+                return;
+            FILE* fp = fopen(path, "a");
+            if (!fp)
+                return;
+            for (int t = 0; t < N; t++) {
+                row(fp, t);
+                fputc('\n', fp);
+            }
+            fclose(fp);
+        };
+        // One int per token: the pre-punc argmax (0 = <NULL>, 1 = the inverted
+        // Spanish opener).
+        dump("PCS_DUMP_PRE", [&](FILE* fp, int t) { fprintf(fp, "%d", result.pre_preds[t]); });
+        // Two ints per token: thresholded boundary, then the hard argmax.
+        dump("PCS_DUMP_SEG",
+             [&](FILE* fp, int t) { fprintf(fp, "%d %d", result.sbd_preds[t] ? 1 : 0, seg_argmax[t] ? 1 : 0); });
+        // 16 bits per token, by character position — the truecase head is
+        // per-CHARACTER within the token, not one flag per token. ⚠ Only the
+        // first `len(piece)` bits are meaningful; the reconstruction reads bit
+        // c for character c and never looks further, so the tail is padding the
+        // model fills arbitrarily and a consumer MUST truncate before comparing.
+        // Comparing all 16 fails a correct artifact (see CrispEmbed
+        // tests/pcs_parity.py, which did exactly that until it was fixed).
+        dump("PCS_DUMP_CAP", [&](FILE* fp, int t) {
+            for (size_t c = 0; c < result.cap_preds[t].size(); c++) {
+                fputc(result.cap_preds[t][c] ? '1' : '0', fp);
+            }
+        });
     }
 
     ggml_free(ctx0);
@@ -988,10 +1071,13 @@ char* pcs_process(pcs_context* ctx, const char* text) {
 void pcs_free(pcs_context* ctx) {
     if (!ctx)
         return;
+#ifdef PCS_HAS_IMATRIX
+    crispembed_imatrix_flush(); // one-shot binaries exit past atexit
+#endif
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->buf)
-        ggml_backend_buffer_free(ctx->buf);
+        core_gguf::release_weight_buffer(ctx->buf);
     if (ctx->w_ctx)
         ggml_free(ctx->w_ctx);
     if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)

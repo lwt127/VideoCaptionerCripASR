@@ -56,10 +56,19 @@ def main() -> None:
         args.output, arch=arch_str,
         endianess=getattr(gguf.GGUFEndian, endianess),
     )
+    # `sub_type` only exists on newer gguf-py. On older versions MetadataDetails
+    # is (type, value, description) and passing it raises TypeError — which made
+    # this script unusable against the gguf currently installed here. Omitting it
+    # is safe there: add_key_value infers the array's element type from the first
+    # element (verified: a list[str] lands as ARRAY/STRING). Pass it when the
+    # field exists so newer versions keep the explicit typing.
+    kwargs = {}
+    if "sub_type" in getattr(MetadataDetails, "_fields", ()):
+        kwargs["sub_type"] = gguf.GGUFValueType.STRING
     new_metadata = {
         "tokenizer.ggml.merges": MetadataDetails(
             gguf.GGUFValueType.ARRAY, merges,
-            description="BPE merges", sub_type=gguf.GGUFValueType.STRING,
+            description="BPE merges", **kwargs,
         ),
     }
     copy_with_new_metadata(reader, writer, new_metadata, remove_metadata=[])

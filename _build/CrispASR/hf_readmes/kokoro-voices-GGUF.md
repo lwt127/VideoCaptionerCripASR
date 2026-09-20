@@ -87,6 +87,32 @@ python models/convert-kokoro-voice-to-gguf.py \
 - kikiri-tts (`df_victoria`, `dm_martin`): [`kikiri-tts/kikiri-german-victoria`](https://huggingface.co/kikiri-tts/kikiri-german-victoria) and [`kikiri-tts/kikiri-german-martin`](https://huggingface.co/kikiri-tts/kikiri-german-martin) by the dida-80b maintainer, Apache-2.0.
 - GGUF format + runtime: [`CrispStrobe/CrispASR`](https://github.com/CrispStrobe/CrispASR).
 
+## Voice provenance (EU AI Act Art. 50(4))
+
+Whose voice a pack reproduces is decided **per pack**, not by the backbone — a
+kokoro model is a base model, not a voice.
+
+| Pack | `speaker_identity` | Evidence |
+|---|---|---|
+| `df_eva`, `dm_bernd` | **real_person** | Per-speaker style packs from HUI-Audio-Corpus-German, carrying the narrators' own names. HUI is built from librivox.org recordings, so Eva and Bernd are real volunteers. |
+| `df_victoria`, `dm_martin` | synthetic | kikiri fine-tunes over `kikiri-german-base-51speakers-synthetic`, whose card states: *"Trained entirely on synthetic (TTS-generated) audio"*. The speaker labels are person-shaped, but the base's training data is the evidence, not the name. |
+| `af_heart`, `ef_dora`, `ff_siwis` | synthetic | hexgrad's shipped style vectors — designed/blended, not any one person. |
+
+Synthesizing with `df_eva` or `dm_bernd` prepends a **spoken AI disclosure**:
+audio resembling an identifiable person is a deep fake under Art. 3(60) whether
+or not any cloning took place. It does **not** require `--i-have-rights` — the
+donor's agreement to the training is a licensing matter settled upstream, which
+a downstream operator cannot attest to.
+
+> **Note the German cascade crosses this boundary.** The documented fallback
+> order is `df_victoria` → `df_eva` → `ff_siwis`, so a missing default silently
+> moves you from a synthetic voice to a real HUI narrator. That is exactly why
+> the disclosure follows the pack rather than the run.
+
+Override per run with `--speaker-identity`, or stamp a pack permanently with
+`models/stamp-speaker-identity.py`. See
+[`docs/eu-ai-act.md` §6.2a](https://github.com/CrispStrobe/CrispASR/blob/main/docs/eu-ai-act.md).
+
 ## License
 
 Apache-2.0 across the bundle, matching every upstream source.

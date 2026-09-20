@@ -5,11 +5,11 @@
 // 1. load_weights_split partitions tensors by the is_gpu predicate correctly.
 // 2. Both GPU and CPU partitions are independently addressable.
 // 3. Tensor data is correctly loaded into the right partition.
-// 4. free_weights cleans up split_bufs without leaks.
-// 5. The split_bufs field holds overflow buffers when the GPU partition
-//    exceeds the 1.5 GiB chunk limit (structural — we verify the field
-//    exists and is managed; actual multi-GiB allocation is only testable
-//    on real Vulkan hardware).
+// 4. free_weights leaves no buffer handle behind and is idempotent.
+// 5. A partition above the chunk limit really does overflow into split_bufs,
+//    and releasing the partition releases those chunks with it.
+//    CRISPASR_GGUF_MAX_ALLOC_CHUNK lowers the limit so this needs no
+//    multi-gigabyte allocation and no Vulkan hardware.
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -21,6 +21,7 @@
 #include "gguf.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -52,6 +53,22 @@ void write_multi_tensor_gguf(const std::string& path, int n_tensors, int elems_p
     REQUIRE(gguf_write_to_file(g, path.c_str(), /*only_meta=*/false));
     gguf_free(g);
     ggml_free(ctx);
+}
+
+// Portable env helpers (Windows has no POSIX setenv/unsetenv).
+void test_setenv(const char* k, const char* v) {
+#if defined(_WIN32)
+    _putenv_s(k, v);
+#else
+    ::setenv(k, v, 1);
+#endif
+}
+void test_unsetenv(const char* k) {
+#if defined(_WIN32)
+    _putenv_s(k, "");
+#else
+    ::unsetenv(k);
+#endif
 }
 
 // Predicate: layers 0..threshold-1 go to GPU, rest to CPU.
@@ -194,26 +211,48 @@ TEST_CASE("load_weights_split rejects null backends/predicate", "[unit][gguf-spl
     ggml_backend_free(be);
 }
 
-TEST_CASE("free_weights clears split_bufs", "[unit][gguf-split]") {
-    // Manually construct a WeightLoad with fake split_bufs entries to verify
-    // free_weights empties the vector. We allocate real buffers so
-    // ggml_backend_buffer_free is exercised (no UAF / double-free).
-    ggml_backend_t be = ggml_backend_cpu_init();
-    REQUIRE(be);
+TEST_CASE("a chunked partition's overflow buffers are released with it", "[unit][gguf-split]") {
+    // The overflow chunks are owned by the loader and released with the first
+    // buffer of their own partition. Reaching that branch normally needs a
+    // partition above 1.5 GiB, so CRISPASR_GGUF_MAX_ALLOC_CHUNK lowers the
+    // limit far enough for a synthetic model to chunk.
+    //
+    // What this proves: the chunked path runs, the overflow buffers are
+    // recorded, and releasing the partition once — or twice — neither
+    // double-frees nor leaves a stale handle. What it cannot prove is that
+    // the memory came back, because ggml exposes no per-backend allocation
+    // counter to assert against; that half is the code review's.
+    test_setenv("CRISPASR_GGUF_MAX_ALLOC_CHUNK", "1024");
 
+    ggml_backend_t gpu_be = ggml_backend_cpu_init();
+    ggml_backend_t cpu_be = ggml_backend_cpu_init();
+    REQUIRE(gpu_be);
+    REQUIRE(cpu_be);
+
+    const std::string path = "crispasr_test_split_chunked.gguf";
+    // 8 tensors of 1 KiB each: several chunks per partition at a 1 KiB limit.
+    write_multi_tensor_gguf(path, 8, 256);
+
+    SplitCtx sc{4};
     core_gguf::WeightLoad wl;
-    // Allocate two small buffers and push them into split_bufs.
-    wl.split_bufs.push_back(ggml_backend_alloc_buffer(be, 256));
-    wl.split_bufs.push_back(ggml_backend_alloc_buffer(be, 256));
-    REQUIRE(wl.split_bufs.size() == 2);
-    REQUIRE(wl.split_bufs[0] != nullptr);
-    REQUIRE(wl.split_bufs[1] != nullptr);
+    REQUIRE(core_gguf::load_weights_split(path.c_str(), gpu_be, cpu_be, test_is_gpu, &sc, "test-chunked", wl));
+    REQUIRE(wl.buf != nullptr);
+    REQUIRE(wl.buf_cpu != nullptr);
+    // Positive control: without this the case would pass having never chunked.
+    REQUIRE_FALSE(wl.split_bufs.empty());
 
     core_gguf::free_weights(wl);
-
-    REQUIRE(wl.split_bufs.empty());
     REQUIRE(wl.buf == nullptr);
     REQUIRE(wl.buf_cpu == nullptr);
+    REQUIRE(wl.split_bufs.empty());
 
-    ggml_backend_free(be);
+    // Idempotent: the loader's record was taken and erased, not just read, so
+    // a second release cannot free the same overflow chunks again.
+    core_gguf::free_weights(wl);
+    REQUIRE(wl.split_bufs.empty());
+
+    test_unsetenv("CRISPASR_GGUF_MAX_ALLOC_CHUNK");
+    std::remove(path.c_str());
+    ggml_backend_free(gpu_be);
+    ggml_backend_free(cpu_be);
 }

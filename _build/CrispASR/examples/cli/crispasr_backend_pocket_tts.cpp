@@ -47,9 +47,10 @@ static bool file_exists(const std::string& path) {
     return true;
 }
 
-// Resolve `--voice` for pocket-tts. Pocket only supports WAV voice references
-// (voice cloning via encoder weights), so a bare name from a server request
-// (`{"voice": "alice"}`) resolves to `<voice-dir>/alice.wav`. Mirrors the
+// Resolve `--voice` for pocket-tts. Accept reference WAVs and Kyutai's official
+// prepared `.safetensors` embeddings. A bare name from a server request
+// (`{"voice": "alba"}`) resolves against --voice-dir, preferring the official
+// embedding and then a locally recorded WAV. Mirrors the
 // bare-name resolution in the vibevoice / qwen3-tts adapters. Absolute paths and
 // names already carrying a `.wav` extension are passed through untouched.
 static std::string resolve_pocket_voice_path(const whisper_params& params) {
@@ -58,7 +59,7 @@ static std::string resolve_pocket_voice_path(const whisper_params& params) {
         return voice_path;
     // Only rewrite a bare token: no path separators, no explicit .wav extension.
     if (voice_path.find('/') != std::string::npos || voice_path.find('\\') != std::string::npos ||
-        ends_with_ci(voice_path, ".wav")) {
+        ends_with_ci(voice_path, ".wav") || ends_with_ci(voice_path, ".safetensors")) {
         return voice_path;
     }
     // Path-traversal sanitisation (the server already guards network requests,
@@ -68,6 +69,9 @@ static std::string resolve_pocket_voice_path(const whisper_params& params) {
                 voice_path.c_str());
         return voice_path;
     }
+    const std::string embedding_path = params.tts_voice_dir + "/" + voice_path + ".safetensors";
+    if (file_exists(embedding_path))
+        return embedding_path;
     const std::string wav_path = params.tts_voice_dir + "/" + voice_path + ".wav";
     if (file_exists(wav_path))
         return wav_path;
@@ -167,11 +171,21 @@ public:
         // repeated requests with the same voice don't re-load the reference.
         std::string voice_path = resolve_pocket_voice_path(params);
         if (!voice_path.empty() && voice_path != last_voice_key_) {
-            std::vector<float> ref_pcm;
-            int ref_sr = 0;
-            if (!crispasr::core::read_wav_mono_pcm16(voice_path, ref_pcm, ref_sr)) {
-                fprintf(stderr, "crispasr[pocket-tts]: failed to read voice reference '%s'\n", voice_path.c_str());
+            if (ends_with_ci(voice_path, ".safetensors")) {
+                int rc = pocket_tts_load_voice_embedding(ctx_, voice_path.c_str());
+                if (rc != 0) {
+                    if (!params.no_prints)
+                        fprintf(stderr, "crispasr[pocket-tts]: prepared voice embedding failed (rc=%d)\n", rc);
+                    return {};
+                }
             } else {
+                std::vector<float> ref_pcm;
+                int ref_sr = 0;
+                if (!crispasr::core::read_wav_mono_pcm16(voice_path, ref_pcm, ref_sr)) {
+                    fprintf(stderr, "crispasr[pocket-tts]: failed to read voice reference '%s'\n", voice_path.c_str());
+                    last_voice_key_ = voice_path;
+                    return {};
+                }
                 // Resample to 24 kHz if needed
                 if (ref_sr != 24000) {
                     ref_pcm = core_audio::resample_polyphase(ref_pcm.data(), (int)ref_pcm.size(), ref_sr, 24000);

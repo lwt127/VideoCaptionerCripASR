@@ -104,6 +104,12 @@ public:
         // LLM context and the AR decoder would cold-start at every
         // boundary — the failure mode the 2026-05-25 long-form matrix
         // measured at 64/35/20/9 % coverage (60/120/300/600 s).
+        // CAP_TEMPERATURE was briefly dropped in f5e77ab9 because the claim
+        // was false — run_voxtral_family's greedy branch was a hand-rolled
+        // argmax loop and `--temperature` reached nothing. It is restored here
+        // on the condition #369 sets for declaring it: that loop now routes
+        // through core_greedy_decode::sample_temp with the session's
+        // temperature and seed, so the cap describes real behaviour.
         return CAP_TIMESTAMPS_CTC | CAP_AUTO_DOWNLOAD | CAP_TEMPERATURE | CAP_PUNCTUATION_TOGGLE | CAP_FLASH_ATTN |
                CAP_TOKEN_CONFIDENCE | CAP_TRANSLATE | CAP_SRC_TGT_LANGUAGE | CAP_BEAM_SEARCH | CAP_DIARIZE |
                CAP_PARALLEL_PROCESSORS | CAP_UNBOUNDED_INPUT | CAP_INTERNAL_CHUNKING;

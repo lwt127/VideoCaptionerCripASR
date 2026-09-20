@@ -13,6 +13,7 @@
 // See qwen3-asr-todo.md for the full plan.
 
 #include "qwen3_asr.h"
+#include "core/quant_bcast.h"
 #include "core/crispasr_env.h"
 #include "../crisp_audio/include/crisp_audio.h"
 #include "crispasr_imatrix.h"
@@ -890,7 +891,11 @@ static ggml_cgraph* qwen3_asr_build_graph_encoder(qwen3_asr_context* ctx, int T_
     // Permute (T,F,C,B) → (F,C,T,B): source axis 0(T)→pos 2, 1(F)→0, 2(C)→1, 3(B)→3
     cur = ggml_cont(ctx0, ggml_permute(ctx0, cur, 2, 0, 1, 3));
     cur = ggml_reshape_3d(ctx0, cur, F_out * C_out, T_out, num_chunks);
-    cur = ggml_mul_mat(ctx0, m.audio.conv_out_w, cur); // (d, T_out, num_chunks)
+    // #416: conv_out_w is quantized and `cur` carries num_chunks in ne2, so
+    // ggml broadcasts src0 across chunks. Gated OFF — see src/core/quant_bcast.h.
+    cur = core_quant_bcast::fold_enabled("CRISPASR_QWEN3ASR_FOLD_BCAST")
+              ? core_quant_bcast::mul_mat_fold_batch(ctx0, m.audio.conv_out_w, cur)
+              : ggml_mul_mat(ctx0, m.audio.conv_out_w, cur); // (d, T_out, num_chunks)
 
     // ------- Add positional embedding (broadcasts over batch) -------
     // pe_in ne = (d, T_out, 1) → broadcast against (d, T_out, num_chunks)
@@ -1359,6 +1364,8 @@ extern "C" const char* qwen3_asr_token_text(qwen3_asr_context* ctx, int id) {
 // model gets them for free.
 #include "core/bpe.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/ggml_cpu_backend.h"
+#include "core/qwen3_forced_aligner.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1490,19 +1497,19 @@ extern "C" qwen3_asr_context* qwen3_asr_init_from_file(const char* path, qwen3_a
 
     // Try GPU backend first (Metal, CUDA, Vulkan...), fall back to CPU.
     // crispasr_init_gpu_backend() picks the highest-priority available backend.
-    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init();
     if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
-    ctx->backend_cpu = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (ctx->backend_cpu) {
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
     }
-    if (ggml_backend_is_cpu(ctx->backend)) {
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend)) {
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
     }
 
     if (!qwen3_asr_load_model(ctx->model, ctx->vocab, path, ctx->backend, ctx->backend_cpu)) {
-        delete ctx;
+        qwen3_asr_free(ctx); // frees the backends this ctx already owns
         return nullptr;
     }
 
@@ -1609,9 +1616,9 @@ extern "C" void qwen3_asr_free(qwen3_asr_context* ctx) {
     if (ctx->kv_ctx)
         ggml_free(ctx->kv_ctx);
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.buf_cpu)
-        ggml_backend_buffer_free(ctx->model.buf_cpu);
+        core_gguf::release_weight_buffer(ctx->model.buf_cpu);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend_cpu)
@@ -1675,6 +1682,7 @@ extern "C" float* qwen3_asr_run_conv(qwen3_asr_context* ctx, const float* mel_fe
     ggml_tensor* mel_in = ggml_graph_get_tensor(gf, "mel_batched");
     ggml_backend_tensor_set(mel_in, mel_padded.data(), 0, mel_padded.size() * sizeof(float));
 
+    core_quant_bcast::audit(gf, "qwen3-asr");
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "qwen3_asr: conv graph compute failed\n");
         return nullptr;
@@ -1793,6 +1801,7 @@ extern "C" float* qwen3_asr_run_encoder(qwen3_asr_context* ctx, const float* mel
     ggml_tensor* mask_in = ggml_graph_get_tensor(gf, "attn_mask");
     ggml_backend_tensor_set(mask_in, mask.data(), 0, mask.size() * sizeof(float));
 
+    core_quant_bcast::audit(gf, "qwen3-asr");
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "qwen3_asr: encoder graph compute failed\n");
         return nullptr;
@@ -1857,18 +1866,31 @@ extern "C" bool qwen3_asr_kv_init(qwen3_asr_context* ctx, int max_ctx) {
     ggml_set_name(ctx->kv_k, "kv_k");
     ggml_set_name(ctx->kv_v, "kv_v");
 
-    const size_t kbytes = ggml_nbytes(ctx->kv_k);
-    const size_t vbytes = ggml_nbytes(ctx->kv_v);
     // PLAN #69b: optional KV-on-CPU spill for long-context / tight-VRAM users.
     ggml_backend_t kv_backend = core_attn::kv_backend_from_env(ctx->backend, ctx->backend_cpu, "qwen3_asr");
-    ctx->kv_buf = ggml_backend_alloc_buffer(kv_backend, kbytes + vbytes);
+
+    // Let ggml size and place both tensors (#367).
+    //
+    // This used to allocate ggml_nbytes(k) + ggml_nbytes(v) and hand-place the
+    // second at base + kbytes. That is wrong for any backend whose
+    // get_alloc_size() exceeds nbytes, and CUDA's does for quantized types: it
+    // pads a row up to MATRIX_ROW_PADDING (512). Our KV rows are head_dim=128
+    // wide, so 128 % 512 != 0 and each q8_0 tensor needs 408 bytes more than
+    // nbytes — the buffer was 816 bytes short, the last tensor ran past its
+    // end, and ggml_backend_tensor_alloc aborted:
+    //
+    //   GGML_ASSERT(... addr + get_alloc_size(...) <= base + get_size(...))
+    //
+    // f16 is not quantized, so it was never padded and never crashed — which is
+    // why this only ever appeared with CRISPASR_KV_QUANT=q8_0, and only on CUDA.
+    // ggml_backend_alloc_ctx_tensors does the sizing, padding and alignment.
+    ctx->kv_buf = ggml_backend_alloc_ctx_tensors(ctx->kv_ctx, kv_backend);
     if (!ctx->kv_buf) {
         fprintf(stderr, "qwen3_asr: failed to allocate kv buffer\n");
         return false;
     }
-    char* base = (char*)ggml_backend_buffer_get_base(ctx->kv_buf);
-    ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_k, base);
-    ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_v, base + kbytes);
+    const size_t kbytes = ggml_nbytes(ctx->kv_k);
+    const size_t vbytes = ggml_nbytes(ctx->kv_v);
     ctx->kv_max_ctx = max_ctx;
     ctx->kv_n_used = 0;
 
@@ -1942,6 +1964,7 @@ extern "C" float* qwen3_asr_run_llm_kv(qwen3_asr_context* ctx, const float* inpu
         ggml_backend_tensor_set(mask_in, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
     }
 
+    core_quant_bcast::audit(gf, "qwen3-asr");
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "qwen3_asr: llm_kv graph compute failed\n");
         return nullptr;
@@ -1997,6 +2020,7 @@ extern "C" float* qwen3_asr_embed_tokens(qwen3_asr_context* ctx, const int32_t* 
     }
     ggml_tensor* ids_in = ggml_graph_get_tensor(gf, "input_ids");
     ggml_backend_tensor_set(ids_in, input_ids, 0, (size_t)n_tokens * sizeof(int32_t));
+    core_quant_bcast::audit(gf, "qwen3-asr");
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "qwen3_asr: embed graph compute failed\n");
         return nullptr;
@@ -2038,6 +2062,7 @@ extern "C" float* qwen3_asr_run_llm_from_embeds(qwen3_asr_context* ctx, const fl
     ggml_tensor* mask_in = ggml_graph_get_tensor(gf, "causal_mask");
     ggml_backend_tensor_set(mask_in, mask.data(), 0, mask.size() * sizeof(float));
 
+    core_quant_bcast::audit(gf, "qwen3-asr");
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "qwen3_asr: llm-from-embeds graph compute failed\n");
         return nullptr;
@@ -2096,6 +2121,7 @@ extern "C" float* qwen3_asr_run_llm(qwen3_asr_context* ctx, const int32_t* input
     ggml_tensor* mask_in = ggml_graph_get_tensor(gf, "causal_mask");
     ggml_backend_tensor_set(mask_in, mask.data(), 0, mask.size() * sizeof(float));
 
+    core_quant_bcast::audit(gf, "qwen3-asr");
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "qwen3_asr: llm graph compute failed\n");
         return nullptr;
@@ -2184,14 +2210,17 @@ extern "C" int qwen3_asr_align_words(struct qwen3_asr_context* ctx, const float*
         ids.push_back(audio_pad_id);
     ids.push_back(audio_end_id);
 
-    // Tokenize each word separately and append two timestamp markers
-    // after it. Whitespace-split English / Latin scripts work fine
-    // through the standard BPE encoder; CJK languages need char-level
-    // pre-tokenization which is tracked as a follow-up. The leading
-    // space convention matches GPT-2 BPE: each non-first word starts
-    // with a space so the tokenizer recognises it as a word boundary.
+    // Tokenize each alignment unit separately and append two timestamp
+    // markers.  The Python blueprint constructs
+    //
+    //   unit<timestamp><timestamp>unit<timestamp><timestamp>...
+    //
+    // with no spaces inserted between units.  A timestamp marker is a hard
+    // tokenizer boundary, so tokenizing each unit separately is equivalent,
+    // but adding a GPT-2 leading space (the old behaviour) is not: it changes
+    // every non-first unit's ids and therefore the aligner's predictions.
     for (int w = 0; w < n_words; w++) {
-        const std::string word = (w == 0) ? std::string(words[w]) : std::string(" ") + words[w];
+        const std::string word = words[w];
         int n = 0;
         int32_t* arr = qwen3_asr_tokenize(ctx, word.c_str(), &n);
         if (arr && n > 0) {
@@ -2271,63 +2300,12 @@ extern "C" int qwen3_asr_align_words(struct qwen3_asr_context* ctx, const float*
         return -7;
     }
 
-    // 6b. Fix timestamp monotonicity via LIS (longest increasing subsequence).
-    // The reference Qwen3-ForcedAligner uses LIS to find the longest monotone
-    // chain, then interpolates outliers. This is more robust than a simple
-    // forward clamp for cases where large inversions occur mid-sequence.
-    {
-        const int M = (int)ts_classes.size();
-        // O(n log n) LIS — find indices of the longest non-decreasing subsequence
-        std::vector<int> dp; // dp[i] = smallest tail value for IS of length i+1
-        std::vector<int> parent(M, -1);
-        std::vector<int> idx_map; // which index produced each dp entry
-
-        for (int i = 0; i < M; i++) {
-            int val = ts_classes[i];
-            // Binary search for first dp entry > val (upper_bound for non-decreasing)
-            auto it = std::upper_bound(dp.begin(), dp.end(), val);
-            int pos = (int)(it - dp.begin());
-            if (pos == (int)dp.size()) {
-                dp.push_back(val);
-                idx_map.push_back(i);
-            } else {
-                dp[pos] = val;
-                idx_map[pos] = i;
-            }
-            parent[i] = (pos > 0) ? idx_map[pos - 1] : -1;
-        }
-
-        // Traceback: find which indices are in the LIS
-        std::vector<bool> in_lis(M, false);
-        int k = idx_map.back();
-        while (k >= 0) {
-            in_lis[k] = true;
-            k = parent[k];
-        }
-
-        // Interpolate outliers: for each non-LIS element, set it to the
-        // value of the nearest LIS neighbor (linear interpolation between
-        // the previous and next LIS values).
-        int prev_lis = -1;
-        int prev_val = 0;
-        for (int i = 0; i < M; i++) {
-            if (in_lis[i]) {
-                // Fill any gap between prev_lis and i
-                if (prev_lis >= 0) {
-                    for (int j = prev_lis + 1; j < i; j++) {
-                        // Linear interpolation
-                        float frac = (float)(j - prev_lis) / (float)(i - prev_lis);
-                        ts_classes[j] = prev_val + (int)(frac * (float)(ts_classes[i] - prev_val));
-                    }
-                }
-                prev_lis = i;
-                prev_val = ts_classes[i];
-            }
-        }
-        // Fill trailing non-LIS elements
-        for (int j = prev_lis + 1; j < M; j++)
-            ts_classes[j] = prev_val;
-    }
+    // 6b. Blueprint-exact timestamp repair.  Keep the first longest
+    // non-decreasing subsequence selected by the Python O(n^2) DP.  Runs of
+    // one or two rejected values snap to their nearest retained neighbour;
+    // longer runs interpolate.  Both the tie rule and the short-run rule
+    // differ materially from the former O(n log n)/always-interpolate port.
+    core_qwen3_forced_aligner::fix_timestamps(ts_classes);
 
     // Ensure each word's end >= start.
     for (int w = 0; w < n_words; w++) {
@@ -2402,6 +2380,7 @@ extern "C" float* qwen3_asr_run_aligner(struct qwen3_asr_context* ctx, const flo
         ggml_backend_tensor_set(mask_in, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
     }
 
+    core_quant_bcast::audit(gf, "qwen3-asr");
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "qwen3_asr: aligner graph compute failed\n");
         return nullptr;

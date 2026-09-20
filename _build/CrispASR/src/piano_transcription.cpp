@@ -16,9 +16,11 @@
 
 #include "piano_transcription.h"
 
+#include "core/crispasr_env.h"
 #include "core/fft.h"
 #include "core/gguf_loader.h"
 #include "core/mel.h"
+#include "core/parallel_for.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -31,7 +33,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ─── Hyperparameters ────────────────────────────────────────────────────────
 
@@ -198,6 +202,29 @@ struct bn_fused {
 static constexpr float PIANO_BN2D_EPS = 0.01f; // ALL BatchNorm2d (bn0 + conv blocks)
 static constexpr float PIANO_BN1D_EPS = 1e-5f; // BatchNorm1d (bn5) only
 
+// #305: everything below the mel front-end (which core_mel already threads) ran
+// on one core — the 3x3 convs, the dense layers and the two GRU directions.
+// Each is split along an axis whose iterations write disjoint outputs and only
+// READ shared inputs, and the innermost accumulation order is untouched, so the
+// result is bit-identical to the serial path. Opt out with
+// CRISPASR_PIANO_SERIAL=1.
+//
+// Deliberately NOT parallelized: the four acoustic_model_forward calls in
+// piano_transcription_transcribe. Running those concurrently would hold four
+// sets of conv activations at once, and the box this ships on has 8 GB.
+static int piano_nthreads() {
+    static int v = -1;
+    if (v < 0) {
+        if (crispasr_env::get("CRISPASR_PIANO_SERIAL") != nullptr) {
+            v = 1;
+        } else {
+            unsigned hw = std::thread::hardware_concurrency();
+            v = (hw == 0) ? 1 : (int)std::min(hw, 8u);
+        }
+    }
+    return v;
+}
+
 static bn_fused fuse_bn(const piano_bn_weights& bn, float eps) {
     int C = (int)ggml_nelements(bn.weight);
     auto w = tensor_to_f32(bn.weight);
@@ -250,27 +277,32 @@ static void apply_bn1d(float* data, int T, int C, const bn_fused& bn) {
 static std::vector<float> conv2d_3x3_pad1(const float* input, int IC, int H, int W, const float* weight, int OC) {
     std::vector<float> output(OC * H * W, 0.0f);
 
-    for (int oc = 0; oc < OC; oc++) {
-        for (int h = 0; h < H; h++) {
-            for (int w = 0; w < W; w++) {
-                float sum = 0.0f;
-                for (int ic = 0; ic < IC; ic++) {
-                    for (int kh = 0; kh < 3; kh++) {
-                        for (int kw = 0; kw < 3; kw++) {
-                            int ih = h + kh - 1;
-                            int iw = w + kw - 1;
-                            if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
-                                // Weight layout: [OC, IC, KH, KW]
-                                // Input layout: [IC, H, W]
-                                sum += weight[oc * IC * 9 + ic * 9 + kh * 3 + kw] * input[ic * H * W + ih * W + iw];
+    // Split over oc: each output channel owns a disjoint [H*W] slab of `output`
+    // and only reads `input`/`weight`. The ic/kh/kw accumulation below is
+    // untouched, so every `sum` is summed in the same order as the serial loop.
+    core_parallel::for_each_chunk(OC, piano_nthreads(), [&](int oc0, int oc1) {
+        for (int oc = oc0; oc < oc1; oc++) {
+            for (int h = 0; h < H; h++) {
+                for (int w = 0; w < W; w++) {
+                    float sum = 0.0f;
+                    for (int ic = 0; ic < IC; ic++) {
+                        for (int kh = 0; kh < 3; kh++) {
+                            for (int kw = 0; kw < 3; kw++) {
+                                int ih = h + kh - 1;
+                                int iw = w + kw - 1;
+                                if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
+                                    // Weight layout: [OC, IC, KH, KW]
+                                    // Input layout: [IC, H, W]
+                                    sum += weight[oc * IC * 9 + ic * 9 + kh * 3 + kw] * input[ic * H * W + ih * W + iw];
+                                }
                             }
                         }
                     }
+                    output[oc * H * W + h * W + w] = sum;
                 }
-                output[oc * H * W + h * W + w] = sum;
             }
         }
-    }
+    });
 
     return output;
 }
@@ -382,9 +414,19 @@ static std::vector<float> bigru_forward(const float* x, int T, int input_size, i
     // Actually our gru_forward reads x + t * input_size — so [T, input_size] row-major
     // is exactly right as long as x_t starts at x + t * input_size. ✓
 
-    auto h_fwd = gru_forward(x, input_size, T, hidden_size, wih.data(), whh.data(), bih.data(), bhh.data(), false);
-    auto h_rev =
-        gru_forward(x, input_size, T, hidden_size, wih_r.data(), whh_r.data(), bih_r.data(), bhh_r.data(), true);
+    // The two directions share no state — each recurrence carries its own `h`
+    // and writes its own output vector — so they run concurrently. Two tasks
+    // only; with piano_nthreads() == 1 for_each_task runs them in the original
+    // forward-then-reverse order.
+    std::vector<float> h_fwd, h_rev;
+    core_parallel::for_each_task(2, piano_nthreads(), [&](int dir, int) {
+        if (dir == 0) {
+            h_fwd = gru_forward(x, input_size, T, hidden_size, wih.data(), whh.data(), bih.data(), bhh.data(), false);
+        } else {
+            h_rev = gru_forward(x, input_size, T, hidden_size, wih_r.data(), whh_r.data(), bih_r.data(), bhh_r.data(),
+                                true);
+        }
+    });
 
     // Concatenate: [T, 2*hidden_size]
     std::vector<float> out(T * 2 * hidden_size);
@@ -411,15 +453,19 @@ static std::vector<float> bigru_2layer(const float* x, int T, int input_size, in
 // output: [T, out_feat]
 static std::vector<float> linear(const float* x, int T, int in_feat, const float* W, const float* b, int out_feat) {
     std::vector<float> y(T * out_feat);
-    for (int t = 0; t < T; t++) {
-        for (int o = 0; o < out_feat; o++) {
-            float sum = b ? b[o] : 0.0f;
-            for (int i = 0; i < in_feat; i++) {
-                sum += W[o * in_feat + i] * x[t * in_feat + i];
+    // Split over t: each row owns a disjoint [out_feat] slab of `y`, and the
+    // dot product over `in_feat` keeps its serial order.
+    core_parallel::for_each_chunk(T, piano_nthreads(), [&](int t0, int t1) {
+        for (int t = t0; t < t1; t++) {
+            for (int o = 0; o < out_feat; o++) {
+                float sum = b ? b[o] : 0.0f;
+                for (int i = 0; i < in_feat; i++) {
+                    sum += W[o * in_feat + i] * x[t * in_feat + i];
+                }
+                y[t * out_feat + o] = sum;
             }
-            y[t * out_feat + o] = sum;
         }
-    }
+    });
     return y;
 }
 
@@ -750,7 +796,7 @@ struct piano_transcription_ctx* piano_transcription_init_from_file(const char* p
     core_gguf::free_metadata(meta);
 
     // Pass 2: load weights
-    ctx->backend = ggml_backend_cpu_init();
+    ctx->backend = core_cpu_backend::init();
     core_gguf::WeightLoad wl;
     if (!core_gguf::load_weights(path, ctx->backend, "piano", wl)) {
         ggml_backend_free(ctx->backend);
@@ -826,7 +872,7 @@ void piano_transcription_free(struct piano_transcription_ctx* ctx) {
     if (!ctx)
         return;
     if (ctx->w_buf)
-        ggml_backend_buffer_free(ctx->w_buf);
+        core_gguf::release_weight_buffer(ctx->w_buf);
     if (ctx->w_ctx)
         ggml_free(ctx->w_ctx);
     if (ctx->backend)

@@ -31,6 +31,16 @@ struct whisper_params; // fwd decl
 // (which everything else uses).
 std::string crispasr_resolve_vad_model(const whisper_params& p);
 
+// The keyword values `--vad-model` accepts, in help-text order. SINGLE SOURCE
+// for both the resolver's keyword test and the `--help` line: they are two
+// lists that must agree, and they had already drifted — the help advertised
+// only 'firered' and 'silero' while the resolver also accepted 'whisper-vad',
+// 'marblenet', 'webrtc' and 'auto'/'default', so four working options were
+// undiscoverable. Add a keyword here and in crispasr_resolve_vad_model().
+inline const char* crispasr_vad_model_keywords() {
+    return "auto, silero, firered, marblenet, webrtc, whisper-vad";
+}
+
 // Returns true if the resolved VAD model is a FireRedVAD model (not Silero).
 // The whisper backend needs this to avoid passing FireRed GGUF to whisper's
 // Silero-only VAD loader.

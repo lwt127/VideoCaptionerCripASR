@@ -11,7 +11,16 @@ namespace CrispASR
     /// </summary>
     internal static class NativeMethods
     {
-        private const string Lib = "crispasr";
+        // One name, shared with NativeLibraryResolver — the resolver only
+        // intercepts loads of exactly this name, so the two must not drift.
+        private const string Lib = NativeLibraryResolver.LibraryName;
+
+        // An explicit type initializer clears `beforefieldinit`, so the CLR is
+        // required to run this before the first static member of the class is
+        // touched — i.e. before any P/Invoke below can attempt a load. That is
+        // what makes the resolver's search order authoritative rather than a
+        // race against default probing.
+        static NativeMethods() => NativeLibraryResolver.Install();
 
         // ---- Session lifecycle ----
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
@@ -80,6 +89,10 @@ namespace CrispASR
             IntPtr s, [MarshalAs(UnmanagedType.LPUTF8Str)] string phonemes);
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void crispasr_session_set_tts_pad_silence_ms(
+            IntPtr s, int ms);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int crispasr_session_is_custom_voice(IntPtr s);
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
@@ -94,6 +107,10 @@ namespace CrispASR
             IntPtr s, [MarshalAs(UnmanagedType.LPUTF8Str)] string hotwords, float boost);
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_set_sensitivity(
+            IntPtr s, [MarshalAs(UnmanagedType.LPUTF8Str)] string preset);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int crispasr_session_set_g2p_dict(
             IntPtr s, [MarshalAs(UnmanagedType.LPUTF8Str)] string source);
 
@@ -103,6 +120,10 @@ namespace CrispASR
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int crispasr_session_set_target_language(
+            IntPtr s, [MarshalAs(UnmanagedType.LPUTF8Str)] string lang);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_set_tts_reference_language(
             IntPtr s, [MarshalAs(UnmanagedType.LPUTF8Str)] string lang);
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
@@ -157,6 +178,9 @@ namespace CrispASR
         internal static extern int crispasr_session_set_max_speech_tokens(IntPtr s, int n);
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_set_min_speech_tokens(IntPtr s, int n);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int crispasr_session_set_length_scale(IntPtr s, float scale);
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
@@ -209,6 +233,12 @@ namespace CrispASR
             out int outNSamples);
 
         // Attest acceptance of AI-content marking/disclosure duty (EU AI Act Art. 50).
+        // Whose voice a PRESET voice is (EU AI Act Art. 50(4)). 0 ok, -1 bad
+        // session, -2 unrecognised value.
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_set_speaker_identity(
+            IntPtr s, [MarshalAs(UnmanagedType.LPUTF8Str)] string identity);
+
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int crispasr_session_accept_marking_responsibility(
             IntPtr s, [MarshalAs(UnmanagedType.LPUTF8Str)] string attestation);
@@ -230,6 +260,26 @@ namespace CrispASR
         // Whisper-family backends, 0 on error).
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int crispasr_session_input_sample_rate(IntPtr s);
+
+        // #332: output-side counterparts. output_sample_rate is the rate of
+        // the PCM synthesize / speech_to_speech return (0 = no audio output);
+        // the channel getters are 1 (mono) for every current backend.
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_output_sample_rate(IntPtr s);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_input_channels(IntPtr s);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_session_output_channels(IntPtr s);
+
+        // AI-content marking (EU AI Act Art. 50(2)) — the other half of
+        // synthesize_raw. alpha <= 0 selects the reliably detectable default.
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void crispasr_watermark_embed(float[] pcm, int nSamples, float alpha);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern float crispasr_watermark_detect(float[] pcm, int nSamples);
 
         // ---- ASR transcription ----
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
@@ -610,6 +660,31 @@ namespace CrispASR
         internal static extern int crispasr_cache_dir_abi(
             [MarshalAs(UnmanagedType.LPUTF8Str)] string? cacheDirOverride,
             byte[] outBuf, int outCap);
+
+        // ---- Audio decode (issue #291: the binding had no way to read a file) ----
+        // Decode any supported format to mono float32 PCM. *out_pcm is
+        // malloc-owned by the native side — release it with crispasr_audio_free.
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_audio_load(
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string path,
+            out IntPtr outPcm, out int outSamples, out int outSampleRate);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_audio_load_at_rate(
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string path, int targetRate,
+            out IntPtr outPcm, out int outSamples, out int outSampleRate);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void crispasr_audio_free(IntPtr pcm);
+
+        // Returns malloc'd WAV bytes; released with crispasr_c2pa_free (the
+        // shared free for the C2PA/provenance byte-buffer family, per crispasr.h).
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr crispasr_pcm_to_wav(
+            float[] pcm, int nSamples, int sampleRate, out UIntPtr outLen);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void crispasr_c2pa_free(IntPtr p);
 
         // ---- Helpers ----
         internal static string NullTerminated(byte[] buf)

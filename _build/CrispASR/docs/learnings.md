@@ -231,7 +231,7 @@ Lessons from the systematic head-to-head benchmark against
     ReLU, not the tanh the header claims), record the design, and build+A/B it on
     Kaggle where it can actually be measured. Correctness (transcript/WER parity)
     is HW-independent and can be pre-validated on M1; perf cannot.** Design in
-    PLAN §232 "RNNT/TDT GPU decode".
+    HISTORY.md §232 "RNNT/TDT GPU decode".
 
 30. **The Parakeet "955 ms P100 decode gap" is substantially a slow-CPU-BLAS
     artifact, not pure GPU-idle.** After actually implementing the ggml-graph

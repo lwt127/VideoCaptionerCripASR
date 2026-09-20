@@ -15,7 +15,7 @@
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (§232 paraformer GPU path)
 #include "core/crispasr_env.h"
 #if defined(GGML_USE_METAL)
-#include "ggml-metal.h" // ggml_backend_is_metal (§232 CUDA/Vulkan-default gate)
+#include "ggml-metal.h" // core_cpu_backend::is_metal(§232 CUDA/Vulkan-default gate)
 #endif
 
 #include "ggml.h"
@@ -30,6 +30,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `PARAFORMER_BENCH=1` for per-stage timings.
@@ -942,7 +943,7 @@ paraformer_context* paraformer_init_from_file(const char* path, paraformer_conte
     ctx->flash_attn = params.flash_attn;
     ctx->verbosity = params.verbosity;
 
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (!ctx->backend_cpu) {
         fprintf(stderr, "paraformer: failed to init CPU backend\n");
         delete ctx;
@@ -964,7 +965,7 @@ paraformer_context* paraformer_init_from_file(const char* path, paraformer_conte
         if (gpu) {
             bool is_metal = false;
 #if defined(GGML_USE_METAL)
-            is_metal = ggml_backend_is_metal(gpu);
+            is_metal = core_cpu_backend::is_metal(gpu);
 #endif
             if (!is_metal || force_gpu) {
                 ctx->backend = gpu;

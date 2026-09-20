@@ -1,0 +1,14 @@
+{
+  "id": "chr1str/crispasr-moss-local-teacher-force",
+  "title": "crispasr moss local teacher force",
+  "code_file": "crispasr-moss-local-teacher-force.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "false",
+  "enable_internet": "true",
+  "dataset_sources": ["chr1str/crispasr-hf-token", "chr1str/crispasr-ccache"],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}

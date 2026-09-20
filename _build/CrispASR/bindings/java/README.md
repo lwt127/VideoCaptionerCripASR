@@ -63,6 +63,64 @@ public class Example {
 }
 ```
 
+## Chat / LLM
+
+`io.github.ggerganov.whispercpp.chat` binds the `crispasr_chat_*` C ABI
+(`include/crispasr_chat.h`) — text in, text out, separate from the ASR surface
+above and usable on its own.
+
+```java
+import io.github.ggerganov.whispercpp.chat.*;
+import java.util.Arrays;
+import java.util.List;
+
+List<ChatMessage> turns = Arrays.asList(
+        ChatMessage.system("You are terse."),
+        ChatMessage.user("Name three primes."));
+
+try (ChatSession s = ChatSession.open("/models/gemma-3-1b-it-Q4_K_M.gguf",
+        new ChatOpenParams().nCtx(4096))) {
+
+    System.out.println(s.templateName() + ", " + s.nCtx() + " tokens");
+    System.out.println(s.countTokens(turns) + " tokens of prompt");
+
+    // One shot.
+    System.out.println(s.generate(turns, new ChatGenerateParams().maxTokens(128)));
+
+    // Or streamed. Chunks are whole characters; concatenated they equal the
+    // one-shot text. The listener must not call back into the same session.
+    s.generateStream(turns, new ChatGenerateParams().maxTokens(128), System.out::print);
+}
+```
+
+Points worth knowing:
+
+- **Pass the WHOLE conversation on every call.** The session compares the
+  templated prompt against the tokens it already holds and decodes only what is
+  new; passing just the latest turn re-prefills from scratch.
+- **Cancellation.** `setAbortCallback` takes a predicate that returns **true to
+  CONTINUE** — the polarity of the C callback and of the ASR side's
+  encoder-begin callback. A cancelled call throws `ChatAbortedException` and
+  leaves the session as if freshly opened, so no `reset()` is needed.
+- **Params keep the ABI defaults.** `new ChatGenerateParams().maxTokens(64)`
+  leaves `temperature` at 0.8, not 0.0.
+- **`maxTokens(0)`** selects the ABI default of 256, not "generate nothing" —
+  use `prefillOnly(true)` for that.
+- **`memoryEstimate` over-reports on purpose.** It bills the KV cache at the
+  full attention width, so on a grouped-query model the figure comes out well
+  above the real working set — the safe direction for a "will this fit?"
+  pre-flight guard. See its javadoc for the measured factor.
+- **EU AI Act Art. 50.** This is synthetic text generation and nothing marks it.
+  `ChatSession.aiDisclosureText()` is the canonical "you are talking to an AI"
+  wording; show it visibly, and mark the output machine-readably yourself.
+
+The end-to-end cases in `ChatSessionTest` need a GGUF chat model and are gated
+on `CRISPASR_CHAT_TEST_MODEL`, self-skipping when it is unset:
+
+```bash
+CRISPASR_CHAT_TEST_MODEL=/models/gemma-3-1b-it-Q4_K_M.gguf ./gradlew test
+```
+
 ## Building & Testing
 
 In order to build, you need to have the JDK 8 or higher installed. Run the tests with:

@@ -13,11 +13,12 @@
 
 #include "t5_translate.h"
 #include "core/beam_decode.h"
+#include "core/repeat_break.h"
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (§232 t5 GPU path)
 #include "core/crispasr_env.h"
 #if defined(GGML_USE_METAL)
-#include "ggml-metal.h" // ggml_backend_is_metal (§232 CUDA/Vulkan-default gate)
+#include "ggml-metal.h" // core_cpu_backend::is_metal(§232 CUDA/Vulkan-default gate)
 #endif
 
 #include "ggml-backend.h"
@@ -36,6 +37,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `T5_TRANSLATE_BENCH=1` for per-stage timings.
@@ -614,6 +616,35 @@ static bool alloc_cross_kv(t5_translate_context* c, int T_enc) {
 
 // ── Encoder graph ────────────────────────────────────────────────
 
+// ── #333 diff-harness capture ────────────────────────────────────
+//
+// OFF unless CRISPASR_T5_DIFF=1 (crispasr-diff sets it before loading), so the
+// shipping graphs are byte-for-byte what they were: marking a tensor as an
+// output perturbs buffer elision, which is exactly the hazard LEARNINGS records
+// for the Metal scheduler.
+static bool t5_diff_capture() {
+    static const bool on = [] {
+        const char* v = std::getenv("CRISPASR_T5_DIFF");
+        return v && *v && std::strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+
+// Which encoder blocks get a snapshot. Four is deliberate — the first two catch
+// a structural error immediately, and mid/last show whether an error grows.
+// Dumping all 32 would be ~1 GB of reference GGUF for no extra signal.
+static const char* t5_enc_stage_name(int il, int n_layers) {
+    if (il == 0)
+        return "enc_blk_first";
+    if (il == 1)
+        return "enc_blk_second";
+    if (il == n_layers / 2)
+        return "enc_blk_mid";
+    if (il == n_layers - 1)
+        return "enc_blk_last";
+    return nullptr;
+}
+
 static ggml_cgraph* build_encoder_graph(t5_translate_context* c, int T) {
     const auto& m = c->model;
     const auto& hp = m.hp;
@@ -644,6 +675,20 @@ static ggml_cgraph* build_encoder_graph(t5_translate_context* c, int T) {
 
     // Embedding (no positional — T5 uses relative position bias)
     ggml_tensor* cur = ggml_get_rows(ctx0, m.shared_embed, inp);
+
+    // #333 diff harness. `ggml_set_output` is not optional here: without it
+    // ggml reuses the buffer and a later layer overwrites the value we wanted
+    // to read back, so the snapshot silently becomes some other stage's output.
+    // Gated so the shipping path allocates nothing extra.
+    const bool dbg = t5_diff_capture();
+    if (dbg) {
+        ggml_set_name(cur, "enc_embed");
+        ggml_set_output(cur);
+        ggml_build_forward_expand(gf, cur);
+        ggml_set_name(pos_bias, "enc_pos_bias");
+        ggml_set_output(pos_bias);
+        ggml_build_forward_expand(gf, pos_bias);
+    }
 
     for (int il = 0; il < hp.enc_n_layers; il++) {
         const auto& l = m.enc_layers[il];
@@ -691,6 +736,15 @@ static ggml_cgraph* build_encoder_graph(t5_translate_context* c, int T) {
         cur = ggml_mul_mat(ctx0, l.ffn_down, ggml_mul(ctx0, gate, up));
 
         cur = ggml_add(ctx0, cur, residual);
+
+        if (dbg) {
+            const char* nm = t5_enc_stage_name(il, hp.enc_n_layers);
+            if (nm) {
+                ggml_set_name(cur, nm);
+                ggml_set_output(cur);
+                ggml_build_forward_expand(gf, cur);
+            }
+        }
     }
 
     cur = t5_rms_norm(ctx0, cur, m.enc_final_rms, hp.layer_norm_eps);
@@ -775,6 +829,8 @@ static ggml_cgraph* build_decoder_graph(t5_translate_context* c, int n_tokens, i
     ggml_context* ctx0 = ggml_init(ip);
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
 
+    const bool dbg = t5_diff_capture();
+
     ggml_tensor* inp = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_name(inp, "dec_tokens");
     ggml_set_input(inp);
@@ -800,6 +856,11 @@ static ggml_cgraph* build_decoder_graph(t5_translate_context* c, int n_tokens, i
 
     // Embedding
     ggml_tensor* cur = ggml_get_rows(ctx0, m.shared_embed, inp);
+    if (dbg) {
+        ggml_set_name(cur, "dec_embed");
+        ggml_set_output(cur);
+        ggml_build_forward_expand(gf, cur);
+    }
 
     for (int il = 0; il < hp.dec_n_layers; il++) {
         const auto& l = m.dec_layers[il];
@@ -881,9 +942,24 @@ static ggml_cgraph* build_decoder_graph(t5_translate_context* c, int n_tokens, i
         cur = ggml_mul_mat(ctx0, l.ffn_down, ggml_mul(ctx0, gate, up));
 
         cur = ggml_add(ctx0, cur, residual);
+
+        if (dbg) {
+            const char* nm = (il == 0) ? "dec_blk_first" : (il == hp.dec_n_layers - 1 ? "dec_blk_last" : nullptr);
+            if (nm) {
+                ggml_set_name(cur, nm);
+                ggml_set_output(cur);
+                ggml_build_forward_expand(gf, cur);
+            }
+        }
     }
 
     cur = t5_rms_norm(ctx0, cur, m.dec_final_rms, hp.layer_norm_eps);
+
+    if (dbg) {
+        ggml_set_name(cur, "dec_out");
+        ggml_set_output(cur);
+        ggml_build_forward_expand(gf, cur);
+    }
 
     if (n_tokens > 1)
         cur = ggml_view_2d(ctx0, cur, D, 1, cur->nb[1], (size_t)(n_tokens - 1) * cur->nb[1]);
@@ -1006,7 +1082,7 @@ extern "C" struct t5_translate_context* t5_translate_init_from_file(const char* 
     //     identical en->de output, 2.13x wall (slow OpenBLAS baseline). On M1
     //     (Accelerate) neutral — launch-bound (LEARNING 34) — so Metal stays CPU
     //     unless forced. Mirrors LEARNING 34's is_metal gate.
-    c->backend_cpu = ggml_backend_cpu_init();
+    c->backend_cpu = core_cpu_backend::init();
     const char* gpu_env = std::getenv("CRISPASR_T5_GPU");
     const bool force_gpu = gpu_env && std::atoi(gpu_env) != 0;
     const bool force_cpu = gpu_env && std::atoi(gpu_env) == 0;
@@ -1016,7 +1092,7 @@ extern "C" struct t5_translate_context* t5_translate_init_from_file(const char* 
         if (gpu) {
             bool is_metal = false;
 #if defined(GGML_USE_METAL)
-            is_metal = ggml_backend_is_metal(gpu);
+            is_metal = core_cpu_backend::is_metal(gpu);
 #endif
             if (!is_metal || force_gpu) {
                 c->backend = gpu;
@@ -1071,7 +1147,7 @@ extern "C" void t5_translate_free(struct t5_translate_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->buf_w)
-        ggml_backend_buffer_free(ctx->buf_w);
+        core_gguf::release_weight_buffer(ctx->buf_w);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)
@@ -1159,6 +1235,19 @@ extern "C" char* t5_translate(struct t5_translate_context* ctx, const char* text
             dec_ids.push_back((int)t);
         }
     } else {
+        // A/B lever for the incremental KV path. With it set, every step
+        // re-forwards the WHOLE decoder prefix from offset 0 instead of
+        // appending one token to the cache — mathematically the same answer,
+        // and much slower, so it exists only to answer "is the cache the
+        // problem?" without needing the 11.76 GB reference checkpoint.
+        // Divergence between the two IS a cache/position bug; agreement means
+        // the model genuinely does not stop and the fix belongs in the decode
+        // policy instead.
+        static const bool no_kv_reuse = [] {
+            const char* v = std::getenv("CRISPASR_T5_NO_KV_REUSE");
+            return v && *v && std::strcmp(v, "0") != 0;
+        }();
+
         int offset = prompt_len;
         for (int step = 0; step < max_new_tokens; step++) {
             // NaN-robust argmax (see lfm2_audio note): seed -inf, skip non-finite,
@@ -1179,13 +1268,42 @@ extern "C" char* t5_translate(struct t5_translate_context* ctx, const char* text
                 break;
             dec_ids.push_back(best_id);
 
+            // #333: stop a degenerate greedy cycle instead of burning the whole
+            // token budget on it. MADLAD does this on short inputs — fr→en
+            // "Bonjour le monde!" translates correctly and then emits a digit
+            // loop to the cap.
+            //
+            // ⚠ This DEVIATES FROM THE BLUEPRINT ON PURPOSE, which is why it is
+            // gated. The PyTorch reference was measured on the same input and
+            // runs away identically (60 tokens, no EOS, byte-identical string),
+            // so this is not a parity fix — the port already matches. It is a
+            // product decision that a repeated 1-8 token cycle is never the
+            // wanted output. CRISPASR_T5_REPEAT_BREAK=0 restores exact
+            // blueprint behaviour for anyone diffing against HF.
+            static const bool repeat_break = [] {
+                const char* v = std::getenv("CRISPASR_T5_REPEAT_BREAK");
+                return !(v && *v && std::strcmp(v, "0") == 0);
+            }();
+            if (repeat_break && (int)dec_ids.size() - prompt_len >= 8 && core_repeat::tail_is_repetition(dec_ids)) {
+                if (ctx->params.verbosity >= 1)
+                    fprintf(stderr,
+                            "t5: decode loop detected after %d tokens — stopping early "
+                            "(CRISPASR_T5_REPEAT_BREAK=0 to disable)\n",
+                            (int)dec_ids.size() - prompt_len);
+                // Drop the repeated tail so the caller gets the good prefix.
+                while ((int)dec_ids.size() > prompt_len + 1 && core_repeat::tail_is_repetition(dec_ids, 2, 8))
+                    dec_ids.pop_back();
+                break;
+            }
+
             if (ctx->params.verbosity >= 2) {
                 fprintf(stderr, "t5[dec]: step=%d tok=%d '%s'\n", step, best_id,
                         best_id < (int)ctx->tokenizer.id_to_token.size() ? ctx->tokenizer.id_to_token[best_id].c_str()
                                                                          : "?");
             }
 
-            logits = run_decoder_step(ctx, &best_id, 1, offset);
+            logits = no_kv_reuse ? run_decoder_step(ctx, dec_ids.data(), (int)dec_ids.size(), 0)
+                                 : run_decoder_step(ctx, &best_id, 1, offset);
             if (logits.empty())
                 return nullptr;
             offset++;
@@ -1199,4 +1317,210 @@ extern "C" char* t5_translate(struct t5_translate_context* ctx, const char* text
     char* out = (char*)malloc(result.size() + 1);
     std::memcpy(out, result.c_str(), result.size() + 1);
     return out;
+}
+
+// ── #333: per-stage parity vs the PyTorch blueprint ──────────────
+//
+// Self-contained, following the dots-tts / voxtral-tts pattern the dev guide
+// recommends for LLM stacks: this loads the runtime AND the reference GGUF and
+// compares inline, so the harness needs no per-stage C API.
+//
+// The FIRST thing it does is take `enc_tokens` from the reference and feed
+// those exact ids to our encoder. That is the structural gate: if we
+// re-tokenized here, a SentencePiece disagreement would show up as a smooth
+// per-layer "numeric drift" and send someone hunting a GELU LUT for hours
+// (LEARNINGS: gate input alignment before trusting any per-layer cosine).
+extern "C" int t5_translate_diff(const char* model_gguf, const char* ref_gguf, int verbosity) {
+    // Must be set before the graphs are built, or nothing is marked as output.
+#ifdef _WIN32
+    _putenv_s("CRISPASR_T5_DIFF", "1");
+#else
+    setenv("CRISPASR_T5_DIFF", "1", 1);
+#endif
+
+    t5_translate_context_params p = t5_translate_context_default_params();
+    p.verbosity = verbosity;
+    t5_translate_context* c = t5_translate_init_from_file(model_gguf, p);
+    if (!c) {
+        std::fprintf(stderr, "t5_diff: failed to load model %s\n", model_gguf);
+        return 2;
+    }
+    core_gguf::WeightLoad rw;
+    if (!core_gguf::load_weights(ref_gguf, c->backend, "ref", rw)) {
+        std::fprintf(stderr, "t5_diff: failed to load reference %s\n", ref_gguf);
+        t5_translate_free(c);
+        return 2;
+    }
+
+    int n_pass = 0, n_fail = 0, n_skip = 0;
+
+    auto fetch = [&](const char* name) -> std::vector<float> {
+        ggml_tensor* t = ggml_get_tensor(rw.ctx, name);
+        if (!t)
+            return {};
+        std::vector<float> v((size_t)ggml_nelements(t));
+        ggml_backend_tensor_get(t, v.data(), 0, v.size() * sizeof(float));
+        return v;
+    };
+
+    // Cosine AND both magnitudes. Cosine is scale-blind — a stage wrong by a
+    // uniform factor passes it and every correlation-style metric, which is why
+    // |mine| / |ref| are printed next to it rather than on request.
+    auto report = [&](const char* tag, const std::vector<float>& got, const std::vector<float>& ref) {
+        if (ref.empty()) {
+            std::printf("t5 %-16s  (absent from reference — skipped)\n", tag);
+            n_skip++;
+            return;
+        }
+        if (got.size() != ref.size()) {
+            std::printf("t5 %-16s  SHAPE MISMATCH mine=%zu ref=%zu  FAIL\n", tag, got.size(), ref.size());
+            n_fail++;
+            return;
+        }
+        double dot = 0, na = 0, nb = 0, maxabs = 0;
+        for (size_t i = 0; i < got.size(); i++) {
+            dot += (double)got[i] * ref[i];
+            na += (double)got[i] * got[i];
+            nb += (double)ref[i] * ref[i];
+            const double d = std::fabs((double)got[i] - ref[i]);
+            if (d > maxabs)
+                maxabs = d;
+        }
+        const double cos = (na > 0 && nb > 0) ? dot / (std::sqrt(na) * std::sqrt(nb)) : 0.0;
+        const bool pass = cos > 0.99;
+        std::printf("t5 %-16s n=%-8zu cos=%.6f  max_abs=%.5f  |mine|=%.4f |ref|=%.4f  %s\n", tag, got.size(), cos,
+                    maxabs, std::sqrt(na), std::sqrt(nb), pass ? "PASS" : "FAIL");
+        if (pass)
+            n_pass++;
+        else
+            n_fail++;
+    };
+
+    // ── input alignment ──
+    std::vector<float> tok_f = fetch("enc_tokens");
+    if (tok_f.empty()) {
+        std::fprintf(stderr, "t5_diff: reference has no enc_tokens — cannot align inputs, refusing to "
+                             "report per-layer numbers that would be meaningless\n");
+        t5_translate_free(c);
+        return 2;
+    }
+    std::vector<int> ids(tok_f.size());
+    for (size_t i = 0; i < tok_f.size(); i++)
+        ids[i] = (int)std::lround(tok_f[i]);
+    const int T = (int)ids.size();
+    const auto& hp = c->model.hp;
+    std::printf("t5 diff: %d source tokens, d_model=%d, %d/%d enc/dec layers\n", T, hp.d_model, hp.enc_n_layers,
+                hp.dec_n_layers);
+
+    // ── encoder ──
+    ggml_cgraph* gf = build_encoder_graph(c, T);
+    ggml_backend_sched_reset(c->sched);
+    if (!ggml_backend_sched_alloc_graph(c->sched, gf)) {
+        t5_translate_free(c);
+        return 2;
+    }
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "enc_tokens"), ids.data(), 0, T * sizeof(int32_t));
+    std::vector<int32_t> buckets((size_t)T * T);
+    for (int q = 0; q < T; q++)
+        for (int k = 0; k < T; k++)
+            buckets[(size_t)q * T + k] =
+                t5_relative_position_bucket(k - q, true, hp.rel_attn_num_buckets, hp.rel_attn_max_dist);
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "enc_pos_bucket"), buckets.data(), 0,
+                            buckets.size() * sizeof(int32_t));
+    if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS) {
+        t5_translate_free(c);
+        return 2;
+    }
+
+    auto snap = [&](const char* name) -> std::vector<float> {
+        ggml_tensor* t = ggml_graph_get_tensor(gf, name);
+        if (!t)
+            return {};
+        std::vector<float> v((size_t)ggml_nelements(t));
+        ggml_backend_tensor_get(t, v.data(), 0, v.size() * sizeof(float));
+        return v;
+    };
+
+    for (const char* nm :
+         {"enc_embed", "enc_pos_bias", "enc_blk_first", "enc_blk_second", "enc_blk_mid", "enc_blk_last", "enc_out"})
+        report(nm, snap(nm), fetch(nm));
+
+    std::vector<float> enc_out = snap("enc_out");
+
+    // ── cross K/V: the encoder-decoder joint, where these ports go wrong ──
+    if (!compute_cross_kv(c, enc_out.data(), T)) {
+        std::fprintf(stderr, "t5_diff: cross-KV computation failed\n");
+        t5_translate_free(c);
+        return 2;
+    }
+    {
+        // The cache is F16 on the device; pull block 0 back and widen for the
+        // comparison. The F16 store is itself part of what we are checking.
+        auto pull = [&](ggml_tensor* t) {
+            const size_t n = (size_t)ggml_nelements(t);
+            std::vector<ggml_fp16_t> h(n);
+            ggml_backend_tensor_get(t, h.data(), 0, n * sizeof(ggml_fp16_t));
+            std::vector<float> f(n);
+            ggml_fp16_to_fp32_row(h.data(), f.data(), (int)n);
+            return f;
+        };
+        report("cross_k_blk0", pull(c->cross_kv_k[0]), fetch("cross_k_blk0"));
+        report("cross_v_blk0", pull(c->cross_kv_v[0]), fetch("cross_v_blk0"));
+    }
+
+    // ── decoder, step 0 ──
+    //
+    // The self-attention KV cache has to be allocated before a decoder graph is
+    // built: `build_decoder_graph` writes this step's K/V into `c->kv_k`/`kv_v`
+    // with `ggml_cpy` into a position view, so a null cache is a null deref in
+    // layer 0. `t5_translate()` does this on its own path and the omission here
+    // segfaulted the first run of this function — the encoder stages all
+    // reported first, which is exactly why the stage-by-stage output is worth
+    // having.
+    if (!alloc_kv_cache(c, 64)) {
+        std::fprintf(stderr, "t5_diff: failed to allocate the decoder KV cache\n");
+        t5_translate_free(c);
+        return 2;
+    }
+    const int start = hp.dec_start_token_id;
+    ggml_cgraph* dg = build_decoder_graph(c, 1, 0);
+    ggml_backend_sched_reset(c->sched);
+    if (!ggml_backend_sched_alloc_graph(c->sched, dg)) {
+        t5_translate_free(c);
+        return 2;
+    }
+    ggml_backend_tensor_set(ggml_graph_get_tensor(dg, "dec_tokens"), &start, 0, sizeof(int32_t));
+    int32_t b0 = t5_relative_position_bucket(0, false, hp.rel_attn_num_buckets, hp.rel_attn_max_dist);
+    ggml_backend_tensor_set(ggml_graph_get_tensor(dg, "dec_pos_bucket"), &b0, 0, sizeof(int32_t));
+    if (ggml_backend_sched_graph_compute(c->sched, dg) != GGML_STATUS_SUCCESS) {
+        t5_translate_free(c);
+        return 2;
+    }
+    auto dsnap = [&](const char* name) -> std::vector<float> {
+        ggml_tensor* t = ggml_graph_get_tensor(dg, name);
+        if (!t)
+            return {};
+        std::vector<float> v((size_t)ggml_nelements(t));
+        ggml_backend_tensor_get(t, v.data(), 0, v.size() * sizeof(float));
+        return v;
+    };
+    for (const char* nm : {"dec_embed", "dec_blk_first", "dec_blk_last", "dec_out"})
+        report(nm, dsnap(nm), fetch(nm));
+
+    std::vector<float> logits = dsnap("logits");
+    std::vector<float> ref_logits = fetch("logits_step0");
+    report("logits_step0", logits, ref_logits);
+
+    // The argmax is what actually steers the decode, so agreement there is a
+    // stronger statement than the cosine — and a disagreement with a high
+    // cosine means near-ties, which is the expected quantization signature.
+    if (!logits.empty() && logits.size() == ref_logits.size()) {
+        const int a = (int)(std::max_element(logits.begin(), logits.end()) - logits.begin());
+        const int b = (int)(std::max_element(ref_logits.begin(), ref_logits.end()) - ref_logits.begin());
+        std::printf("t5 %-16s mine=%d ref=%d  %s\n", "argmax_step0", a, b, a == b ? "MATCH" : "DIFFER");
+    }
+
+    std::printf("t5 diff: %d pass, %d fail, %d skipped\n", n_pass, n_fail, n_skip);
+    t5_translate_free(c);
+    return n_fail == 0 ? 0 : 1;
 }

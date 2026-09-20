@@ -72,6 +72,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 namespace {
 
@@ -158,7 +159,7 @@ struct snac_decoder_ctx {
             ggml_free(ctx_w);
         }
         if (buf_w) {
-            ggml_backend_buffer_free(buf_w);
+            core_gguf::release_weight_buffer(buf_w);
         }
         if (backend && backend != backend_cpu) {
             ggml_backend_free(backend);
@@ -629,13 +630,13 @@ extern "C" struct snac_decoder_ctx* snac_decoder_init_from_file(const char* path
     }
 
     // Backend.
-    c->backend_cpu = ggml_backend_cpu_init();
+    c->backend_cpu = core_cpu_backend::init();
     if (!c->backend_cpu) {
         fprintf(stderr, "snac: failed to init CPU backend\n");
         delete c;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(c->backend_cpu, c->n_threads);
+    core_cpu_backend::set_n_threads(c->backend_cpu, c->n_threads);
     c->backend = params.use_gpu ? crispasr_init_gpu_backend() : c->backend_cpu;
     if (!c->backend) {
         c->backend = c->backend_cpu;

@@ -25,13 +25,15 @@ logger = setup_logger("batch_process_thread")
 
 
 class BatchTask:
-    def __init__(self, file_path: str, task_type: BatchTaskType):
+    def __init__(self, file_path: str, task_type: BatchTaskType, transcribe_task=None):
         self.file_path = file_path
         self.task_type = task_type
         self.status = BatchTaskStatus.WAITING
         self.progress = 0
         self.error_message = ""
         self.current_thread: Optional[QThread] = None
+        # Freeze model and license approvals at submission, not worker start.
+        self.transcribe_task = transcribe_task
 
 
 class BatchProcessThread(QThread):
@@ -123,7 +125,7 @@ class BatchProcessThread(QThread):
 
     def _handle_transcribe_task(self, batch_task: BatchTask):
         # self.max_concurrent_tasks = 3
-        task = self.factory.create_transcribe_task(batch_task.file_path)
+        task = batch_task.transcribe_task or self.factory.create_transcribe_task(batch_task.file_path)
         thread = TranscriptThread(task)
         batch_task.current_thread = thread
 
@@ -165,8 +167,7 @@ class BatchProcessThread(QThread):
         thread.start()
 
     def _handle_trans_sub_task(self, batch_task: BatchTask):
-        task = self.factory.create_transcript_and_subtitle_task(batch_task.file_path)
-        trans_task = self.factory.create_transcribe_task(
+        trans_task = batch_task.transcribe_task or self.factory.create_transcribe_task(
             batch_task.file_path, need_next_task=True
         )
         thread = TranscriptThread(trans_task)
@@ -238,9 +239,8 @@ class BatchProcessThread(QThread):
         self.task_progress.emit(batch_task.file_path, progress, message)
 
     def _handle_full_process_task(self, batch_task: BatchTask):
-        task = self.factory.create_full_process_task(batch_task.file_path)
         # 首先创建转录任务
-        trans_task = self.factory.create_transcribe_task(
+        trans_task = batch_task.transcribe_task or self.factory.create_transcribe_task(
             batch_task.file_path, need_next_task=True
         )
         thread = TranscriptThread(trans_task)

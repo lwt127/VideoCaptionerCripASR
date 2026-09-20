@@ -9,6 +9,7 @@
 #include "crispasr_diarize_cli.h"
 #include "crispasr_cache.h"
 #include "crispasr_diarize_internal.h"
+#include "crispasr_model_registry.h"
 #include "crispasr_speaker_cluster.h"
 #include "crispasr_speaker_embedder.h"
 #include "crispasr_subprocess.h"
@@ -16,14 +17,21 @@
 #include "speaker_db.h"
 #include "whisper_params.h"
 
+#include <set>
+
+#include "core/diarize_tracks.h"
 #include "core/spectral_diarize.h"
 
 #include <algorithm>
+#include <chrono>
+#include <atomic> // cross-segment embed workers (#326)
+#include <thread>
 #include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -297,10 +305,20 @@ bool apply_sherpa(const std::vector<float>& mono, int64_t slice_t0_cs, std::vect
 std::string resolve_pyannote_model(const whisper_params& params) {
     std::string mp = params.sherpa_segment_model;
     if (mp.empty() || mp == "auto") {
-        mp = crispasr_cache::ensure_cached_file(
+        // MIT, and the GGUF repo is ungated — same licence as the upstream
+        // pyannote/segmentation-3.0 it was exported from.
+        //
+        // This was tagged "other", which the registry treats as restricted (a
+        // correct default for an unknown licence — see the `restricted[]` list
+        // in crispasr_model_registry.cpp). The effect was that `--diarize-method
+        // pyannote` with the default "auto" refused to fetch its own
+        // segmentation model and printed a licence warning, so pyannote
+        // diarization did not work out of the box at all: it fell through to
+        // "sherpa needs --sherpa-segment-model" and produced no speaker turns.
+        mp = crispasr_managed_download(
             "pyannote-seg-3.0.gguf",
-            "https://huggingface.co/cstr/pyannote-v3-segmentation-GGUF/resolve/main/pyannote-seg-3.0.gguf",
-            params.no_prints, "crispasr[diarize]", params.cache_dir);
+            "https://huggingface.co/cstr/pyannote-v3-segmentation-GGUF/resolve/main/pyannote-seg-3.0.gguf", "mit",
+            params.no_prints, "crispasr[diarize]", params.cache_dir, params.accept_license);
     }
     if (mp.size() < 5 || mp.compare(mp.size() - 5, 5, ".gguf") != 0)
         return {}; // not GGUF → caller can fall back to sherpa subprocess
@@ -313,6 +331,18 @@ std::string resolve_pyannote_model(const whisper_params& params) {
 std::string resolve_foxnose_embedder(const whisper_params& params) {
     std::string mp = params.diarize_embedder;
     if (mp.empty() || mp == "auto") {
+        CrispasrRegistryEntry entry;
+        if (crispasr_registry_lookup("wespeaker", entry)) {
+            if (crispasr_license_requires_acceptance(entry.license) &&
+                !crispasr_license_accepted(entry.license, params.accept_license)) {
+                fprintf(stderr,
+                        "crispasr[diarize]: refusing restricted WeSpeaker weights without --accept-license %s\n",
+                        crispasr_license_tag(entry.license).c_str());
+                return {};
+            }
+            if (!params.no_prints)
+                fprintf(stderr, "crispasr[diarize]: weights license: %s\n", entry.license.c_str());
+        }
         mp = crispasr_cache::ensure_cached_file(
             "wespeaker-resnet34-lm.gguf",
             "https://huggingface.co/cstr/wespeaker-resnet34-lm-GGUF/resolve/main/wespeaker-resnet34-lm.gguf",
@@ -758,6 +788,53 @@ bool crispasr_compute_sherpa_cache(const float* full_audio, int n_samples, const
     return true;
 }
 
+void crispasr_diarize_merged_by_slice(
+    std::vector<crispasr_segment>& segs, const std::vector<crispasr_audio_slice>& slices,
+    const std::function<void(const crispasr_audio_slice&, std::vector<crispasr_segment>&)>& diarize_slice) {
+    if (segs.empty() || slices.empty() || !diarize_slice)
+        return;
+
+    std::vector<crispasr_segment> out;
+    out.reserve(segs.size());
+
+    size_t seg_offset = 0;
+    for (size_t i = 0; i < slices.size(); ++i) {
+        // Segments belonging to this slice: everything up to the first one that
+        // starts at or after the NEXT slice's t0. The last slice takes the rest.
+        size_t seg_count = 0;
+        for (size_t j = seg_offset; j < segs.size(); ++j) {
+            if (i + 1 < slices.size() && segs[j].t0 >= slices[i + 1].t0_cs)
+                break;
+            seg_count++;
+        }
+        if (seg_count == 0)
+            continue;
+
+        std::vector<crispasr_segment> slice_segs(
+            std::make_move_iterator(segs.begin() + (ptrdiff_t)seg_offset),
+            std::make_move_iterator(segs.begin() + (ptrdiff_t)(seg_offset + seg_count)));
+        seg_offset += seg_count;
+
+        diarize_slice(slices[i], slice_segs);
+
+        // Append whatever came back — MORE than went in when the diarizer split
+        // a segment at a speaker turn, fewer if it dropped one. Neither case can
+        // lose a segment or index past the end here, which the old in-place
+        // copy-back of `seg_count` elements did both of (#324).
+        for (auto& s : slice_segs)
+            out.push_back(std::move(s));
+    }
+
+    // Anything the slice walk never claimed survives unlabelled rather than
+    // being dropped. The last slice takes the remainder, so this is normally
+    // empty — it keeps "never lose a segment" a property of this function
+    // instead of a consequence of that special case.
+    for (; seg_offset < segs.size(); ++seg_offset)
+        out.push_back(std::move(segs[seg_offset]));
+
+    segs = std::move(out);
+}
+
 bool crispasr_apply_foxnose_global(std::vector<crispasr_segment>& all_segs, const std::vector<float>& samples,
                                    const whisper_params& params) {
     if (!params.diarize || !params.diarize_embedder_is_foxnose() || all_segs.empty() || samples.empty())
@@ -934,15 +1011,59 @@ bool crispasr_apply_diarize(const std::vector<float>& left, const std::vector<fl
 // (~250 ms+; shorter clips give noisy vectors on TitaNet and similar).
 // Fills `embed_idx` with the segs indices that produced an embedding
 // and `embeddings` with embed_idx.size()*dim floats, row-major.
+// Number of segments to embed concurrently (#326).
+//
+// Once pyannote segmentation was chunked, the embedder became the dominant cost
+// of diarization — one forward per segment, strictly sequentially. It cannot be
+// sped up with `-t`: on TitaNet those per-segment graphs do not engage ggml's
+// threads at all (measured on an M1, user CPU within 3% of wall from -t 1 to
+// -t 4, at both 2 s and 10 s segments), so running segments concurrently is the
+// only parallelism this path has.
+//
+// Each worker needs its own model instance, because a ggml backend is not safe
+// for concurrent use. That costs memory — TitaNet-Large is ~45 MB — which is
+// why this is capped rather than opened up to every core on a 24-core box.
+// Measured speedup on an M1 (8 cores, 4 of them performance): 1.40x at 2,
+// 2.11x at 4, 2.34x at 6, 2.54x at 8 — it tracks the performance cores and
+// then flattens, so a big cap would buy memory rather than throughput.
+static int crispasr_embed_workers(size_t n_candidates) {
+    if (const char* e = std::getenv("CRISPASR_SPEAKER_EMBED_WORKERS")) {
+        const int v = std::atoi(e);
+        if (v > 0)
+            return v;
+        if (v == 0)
+            return 1; // explicit opt-out
+    }
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0)
+        hw = 4;
+    int k = (int)std::min<unsigned>(hw, 4);
+    // Never spin up more workers than there is work, and never pay the extra
+    // model loads for a handful of segments.
+    if (n_candidates < 8)
+        return 1;
+    return std::max(1, std::min<int>(k, (int)(n_candidates / 2)));
+}
+
 static void crispasr_embed_segments(const std::vector<crispasr_segment>& segs, const float* full_audio, int n_samples,
                                     CrispasrSpeakerEmbedder* embedder, int d, std::vector<size_t>& embed_idx,
                                     std::vector<float>& embeddings) {
     constexpr int64_t MIN_EMBED_CS = 25; // 0.25 s
+    // This stage is the dominant diarization cost on files with many segments
+    // (#326), and its share swings enormously with segment count — it is ~3% of
+    // a 600 s single-speaker run and was ~60% of the 2888 s file in that report.
+    // Without a per-stage number, "is the embedder slow here?" is unanswerable
+    // from a total runtime, and any speedup claim is unfalsifiable.
+    const auto embed_t0 = std::chrono::steady_clock::now();
 
-    embed_idx.reserve(segs.size());
-    embeddings.reserve((size_t)segs.size() * (size_t)d);
-
-    std::vector<float> tmp(d);
+    // Decide which segments are embeddable first, so the workers below split a
+    // known list and the output order does not depend on thread scheduling.
+    struct Job {
+        size_t seg_i;
+        int64_t s0, s1;
+    };
+    std::vector<Job> jobs;
+    jobs.reserve(segs.size());
     for (size_t i = 0; i < segs.size(); i++) {
         const auto& seg = segs[i];
         if ((seg.t1 - seg.t0) < MIN_EMBED_CS)
@@ -952,10 +1073,67 @@ static void crispasr_embed_segments(const std::vector<crispasr_segment>& segs, c
         const int64_t s1 = std::min<int64_t>(n_samples, seg.t1 * 160);
         if (s1 - s0 < 4000) // <250 ms after clamping
             continue;
-        if (!embedder->embed(full_audio + s0, (int)(s1 - s0), tmp.data()))
+        jobs.push_back({i, s0, s1});
+    }
+
+    embed_idx.reserve(jobs.size());
+    embeddings.reserve(jobs.size() * (size_t)d);
+
+    // One embedder per worker; worker 0 reuses the caller's. If cloning is not
+    // supported, or only one worker is wanted, this stays exactly the old loop.
+    std::vector<std::unique_ptr<CrispasrSpeakerEmbedder>> owned;
+    std::vector<CrispasrSpeakerEmbedder*> workers{embedder};
+    const int want = crispasr_embed_workers(jobs.size());
+    for (int k = 1; k < want; k++) {
+        auto c = embedder->clone();
+        if (!c)
+            break; // adapter cannot clone — run with what we have
+        workers.push_back(c.get());
+        owned.push_back(std::move(c));
+    }
+
+    // Results are written into per-job slots, so the output is identical
+    // whatever order the workers finish in.
+    std::vector<std::vector<float>> out(jobs.size());
+    std::atomic<size_t> next{0};
+    auto run = [&](CrispasrSpeakerEmbedder* emb) {
+        std::vector<float> tmp(d);
+        for (;;) {
+            const size_t j = next.fetch_add(1);
+            if (j >= jobs.size())
+                return;
+            const Job& job = jobs[j];
+            if (emb->embed(full_audio + job.s0, (int)(job.s1 - job.s0), tmp.data()))
+                out[j].assign(tmp.begin(), tmp.end());
+        }
+    };
+
+    if (workers.size() == 1) {
+        run(workers[0]);
+    } else {
+        std::vector<std::thread> th;
+        th.reserve(workers.size() - 1);
+        for (size_t k = 1; k < workers.size(); k++)
+            th.emplace_back(run, workers[k]);
+        run(workers[0]);
+        for (auto& t : th)
+            t.join();
+    }
+
+    // Collect in job order. A segment whose embed() failed is skipped, exactly
+    // as the sequential version skipped it.
+    for (size_t j = 0; j < jobs.size(); j++) {
+        if (out[j].empty())
             continue;
-        embed_idx.push_back(i);
-        embeddings.insert(embeddings.end(), tmp.begin(), tmp.end());
+        embed_idx.push_back(jobs[j].seg_i);
+        embeddings.insert(embeddings.end(), out[j].begin(), out[j].end());
+    }
+
+    if (std::getenv("CRISPASR_DIARIZE_DEBUG")) {
+        const double ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - embed_t0).count();
+        fprintf(stderr, "crispasr[diarize]: embed %zu segments in %.0f ms (%.1f ms/seg, %zu worker%s)\n", jobs.size(),
+                ms, jobs.empty() ? 0.0 : ms / (double)jobs.size(), workers.size(), workers.size() == 1 ? "" : "s");
     }
 }
 
@@ -1015,15 +1193,34 @@ void crispasr_remap_speakers_via_embeddings(std::vector<crispasr_segment>& segs,
     // actually passes it: the threshold is meaningless to the spectral path,
     // so honouring its DEFAULT would just reinstate the bug.
     std::vector<int> labels;
+    // The pyannote local tracks already on the segments are a lower
+    // bound on the true speaker count. They come from a single forward pass
+    // (the #107 full-audio cache), so within one pass the track indices are
+    // globally consistent — distinct tracks are distinct speakers. The
+    // GMM/BIC estimator can collapse to k=1 on short inputs (few segments,
+    // near-duplicate embeddings), which would silently merge distinct
+    // speakers into one label; clamp min_speakers to at least the number of
+    // distinct local tracks seen on the embeddable segments.
+    // Distinct local tracks, not max+1 — sparse ids (only tracks 1 and 2 active)
+    // would over-estimate and force a split that does not exist. The rule lives
+    // in core/diarize_tracks.h with tests: the two implementations agree on every
+    // DENSE input, so only the sparse case can tell them apart, and that is not
+    // something to leave to an inline expression.
+    std::vector<std::string> track_labels;
+    track_labels.reserve(embed_idx.size());
+    for (size_t k = 0; k < embed_idx.size(); k++)
+        track_labels.push_back(segs[embed_idx[k]].speaker);
+    const int min_spk = core_diarize_tracks::min_speakers_from_labels(track_labels);
     if (params.diarize_cluster_threshold_explicit) {
         labels = crispasr_agglomerative_cluster(embeddings, n_emb, d, thr, max_spk);
     } else {
         core_spectral::SpeakerEstimate est;
-        labels = core_spectral::cluster_speakers(embeddings.data(), n_emb, d, /*min_speakers=*/1, max_spk,
-                                                 /*num_speakers=*/params.diarize_num_speakers, &est);
+        labels = core_spectral::cluster_speakers(embeddings.data(), n_emb, d, /*min_speakers=*/min_spk, max_spk,
+                                                 /*num_speakers=*/params.diarize_num_speakers, &est,
+                                                 /*seed=*/42, /*n_threads=*/params.n_threads);
         if (std::getenv("CRISPASR_DIARIZE_DEBUG"))
-            fprintf(stderr, "crispasr[diarize]: n_emb=%d dim=%d -> k=%d (%s, cos_p10=%.4f, pca=%d)\n", n_emb, d,
-                    est.best_k, est.reason, est.cosine_sim_p10, est.pca_dim);
+            fprintf(stderr, "crispasr[diarize]: n_emb=%d dim=%d -> k=%d (min_spk=%d, %s, cos_p10=%.4f, pca=%d)\n",
+                    n_emb, d, est.best_k, min_spk, est.reason, est.cosine_sim_p10, est.pca_dim);
     }
 
     // Rewrite segment speakers from clustering output. Segments that

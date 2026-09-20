@@ -31,6 +31,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -160,10 +161,17 @@ struct ark_asr_context {
     std::unordered_map<std::string, int32_t> merge_rank;
     int32_t id_user = 151665, id_boa = 151666, id_audio = 151663, id_eoa = 151667;
     int32_t id_assistant = 151668, id_im_end = 151645;
+    // Upstream's bad_words_ids: every special / <|…|> added token except EOS,
+    // banned at EVERY decode step. Built once at init (see ark_build_banned_ids).
+    std::vector<int32_t> banned_ids;
 
     std::string language;
     std::string ask; // EXPERIMENTAL transcription instruction (see ark_asr_set_ask)
 };
+
+// Defined below with the decode helpers; called from init once the vocab and
+// the special-token ids are resolved.
+static void ark_build_banned_ids(ark_asr_context* ctx);
 
 // ===========================================================================
 // Direct real-input DFT (n_fft=400 is not a power of two). Fills out[2k],
@@ -213,16 +221,15 @@ static bool ark_kv_init(ark_asr_context* ctx, int max_ctx) {
     ggml_set_name(ctx->kv_v, "ark_kv_v");
 
     ggml_backend_t kv_be = core_attn::kv_backend_from_env(ctx->backend, ctx->backend_cpu, "ark_asr");
-    const size_t kbytes = ggml_nbytes(ctx->kv_k);
-    const size_t vbytes = ggml_nbytes(ctx->kv_v);
-    ctx->kv_buf = ggml_backend_alloc_buffer(kv_be, kbytes + vbytes);
+    // #367: size and place via ggml, not ggml_nbytes() arithmetic. CUDA's
+    // get_alloc_size() pads a quantized row up to MATRIX_ROW_PADDING (512),
+    // and these KV rows are head_dim wide (128), so each q8_0 tensor needs
+    // 408 bytes more than nbytes — the hand-sized buffer came up short and
+    // ggml_backend_tensor_alloc aborted. f16 is not quantized, so this only
+    // ever fired with CRISPASR_KV_QUANT set, and only on CUDA.
+    ctx->kv_buf = ggml_backend_alloc_ctx_tensors(ctx->kv_ctx, kv_be);
     if (!ctx->kv_buf)
         return false;
-    {
-        char* base = (char*)ggml_backend_buffer_get_base(ctx->kv_buf);
-        ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_k, base);
-        ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_v, base + kbytes);
-    }
     // Zero-clear so never-written tail slots can't leak NaN/garbage.
     ggml_backend_buffer_clear(ctx->kv_buf, 0);
     ctx->kv_max_ctx = max_ctx;
@@ -303,16 +310,17 @@ extern "C" struct ark_asr_context* ark_asr_init_from_file(const char* path_model
     ctx->id_audio = (int32_t)hp.audio_token_id;
     ctx->id_eoa = find_id("<|end_of_audio|>", ctx->id_eoa);
     ctx->id_assistant = find_id("<|assistant|>", ctx->id_assistant);
+    ark_build_banned_ids(ctx);
     ctx->id_im_end = (int32_t)hp.eos_token_id;
 
     // Backends
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (!ctx->backend_cpu) {
         fprintf(stderr, "ark_asr: failed to init CPU backend\n");
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
     // GPU default. Validated verbatim on M1 Metal (en jfk + de De-Abwasch,
     // 2026-06-29): ~5.6x faster prefill, ~neutral per-token decode (single-token
     // decode is bandwidth/dispatch-bound on unified memory), ~1.7x faster overall
@@ -784,6 +792,119 @@ static float* ark_run_decoder(ark_asr_context* ctx, const int32_t* ids, int T, i
     return out;
 }
 
+// Upstream's `bad_words_ids`, which its README builds as
+//
+//     bad = set(tokenizer.all_special_ids) - {eos}
+//     bad |= {id for tok, id in tokenizer.get_added_vocab().items()
+//             if tok.startswith("<") and tok.endswith(">") and id != eos}
+//
+// and passes to every generate() call, so the ban applies at EVERY step, not
+// just the first. We had no equivalent: nothing stopped ark emitting <|audio|>
+// or <|user|> mid-transcript, which decodes to either literal junk or (with
+// skip_special_tokens-style cleanup) a silent hole in the text.
+//
+// Approximated from the GGUF vocab by shape — `<|…|>` — because the added-token
+// table upstream reads is not carried into the GGUF. That covers Qwen2.5's
+// specials and ark's five extra role/audio markers. EOS is kept: it is how
+// generation stops. Disable with CRISPASR_ARKASR_NO_SPECIAL_SUPPRESS=1.
+static void ark_build_banned_ids(ark_asr_context* ctx) {
+    ctx->banned_ids.clear();
+    if (std::getenv("CRISPASR_ARKASR_NO_SPECIAL_SUPPRESS") != nullptr)
+        return;
+    for (size_t i = 0; i < ctx->vocab.size(); i++) {
+        const std::string& t = ctx->vocab[i];
+        if (t.size() >= 4 && t.compare(0, 2, "<|") == 0 && t.compare(t.size() - 2, 2, "|>") == 0 &&
+            (int32_t)i != ctx->id_im_end)
+            ctx->banned_ids.push_back((int32_t)i);
+    }
+}
+
+// Upstream additionally blocks every id at or above `asr_block_token_id_from`
+// (scripts/infer/ark_asr_transformers.py, default 151670) via
+// BlockTokenIdsFromLogitsProcessor. The text vocabulary ends at 151669
+// (<|system|>); everything above it is bicodec / semantic-token space that the
+// shared multi-task vocabulary carries but ASR must never emit. Our vocab is
+// 151936, so 266 ids were emittable that upstream forbids. Override or disable
+// with CRISPASR_ARKASR_BLOCK_FROM_ID (negative = off).
+static int ark_block_from_id() {
+    static const int s_from = []() {
+        const char* e = std::getenv("CRISPASR_ARKASR_BLOCK_FROM_ID");
+        return e ? atoi(e) : 151670;
+    }();
+    return s_from;
+}
+
+// Apply both bans to one logits row, in place.
+static void ark_mask_specials(const ark_asr_context* ctx, float* logits) {
+    const int vocab = (int)ctx->hp.llm_vocab;
+    for (int32_t id : ctx->banned_ids)
+        if (id >= 0 && id < vocab)
+            logits[id] = -INFINITY;
+    const int from = ark_block_from_id();
+    if (from >= 0)
+        for (int i = from; i < vocab; i++)
+            logits[i] = -INFINITY;
+}
+
+// Append the user's text instruction, which upstream places BETWEEN
+// <|end_of_audio|> and <|assistant|>.
+//
+// ArkAsrProcessor._build_templates_and_audios concatenates each content part in
+// order, so the documented ASR conversation
+//
+//     {"role": "user", "content": [{"type": "audio", ...},
+//                                  {"type": "text", "text": "Please transcribe this audio."}]}
+//
+// renders as
+//
+//     <|user|><|begin_of_audio|>…<|end_of_audio|>Please transcribe this audio.<|assistant|>
+//
+// We used to jump straight from <|end_of_audio|> to <|assistant|>, i.e. decode
+// with a prompt the model never saw in training. It mostly worked, which is why
+// it survived — but it left the first decode step marginal, and a marginal step
+// is one any small numeric perturbation can tip. That is the whole shape of
+// the ark empty-transcript symptom: <im_end> right after a single "." token,
+// flipping with the KV cache
+// dtype and with audio length, on a model that is otherwise fine. The existing
+// `ctx->ask` knob is NOT this: it inserts text BEFORE <|begin_of_audio|>, which
+// is a different position from upstream's, and it is off by default.
+//
+// Precedence: ark_asr_set_ask() > CRISPASR_ARKASR_INSTRUCTION > upstream's
+// default. Setting any of them empty restores the old promptless behaviour.
+//
+// `ask` used to be spliced in before <|begin_of_audio|> and ONLY in
+// ark_build_prefill_inputs — ark_transcribe_window never looked at it — so the
+// caller-supplied instruction reached the diff/logits harness and never a real
+// transcript. Routing it here fixes both halves at once: it now applies to
+// transcription, and it lands in the slot upstream actually puts text in.
+static void ark_push_instruction(ark_asr_context* ctx, std::vector<int32_t>& ids) {
+    // The env var is an explicit operator override, so it outranks `ask` —
+    // which the CLI derives automatically from the detected language and would
+    // otherwise always set, leaving the env knob unreachable in practice.
+    // Present-but-empty is a deliberate "no instruction at all".
+    static const bool s_env_set = std::getenv("CRISPASR_ARKASR_INSTRUCTION") != nullptr;
+    static const std::string s_env = s_env_set ? std::getenv("CRISPASR_ARKASR_INSTRUCTION") : std::string();
+    static const std::string s_default = "Please transcribe this audio.";
+
+    const std::string& instruction = s_env_set ? s_env : (!ctx->ask.empty() ? ctx->ask : s_default);
+    if (instruction.empty())
+        return;
+    const std::vector<int32_t> tids = core_bpe::tokenize_simple(ctx->token_to_id, ctx->merge_rank, instruction);
+    if (std::getenv("CRISPASR_ARKASR_DEBUG_GEN")) {
+        // tokenize_simple does NOT do GPT-2 regex pre-tokenization (its own
+        // docstring says so): it splits on whitespace only, so a trailing "."
+        // stays glued to the last word and can BPE-merge across a boundary the
+        // reference tokenizer would have split. Print what we actually feed the
+        // model so a non-canonical prompt is visible rather than inferred.
+        fprintf(stderr, "[ark-instr] \"%s\" -> %zu tokens:", instruction.c_str(), tids.size());
+        for (int32_t t : tids)
+            fprintf(stderr, " %d(%s)", t,
+                    (t >= 0 && (size_t)t < ctx->vocab.size()) ? ctx->vocab[(size_t)t].c_str() : "?");
+        fprintf(stderr, "\n");
+    }
+    ids.insert(ids.end(), tids.begin(), tids.end());
+}
+
 // Build the ASR prompt + audio-feature/keep buffers from raw PCM. Returns the
 // prompt token ids (with N <|audio|> placeholders) and fills feats[hidden*T] /
 // keep[T]. Returns false on failure.
@@ -803,17 +924,15 @@ static bool ark_build_prefill_inputs(ark_asr_context* ctx, const float* pcm, int
     ids.clear();
     ids.reserve((size_t)N + 16);
     ids.push_back(ctx->id_user);
-    // EXPERIMENTAL: prepend a tokenised instruction (e.g. language steering)
-    // when set. Default (no ask) is promptless — the validated path.
-    if (!ctx->ask.empty()) {
-        std::vector<int32_t> tids = core_bpe::tokenize_simple(ctx->token_to_id, ctx->merge_rank, ctx->ask);
-        ids.insert(ids.end(), tids.begin(), tids.end());
-    }
+    // `ask` is no longer spliced in here: it goes through ark_push_instruction
+    // below, at the position upstream puts text in, so this path and
+    // ark_transcribe_window build the same prompt.
     ids.push_back(ctx->id_boa);
     const int audio_start = (int)ids.size();
     for (int i = 0; i < N; i++)
         ids.push_back(ctx->id_audio);
     ids.push_back(ctx->id_eoa);
+    ark_push_instruction(ctx, ids);
     ids.push_back(ctx->id_assistant);
     const int T = (int)ids.size();
     feats.assign((size_t)hidden * T, 0.0f);
@@ -935,15 +1054,17 @@ static std::string ark_transcribe_window(ark_asr_context* ctx, const float* pcm,
         return std::string();
     }
 
-    // Prompt: <|user|> <|begin_of_audio|> <|audio|>xN <|end_of_audio|> <|assistant|>
+    // Prompt, mirroring upstream's ArkAsrProcessor._build_templates_and_audios:
+    //   <|user|> <|begin_of_audio|> <|audio|>xN <|end_of_audio|> INSTRUCTION <|assistant|>
     std::vector<int32_t> ids;
-    ids.reserve((size_t)N + 8);
+    ids.reserve((size_t)N + 16);
     ids.push_back(ctx->id_user);
     ids.push_back(ctx->id_boa);
     const int audio_start = (int)ids.size();
     for (int i = 0; i < N; i++)
         ids.push_back(ctx->id_audio);
     ids.push_back(ctx->id_eoa);
+    ark_push_instruction(ctx, ids);
     ids.push_back(ctx->id_assistant);
     // Cross-chunk conditioning: seed the assistant turn with the tail of the
     // previous chunk's transcript so the model continues in the same language
@@ -996,6 +1117,9 @@ static std::string ark_transcribe_window(ark_asr_context* ctx, const float* pcm,
     if (ctx->id_im_end >= 0 && ctx->id_im_end < (int)ctx->hp.llm_vocab &&
         std::getenv("CRISPASR_ARKASR_NO_EOS_SUPPRESS") == nullptr)
         logits[ctx->id_im_end] = -INFINITY;
+    // Upstream bans the other special tokens at every step (see
+    // ark_build_banned_ids); this is the first of those steps.
+    ark_mask_specials(ctx, logits);
 
     std::vector<int32_t> gen;
     gen.reserve((size_t)max_new);
@@ -1007,7 +1131,10 @@ static std::string ark_transcribe_window(ark_asr_context* ctx, const float* pcm,
         // rebuilds its suffix by replaying from that anchor. ark_run_decoder
         // embeds the token ids itself and returns the last-position logits.
         auto replay = [](ark_asr_context* c, const int32_t* toks, int n, int prompt_len) -> float* {
-            return ark_run_decoder(c, toks, n, prompt_len, false, nullptr, nullptr);
+            float* L = ark_run_decoder(c, toks, n, prompt_len, false, nullptr, nullptr);
+            if (L)
+                ark_mask_specials(c, L); // same ban as the greedy path
+            return L;
         };
         core_beam_decode::Config cfg;
         cfg.max_new_tokens = max_new;
@@ -1032,6 +1159,7 @@ static std::string ark_transcribe_window(ark_asr_context* ctx, const float* pcm,
             float* L = ark_run_decoder(ctx, &tok, 1, n_past, false, nullptr, nullptr);
             if (!L)
                 break;
+            ark_mask_specials(ctx, L);
             next = argmax(L);
             free(L);
             n_past++;
@@ -1179,9 +1307,9 @@ extern "C" void ark_asr_free(struct ark_asr_context* ctx) {
     if (ctx->kv_ctx)
         ggml_free(ctx->kv_ctx);
     if (ctx->buf_w)
-        ggml_backend_buffer_free(ctx->buf_w);
+        core_gguf::release_weight_buffer(ctx->buf_w);
     if (ctx->buf_w_cpu)
-        ggml_backend_buffer_free(ctx->buf_w_cpu);
+        core_gguf::release_weight_buffer(ctx->buf_w_cpu);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)

@@ -22,6 +22,7 @@
 #include "core/sanm.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "core/crispasr_env.h"
+#include "core/quant_bcast.h" // CRISPASR_AUDIT_QUANT_BCAST detector (#416)
 
 #include <algorithm>
 #include <cassert>
@@ -30,12 +31,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <map>
 #include <random>
 #include <string>
 #include <unordered_map>
 #include <vector>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -232,6 +235,22 @@ struct funasr_vocab {
     std::unordered_map<std::string, int32_t> merge_rank;
 };
 
+// One cached single-token decode graph, valid for every step whose
+// (n_past + 1) fits inside `lk`. See funasr_get_step_graph.
+struct funasr_step_graph {
+    int lk = 0;
+    std::vector<uint8_t> meta;
+    ggml_context* ctx0 = nullptr;
+    ggml_cgraph* graph = nullptr;
+    ggml_gallocr_t galloc = nullptr;
+};
+
+// Node budget for a cached step graph. T=1 over 28 Qwen3 layers builds
+// ~900 nodes; 4096 leaves headroom for the FUNASR_DUMP_STAGES snaps
+// without paying 16384 tensor-overheads of arena per cached bucket
+// (~6 MB each, and we hold one arena per live bucket).
+static const int FUNASR_STEP_GRAPH_NODES = 4096;
+
 struct funasr_context {
     funasr_context_params params;
     funasr_model model;
@@ -265,24 +284,32 @@ struct funasr_context {
     // #292: decode cap; forwarded from --max-new-tokens when set, else this default.
     int max_new_tokens = 512;
 
-    // Cached per-step LLM decode graph (PLAN funasr-perf #1). Built once
-    // at first decode call (via funasr_ensure_step_graph) using
-    // `kv_indices` runtime input + `fixed_kv_len = kv_max_ctx`, so the
-    // topology stays constant across calls regardless of n_past. Each
-    // decode step just re-writes the four input tensors (inputs_embeds,
-    // positions, kv_indices, causal_mask) and re-runs the graph — skipping
-    // the per-step `ggml_init` + tensor pool + sched_alloc rebuild that
-    // dominates non-cached decode at ~10 ms/tok on M1.
+    // Cached per-step LLM decode graphs (PLAN funasr-perf #1), keyed by an
+    // Lk *bucket* rather than a single kv_max_ctx-wide graph.
+    //
+    // Each entry is built once with `kv_indices` as a runtime input and
+    // `fixed_kv_len = entry.lk`, so its topology is constant across every
+    // step whose n_past+1 <= lk. A decode step only re-writes the three
+    // input tensors (inputs_embeds, positions/kv_indices, causal_mask) and
+    // re-runs — skipping the per-step ggml_init + tensor-pool rebuild +
+    // ggml_backend_sched_alloc_graph that the per-call path pays.
+    //
+    // Bucketing is what makes this a win. The originally recorded design
+    // (`fixed_kv_len = kv_max_ctx`) keeps ONE graph but forces every step
+    // to read a kv_max_ctx-wide K/V window; with GQA_MANUAL_CONT the read
+    // materialises Lk * n_heads * head_dim elements per layer, so the
+    // wasted window costs more than the graph build it saves (measured 135
+    // vs 42 ms/tok on M1 before this change). Rounding Lk up to the next
+    // `step_bucket` multiple caps the waste at one bucket while still
+    // reusing each graph for `step_bucket` consecutive steps.
     //
     // Bypasses ggml_backend_sched (which re-plans per call and conflicts
     // with cached graphs holding views into pre-allocated KV buffers);
-    // uses a dedicated `ggml_gallocr_t` reserved once, plus
-    // `ggml_backend_graph_compute(ctx->backend, gf)` per step. Mirrors
-    // the voxcpm2 TSLM step-bucket pattern (HISTORY 2026-05-19).
-    std::vector<uint8_t> step_compute_meta;
-    ggml_context* step_ctx0 = nullptr;
-    ggml_cgraph* step_graph = nullptr;
-    ggml_gallocr_t step_galloc = nullptr;
+    // each entry owns a `ggml_gallocr_t` reserved once, and steps run via
+    // `ggml_backend_graph_compute(ctx->backend, gf)`. Mirrors the voxcpm2
+    // TSLM step-bucket pattern (HISTORY 2026-05-19).
+    std::vector<funasr_step_graph> step_graphs;
+    int step_bucket = 16;
 
     int n_threads = 4;
 
@@ -293,13 +320,26 @@ struct funasr_context {
     //     with FUNASR_NO_FA=1 for diffing against a pre-FA reference
     //     or to dodge a hypothetical backend bug.
     //   step_graph_cache — reuse the per-step LLM decode graph across
-    //     calls. Default OFF on this workload — see comment in
-    //     funasr_ensure_step_graph for the perf-regression analysis.
-    //     Enable opportunistically with FUNASR_STEP_CACHE=1 for
-    //     experimentation; the right long-term fix is bucketed Lk
-    //     graphs (PLAN funasr-perf #1).
+    //     decode steps, bucketed on Lk. Default ON; opt out with
+    //     CRISPASR_FUNASR_STEP_CACHE=0. Bucket width is tunable with
+    //     CRISPASR_FUNASR_STEP_BUCKET=<n> (default 16, see
+    //     funasr_step_bucket_for for why).
+    //   enc_graph_cache — reuse the encoder+adaptor graph across calls
+    //     with the same T_lfr. Default ON; opt out with
+    //     CRISPASR_FUNASR_ENC_CACHE=0.
     bool enc_flash_attn = true;
-    bool step_graph_cache = false;
+    bool step_graph_cache = true;
+    bool enc_graph_cache = true;
+
+    // Bench accumulators (CRISPASR_FUNASR_BENCH=1). Split the decode step
+    // between graph preparation (build / gallocr / sched alloc) and the
+    // actual backend compute + logits readback, which is the number the
+    // step cache is meant to move.
+    double bench_step_prep_ms = 0.0;
+    double bench_step_compute_ms = 0.0;
+    double bench_enc_build_ms = 0.0;
+    double bench_enc_alloc_ms = 0.0;
+    int bench_step_builds = 0;
 
     // Language hint from -l / set_language. Empty = default ("语音转写：").
     // Non-empty = "语音转写成{language}：" matching upstream get_prompt().
@@ -441,7 +481,7 @@ static bool funasr_load_model(funasr_model& model, funasr_vocab& vocab, const ch
         const char* s = crispasr_env::get("CRISPASR_FUNASR_LLM_CPU");
         return s && *s && *s != '0';
     }();
-    if (!ggml_backend_is_cpu(backend) && cpu_backend && force_llm_cpu) {
+    if (!core_cpu_backend::is_cpu(backend) && cpu_backend && force_llm_cpu) {
         auto is_gpu = [](const char* name, void*) -> bool { return std::strncmp(name, "funasr.", 7) == 0; };
         if (!core_gguf::load_weights_split(path, backend, cpu_backend, is_gpu, nullptr, "funasr", wl))
             return false;
@@ -752,32 +792,83 @@ static std::vector<float> funasr_run_encoder_adaptor(funasr_context* ctx, const 
         compute_encoder_pe(ctx->model, T_lfr + 256);
     }
 
-    // #235: always rebuild — cached graph has stale GPU buffer handles after sched regrow
-    ggml_cgraph* gf;
+    // Encoder graph cache (PLAN funasr-perf #2), keyed on the EXACT T_lfr.
+    //
+    // The recorded design was to bucket T_lfr to {128,256,512,1024,2048},
+    // pad the input and drop the trailing rows with a static mask. That is
+    // not implementable bit-identically from this file: the SANM block's
+    // FSMN branch is a depthwise conv1d of width `sanm_kernel` (11) over the
+    // TIME axis (core/sanm.h), so a padded frame mixes into the last
+    // (kernel-1)/2 = 5 real frames of every one of the 70 blocks. Zeroing
+    // the padded input rows does not help — LayerNorm of a zero row is the
+    // bias vector, so V for a padded row is non-zero and still leaks. Killing
+    // the leak needs a time mask applied to V inside core_sanm::build_block,
+    // i.e. a change to core/sanm.h, which is outside this change's blast
+    // radius. Padding is also a bad trade here even ignoring correctness:
+    // encoder compute is 5–15 s per call on this box against a graph build of
+    // a few ms, so rounding T_lfr=183 up to 256 would cost ~40% of seconds to
+    // save milliseconds.
+    //
+    // Exact-T_lfr reuse has none of those problems: identical topology,
+    // identical numerics, no mask, no padding. It hits whenever a session
+    // transcribes several equal-length buffers (fixed-window chunking, the
+    // diff harness, batch CLI runs over same-length clips).
+    //
+    // #235 note: the cache this replaces was removed because a cached graph
+    // held stale GPU buffer handles after a sched regrow. The graph is still
+    // re-allocated through ggml_backend_sched_alloc_graph on every call here
+    // (which is what re-points every tensor at the current sched buffers), so
+    // the stale-handle window is the same one the per-call path has. Opt out
+    // with CRISPASR_FUNASR_ENC_CACHE=0 to restore the always-rebuild
+    // behaviour if a backend ever disagrees.
+    ggml_cgraph* gf = nullptr;
+    bool enc_cache_hit = false;
     {
-        if (ctx->cached_enc_ctx) {
-            ggml_free(ctx->cached_enc_ctx);
-            ctx->cached_enc_ctx = nullptr;
-            ctx->cached_enc_gf = nullptr;
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool reuse = ctx->enc_graph_cache && ctx->cached_enc_gf && ctx->cached_enc_T_lfr == T_lfr;
+        enc_cache_hit = reuse;
+        if (reuse) {
+            gf = ctx->cached_enc_gf;
+        } else {
+            if (ctx->cached_enc_ctx) {
+                ggml_free(ctx->cached_enc_ctx);
+                ctx->cached_enc_ctx = nullptr;
+                ctx->cached_enc_gf = nullptr;
+                ctx->cached_enc_T_lfr = 0;
+            }
+            ctx->cached_enc_meta.assign(ctx->compute_meta.size(), 0);
+            ggml_init_params ip = {ctx->cached_enc_meta.size(), ctx->cached_enc_meta.data(), true};
+            ctx->cached_enc_ctx = ggml_init(ip);
+            gf = funasr_build_graph_features(ctx, T_lfr, ctx->cached_enc_ctx);
+            ctx->cached_enc_gf = gf;
+            ctx->cached_enc_T_lfr = T_lfr;
         }
-        ctx->cached_enc_meta.assign(ctx->compute_meta.size(), 0);
-        ggml_init_params ip = {ctx->cached_enc_meta.size(), ctx->cached_enc_meta.data(), true};
-        ctx->cached_enc_ctx = ggml_init(ip);
-        gf = funasr_build_graph_features(ctx, T_lfr, ctx->cached_enc_ctx);
-        ctx->cached_enc_gf = gf;
-        ctx->cached_enc_T_lfr = T_lfr;
+        ctx->bench_enc_build_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     }
 
-    ggml_backend_sched_reset(ctx->sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
-        std::fprintf(stderr, "funasr: failed to alloc encoder graph\n");
-        return {};
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        ggml_backend_sched_reset(ctx->sched);
+        if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+            std::fprintf(stderr, "funasr: failed to alloc encoder graph\n");
+            return {};
+        }
+        ctx->bench_enc_alloc_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
+    if (funasr_bench_enabled()) {
+        std::fprintf(stderr, "  funasr_bench: %-22s %.2f ms build (%s, T_lfr=%d) + %.2f ms sched_alloc\n",
+                     "enc_graph_prep", ctx->bench_enc_build_ms, enc_cache_hit ? "cache hit" : "built", T_lfr,
+                     ctx->bench_enc_alloc_ms);
     }
 
     ggml_tensor* mel_in = ggml_graph_get_tensor(gf, "mel_features");
     ggml_backend_tensor_set(mel_in, lfr.data(), 0, (size_t)D_lfr * (size_t)T_lfr * sizeof(float));
     ggml_tensor* pe_in = ggml_graph_get_tensor(gf, "enc_pe");
     ggml_backend_tensor_set(pe_in, ctx->model.enc_pe.data(), 0, (size_t)D_lfr * (size_t)T_lfr * sizeof(float));
+
+    core_quant_bcast::audit(gf, "funasr-enc");
 
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "funasr: encoder graph compute failed\n");
@@ -1015,13 +1106,14 @@ static std::string funasr_decode_token(const funasr_vocab& v, int id) {
 //   exits (per legacy behaviour).
 //
 //   Cached-step path (cached_step=true). Used for the AR decode loop
-//   (T = 1). Built once, reused for every step. Lk is fixed at
-//   kv_max_ctx so the topology stays constant; K/V writes use
-//   ggml_set_rows keyed by the runtime `kv_indices` tensor (which we
-//   alias to `positions` — by construction it carries [n_past] for
-//   T=1 decode). The causal mask is a runtime input of shape
-//   (kv_max_ctx, 1) F16 — mask[k] = 0 if k <= n_past else -inf,
-//   refreshed on every step.
+//   (T = 1). Built once per Lk bucket, reused for every step that fits
+//   in that bucket. Lk is fixed at `fixed_lk` so the topology stays
+//   constant; K/V writes use ggml_set_rows keyed by the runtime
+//   `kv_indices` tensor (which we alias to `positions` — by construction
+//   it carries [n_past] for T=1 decode). The causal mask is a runtime
+//   input of shape (fixed_lk, 1) F16 — mask[k] = 0 if k <= n_past else
+//   -inf, refreshed on every step, so the slots past n_past inside the
+//   bucket contribute exactly nothing.
 //
 // The persistent ggml_context used by the cached path stays alive for
 // the session's lifetime (freed in funasr_free); the graph object
@@ -1029,7 +1121,7 @@ static std::string funasr_decode_token(const funasr_vocab& v, int id) {
 // ===========================================================================
 
 static ggml_cgraph* funasr_build_graph_llm_kv_impl(funasr_context* ctx, int n_past, int n_tokens, bool cached_step,
-                                                   ggml_context* dedicated_ctx0 = nullptr) {
+                                                   ggml_context* dedicated_ctx0 = nullptr, int fixed_lk = 0) {
     const auto& m = ctx->model;
     const auto& hp = m.hparams;
     const int d = (int)hp.llm_d_model;
@@ -1041,20 +1133,23 @@ static ggml_cgraph* funasr_build_graph_llm_kv_impl(funasr_context* ctx, int n_pa
     const float theta = hp.llm_rope_theta;
     const float attn_scale = 1.0f / std::sqrt((float)hd);
     const int T = n_tokens;
-    const int Lk = cached_step ? ctx->kv_max_ctx : (n_past + T);
+    const int Lk = cached_step ? fixed_lk : (n_past + T);
 
     GGML_ASSERT(ctx->kv_k && ctx->kv_v);
+    GGML_ASSERT(Lk > 0);
     GGML_ASSERT(Lk <= ctx->kv_max_ctx);
 
     ggml_context* ctx0;
+    int graph_nodes = 16384;
     if (cached_step) {
         GGML_ASSERT(dedicated_ctx0 != nullptr);
         ctx0 = dedicated_ctx0;
+        graph_nodes = FUNASR_STEP_GRAPH_NODES;
     } else {
         ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
         ctx0 = ggml_init(ip);
     }
-    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, (size_t)graph_nodes, false);
 
     ggml_tensor* embeds = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d, T);
     ggml_set_name(embeds, "inputs_embeds");
@@ -1096,7 +1191,7 @@ static ggml_cgraph* funasr_build_graph_llm_kv_impl(funasr_context* ctx, int n_pa
     // topology constant across calls. Per-call path leaves both null
     // for the legacy static-offset write.
     ggml_tensor* const kv_indices = cached_step ? positions : nullptr;
-    const int fixed_kv_len = cached_step ? ctx->kv_max_ctx : 0;
+    const int fixed_kv_len = cached_step ? Lk : 0;
 
     // FUNASR_LLM_LAYERS=N limits the number of LLM layers for debugging.
     // Useful with FUNASR_NAN_CHECK=1 to isolate the failing layer faster.
@@ -1189,60 +1284,117 @@ static ggml_cgraph* funasr_build_graph_llm_kv(funasr_context* ctx, int n_past, i
     return funasr_build_graph_llm_kv_impl(ctx, n_past, n_tokens, /*cached_step*/ false);
 }
 
-// Lazily build the cached step graph the first time the AR decode loop
-// runs. kv_max_ctx must be set (i.e. funasr_kv_init has already
-// allocated the KV buffers).
-//
-// Default OFF — see why: a fixed Lk in the cached graph forces every
-// per-step attention to compute over the full kv_max_ctx window, while
-// the per-call path only attends to (n_past+1) keys. On samples/jfk.wav
-// the cached path measured 135 ms/tok vs the per-call's 42 ms/tok — the
-// ~10 ms graph-build savings get eaten by ~100 ms of extra attention
-// work. The infrastructure here (kv_indices + fixed_kv_len + dedicated
-// gallocr) is correct (77/77 PASS, byte-identical text) and ready for
-// PLAN funasr-perf #1 (bucketed Lk graphs, voxcpm2-TSLM pattern) which
-// would size the bucket to actual prompt + decode usage and recover
-// the graph-build savings without the attention-window penalty.
-static void funasr_ensure_step_graph(funasr_context* ctx) {
-    if (ctx->step_graph || !ctx->step_graph_cache)
-        return;
-    if (!ctx->kv_k || ctx->kv_max_ctx <= 0)
-        return;
+// Drop every cached step graph (and its arena / gallocr). Called when the
+// KV cache is re-allocated — the cached graphs hold views into the old
+// kv_k / kv_v — and from funasr_free.
+static void funasr_free_step_graphs(funasr_context* ctx) {
+    for (auto& e : ctx->step_graphs) {
+        if (e.galloc)
+            ggml_gallocr_free(e.galloc);
+        if (e.ctx0)
+            ggml_free(e.ctx0);
+    }
+    ctx->step_graphs.clear();
+}
 
-    // 16384-node budget mirrors the per-call path; in practice T=1 +
-    // 28-layer Qwen3-0.6B uses only ~1000 nodes, but keeping the
-    // budget identical avoids surprises if someone bumps the layer
-    // count later.
-    ctx->step_compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
-    ggml_init_params ip = {ctx->step_compute_meta.size(), ctx->step_compute_meta.data(), true};
-    ctx->step_ctx0 = ggml_init(ip);
-    if (!ctx->step_ctx0) {
-        std::fprintf(stderr, "funasr: failed to init step graph context\n");
-        return;
+// Round the required KV window up to the next bucket. Buckets are
+// `step_bucket`-wide (default 16) rather than the coarse
+// {128,256,512,1024,2048} ladder: the prompt alone is already 150–400
+// tokens for a typical clip, so a coarse ladder would round a 210-key step
+// up to 256 or a 530-key step up to 1024 and hand back the whole
+// attention-window penalty the bucketing exists to avoid.
+//
+// Why 16 and not something larger. Both sides of the trade were measured on
+// samples/jfk.wav (q4_k, 4 threads, decode CPU time, min of 5 interleaved
+// reps — see the report for the raw table):
+//
+//   * one wasted KV key costs ~0.28 ms CPU per token. That is the
+//     GQA_MANUAL_CONT repeat+cont of K and V: 2 * n_heads(16) *
+//     head_dim(128) * 2 B * n_layers(28) = 229 KB of extra traffic per key
+//     per step. It is linear and it dominates: fixed_kv_len = kv_max_ctx
+//     (the originally recorded design, reachable here with
+//     CRISPASR_FUNASR_STEP_BUCKET=100000) wastes 516 keys and measured
+//     359 ms/tok CPU against 212 ms/tok for the per-call path — +69%.
+//   * skipping the per-step graph build + gallocr/sched alloc saves
+//     ~2.1 ms/tok (the `decode_step_prep` bench line drops 2.1 -> 0.15).
+//
+// A bucket of width w wastes w/2 keys on average, so it costs ~0.14*w ms
+// and saves ~2.1 ms: break-even at w ~= 15. Measured minima agree —
+// w=16: 212 ms/tok (vs 212 off), w=32: 223, w=64: 232. Anything coarser is
+// a net loss on this hardware. Platforms where graph construction is more
+// expensive relative to memory bandwidth (the ~30 ms/tok quoted for M1 in
+// PLAN) move break-even far to the right, so 16 is the conservative pick
+// that cannot lose; CRISPASR_FUNASR_STEP_BUCKET raises it.
+static int funasr_step_bucket_for(const funasr_context* ctx, int need) {
+    const int w = ctx->step_bucket > 0 ? ctx->step_bucket : 16;
+    long long lk = ((long long)(need + w - 1) / w) * w;
+    if (lk > ctx->kv_max_ctx)
+        lk = ctx->kv_max_ctx;
+    return (int)lk;
+}
+
+// Fetch (building on first use) the cached step graph whose fixed Lk covers
+// `need` = n_past + 1 keys. Returns nullptr when the cache is disabled or a
+// build/reserve fails — callers then fall back to the per-call path.
+//
+// kv_max_ctx must already be set (funasr_kv_init has run).
+static funasr_step_graph* funasr_get_step_graph(funasr_context* ctx, int need) {
+    if (!ctx->step_graph_cache || !ctx->kv_k || ctx->kv_max_ctx <= 0)
+        return nullptr;
+    if (need <= 0 || need > ctx->kv_max_ctx)
+        return nullptr;
+
+    const int lk = funasr_step_bucket_for(ctx, need);
+    for (auto& e : ctx->step_graphs) {
+        if (e.lk == lk)
+            return &e;
     }
-    ctx->step_graph = funasr_build_graph_llm_kv_impl(ctx, /*n_past*/ 0, /*n_tokens*/ 1,
-                                                     /*cached_step*/ true, ctx->step_ctx0);
-    if (!ctx->step_graph) {
-        ggml_free(ctx->step_ctx0);
-        ctx->step_ctx0 = nullptr;
-        return;
+
+    // Bound the live arena count. Each entry costs one
+    // FUNASR_STEP_GRAPH_NODES arena (~1.5 MB) plus its gallocr activation
+    // buffer (a few MB). Lk only ever grows inside a decode, so an entry is
+    // dead the moment the next bucket is built; a 4-deep FIFO is ample and
+    // still survives a second, shorter utterance reusing an earlier bucket.
+    while (ctx->step_graphs.size() >= 4) {
+        auto& victim = ctx->step_graphs.front();
+        if (victim.galloc)
+            ggml_gallocr_free(victim.galloc);
+        if (victim.ctx0)
+            ggml_free(victim.ctx0);
+        ctx->step_graphs.erase(ctx->step_graphs.begin());
     }
-    // Reserve the gallocr — allocates the intermediate-activation buffer
-    // on the default Metal/CUDA backend buffer type. Per-call cost is
-    // just `ggml_gallocr_alloc_graph` (which re-bumps the arena) + tensor
-    // sets + compute.
-    ctx->step_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
-    if (!ctx->step_galloc || !ggml_gallocr_reserve(ctx->step_galloc, ctx->step_graph)) {
-        std::fprintf(stderr, "funasr: failed to reserve step gallocr\n");
-        if (ctx->step_galloc) {
-            ggml_gallocr_free(ctx->step_galloc);
-            ctx->step_galloc = nullptr;
+
+    funasr_step_graph e;
+    e.lk = lk;
+    e.meta.resize(ggml_tensor_overhead() * (size_t)FUNASR_STEP_GRAPH_NODES +
+                  ggml_graph_overhead_custom((size_t)FUNASR_STEP_GRAPH_NODES, false));
+    ggml_init_params ip = {e.meta.size(), e.meta.data(), true};
+    e.ctx0 = ggml_init(ip);
+    if (!e.ctx0) {
+        std::fprintf(stderr, "funasr: failed to init step graph context (Lk=%d)\n", lk);
+        return nullptr;
+    }
+    e.graph = funasr_build_graph_llm_kv_impl(ctx, /*n_past*/ 0, /*n_tokens*/ 1,
+                                             /*cached_step*/ true, e.ctx0, /*fixed_lk*/ lk);
+    // Reserve the gallocr — allocates the intermediate-activation buffer on
+    // the default Metal/CUDA/CPU backend buffer type. Per-step cost is then
+    // just `ggml_gallocr_alloc_graph` (re-bumping the arena) + tensor sets +
+    // compute.
+    if (e.graph) {
+        e.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+        if (e.galloc && ggml_gallocr_reserve(e.galloc, e.graph)) {
+            ctx->bench_step_builds++;
+            ctx->step_graphs.push_back(std::move(e));
+            return &ctx->step_graphs.back();
         }
-        ggml_free(ctx->step_ctx0);
-        ctx->step_ctx0 = nullptr;
-        ctx->step_graph = nullptr;
-        ctx->step_graph_cache = false;
     }
+    std::fprintf(stderr, "funasr: failed to build/reserve step graph (Lk=%d) — disabling step cache\n", lk);
+    if (e.galloc)
+        ggml_gallocr_free(e.galloc);
+    if (e.ctx0)
+        ggml_free(e.ctx0);
+    ctx->step_graph_cache = false;
+    return nullptr;
 }
 
 // ===========================================================================
@@ -1280,18 +1432,10 @@ static bool funasr_kv_init(funasr_context* ctx, int max_ctx) {
         ggml_free(ctx->kv_ctx);
         ctx->kv_ctx = nullptr;
     }
-    // Invalidate the cached step graph — its tensor pointers reference
-    // the about-to-be-freed kv_k/kv_v. Next ensure_step_graph rebuilds
-    // against the new cache.
-    if (ctx->step_galloc) {
-        ggml_gallocr_free(ctx->step_galloc);
-        ctx->step_galloc = nullptr;
-    }
-    if (ctx->step_ctx0) {
-        ggml_free(ctx->step_ctx0);
-        ctx->step_ctx0 = nullptr;
-    }
-    ctx->step_graph = nullptr;
+    // Invalidate every cached step graph — their tensor pointers reference
+    // the about-to-be-freed kv_k/kv_v. funasr_get_step_graph rebuilds them
+    // on demand against the new cache.
+    funasr_free_step_graphs(ctx);
     const auto& hp = ctx->model.hparams;
     const int hd = (int)hp.llm_head_dim;
     const int n_kv = (int)hp.llm_n_kv_heads;
@@ -1311,14 +1455,17 @@ static bool funasr_kv_init(funasr_context* ctx, int max_ctx) {
     ggml_backend_t kv_backend = (ctx->model.buf_cpu)
                                     ? ctx->backend_cpu
                                     : core_attn::kv_backend_from_env(ctx->backend, ctx->backend_cpu, "funasr");
-    ctx->kv_buf = ggml_backend_alloc_buffer(kv_backend, kbytes + vbytes);
+    // #367: size and place via ggml, not ggml_nbytes() arithmetic. CUDA's
+    // get_alloc_size() pads a quantized row up to MATRIX_ROW_PADDING (512),
+    // and these KV rows are head_dim wide (128), so each q8_0 tensor needs
+    // 408 bytes more than nbytes — the hand-sized buffer came up short and
+    // ggml_backend_tensor_alloc aborted. f16 is not quantized, so this only
+    // ever fired with CRISPASR_KV_QUANT set, and only on CUDA.
+    ctx->kv_buf = ggml_backend_alloc_ctx_tensors(ctx->kv_ctx, kv_backend);
     if (!ctx->kv_buf) {
         std::fprintf(stderr, "funasr: failed to allocate kv buffer\n");
         return false;
     }
-    char* base = (char*)ggml_backend_buffer_get_base(ctx->kv_buf);
-    ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_k, base);
-    ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_v, base + kbytes);
     // Zero-fill the KV cache. On CUDA, ggml_backend_alloc_buffer does not
     // zero memory (cudaMalloc). If the graph scheduler reads a KV slot
     // before the corresponding ggml_cpy writes it (aliasing-based race in
@@ -1473,36 +1620,35 @@ static std::vector<float> funasr_run_llm_step(funasr_context* ctx, const float* 
     const int d = (int)hp.llm_d_model;
     const int vocab = (int)hp.llm_vocab_size;
 
-    // Decide which graph to drive. Single-token decode steps use the
-    // cached step graph (built once, reused) when step_graph_cache is on;
-    // anything else (prefill, opt-out) takes the per-call path.
-    const bool use_cached = ctx->step_graph_cache && n_tokens == 1;
-    if (use_cached) {
-        funasr_ensure_step_graph(ctx);
-        if (!ctx->step_graph) {
-            // Build failed — fall back to per-call. Logged inside ensure.
-            // (Setting use_cached=false would shadow the const; just goto
-            // the per-call branch below by clearing the cache once.)
-            ctx->step_graph_cache = false;
-        }
-    }
+    // Decide which graph to drive. Single-token decode steps use a cached
+    // step graph (one per Lk bucket, built on first use) when
+    // step_graph_cache is on; anything else (prefill, opt-out, a build
+    // failure) takes the per-call path.
+    funasr_step_graph* se = (n_tokens == 1) ? funasr_get_step_graph(ctx, n_past + 1) : nullptr;
 
-    if (use_cached && ctx->step_graph && ctx->step_galloc) {
-        // ---- Cached-step path (T=1, Lk = kv_max_ctx, kv_indices=positions). ----
+    if (se) {
+        // ---- Cached-step path (T=1, Lk = bucket, kv_indices=positions). ----
         // Bypass the sched (which re-plans per call and conflicts with
         // graphs holding views into pre-allocated KV buffers); drive
         // the gallocr + backend directly, voxcpm2-TSLM style.
-        const int Lk = ctx->kv_max_ctx;
+        const auto t_prep0 = std::chrono::steady_clock::now();
+        const int Lk = se->lk;
         const int32_t pos = (int32_t)n_past;
 
+        // Slots (n_past, Lk) inside the bucket are either never-written
+        // (zeroed at kv_init) or stale from a previous, longer decode.
+        // -inf masks them out exactly: ggml's flash-attn skips a fully
+        // masked kv position outright and soft_max_ext maps -inf to a 0
+        // weight, so neither the running max nor the accumulator ever sees
+        // them — the result is bit-identical to an Lk = n_past+1 graph.
         std::vector<ggml_fp16_t> mask((size_t)Lk);
         const ggml_fp16_t zero_h = ggml_fp32_to_fp16(0.0f);
         const ggml_fp16_t ninf_h = ggml_fp32_to_fp16(-INFINITY);
         for (int k = 0; k < Lk; k++)
             mask[(size_t)k] = (k <= n_past) ? zero_h : ninf_h;
 
-        ggml_cgraph* gf = ctx->step_graph;
-        if (!ggml_gallocr_alloc_graph(ctx->step_galloc, gf)) {
+        ggml_cgraph* gf = se->graph;
+        if (!ggml_gallocr_alloc_graph(se->galloc, gf)) {
             std::fprintf(stderr, "funasr: failed to alloc cached step graph\n");
             return {};
         }
@@ -1512,6 +1658,9 @@ static std::vector<float> funasr_run_llm_step(funasr_context* ctx, const float* 
         ggml_backend_tensor_set(pos_in, &pos, 0, sizeof(int32_t));
         ggml_tensor* mask_in = ggml_graph_get_tensor(gf, "causal_mask");
         ggml_backend_tensor_set(mask_in, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+        const auto t_prep1 = std::chrono::steady_clock::now();
+
+        core_quant_bcast::audit(gf, "funasr");
 
         if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
             std::fprintf(stderr, "funasr: cached step graph compute failed\n");
@@ -1520,10 +1669,16 @@ static std::vector<float> funasr_run_llm_step(funasr_context* ctx, const float* 
         ggml_tensor* out = ggml_graph_get_tensor(gf, "logits");
         std::vector<float> result((size_t)vocab, 0.0f);
         ggml_backend_tensor_get(out, result.data(), 0, (size_t)vocab * sizeof(float));
+        if (funasr_bench_enabled()) {
+            const auto t_end = std::chrono::steady_clock::now();
+            ctx->bench_step_prep_ms += std::chrono::duration<double, std::milli>(t_prep1 - t_prep0).count();
+            ctx->bench_step_compute_ms += std::chrono::duration<double, std::milli>(t_end - t_prep1).count();
+        }
         return result;
     }
 
     // ---- Per-call path (prefill or step-cache opt-out). ----
+    const auto t_prep0 = std::chrono::steady_clock::now();
     const int Lk = n_past + n_tokens;
 
     std::vector<int32_t> positions((size_t)n_tokens);
@@ -1554,6 +1709,9 @@ static std::vector<float> funasr_run_llm_step(funasr_context* ctx, const float* 
         ggml_tensor* mask_in = ggml_graph_get_tensor(gf, "causal_mask");
         ggml_backend_tensor_set(mask_in, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
     }
+    const auto t_prep1 = std::chrono::steady_clock::now();
+
+    core_quant_bcast::audit(gf, "funasr");
 
     // Install per-node NaN checker when FUNASR_NAN_CHECK=1 (prefill only).
     funasr_nan_check_state nan_state;
@@ -1667,6 +1825,11 @@ static std::vector<float> funasr_run_llm_step(funasr_context* ctx, const float* 
     ggml_tensor* out = ggml_graph_get_tensor(gf, "logits");
     std::vector<float> result((size_t)vocab, 0.0f);
     ggml_backend_tensor_get(out, result.data(), 0, (size_t)vocab * sizeof(float));
+    if (funasr_bench_enabled() && n_tokens == 1) {
+        const auto t_end = std::chrono::steady_clock::now();
+        ctx->bench_step_prep_ms += std::chrono::duration<double, std::milli>(t_prep1 - t_prep0).count();
+        ctx->bench_step_compute_ms += std::chrono::duration<double, std::milli>(t_end - t_prep1).count();
+    }
     return result;
 }
 
@@ -1746,6 +1909,9 @@ static std::string funasr_transcribe_impl(funasr_context* ctx, const float* pcm,
                                           std::vector<int32_t>* out_ids = nullptr,
                                           std::vector<float>* out_probs = nullptr) {
     const auto& hp = ctx->model.hparams;
+    ctx->bench_step_prep_ms = 0.0;
+    ctx->bench_step_compute_ms = 0.0;
+    ctx->bench_step_builds = 0;
 
     int T_lfr = 0, D_lfr = 0;
     std::vector<float> lfr;
@@ -1954,6 +2120,10 @@ static std::string funasr_transcribe_impl(funasr_context* ctx, const float* pcm,
     std::vector<int32_t> generated;
     std::vector<float> generated_probs;
     auto decode_t0 = std::chrono::steady_clock::now();
+    // Process CPU time (all threads) across the decode loop. Wall time is
+    // useless for A/B on a shared/loaded machine; CPU time measures the work
+    // actually done and is what the perf claims below are based on.
+    const std::clock_t decode_cpu0 = std::clock();
     double decode_embed_ms = 0;
 
     if (ctx->beam_size > 1) {
@@ -2036,11 +2206,22 @@ static std::string funasr_transcribe_impl(funasr_context* ctx, const float* pcm,
     if (funasr_bench_enabled()) {
         auto decode_t1 = std::chrono::steady_clock::now();
         double ms = std::chrono::duration<double, std::milli>(decode_t1 - decode_t0).count();
+        const double cpu_ms = 1000.0 * (double)(std::clock() - decode_cpu0) / (double)CLOCKS_PER_SEC;
         const int n_steps = (int)generated.size();
         std::fprintf(stderr, "  funasr_bench: %-22s %.2f ms  (%d tokens, %.2f ms/tok)\n", "llm_decode_total", ms,
                      n_steps, n_steps > 0 ? ms / n_steps : 0.0);
+        std::fprintf(stderr, "  funasr_bench: %-22s %.2f ms  (%d tokens, %.2f ms/tok)\n", "llm_decode_total_cpu",
+                     cpu_ms, n_steps, n_steps > 0 ? cpu_ms / n_steps : 0.0);
         std::fprintf(stderr, "  funasr_bench: %-22s %.2f ms  (%.2f ms/tok)\n", "decode_embed_only", decode_embed_ms,
                      n_steps > 0 ? decode_embed_ms / n_steps : 0.0);
+        // The split the step cache exists to move: `prep` is graph
+        // build + allocation + input writes, `compute` is the backend
+        // forward + logits readback.
+        std::fprintf(stderr, "  funasr_bench: %-22s %.2f ms  (%.2f ms/tok)  [step_cache=%s/%d, %d graph build(s)]\n",
+                     "decode_step_prep", ctx->bench_step_prep_ms, n_steps > 0 ? ctx->bench_step_prep_ms / n_steps : 0.0,
+                     ctx->step_graph_cache ? "on" : "off", ctx->step_bucket, ctx->bench_step_builds);
+        std::fprintf(stderr, "  funasr_bench: %-22s %.2f ms  (%.2f ms/tok)\n", "decode_step_compute",
+                     ctx->bench_step_compute_ms, n_steps > 0 ? ctx->bench_step_compute_ms / n_steps : 0.0);
     }
     (void)d;
 
@@ -2081,17 +2262,17 @@ extern "C" funasr_context* funasr_init_from_file(const char* path, funasr_contex
     ctx->params = params;
     ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
-    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init();
     if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
-    ctx->backend_cpu = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (ctx->backend_cpu)
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
-    if (ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
 
     if (!funasr_load_model(ctx->model, ctx->vocab, path, ctx->backend, ctx->backend_cpu)) {
-        delete ctx;
+        funasr_free(ctx); // frees the backends this ctx already owns
         return nullptr;
     }
 
@@ -2167,25 +2348,38 @@ extern "C" funasr_context* funasr_init_from_file(const char* path, funasr_contex
         if (*s && *s != '0')
             ctx->enc_flash_attn = false;
     }
-    // Step-graph cache opt-in. The default-off path runs ~3× faster on
-    // typical ASR workloads — the cached graph attends to a fixed
-    // (kv_max_ctx-wide) window every step, which costs more than it
-    // saves vs the per-call path's growing-Lk attention. The cache
-    // becomes a win only with bucketed Lk graphs (voxcpm2 TSLM pattern,
-    // PLAN funasr-perf #1) — when that lands we'll flip the default.
+    // Step-graph cache (PLAN funasr-perf #1) — DEFAULT ON, bucketed on Lk.
+    // CRISPASR_FUNASR_STEP_CACHE=0 restores the per-call rebuild path (the
+    // bisection arm: it is the pre-cache behaviour, bit-for-bit).
+    // CRISPASR_FUNASR_STEP_BUCKET=<n> tunes the bucket width; n<=0 or unset
+    // keeps 16. Setting it to a value >= kv_max_ctx reproduces the original
+    // single-graph fixed_kv_len=kv_max_ctx design (measured +69% decode CPU
+    // — it is the A/B arm, not a recommendation).
     if (const char* s = crispasr_env::get("CRISPASR_FUNASR_STEP_CACHE")) {
-        if (*s && *s != '0')
-            ctx->step_graph_cache = true;
+        if (*s && *s == '0')
+            ctx->step_graph_cache = false;
+    }
+    if (const char* s = crispasr_env::get("CRISPASR_FUNASR_STEP_BUCKET")) {
+        const int b = (s && *s) ? std::atoi(s) : 0;
+        if (b > 0)
+            ctx->step_bucket = b;
+    }
+    // Encoder+adaptor graph cache (PLAN funasr-perf #2) — DEFAULT ON, keyed
+    // on exact T_lfr. CRISPASR_FUNASR_ENC_CACHE=0 restores the #235
+    // always-rebuild behaviour.
+    if (const char* s = crispasr_env::get("CRISPASR_FUNASR_ENC_CACHE")) {
+        if (*s && *s == '0')
+            ctx->enc_graph_cache = false;
     }
 
     if (params.verbosity >= 1) {
         std::fprintf(stderr,
                      "funasr: loaded %s  (enc %u blocks + tp %u blocks, adaptor %u, llm %u, vocab %u, fa=%s, "
-                     "step_cache=%s)\n",
+                     "step_cache=%s/%d, enc_cache=%s)\n",
                      path, ctx->model.hparams.n_blocks_base, ctx->model.hparams.n_blocks_tp,
                      ctx->model.hparams.ada_n_layers, ctx->model.hparams.llm_n_layers,
                      (uint32_t)ctx->vocab.id_to_token.size(), ctx->enc_flash_attn ? "on" : "off",
-                     ctx->step_graph_cache ? "on" : "off");
+                     ctx->step_graph_cache ? "on" : "off", ctx->step_bucket, ctx->enc_graph_cache ? "on" : "off");
     }
     return ctx;
 }
@@ -2215,10 +2409,7 @@ extern "C" void funasr_free(funasr_context* ctx) {
         ggml_free(ctx->cached_enc_ctx);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
-    if (ctx->step_galloc)
-        ggml_gallocr_free(ctx->step_galloc);
-    if (ctx->step_ctx0)
-        ggml_free(ctx->step_ctx0);
+    funasr_free_step_graphs(ctx);
     if (ctx->kv_buf)
         ggml_backend_buffer_free(ctx->kv_buf);
     if (ctx->kv_ctx)
@@ -2228,9 +2419,9 @@ extern "C" void funasr_free(funasr_context* ctx) {
     if (ctx->fused_ctx)
         ggml_free(ctx->fused_ctx);
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.buf_cpu)
-        ggml_backend_buffer_free(ctx->model.buf_cpu);
+        core_gguf::release_weight_buffer(ctx->model.buf_cpu);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend)

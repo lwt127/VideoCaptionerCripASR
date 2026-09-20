@@ -200,6 +200,42 @@ inline bool parse_seconds(const std::string& v, double& out) {
 
 } // namespace detail
 
+// True when an utterance's Content is one of the model's own NON-SPEECH
+// markers rather than a transcript.
+//
+// VibeVoice-ASR is trained on JSON transcripts that label non-speech regions
+// instead of transcribing them, so "[Silence]" is a Content value the MODEL
+// emits — it appears nowhere in this codebase. Handing it through as segment
+// text puts the literal string "[Silence]" into the user's SRT for audio that
+// is plainly not silent, and, worse, makes it invisible: the CLI's "no text
+// produced for N s of non-silent audio" warning cannot fire, because there IS
+// text. Observed on the 7B checkpoint for heavily time-stretched speech
+// (#369), where a passage inside a long recording would be dropped in silence.
+//
+// Deliberately narrow. The list is what has actually been observed, not what
+// might exist: a marker is only recognised when the WHOLE content is a single
+// bracketed token that matches. "[Music]" and "[Laughter]" are left alone —
+// those are annotations a user may legitimately want in a transcript, and
+// guessing at the model's full vocabulary here would silently delete content.
+inline bool is_non_speech_marker(const std::string& text) {
+    size_t b = 0, e = text.size();
+    while (b < e && (unsigned char)text[b] <= ' ')
+        b++;
+    while (e > b && (unsigned char)text[e - 1] <= ' ')
+        e--;
+    if (e - b < 2 || text[b] != '[' || text[e - 1] != ']')
+        return false;
+    std::string inner = text.substr(b + 1, e - b - 2);
+    // Trailing punctuation the model sometimes appends inside the object.
+    while (!inner.empty() && (inner.back() == '.' || (unsigned char)inner.back() <= ' '))
+        inner.pop_back();
+    static const char* kMarkers[] = {"silence", "blank_audio", "blank audio", "no speech", "inaudible"};
+    for (const char* m : kMarkers)
+        if (detail::iequals(inner, m))
+            return true;
+    return false;
+}
+
 // Scan `raw` for utterance objects. Returns them in emission order; an empty
 // result means "this is not a VibeVoice transcript blob" and the caller should
 // fall back to treating `raw` as plain text.

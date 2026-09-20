@@ -34,6 +34,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `SILERO_LID_BENCH=1` for per-stage timings.
@@ -157,6 +158,26 @@ static bool lid_load(lid_model& m, const char* path, ggml_backend_t backend, ggm
     m.buf = wl.buf;
     m.buf_cpu = wl.buf_cpu;
     m.tensors = std::move(wl.tensors);
+
+    // The published q8_0 / q5_0 quantizations of this model are broken:
+    // the ggml graph deflates every logit into junk (clean English reads
+    // pa-IN at p~=0.02) and the legacy path dereferences tensor->data as
+    // f32 and computes NaN confidences. A 16 MB f32 classifier has
+    // nothing to gain from quantization - refuse loudly instead of
+    // misdetecting. Verified natively 2026-09-02 (jfk.wav: f32 -> en
+    // p=0.9985 on both paths; q8_0 -> pa-IN / -nan). Lift this only
+    // after a re-quantization is validated per-stage against the f32.
+    for (const auto& kv : m.tensors) {
+        const ggml_tensor* t = kv.second;
+        if (t && ggml_is_quantized(t->type)) {
+            fprintf(stderr,
+                    "silero_lid: quantized tensor '%s' (%s) in '%s' - this backend supports\n"
+                    "  f32/f16 weights only (the published q8_0/q5_0 files misdetect); use\n"
+                    "  silero-lid-lang95-f32.gguf\n",
+                    kv.first.c_str(), ggml_type_name(t->type), path);
+            return false;
+        }
+    }
 
     // Bind top-level
     m.frontend_w = lid_get(m, "lid.frontend.weight");
@@ -777,12 +798,12 @@ extern "C" struct silero_lid_context* silero_lid_init(const char* gguf_path, int
     auto* ctx = new silero_lid_context();
     ctx->n_threads = n_threads > 0 ? n_threads : 4;
 
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (!ctx->backend_cpu) {
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
 
     if (silero_use_legacy()) {
         // The legacy forward dereferences tensor->data directly, so weights
@@ -792,7 +813,7 @@ extern "C" struct silero_lid_context* silero_lid_init(const char* gguf_path, int
         ctx->backend = ctx->backend_cpu;
     } else {
         ctx->backend = crispasr_init_gpu_backend();
-        if (ctx->backend && ggml_backend_is_cpu(ctx->backend)) {
+        if (ctx->backend && core_cpu_backend::is_cpu(ctx->backend)) {
             // CPU-only build: drop the duplicate instance so the sched uses
             // the one with n_threads configured.
             ggml_backend_free(ctx->backend);
@@ -831,7 +852,7 @@ extern "C" struct silero_lid_context* silero_lid_init(const char* gguf_path, int
     }
 
     if (!lid_load(ctx->model, gguf_path, ctx->backend, ctx->backend_cpu)) {
-        delete ctx;
+        silero_lid_free(ctx);
         return nullptr;
     }
 
@@ -869,9 +890,9 @@ extern "C" void silero_lid_free(struct silero_lid_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.buf_cpu)
-        ggml_backend_buffer_free(ctx->model.buf_cpu);
+        core_gguf::release_weight_buffer(ctx->model.buf_cpu);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)
@@ -1215,6 +1236,38 @@ extern "C" const char* silero_lid_detect(struct silero_lid_context* ctx, const f
         if (logits[i] > logits[best])
             best = i;
 
+    // Softmax the raw classifier logits so out_confidence is a probability in
+    // [0, 1], matching the whisper LID arm's contract. Callers (CLI "p=",
+    // the C ABI, CrisperWeaver's 0.35 floor) all treat it as one; before
+    // this the silero arm handed back the raw top logit (e.g. -0.79 for a
+    // 99.8%-confident answer), which every probability threshold rejected.
+    double denom = 0.0;
+    for (float l : logits)
+        denom += std::exp((double)l - (double)logits[best]);
+    const float best_p = (float)(1.0 / denom);
+
+    // #409 evidence floor, gated on the RAW top logit — deliberately not on
+    // best_p. On out-of-domain audio (codec artifacts, wrong-language edge
+    // cases) the head's logits deflate wholesale and softmax renormalizes
+    // noise into fake confidence (jfk.mp3 decodes to 'yo' at p=0.578).
+    // The raw magnitude separates cleanly: every verified-correct case sits
+    // at logit >= ~-1.1, every observed failure at <= -3.35 (measured
+    // against the upstream ONNX as well — the model itself does this).
+    // Below the floor the answer is a guess: refuse it so callers fall back
+    // (the CLI falls back to whisper LID). Tune or disable via
+    // CRISPASR_SILERO_LID_MIN_LOGIT (e.g. -999 to disable).
+    float min_logit = -2.0f;
+    if (const char* e = crispasr_env::get("CRISPASR_SILERO_LID_MIN_LOGIT"))
+        min_logit = strtof(e, nullptr);
+    if (logits[best] < min_logit) {
+        fprintf(stderr,
+                "silero_lid: rejecting low-evidence answer '%s' (top logit %.2f < floor %.2f, p=%.3f) — "
+                "out-of-domain audio; caller should fall back\n",
+                best < (int)ctx->lang_strs.size() ? ctx->lang_strs[best].c_str() : "?", logits[best], min_logit,
+                best_p);
+        return nullptr;
+    }
+
     if (crispasr_env::get("CRISPASR_SILERO_LID_DEBUG")) {
         std::vector<int> order(logits.size());
         for (int i = 0; i < (int)order.size(); i++)
@@ -1230,7 +1283,7 @@ extern "C" const char* silero_lid_detect(struct silero_lid_context* ctx, const f
     }
 
     if (out_confidence)
-        *out_confidence = logits[best];
+        *out_confidence = best_p;
 
     if (best < (int)ctx->lang_strs.size())
         return ctx->lang_strs[best].c_str();

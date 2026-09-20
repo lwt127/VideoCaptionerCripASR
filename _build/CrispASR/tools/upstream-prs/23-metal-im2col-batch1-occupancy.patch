@@ -1,151 +1,235 @@
-From: <author>
-Subject: [PATCH] metal : fix im2col occupancy for batch-1 (inference) convolutions
+From 89a2039d6bd4368258147894704dec6d388ff265 Mon Sep 17 00:00:00 2001
+From: CrispStrobe <cze+github@mailbox.org>
+Date: Thu, 6 Aug 2026 10:27:06 +0200
+Subject: [PATCH] metal: flat-dispatch im2col for tiny-threadgroup and
+ conv_2d_dw shapes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
-im2col sized the threadgroup's first dim from batch N; at inference N==1
-every threadgroup ran only KH*KW (3..11) threads. Block a range of OW
-across thread-dim0 instead so threadgroups fill; loop N inside. Bit-exact
-gather-copy. ~2-3x on conv-heavy inference (HiFi-GAN im2col 58% -> ~2x).
+The standard im2col kernel launches (N, KH, KW)-thread threadgroups over an
+IC x OH x OW grid. Two shape classes are pathological on Apple Silicon:
 
-(Fork ships this behind CRISPASR_METAL_IM2COL_OCC, auto-on N==1; the PR
- should auto-select without the env var. See 23-*.md.)
+- small N*KH*KW (a 1x1 conv over a batch of 8 runs 8-thread threadgroups,
+  a quarter of one simdgroup, across ~344k groups);
+- the ggml_conv_2d_dw lowering (IC==1, N=C*batch), where each thread loops
+  N/ntg0 iterations with per-plane strides on both src and dst — zero
+  coalescing either side, ~0.4 GB/s effective on M1. Measured 70% of the
+  whole PP-OCRv6 medium recognizer graph (per-op profiler, batch-8 width
+  groups: ~160 ms per ~50 MB depthwise materialization).
+
+kernel_im2col_flat assigns one thread per dst element from a
+(ceil(OW*CHW/256), OH, N) grid: dst writes are contiguous across the
+threadgroup, dw reads are 2D-local in one channel plane, and the only
+index math left is 32-bit divmods on the row-local index (a first cut
+decomposed a fully flat index with int64 divmods — Apple GPUs emulate
+int64 division and that cost more than the copy).
+
+Selection is a shared predicate (ggml_metal_im2col_use_flat) used by both
+the pipeline getter and the encoder; CRISPASR_METAL_IM2COL_FLAT=0 restores
+the standard kernel (regression-bisection lever).
+
+Measured (M1, PP-OCRv6 medium rec, 38-crop page, interleaved pairs,
+outputs byte-identical): recognize 13.4-14.0 s -> 5.8-6.2 s (2.3x); the
+fused batch-8 width-group graphs 2.6-3.1 s -> 0.7-1.2 s. layout_detect
+(RT-DETR, N=1 convs) 1.56-1.62 s -> 0.95-0.99 s (1.6x), regions
+byte-identical. Successor to the pre-v0.17 CRISPASR_METAL_IM2COL_OCC
+variant, re-derived against the current dispatch as its drop note asked.
 ---
+ src/ggml-metal/ggml-metal-device.cpp | 40 ++++++++++++++++++-
+ src/ggml-metal/ggml-metal-device.h   |  3 ++
+ src/ggml-metal/ggml-metal-impl.h     |  4 ++
+ src/ggml-metal/ggml-metal-ops.cpp    | 17 ++++++++-
+ src/ggml-metal/ggml-metal.metal      | 57 ++++++++++++++++++++++++++++
+ 5 files changed, 119 insertions(+), 2 deletions(-)
+
+diff --git a/src/ggml-metal/ggml-metal-device.cpp b/src/ggml-metal/ggml-metal-device.cpp
+index 8ce1773d..27c17537 100644
+--- a/src/ggml-metal/ggml-metal-device.cpp
++++ b/src/ggml-metal/ggml-metal-device.cpp
+@@ -1799,6 +1799,42 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rope(ggml_metal_
+     return res;
+ }
+ 
++// CrispASR patch (CrispEmbed ppocr rec): the standard im2col kernel launches
++// (N, KH, KW)-thread threadgroups across an IC x OH x OW grid, so a 1x1
++// convolution over a small batch (PP-OCR rec: N=8, KH=KW=1) runs 8-thread
++// threadgroups — a quarter of one simdgroup each; measured 70% of the whole
++// recognizer graph on M1 (~30 ms per ~11 MB materialization). For such shapes
++// use kernel_im2col_flat (one thread per dst element, 256-thread groups).
++// Predicate shared by the pipeline getter and the encoder so they cannot
++// disagree. CRISPASR_METAL_IM2COL_FLAT: unset/1 = auto, 0 = legacy kernel.
++bool ggml_metal_im2col_use_flat(const struct ggml_tensor * op) {
++    static const int flat_env = [] {
++        const char * e = getenv("CRISPASR_METAL_IM2COL_FLAT");
++        return (e && e[0] == '0' && e[1] == '\0') ? 0 : 1;
++    }();
++    if (flat_env == 0) {
++        return false;
++    }
++
++    const bool is_2D = ((const int32_t *)(op->op_params))[6] == 1;
++
++    const int64_t N  = op->src[1]->ne[is_2D ? 3 : 2];
++    const int64_t IC = op->src[1]->ne[is_2D ? 2 : 1];
++    const int64_t KH = is_2D ? op->src[0]->ne[1] : 1;
++    const int64_t KW = op->src[0]->ne[0];
++
++    // Two measured-pathological shapes for the standard kernel:
++    // - tiny threadgroups: it holds min(max_threads/(KH*KW), N)*KH*KW <=
++    //   N*KH*KW threads per group; below ~4 simdgroups the dispatch is
++    //   occupancy-bound;
++    // - the ggml_conv_2d_dw lowering (IC==1, N=C*batch): each thread loops
++    //   N/ntg0 times with both src and dst strides of a full plane — zero
++    //   coalescing either side (~0.4 GB/s on M1; 70% of the PP-OCR medium
++    //   recognizer graph). The flat kernel's dst-ordered mapping makes writes
++    //   contiguous and reads 2D-local per channel plane.
++    return N*KH*KW < 128 || IC == 1;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_im2col(ggml_metal_library_t lib, const ggml_tensor * op) {
+     assert(op->op == GGML_OP_IM2COL);
+ 
+@@ -1815,7 +1851,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_im2col(ggml_meta
+     char base[256];
+     char name[256];
+ 
+-    if (KH*KW <= 1024) {
++    if (ggml_metal_im2col_use_flat(op)) {
++        snprintf(base, 256, "kernel_im2col_flat_%s", ggml_type_name(op->type));
++    } else if (KH*KW <= 1024) {
+         snprintf(base, 256, "kernel_im2col_%s", ggml_type_name(op->type));
+     } else {
+         snprintf(base, 256, "kernel_im2col_ext_%s", ggml_type_name(op->type));
+diff --git a/src/ggml-metal/ggml-metal-device.h b/src/ggml-metal/ggml-metal-device.h
+index 943ec07d..d74b74a8 100644
+--- a/src/ggml-metal/ggml-metal-device.h
++++ b/src/ggml-metal/ggml-metal-device.h
+@@ -147,6 +147,9 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_l2_norm
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_group_norm        (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm              (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t n_fuse);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rope              (ggml_metal_library_t lib, const struct ggml_tensor * op);
++// CrispASR patch (CrispEmbed ppocr rec): shared predicate — true when the op
++// should use kernel_im2col_flat (see ggml-metal-device.cpp).
++bool ggml_metal_im2col_use_flat(const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_im2col            (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_transpose_1d (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ // CrispASR patch (PR #160 col2im_1d) — MUST RE-APPLY after ggml bump.
 diff --git a/src/ggml-metal/ggml-metal-impl.h b/src/ggml-metal/ggml-metal-impl.h
-index dcba3f2a..37289618 100644
+index 8bcffe1f..dcf86df9 100644
 --- a/src/ggml-metal/ggml-metal-impl.h
 +++ b/src/ggml-metal/ggml-metal-impl.h
-@@ -754,6 +754,11 @@ typedef struct {
+@@ -788,6 +788,10 @@ typedef struct {
      int32_t  KH;
      int32_t  KW;
      int32_t  KHW; // KH * KW, pre-computed on CPU to save GPU resources
-+    int32_t  OW;  // CrispASR fork: explicit OW (grid z-dim blocks OW in occ mode).
-+    int32_t  occ; // CrispASR fork: 1 = batch-1 occupancy path (OW-blocked threads,
-+                  // ~2x on batch-1 conv, bit-exact), 0 = original (thread-dim0 = N).
-+                  // Gated CRISPASR_METAL_IM2COL_OCC, default 0. See kernel_im2col
-+                  // note. MUST RE-APPLY after ggml bump.
++    // CrispASR patch (CrispEmbed ppocr rec): OW/OH for kernel_im2col_flat,
++    // whose flat dispatch no longer encodes them in the threadgroup grid.
++    int32_t  OW;
++    int32_t  OH;
  } ggml_metal_kargs_im2col;
  
  typedef struct {
 diff --git a/src/ggml-metal/ggml-metal-ops.cpp b/src/ggml-metal/ggml-metal-ops.cpp
-index 5517e934..281ff242 100644
+index 0dde096a..fefe9c3e 100644
 --- a/src/ggml-metal/ggml-metal-ops.cpp
 +++ b/src/ggml-metal/ggml-metal-ops.cpp
-@@ -3898,13 +3898,35 @@ int ggml_metal_op_im2col(ggml_metal_op_t ctx, int idx) {
+@@ -3986,11 +3986,26 @@ int ggml_metal_op_im2col(ggml_metal_op_t ctx, int idx) {
          /*.KH   =*/ KH,
          /*.KW   =*/ KW,
          /*.KHW  =*/ KH * KW,
 +        /*.OW   =*/ OW,
-+        /*.occ  =*/ 0,
++        /*.OH   =*/ OH,
      };
  
      auto pipeline = ggml_metal_library_get_pipeline_im2col(lib, op);
  
-     GGML_ASSERT(KH*KW <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
- 
--    const uint64_t ntptg0 = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)/(KH*KW), N);
-+    // CrispASR fork (batch-1 occupancy). occ path fills the threadgroup with a block
-+    // of OW columns (× KH×KW) instead of sizing thread-dim0 from N (upstream ntptg0
-+    // = 1 at inference N=1 → only KH*KW threads/tg → im2col ~40x below BW, measured
-+    // 58% of melotts HiFi-GAN GPU time). Bit-exact reorg (copy, each dst written once
-+    // — validated: moonshine ASR occ-on == occ-off byte-for-byte; melotts ASR
-+    // round-trip valid), ~2x on batch-1 conv (hifigan gpu 1.88s→0.83s).
-+    // Default: AUTO — enabled for N==1 (the degenerate inference case; strictly
-+    // better, cannot regress N>1 which keeps the upstream path). Override with
-+    // CRISPASR_METAL_IM2COL_OCC=1 (force on) / =0 (force off, upstream).
-+    static int s_occ_env = -2; // -2 unread, -1 auto, 0 force-off, 1 force-on
-+    if (s_occ_env == -2) {
-+        const char * e = std::getenv("CRISPASR_METAL_IM2COL_OCC");
-+        s_occ_env = !e ? -1 : ((*e && *e != '0') ? 1 : 0);
-+    }
-+    const int use_occ = (s_occ_env == -1) ? (N == 1 ? 1 : 0) : s_occ_env;
-+    args.occ = use_occ;
+-    if (KH*KW <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
++    // CrispASR patch (CrispEmbed ppocr rec): flat one-thread-per-element
++    // dispatch for shapes whose standard (N, KH, KW) threadgroup is tiny —
++    // the getter returned kernel_im2col_flat for exactly these ops.
++    if (ggml_metal_im2col_use_flat(op)) {
++        const int64_t owchw = (int64_t) OW * CHW;
++        const int64_t ntg   = 256;
 +
-+    const uint64_t max_t     = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline);
-+    const uint64_t ntptg0    = std::min<uint64_t>(max_t/(KH*KW), (uint64_t) N); // upstream
-+    const uint64_t ow_per_tg = std::min<uint64_t>(std::max<uint64_t>(1, max_t/(KH*KW)), (uint64_t) OW);
-+    const uint64_t ow_blocks = ((uint64_t) OW + ow_per_tg - 1)/ow_per_tg;
++        ggml_metal_encoder_set_pipeline(enc, pipeline);
++        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
++        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 1);
++        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
++
++        ggml_metal_encoder_dispatch_threadgroups(enc, (owchw + ntg - 1)/ntg, OH, N, ntg, 1, 1);
++    } else if (KH*KW <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
+         const uint64_t ntptg0 = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)/(KH*KW), N);
  
-     // CrispASR debug (#83 r9 follow-up #5): host-side readback of op->src[1]
-     // for the FIRST UNet im2col call (signature IC==320, KH==1, KW==3).
-@@ -3946,7 +3968,11 @@ int ggml_metal_op_im2col(ggml_metal_op_t ctx, int idx) {
-     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 1);
-     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
- 
--    ggml_metal_encoder_dispatch_threadgroups(enc, IC, OH, OW, ntptg0, KH, KW);
-+    if (use_occ) {
-+        ggml_metal_encoder_dispatch_threadgroups(enc, IC, OH, ow_blocks, ow_per_tg, KH, KW);
-+    } else {
-+        ggml_metal_encoder_dispatch_threadgroups(enc, IC, OH, OW, ntptg0, KH, KW);
-+    }
- 
-     return 1;
- }
+         ggml_metal_encoder_set_pipeline(enc, pipeline);
 diff --git a/src/ggml-metal/ggml-metal.metal b/src/ggml-metal/ggml-metal.metal
-index f9ac1f2c..49a1e6e0 100644
+index f2ba6d2b..52611a5b 100644
 --- a/src/ggml-metal/ggml-metal.metal
 +++ b/src/ggml-metal/ggml-metal.metal
-@@ -4706,6 +4706,16 @@ typedef void (im2col_t)(
-         uint3   ntg[[threads_per_threadgroup]]);
+@@ -5029,6 +5029,63 @@ kernel void kernel_im2col(
+ template [[host_name("kernel_im2col_f32")]] kernel im2col_t kernel_im2col<float>;
+ template [[host_name("kernel_im2col_f16")]] kernel im2col_t kernel_im2col<half>;
  
- template <typename T>
-+// CrispASR fork: batch-1 occupancy path (args.occ==1, gated by
-+// CRISPASR_METAL_IM2COL_OCC=1, default OFF). Upstream sizes thread-dim0 from N
-+// (ntptg0 = min(max/(KH*KW), N)), so at inference batch N=1 every threadgroup runs
-+// only KH*KW (=3..11) threads → ~10-34% of one simdgroup → im2col ~40x below BW
-+// (measured 58% of melotts HiFi-GAN GPU time). The occ path blocks OW across
-+// thread-dim0 (grid z = ceil(OW/OW_PER_TG), threads = OW_PER_TG*KH*KW), N looped
-+// inside — a bit-exact reorganization of the same copy (each dst element written
-+// once with the same value, no FP reorder). Measured ~2x on melotts HiFi-GAN
-+// (gpu 1.88s→0.83s), ASR-roundtrip validated. args.occ==0 is the upstream path,
-+// unchanged (kept for A/B). MUST RE-APPLY after ggml bump.
- kernel void kernel_im2col(
-         constant ggml_metal_kargs_im2col & args,
-         device const float * x,
-@@ -4714,19 +4724,45 @@ kernel void kernel_im2col(
-         uint3  tgpg[[threadgroups_per_grid]],
-         uint3 tpitg[[thread_position_in_threadgroup]],
-         uint3   ntg[[threads_per_threadgroup]]) {
--//    const int64_t IC = tgpg[0];
-     const int64_t OH = tgpg[1];
--    const int64_t OW = tgpg[2];
- 
-     const int64_t KH = ntg[1];
-     const int64_t KW = ntg[2];
- 
--          int64_t in  = tpitg[0];
-     const int64_t ikh = tpitg[1];
-     const int64_t ikw = tpitg[2];
- 
-     const int64_t iic = tgpig[0];
-     const int64_t ioh = tgpig[1];
-+
-+    if (args.occ) {
-+        // batch-1 occupancy path (experimental, default OFF)
-+        const int64_t OW  = args.OW;
-+        const int64_t iow = (int64_t) tgpig[2]*ntg[0] + tpitg[0];
-+        if (iow >= OW) {
-+            return; // tail of the last OW block
-+        }
-+        const int64_t iiw = iow*args.s0 + ikw*args.d0 - args.p0;
-+        const int64_t iih = ioh*args.s1 + ikh*args.d1 - args.p1;
-+        device T * pdst = (device T *) (dst);
-+        const int64_t dst_col = iic*(KH*KW) + ikh*KW + ikw;
-+        const bool oob = (iih < 0 || iih >= args.IH || iiw < 0 || iiw >= args.IW);
-+        for (int64_t in = 0; in < args.N; ++in) {
-+            const int64_t offset_dst = (in*OH*OW + ioh*OW + iow)*args.CHW + dst_col;
-+            if (oob) {
-+                pdst[offset_dst] = 0.0f;
-+            } else {
-+                const int64_t offset_src = in*args.ofs0 + iic*args.ofs1 + iih*args.IW + iiw;
-+                pdst[offset_dst] = x[offset_src];
-+            }
-+        }
++// CrispASR patch (CrispEmbed ppocr rec, successor to the pre-v0.17
++// CRISPASR_METAL_IM2COL_OCC variant noted above — re-derived against the new
++// dispatch): the standard kernel launches (N, KH, KW)-thread threadgroups, so a
++// 1x1 convolution over a small batch (PP-OCR rec: N=8, KH=KW=1) runs 8-thread
++// threadgroups across IC*OH*OW groups — a quarter of one simdgroup each, and
++// measured 70% of the whole recognizer graph (~30 ms per ~11 MB copy). This
++// variant assigns one thread per dst element from a flat 256-thread dispatch;
++// byte-identical output ordering. Selected in ggml_metal_op_im2col only when
++// the standard threadgroup would be tiny.
++template <typename T>
++kernel void kernel_im2col_flat(
++        constant ggml_metal_kargs_im2col & args,
++        device const float * x,
++        device        char * dst,
++        uint3 tgpig[[threadgroup_position_in_grid]],
++        uint3  tgpg[[threadgroups_per_grid]],
++        uint3 tpitg[[thread_position_in_threadgroup]],
++        uint3   ntg[[threads_per_threadgroup]]) {
++    // Grid: (ceil(OW*CHW/ntg0), OH, N) — ioh and in ride the grid for free;
++    // only the row-local index needs divmods, and 32-bit ones (int64 division
++    // is emulated on Apple GPUs and dominated the first cut of this kernel).
++    const uint32_t idx0 = tgpig[0]*ntg[0] + tpitg[0]; // iow*CHW + chw
++    const uint32_t OWCHW = (uint32_t) args.OW * (uint32_t) args.CHW;
++    if (idx0 >= OWCHW) {
 +        return;
 +    }
 +
-+    // ── upstream path (args.occ==0), unchanged ──
-+    const int64_t OW = tgpg[2];
++    const uint32_t ioh = tgpig[1];
++    const uint32_t in  = tgpig[2];
 +
-+          int64_t in  = tpitg[0];
-     const int64_t iow = tgpig[2];
- 
-     const int64_t iiw = iow*args.s0 + ikw*args.d0 - args.p0;
++    const uint32_t chw = idx0 % (uint32_t) args.CHW;
++    const uint32_t iow = idx0 / (uint32_t) args.CHW;
++
++    const uint32_t iic = chw / (uint32_t) args.KHW;
++    const uint32_t k   = chw % (uint32_t) args.KHW;
++    const uint32_t ikh = k / (uint32_t) args.KW;
++    const uint32_t ikw = k % (uint32_t) args.KW;
++
++    const int32_t iiw = (int32_t) iow*args.s0 + (int32_t) ikw*args.d0 - args.p0;
++    const int32_t iih = (int32_t) ioh*args.s1 + (int32_t) ikh*args.d1 - args.p1;
++
++    // dst layout: ((in*OH + ioh)*OW + iow)*CHW + chw — identical to
++    // kernel_im2col's offset_dst; contiguous across the threadgroup.
++    const int64_t offset_dst = ((int64_t) in*args.OH + ioh)*OWCHW + idx0;
++
++    device T * pdst = (device T *) (dst);
++
++    if (iih < 0 || iih >= args.IH || iiw < 0 || iiw >= args.IW) {
++        pdst[offset_dst] = 0.0f;
++    } else {
++        pdst[offset_dst] = x[(int64_t) in*args.ofs0 + (int64_t) iic*args.ofs1 + (int64_t) iih*args.IW + iiw];
++    }
++}
++
++template [[host_name("kernel_im2col_flat_f32")]] kernel im2col_t kernel_im2col_flat<float>;
++template [[host_name("kernel_im2col_flat_f16")]] kernel im2col_t kernel_im2col_flat<half>;
++
+ // TODO: optimize
+ typedef void (im2col_ext_t)(
+         constant ggml_metal_kargs_im2col & args,
+-- 
+2.50.1 (Apple Git-155)
+

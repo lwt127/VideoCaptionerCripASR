@@ -32,6 +32,7 @@
 #include <string>
 #include <unordered_set>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -666,17 +667,17 @@ extern "C" sensevoice_context* sensevoice_init_from_file(const char* path, sense
     ctx->params = params;
     ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
-    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init();
     if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
-    ctx->backend_cpu = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (ctx->backend_cpu)
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
-    if (ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
 
     if (!sensevoice_load_model(ctx->model, ctx->vocab, path, ctx->backend, ctx->backend_cpu)) {
-        delete ctx;
+        sensevoice_free(ctx); // frees the backends this ctx already owns
         return nullptr;
     }
 
@@ -719,9 +720,9 @@ extern "C" void sensevoice_free(sensevoice_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.buf_cpu)
-        ggml_backend_buffer_free(ctx->model.buf_cpu);
+        core_gguf::release_weight_buffer(ctx->model.buf_cpu);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend)
@@ -729,19 +730,6 @@ extern "C" void sensevoice_free(sensevoice_context* ctx) {
     if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
         ggml_backend_free(ctx->backend_cpu);
     delete ctx;
-}
-
-extern "C" char* sensevoice_transcribe(sensevoice_context* ctx, const float* samples, int n_samples,
-                                       const char* language, bool use_itn) {
-    if (!ctx || !samples || n_samples <= 0)
-        return nullptr;
-    std::string s = sensevoice_transcribe_impl(ctx, samples, n_samples, language, use_itn, nullptr, nullptr);
-    char* out = (char*)std::malloc(s.size() + 1);
-    if (!out)
-        return nullptr;
-    std::memcpy(out, s.data(), s.size());
-    out[s.size()] = '\0';
-    return out;
 }
 
 namespace {
@@ -752,6 +740,11 @@ namespace {
 // not by the input query-embed order. Content classification is robust
 // to ordering surprises and to the model dropping a marker on degenerate
 // audio.
+//
+// The emotion marker is parsed only so it can be DROPPED. Its value is
+// classified into `emotion` and then discarded by both public entry points —
+// see the header for why CrispASR ships no emotion-recognition capability
+// (EU AI Act Art. 5(1)(f) / Annex III(1)(c); docs/eu-ai-act.md).
 struct sv_prefix {
     std::string language;
     std::string emotion;
@@ -809,6 +802,41 @@ static char* sv_dup(const std::string& s) {
 
 } // namespace
 
+extern "C" char* sensevoice_transcribe(sensevoice_context* ctx, const float* samples, int n_samples,
+                                       const char* language, bool use_itn) {
+    if (!ctx || !samples || n_samples <= 0)
+        return nullptr;
+    std::string s = sensevoice_transcribe_impl(ctx, samples, n_samples, language, use_itn, nullptr, nullptr);
+    // Strip the `<|lang|><|emotion|><|event|><|itn|>` annotation prefix. It used
+    // to be returned verbatim, so every session-ABI consumer (Python/Rust/Go/
+    // Dart/Java/C#/JS/WASM — src/crispasr_c_api.cpp routes sensevoice through
+    // here) got transcripts that literally began "<|en|><|HAPPY|><|Speech|>
+    // <|withitn|>". That both corrupted the transcript (docs/learnings.md:149
+    // logs it as a WER-normalisation problem) and leaked a per-utterance
+    // emotion inference onto every binding. Both entry points now drop it:
+    // sensevoice_transcribe_structured() keeps language/event/itn as fields,
+    // this one keeps nothing but the words.
+    const sv_prefix pre = sv_parse_prefix(s);
+    // Resolve the prefix and the SentencePiece ▁ artefact on the first
+    // post-prefix token into ONE offset. Erasing them in turn would memmove the
+    // whole transcript twice before the copy below copies it a third time.
+    // find_first_not_of, not a advance-past-whitespace loop: when everything
+    // after the prefix is whitespace the structured path leaves it alone
+    // (lead == npos short-circuits its erase), and the two entry points must
+    // not disagree about that.
+    size_t off = pre.consumed;
+    const size_t lead = s.find_first_not_of(" \t", off);
+    if (lead != std::string::npos)
+        off = lead;
+    const size_t n = s.size() - off;
+    char* out = (char*)std::malloc(n + 1);
+    if (!out)
+        return nullptr;
+    std::memcpy(out, s.data() + off, n);
+    out[n] = '\0';
+    return out;
+}
+
 extern "C" sensevoice_result* sensevoice_transcribe_structured(sensevoice_context* ctx, const float* samples,
                                                                int n_samples, const char* language, bool use_itn) {
     if (!ctx || !samples || n_samples <= 0)
@@ -827,12 +855,13 @@ extern "C" sensevoice_result* sensevoice_transcribe_structured(sensevoice_contex
     if (!r)
         return nullptr;
     r->language = sv_dup(pre.language);
-    r->emotion = sv_dup(pre.emotion);
+    // pre.emotion is intentionally NOT copied out — parsed only so the marker is
+    // stripped from `text`. See sensevoice.h / docs/eu-ai-act.md.
     r->audio_event = sv_dup(pre.audio_event);
     r->itn = sv_dup(pre.itn);
     r->text = sv_dup(text);
     r->raw = sv_dup(raw);
-    if (!r->language || !r->emotion || !r->audio_event || !r->itn || !r->text || !r->raw) {
+    if (!r->language || !r->audio_event || !r->itn || !r->text || !r->raw) {
         sensevoice_result_free(r);
         return nullptr;
     }
@@ -843,7 +872,6 @@ extern "C" void sensevoice_result_free(sensevoice_result* r) {
     if (!r)
         return;
     std::free(r->language);
-    std::free(r->emotion);
     std::free(r->audio_event);
     std::free(r->itn);
     std::free(r->text);

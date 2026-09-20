@@ -107,3 +107,13 @@ crispasr --backend piper -m piper-de_DE-thorsten-medium-f16.gguf \
 
 In CrisperWeaver these appear in the Synthesize screen's model picker once
 downloaded; the backend resamples 22.05 kHz → 24 kHz transparently.
+
+## Voice provenance (EU AI Act Art. 50(4))
+
+Every piper voice is a single-speaker VITS model trained on one **named donor's** recordings: the Lessac corpus, Thorsten Müller (who released his voice under CC0), Kerstin. Releasing a voice is consent to publish it — it is not a reason to stop telling listeners the audio is synthetic.
+
+CrispASR records this as `speaker_identity=real_person`. Output synthesized with it carries a **spoken AI disclosure**, because audio resembling an identifiable person is a deep fake under Art. 3(60) whether or not any cloning took place. It does **not** require `--i-have-rights`: the donor's agreement to the training is a licensing matter settled upstream, which a downstream operator cannot attest to.
+
+Override per run with `--speaker-identity`, or stamp a file permanently with
+`models/stamp-speaker-identity.py`. See
+[`docs/eu-ai-act.md` §6.2a](https://github.com/CrispStrobe/CrispASR/blob/main/docs/eu-ai-act.md).

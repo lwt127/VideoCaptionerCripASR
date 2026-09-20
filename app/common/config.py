@@ -36,10 +36,10 @@ from ..core.entities import (
 class Language(Enum):
     """软件语言"""
 
-    CHINESE_SIMPLIFIED = QLocale(QLocale.Chinese, QLocale.China)
-    CHINESE_TRADITIONAL = QLocale(QLocale.Chinese, QLocale.Taiwan)
-    ENGLISH = QLocale(QLocale.English)
-    AUTO = QLocale()
+    CHINESE_SIMPLIFIED = "zh_CN"
+    CHINESE_TRADITIONAL = "zh_TW"
+    ENGLISH = "en_US"
+    AUTO = "Auto"
 
 
 class SubtitleLayoutEnum(Enum):
@@ -55,10 +55,18 @@ class LanguageSerializer(ConfigSerializer):
     """Language serializer"""
 
     def serialize(self, language):
-        return language.value.name() if language != Language.AUTO else "Auto"
+        return language.value if isinstance(language, Language) else "Auto"
 
     def deserialize(self, value: str):
-        return Language(QLocale(value)) if value != "Auto" else Language.AUTO
+        if value == "Auto" or not isinstance(value, str):
+            return Language.AUTO
+        locale = QLocale(value)
+        if locale.language() == QLocale.Chinese:
+            return (Language.CHINESE_TRADITIONAL if locale.script() == QLocale.TraditionalHanScript
+                    else Language.CHINESE_SIMPLIFIED)
+        if locale.language() == QLocale.English:
+            return Language.ENGLISH
+        return Language.AUTO
 
 
 class Config(QConfig):
@@ -172,13 +180,22 @@ class Config(QConfig):
     )
 
     # ------------------- CrispASR 配置 (多后端 ASR 引擎) -------------------
-    # 后端引擎、模型、VAD 方法均以标签字符串存储（详见 core/bk_asr/crisp_asr_catalog.py）
+    # 固定 ID 存储；旧显示标签由 catalog.normalize_selection 兼容迁移。
     crisp_asr_backend = ConfigItem("CrispASR", "CrispAsrBackend", "")
     crisp_asr_model = ConfigItem("CrispASR", "CrispAsrModel", "")
     crisp_asr_vad_method = ConfigItem("CrispASR", "CrispAsrVadMethod", "")
     crisp_asr_lid_method = ConfigItem("CrispASR", "CrispAsrLidMethod", "")
     crisp_asr_use_gpu = ConfigItem("CrispASR", "CrispAsrUseGpu", True, BoolValidator())
     crisp_asr_use_vad = ConfigItem("CrispASR", "CrispAsrUseVad", True, BoolValidator())
+    crisp_asr_cohere_multilingual = ConfigItem(
+        "CrispASR", "CrispAsrCohereMultilingual", False, BoolValidator()
+    )
+    # Only explicit GUI confirmations are recorded, never model selection alone.
+    crisp_asr_license_acceptances = ConfigItem("CrispASR", "ModelLicenseAcceptances", [])
+    crisp_asr_engine_flavor = ConfigItem("CrispASR", "EngineFlavor", "auto")
+    crisp_asr_alignment_mode = ConfigItem("CrispASR", "AlignmentMode", "default")
+    crisp_asr_aligner = ConfigItem("CrispASR", "Aligner", "qwen3-forced-aligner")
+    crisp_asr_word_timestamps = ConfigItem("CrispASR", "WordTimestamps", False, BoolValidator())
 
     # ------------------- Faster Whisper 配置 -------------------
     faster_whisper_program = ConfigItem(

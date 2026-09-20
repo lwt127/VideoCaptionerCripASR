@@ -51,6 +51,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifdef __APPLE__
 #include <Accelerate/Accelerate.h> // vDSP_conv, vvsinf, vDSP_vsq — Step C-1
@@ -191,7 +192,7 @@ struct indextts_voc_context {
             ggml_free(ctx_w);
         }
         if (buf_w) {
-            ggml_backend_buffer_free(buf_w);
+            core_gguf::release_weight_buffer(buf_w);
         }
         if (backend && backend != backend_cpu) {
             ggml_backend_free(backend);
@@ -265,7 +266,13 @@ static void aa_snake_beta_op(struct ggml_tensor* dst, const struct ggml_tensor* 
     auto& snake_tmp = p->scratch_snake[ith];
     // Step C-1 A/B knob — INDEXTTS_AA_SCALAR=1 forces the scalar paths for the
     // SnakeBeta and downsample stages so we can bench Accelerate's contribution.
-    static const bool s_force_scalar = crispasr_env::get("CRISPASR_INDEXTTS_AA_SCALAR") != nullptr;
+    // Read per call, NOT cached in a function-local static: a cached read is
+    // fixed for the process, so flipping the env on a live context changes
+    // nothing and both arms of an in-process A/B silently run the same path.
+    // This is a ggml custom-op callback (once per worker per op node, ~tens of
+    // calls per generation), not a per-sample hot loop, so the getenv cost is
+    // negligible; and getenv reads are thread-safe absent a concurrent setenv.
+    const bool s_force_scalar = crispasr_env::get("CRISPASR_INDEXTTS_AA_SCALAR") != nullptr;
     if ((int)padded.size() < T_padded)
         padded.resize(T_padded);
     if ((int)upsampled.size() < T_up)
@@ -1350,7 +1357,7 @@ extern "C" struct indextts_voc_context* indextts_voc_init(const char* path, int 
     // users don't have to remember `--no-gpu` for IndexTTS. Set
     // INDEXTTS_VOC_FORCE_GPU=1 to opt back into the slow mixed path (useful
     // for the benchmark history once Step B/C lift the AA op to GPU).
-    c->backend_cpu = ggml_backend_cpu_init();
+    c->backend_cpu = core_cpu_backend::init();
     if (!c->backend_cpu) {
         fprintf(stderr, "indextts-voc: failed to init CPU backend\n");
         delete c;

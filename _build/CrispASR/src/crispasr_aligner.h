@@ -49,6 +49,21 @@ struct CrispasrAlignedSegment {
     size_t word_end = 0;
 };
 
+// Absolute sample interval used when aligning one ASR segment.  Keeping this
+// calculation beside the aligner prevents per-slice callers from accidentally
+// feeding every segment the whole VAD slice (issue #444), which resets each
+// segment's timestamps to the same slice origin.
+struct CrispasrAlignmentAudioRange {
+    int start = 0;         // absolute sample index, inclusive
+    int end = 0;           // absolute sample index, exclusive
+    int64_t offset_cs = 0; // timestamp corresponding to start
+
+    bool valid() const { return end > start; }
+};
+
+CrispasrAlignmentAudioRange crispasr_alignment_audio_range(int64_t segment_t0_cs, int64_t segment_t1_cs,
+                                                           int slice_start, int slice_end, int sample_rate);
+
 /// Split text into alignment "words": whitespace-delimited for
 /// space-delimited languages, per-character for CJK. This is the exact
 /// splitter the aligner backends use — callers that map aligned words back
@@ -59,6 +74,13 @@ std::vector<std::string> crispasr_tokenise_align_words(const std::string& text);
 /// Parse SRT content into cue texts (indices and timestamps discarded,
 /// multi-line cue text joined with spaces, whitespace-only cues dropped).
 std::vector<std::string> crispasr_parse_srt_cues(const std::string& raw);
+
+/// Parse CrispASR JSON output into segment texts. Extracts the "text" field
+/// from each object in the "transcription" array. Works with both the full
+/// JSON format (--output-json-full) and the plain format (--output-json).
+/// Also accepts the align-only JSON format (array of {text, start, end}).
+/// Returns empty on parse failure or missing transcription data.
+std::vector<std::string> crispasr_parse_json_segments(const std::string& raw);
 
 /// Group a flat word alignment back into the segment texts it was built
 /// from. `segment_texts` joined with spaces must equal the transcript the

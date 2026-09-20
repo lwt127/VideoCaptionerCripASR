@@ -36,6 +36,17 @@ static bool parse_auto_quant_spec(const std::string& spec, std::string& base, st
     return true;
 }
 
+// A bare explicit filename means "this exact file", but users commonly keep
+// those files in --cache-dir / CRISPASR_MODELS_DIR rather than the shell's
+// current directory.  Search the normal model roots before consulting the
+// registry; otherwise an unregistered Piper voice can be silently replaced by
+// the backend's unrelated default voice (#397).
+static std::string probe_explicit_model_filename(const std::string& model_arg, const std::string& cache_dir_override) {
+    if (model_arg.empty() || model_arg.find_first_of("/\\") != std::string::npos)
+        return {};
+    return crispasr_cache::probe_cached_file(model_arg, cache_dir_override);
+}
+
 static CrispasrResolvePreview build_preview(const std::string& model_arg, const std::string& backend_name,
                                             const std::string& cache_dir_override, const std::string& preferred_quant,
                                             bool ignore_cache) {
@@ -62,6 +73,14 @@ static CrispasrResolvePreview build_preview(const std::string& model_arg, const 
             fclose(f);
             out.exists_locally = true;
             out.resolved_path = effective_model_arg;
+            out.filename = effective_model_arg;
+            return out;
+        }
+
+        const std::string cached = probe_explicit_model_filename(effective_model_arg, cache_dir_override);
+        if (!cached.empty()) {
+            out.exists_locally = true;
+            out.resolved_path = cached;
             out.filename = effective_model_arg;
             return out;
         }
@@ -141,6 +160,13 @@ std::string crispasr_resolve_model_cli(const std::string& model_arg, const std::
     }
     const int open_errno = errno;
 
+    const std::string cached_explicit = probe_explicit_model_filename(effective_model_arg, cache_dir_override);
+    if (!cached_explicit.empty()) {
+        if (!quiet)
+            fprintf(stderr, "crispasr: found explicit model in model search path: %s\n", cached_explicit.c_str());
+        return cached_explicit;
+    }
+
     // fopen failed. Distinguish "no such entry" (maybe a registry model *name*
     // to download — handled below) from "the entry exists but we can't open
     // it" (a dangling/unreadable symlink, a permission problem, an unmounted
@@ -179,8 +205,33 @@ std::string crispasr_resolve_model_cli(const std::string& model_arg, const std::
     bool have_match = crispasr_registry_lookup_by_filename(effective_model_arg, match, effective_quant);
     if (!have_match)
         have_match = crispasr_registry_lookup(effective_model_arg, match, effective_quant);
-    if (!have_match && !backend_name.empty())
+    bool backend_fallback = false; // step 3: the -m arg itself matched NOTHING
+    if (!have_match && !backend_name.empty()) {
         have_match = crispasr_registry_lookup(backend_name, match, effective_quant);
+        backend_fallback = have_match;
+    }
+
+    if (backend_fallback) {
+        // The user's -m matched nothing; only --backend did. Silently handing
+        // back the backend's registry default here meant a typo'd path
+        // transcribed with a DIFFERENT model at rc 0 (found 2026-09-02 while
+        // execution-verifying the getting-started tutorial). A slash makes the
+        // intent unambiguous — that is a PATH, and a missing path is an error,
+        // same posture as the unreadable-entry branch above. A bare name keeps
+        // the historical substitution but says so loudly.
+        if (effective_model_arg.find('/') != std::string::npos || effective_model_arg.find('\\') != std::string::npos) {
+            fprintf(stderr,
+                    "crispasr: model file '%s' does not exist and matches no registry entry.\n"
+                    "  Refusing to substitute the '%s' registry default for an explicit --model path.\n"
+                    "  Fix the path, or pass -m auto to use the registry default.\n",
+                    effective_model_arg.c_str(), backend_name.c_str());
+            return effective_model_arg;
+        }
+        fprintf(stderr,
+                "crispasr: WARNING: '-m %s' does not exist and matches no registry entry — "
+                "substituting the '%s' registry default '%s'. Pass -m auto to silence this.\n",
+                effective_model_arg.c_str(), backend_name.c_str(), match.filename.c_str());
+    }
 
     if (!have_match) {
         // Nothing to download — return the arg and let the load layer
@@ -202,7 +253,10 @@ std::string crispasr_resolve_model_cli(const std::string& model_arg, const std::
     }
 
     fprintf(stderr, "crispasr: model '%s' not found locally.\n", effective_model_arg.c_str());
-    fprintf(stderr, "  Available for download: %s (%s)\n", match.filename.c_str(), match.approx_size.c_str());
+    if (match.approx_size.empty())
+        fprintf(stderr, "  Available for download: %s\n", match.filename.c_str());
+    else
+        fprintf(stderr, "  Available for download: %s (%s)\n", match.filename.c_str(), match.approx_size.c_str());
     if (!match.license.empty()) {
         const bool is_nc = crispasr_license_requires_acceptance(match.license);
         if (is_nc)
@@ -216,7 +270,7 @@ std::string crispasr_resolve_model_cli(const std::string& model_arg, const std::
     // NOT sufficient (mirrors CrispEmbed).
     const bool restricted = !match.license.empty() && crispasr_license_requires_acceptance(match.license);
     const bool accepted = restricted && crispasr_license_accepted(match.license, accepted_license);
-    if (restricted && !accepted && !isatty(fileno(stdin))) {
+    if (restricted && !accepted) {
         fprintf(stderr, "  Refusing: pass --accept-license %s (or set CRISPASR_ACCEPT_LICENSE).\n",
                 crispasr_license_tag(match.license).c_str());
         return effective_model_arg;

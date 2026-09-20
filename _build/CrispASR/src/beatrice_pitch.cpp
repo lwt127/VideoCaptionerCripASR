@@ -34,6 +34,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ---------------------------------------------------------------------------
 // Hyperparameters
@@ -273,7 +274,7 @@ beatrice_pitch_context* beatrice_pitch_init_from_file(const char* model_path, be
 
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : nullptr;
     if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
 
     core_gguf::WeightLoad wl;
     if (!core_gguf::load_weights(model_path, ctx->backend, "beatrice", wl)) {
@@ -309,7 +310,7 @@ void beatrice_pitch_free(beatrice_pitch_context* ctx) {
     if (!ctx)
         return;
     if (ctx->buf_w)
-        ggml_backend_buffer_free(ctx->buf_w);
+        core_gguf::release_weight_buffer(ctx->buf_w);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
     if (ctx->backend)
@@ -621,7 +622,7 @@ beatrice_pitch_result* beatrice_pitch_estimate(beatrice_pitch_context* c, const 
     ggml_backend_tensor_set(io.instfreq, feat.instfreq.data(), 0, feat.instfreq.size() * sizeof(float));
     ggml_backend_tensor_set(io.corr_diff, feat.corr_diff.data(), 0, feat.corr_diff.size() * sizeof(float));
     if (c->params.n_threads > 0)
-        ggml_backend_cpu_set_n_threads(c->backend, c->params.n_threads);
+        core_cpu_backend::set_n_threads(c->backend, c->params.n_threads);
     ggml_backend_graph_compute(c->backend, gf);
 
     auto* r = new beatrice_pitch_result();

@@ -249,8 +249,10 @@ public:
                     if (crispasr_cache::file_present(cached)) {
                         prompt_path = cached;
                     } else if (p.auto_download) {
-                        prompt_path = crispasr_cache::ensure_cached_file(ref_name, tada_lang_ref_url(p.backend, lang),
-                                                                         p.no_prints, "crispasr", p.cache_dir);
+                        prompt_path = crispasr_managed_download(
+                            ref_name, tada_lang_ref_url(p.backend, lang),
+                            "CC-BY-4.0 (FLEURS voice reference; see https://huggingface.co/datasets/google/fleurs)",
+                            p.no_prints, "crispasr[tada]", p.cache_dir, p.accept_license);
                     } else if (!p.no_prints) {
                         fprintf(stderr,
                                 "crispasr[tada]: no voice reference for language '%s' found. "
@@ -304,7 +306,10 @@ public:
             const std::string base = (p.backend == "tada-1b" || p.backend == "tada-tts-1b")
                                          ? "https://huggingface.co/cstr/tada-tts-1b-GGUF/resolve/main/"
                                          : "https://huggingface.co/cstr/tada-tts-3b-ml-GGUF/resolve/main/";
-            return crispasr_cache::ensure_cached_file(fname, base + fname, p.no_prints, "crispasr", p.cache_dir);
+            return crispasr_managed_download(fname, base + fname,
+                                             "llama3.2 (TADA-derived auxiliary model; see "
+                                             "https://huggingface.co/HumeAI/tada-3b-ml/blob/main/LICENSE)",
+                                             p.no_prints, "crispasr[tada]", p.cache_dir, p.accept_license);
         }
         return std::string();
     }

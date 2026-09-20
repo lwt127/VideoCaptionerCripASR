@@ -52,6 +52,7 @@ static int g_cpu_n_threads = 4;
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `VOXCPM2_BENCH=1` for per-stage timings.
@@ -127,7 +128,7 @@ static ggml_backend_t g_cpu_backend = nullptr;
 
 static ggml_backend_t get_cpu_backend() {
     if (!g_cpu_backend) {
-        g_cpu_backend = ggml_backend_cpu_init();
+        g_cpu_backend = core_cpu_backend::init();
     }
     return g_cpu_backend;
 }
@@ -582,8 +583,8 @@ static void matmul_mv_ggml(ggml_backend_t cpu_be, ggml_tensor* W, const float* v
     ggml_cgraph* gf = ggml_new_graph(tmp_ctx);
     ggml_build_forward_expand(gf, result);
 
-    if (ggml_backend_is_cpu(cpu_be)) {
-        ggml_backend_cpu_set_n_threads(cpu_be, g_cpu_n_threads);
+    if (core_cpu_backend::is_cpu(cpu_be)) {
+        core_cpu_backend::set_n_threads(cpu_be, g_cpu_n_threads);
     }
     ggml_backend_graph_compute(cpu_be, gf);
 
@@ -1211,8 +1212,8 @@ static std::vector<float> ralm_step_graph(voxcpm2_context* ctx, const float* hid
         ggml_backend_tensor_set(t_positions, &pos_i, 0, sizeof(int32_t));
     }
 
-    if (ggml_backend_is_cpu(ctx->backend)) {
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend)) {
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
     }
     if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "voxcpm2: ralm_step graph compute failed\n");
@@ -1557,8 +1558,8 @@ static std::vector<float> tslm_step_graph(voxcpm2_context* ctx, const float* hid
         ggml_backend_tensor_set(fsq_half_t, half_buf.data(), 0, (size_t)n * sizeof(float));
     }
 
-    if (ggml_backend_is_cpu(ctx->backend)) {
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend)) {
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
     }
     if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "voxcpm2: tslm_step graph compute failed\n");
@@ -2147,8 +2148,8 @@ static std::vector<float> locenc_forward_graph(voxcpm2_context* ctx, const float
     ggml_backend_tensor_set(t_patch, patch_buf.data(), 0, patch_buf.size() * sizeof(float));
     ggml_backend_tensor_set(t_pos, positions.data(), 0, positions.size() * sizeof(int32_t));
 
-    if (ggml_backend_is_cpu(ctx->backend)) {
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend)) {
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
     }
     if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "voxcpm2: locenc graph compute failed\n");
@@ -2676,8 +2677,8 @@ static std::vector<float> locdit_forward_graph(voxcpm2_context* ctx, const float
     ggml_backend_tensor_set(t_dsin, dt_sin.data(), 0, dt_sin.size() * sizeof(float));
     ggml_backend_tensor_set(t_pos, positions.data(), 0, positions.size() * sizeof(int32_t));
 
-    if (ggml_backend_is_cpu(ctx->backend)) {
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend)) {
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
     }
     if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "voxcpm2: locdit graph compute failed\n");
@@ -3898,7 +3899,7 @@ static std::vector<float> vae_decode_graph(voxcpm2_context* ctx, const std::vect
     const int64_t out_samples = (int64_t)T_lat * 1920;
     const char* backend_name = ggml_backend_name(ctx->backend);
     const bool is_cuda = backend_name && std::strncmp(backend_name, "CUDA", 4) == 0;
-    if (out_samples > 500000 && !ggml_backend_is_cpu(ctx->backend) && !is_cuda) {
+    if (out_samples > 500000 && !core_cpu_backend::is_cpu(ctx->backend) && !is_cuda) {
         if (ctx->verbosity >= 1)
             fprintf(stderr,
                     "voxcpm2: VAE output too long for GPU dispatch "
@@ -4091,8 +4092,8 @@ static std::vector<float> vae_decode_graph(voxcpm2_context* ctx, const std::vect
     }
     ggml_backend_tensor_set(t_latents, latents_host.data(), 0, latents_host.size() * sizeof(float));
 
-    if (ggml_backend_is_cpu(ctx->backend)) {
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend)) {
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
     }
     if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "voxcpm2: vae_decode_graph compute failed; falling back to CPU\n");
@@ -4951,7 +4952,7 @@ static std::vector<float> vae_encode_graph(voxcpm2_context* ctx, const float* pc
     // slice of synthesis time, so fall back to CPU for pathological lengths.
     const char* backend_name = ggml_backend_name(ctx->backend);
     const bool is_cuda = backend_name && std::strncmp(backend_name, "CUDA", 4) == 0;
-    if (padded_n > 500000 && !ggml_backend_is_cpu(ctx->backend) && !is_cuda) {
+    if (padded_n > 500000 && !core_cpu_backend::is_cpu(ctx->backend) && !is_cuda) {
         if (ctx->verbosity >= 1)
             fprintf(stderr, "voxcpm2: VAE encode input too long for GPU dispatch (%d samples); using CPU\n", padded_n);
         return vae_encode_uncached(ctx, pcm, n_samples, out_T_patches);
@@ -5048,8 +5049,8 @@ static std::vector<float> vae_encode_graph(voxcpm2_context* ctx, const float* pc
     std::memcpy(x_host.data(), pcm, (size_t)std::min(n_samples, padded_n) * sizeof(float));
     ggml_backend_tensor_set(t_in, x_host.data(), 0, x_host.size() * sizeof(float));
 
-    if (ggml_backend_is_cpu(ctx->backend)) {
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend)) {
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
     }
     if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "voxcpm2: vae_encode_graph compute failed; falling back to CPU\n");
@@ -6067,8 +6068,8 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
     *out_n_samples = 0;
 
     ggml_backend_t cpu_be = get_cpu_backend();
-    if (ggml_backend_is_cpu(cpu_be)) {
-        ggml_backend_cpu_set_n_threads(cpu_be, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(cpu_be)) {
+        core_cpu_backend::set_n_threads(cpu_be, ctx->n_threads);
     }
 
     // Seed RNG for CFM noise
@@ -6527,7 +6528,7 @@ static struct voxcpm2_context* voxcpm2_init_internal(const char* path_model, str
     // The standalone VAE owns a separate CPU backend. This keeps its thread
     // configuration and lifecycle independent when a full VoxCPM2 TTS
     // context is loaded in the same process.
-    ctx->backend_cpu = vae_only ? ggml_backend_cpu_init() : get_cpu_backend();
+    ctx->backend_cpu = vae_only ? core_cpu_backend::init() : get_cpu_backend();
     ctx->owns_backend_cpu = vae_only;
     if (!ctx->backend_cpu) {
         fprintf(stderr, "voxcpm2: failed to init CPU backend\n");
@@ -6839,7 +6840,7 @@ void voxcpm2_free(struct voxcpm2_context* ctx) {
         ctx->gpu_ggml_ctx = nullptr;
     }
     if (ctx->weight_buf) {
-        ggml_backend_buffer_free(ctx->weight_buf);
+        core_gguf::release_weight_buffer(ctx->weight_buf);
         ctx->weight_buf = nullptr;
     }
     if (ctx->ggml_ctx) {
@@ -7059,8 +7060,8 @@ float* voxcpm2_extract_stage(struct voxcpm2_context* ctx, const char* text, cons
     *out_n = 0;
 
     ggml_backend_t cpu_be = get_cpu_backend();
-    if (ggml_backend_is_cpu(cpu_be)) {
-        ggml_backend_cpu_set_n_threads(cpu_be, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(cpu_be)) {
+        core_cpu_backend::set_n_threads(cpu_be, ctx->n_threads);
     }
 
     std::string stage(stage_name);

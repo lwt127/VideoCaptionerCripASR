@@ -301,7 +301,10 @@ inline void crispasr_c2pa_startup_check() {
         warned = true;
     }
 #elif !defined(CRISPASR_HAVE_C2PA)
-    // Native signer covers WAV; only MP3/M4A need c2pa-rs. No warning for the
-    // common (WAV) case — signing works out of the box.
+    // The native signer covers WAV, MP3 (ID3v2.4 GEOB), M4A/MP4 (ISO BMFF
+    // uuid) and FLAC — see crispasr_c2pa_sign_pem() above. c2pa-rs is only a
+    // fallback for formats outside that set. No warning: signing works out of
+    // the box for every container CrispASR emits a manifest into, and the
+    // watertight marking floor relies on that being true.
 #endif
 }

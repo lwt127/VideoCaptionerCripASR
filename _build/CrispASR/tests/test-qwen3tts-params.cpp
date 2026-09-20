@@ -4,6 +4,7 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include "qwen3_tts.h"
+#include "qwen3_tts_hip_policy.h"
 
 TEST_CASE("qwen3_tts_params: default values are sensible", "[unit][qwen3_tts]") {
     struct qwen3_tts_context_params p = qwen3_tts_context_default_params();
@@ -40,4 +41,19 @@ TEST_CASE("qwen3_tts_init_from_file: empty path returns nullptr", "[unit][qwen3_
 TEST_CASE("qwen3_tts_free: NULL context is a no-op", "[unit][qwen3_tts]") {
     qwen3_tts_free(nullptr);
     SUCCEED("qwen3_tts_free tolerated a NULL ctx.");
+}
+
+TEST_CASE("qwen3_tts HIP policy defaults known-bad paths to CPU", "[unit][qwen3_tts][hip]") {
+    using namespace qwen3_tts_hip_policy;
+
+    REQUIRE(codec_must_use_cpu("ROCm0", false));
+    REQUIRE_FALSE(codec_must_use_cpu("ROCm0", true));
+    REQUIRE_FALSE(codec_must_use_cpu("CUDA0", false));
+    REQUIRE_FALSE(codec_must_use_cpu("Metal", false));
+
+    REQUIRE(code_predictor_must_use_cpu("ROCm0", false, 5, 1024, true));
+    REQUIRE_FALSE(code_predictor_must_use_cpu("ROCm0", true, 5, 1024, true));
+    REQUIRE_FALSE(code_predictor_must_use_cpu("ROCm0", false, 5, 1024, false));
+    REQUIRE_FALSE(code_predictor_must_use_cpu("ROCm0", false, 28, 2048, true));
+    REQUIRE_FALSE(code_predictor_must_use_cpu("CUDA0", false, 5, 1024, true));
 }

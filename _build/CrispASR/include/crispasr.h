@@ -601,6 +601,14 @@ CRISPASR_API int crispasr_session_set_cfg_weight(struct crispasr_session* s, flo
 CRISPASR_API int crispasr_session_set_tts_noise_temp(struct crispasr_session* s, float noise_temp);
 CRISPASR_API int crispasr_session_set_exaggeration(struct crispasr_session* s, float exaggeration);
 CRISPASR_API int crispasr_session_set_max_speech_tokens(struct crispasr_session* s, int n);
+// Issue #360: the floor counterpart to set_max_speech_tokens. UNITS are the
+// backend's own AR decode step — NOT samples, NOT milliseconds. Today only the
+// MOSS TTS backends consume it, where one unit is an audio-codec frame at
+// sampling_rate / downsample_rate (24000 / 1920 = 12.5 Hz on the shipped
+// models), i.e. 80 ms per frame, so n = 25 floors the output at ~2 s. It works
+// by masking the audio-end token until n frames exist, so it bounds the decode
+// rather than padding the result. Other backends return -2.
+CRISPASR_API int crispasr_session_set_min_speech_tokens(struct crispasr_session* s, int n);
 CRISPASR_API int crispasr_session_set_length_scale(struct crispasr_session* s, float scale);
 // G2P dict source: "olaph" (MIT), "open-dict" (CC-BY-SA), or file path.
 CRISPASR_API int crispasr_session_set_g2p_dict(struct crispasr_session* s, const char* source);
@@ -612,6 +620,14 @@ CRISPASR_API int crispasr_session_set_grammar_text(struct crispasr_session* s, c
 CRISPASR_API int crispasr_session_set_fallback_thresholds(struct crispasr_session* s, float entropy_thold,
                                                           float logprob_thold, float no_speech_thold,
                                                           float temperature_inc);
+// Apply a named bundle of the four thresholds above: "conservative",
+// "balanced" (== the shipped defaults, always a no-op) or "aggressive".
+// "strict"/"default"/"loose" are accepted aliases. Mirrors the CLI's
+// --sensitivity. Returns 0 on success, -1 on a null/empty argument, -2 for an
+// unrecognised name — an unknown preset is REJECTED rather than silently
+// treated as balanced, so a typo is visible. Call before transcribing; a later
+// crispasr_session_set_fallback_thresholds() overrides it.
+CRISPASR_API int crispasr_session_set_sensitivity(struct crispasr_session* s, const char* preset_name);
 CRISPASR_API int crispasr_session_set_alt_n(struct crispasr_session* s, int n);
 CRISPASR_API int crispasr_session_set_whisper_decode_extras(struct crispasr_session* s, int suppress_nst,
                                                             const char* suppress_regex, int carry_initial_prompt);
@@ -628,6 +644,32 @@ CRISPASR_API float* crispasr_session_synthesize_raw(struct crispasr_session* s, 
 // (EU AI Act Art. 50). REQUIRED to use crispasr_session_synthesize_raw(); the
 // default marked paths do not need it. `attestation` is recorded for audit.
 CRISPASR_API int crispasr_session_accept_marking_responsibility(struct crispasr_session* s, const char* attestation);
+// Declare whose voice the current PRESET voice is: "real_person" | "synthetic" |
+// "unknown". Cloning is not the only way to produce a deep fake: a preset voice
+// shipped inside a model can be an identifiable individual (a named donor, a
+// corpus speaker such as VCTK's p225), and Art. 3(60) attaches to the audio
+// resembling that person, not to which pipeline made it. Setting real_person
+// makes the Art. 50(4) reminder fire for a non-cloned voice. It does NOT require
+// a consent attestation — whether the donor agreed to the model being trained is
+// a licensing matter settled upstream that you cannot attest to.
+// Returns 0, -1 on a bad session, -2 on an unrecognised value.
+CRISPASR_API int crispasr_session_set_speaker_identity(struct crispasr_session* s, const char* identity);
+
+// Spoken AI-disclosure for voice clones (EU AI Act Art. 50(4)). The watermark
+// on synthesize() covers the machine-readable marking duty (Art. 50(2)), but a
+// deepfake additionally needs a VISIBLE OR AUDIBLE label, which a watermark is
+// not. The CLI and server prepend one automatically; the ABI cannot (neutral-
+// voice synthesis is not portable once a clone voice is applied), so it hands
+// you the pieces and logs a one-time [MARKING] warning instead of refusing.
+//
+// disclaimer_text() is a static string — use it for a visible label.
+// get_disclaimer_pcm() synthesizes it in the neutral voice and MUST be called
+// BEFORE crispasr_session_set_voice() installs a clone; afterwards it returns
+// nullptr, because a disclosure spoken in the cloned voice would make the
+// output more deceptive rather than less. Caller frees with crispasr_pcm_free().
+CRISPASR_API const char* crispasr_session_disclaimer_text(void);
+CRISPASR_API float* crispasr_session_get_disclaimer_pcm(struct crispasr_session* s, int* out_n_samples);
+
 CRISPASR_API void crispasr_pcm_free(float* pcm);
 
 // Speech-to-Speech — audio in → audio out via a single model pass.
@@ -661,6 +703,23 @@ CRISPASR_API int crispasr_session_input_sample_rate(struct crispasr_session* s);
 // Backends that normally resample (e.g. 16 kHz → 24 kHz) will skip the
 // step when the rate already matches. Defaults to 16000 for back-compat.
 CRISPASR_API int crispasr_session_set_pcm_sample_rate(struct crispasr_session* s, int rate);
+
+// #332: Sample rate of the PCM produced by synthesize / synthesize_raw /
+// synthesize_streaming / get_disclaimer_pcm / speech_to_speech for this
+// session's backend (the "backend-native rate" those calls document).
+// Returns 0 for a NULL session or a backend that produces no audio output
+// (ASR-only). Mirrors the CLI adapters' tts_sample_rate().
+CRISPASR_API int crispasr_session_output_sample_rate(struct crispasr_session* s);
+
+// #332: channel counts for the session's audio input (transcribe / s2s /
+// voice input) and audio output (synthesize / s2s). Both are 1 (mono) for
+// every current backend — source separation is the stereo exception and has
+// its own surface (crispasr_session_separate*). Getters rather than
+// documented constants so a future multi-channel backend is additive.
+// Return 0 on a NULL session; output_channels is also 0 when the backend
+// produces no audio output.
+CRISPASR_API int crispasr_session_input_channels(struct crispasr_session* s);
+CRISPASR_API int crispasr_session_output_channels(struct crispasr_session* s);
 
 // CTC vocabulary access. Returns 0 / "" for backends without an exposed CTC
 // vocabulary. The token text pointer is model-owned and must not be freed.
@@ -870,8 +929,14 @@ CRISPASR_API int crispasr_lcs_dedup_prefix_count(const int32_t* prev_tail_tokens
 CRISPASR_API float crispasr_watermark_detect(const float* pcm, int n_samples);
 
 // Embed watermark into float32 mono PCM (in-place).
-// `alpha` controls spread-spectrum strength (0.005 default); ignored
-// when AudioSeal is loaded.
+//
+// `alpha` controls spread-spectrum strength; ignored when AudioSeal is loaded.
+// PASS alpha <= 0 — that selects the band-limited default (~0.05) which is
+// what makes the mark reliably DETECTABLE, the property EU AI Act Art. 50(2)
+// actually requires. An explicit positive alpha is used verbatim, so passing
+// the old 0.005 documented here produces a mark too faint to find again on
+// real speech: marking that cannot be detected is not marking. Only pass a
+// literal alpha if you are deliberately A/B-ing watermark strength.
 CRISPASR_API void crispasr_watermark_embed(float* pcm, int n_samples, float alpha);
 
 // C2PA (Content Credentials) signing of an in-memory audio CONTAINER (WAV/MP3

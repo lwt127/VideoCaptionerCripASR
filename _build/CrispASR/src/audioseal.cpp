@@ -34,6 +34,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `AUDIOSEAL_BENCH=1` for per-stage timings.
@@ -317,7 +318,7 @@ struct audioseal_ctx {
         if (ctx_w)
             ggml_free(ctx_w);
         if (buf_w)
-            ggml_backend_buffer_free(buf_w);
+            core_gguf::release_weight_buffer(buf_w);
         if (backend && backend != backend_cpu)
             ggml_backend_free(backend);
         if (backend_cpu)
@@ -666,9 +667,9 @@ struct audioseal_ctx* audioseal_init_from_file(const char* path, struct audiosea
         c->backend = crispasr_init_gpu_backend();
     }
     if (!c->backend) {
-        c->backend = ggml_backend_cpu_init();
+        c->backend = core_cpu_backend::init();
     }
-    c->backend_cpu = ggml_backend_cpu_init();
+    c->backend_cpu = core_cpu_backend::init();
 
     // Pass 2: weights
     core_gguf::WeightLoad wl;

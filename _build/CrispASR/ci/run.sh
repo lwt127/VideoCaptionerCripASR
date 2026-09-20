@@ -236,7 +236,12 @@ function gg_run_ctest {
     (time cmake -DCMAKE_BUILD_TYPE=${mode} ${CMAKE_EXTRA} .. ) 2>&1 | tee -a $OUT/${ci}-cmake.log
     (time make -j$(nproc)                                    ) 2>&1 | tee -a $OUT/${ci}-make.log
 
-    (time ctest --output-on-failure -L main -E test-opt ) 2>&1 | tee -a $OUT/${ci}-ctest.log
+    # `-L main` was upstream whisper.cpp's label convention; NOTHING in this
+    # tree carries it, so this ctest ran ZERO tests while the job stayed green
+    # (found in the 2026-09-02 orphaned-label audit, same failure mode as the
+    # dead `cli` label). `unit` is the no-model suite that runs everywhere —
+    # and this is the only place it runs in a Debug build.
+    (time ctest --output-on-failure -L unit -E test-opt ) 2>&1 | tee -a $OUT/${ci}-ctest.log
 
     set +e
 }

@@ -6,9 +6,12 @@ which is the perf benchmark.
 
 Each backend declares advertised capabilities (`transcribe`,
 `json-output`, `stream`, `beam`, `best-of-n`, `temperature`,
-`word-timestamps`, `punctuation`, `vad`, `lid`, `tts-roundtrip`).
+`word-timestamps`, `punctuation`, `vad`, `lid`, `tts-roundtrip`,
+`translate`, `voice-cloning`).
 For each capability, three tiers exist: `ignore` / `smoke` / `full`.
-Profiles set defaults; per-capability flags override.
+Profiles set defaults; per-capability flags override. The three profiles
+are `smoke` (default — `transcribe` only), `feature` (every capability at
+the `smoke` tier) and `full` (every capability at the `full` tier).
 
 ```bash
 # Quick smoke (transcribe-only on the JFK reference)
@@ -44,8 +47,9 @@ python tools/test-all-backends.py \
 ```
 
 The reference downloads (~500 MB total) stay resident; each big
-backend (1–2 GB Q4_K) comes + goes one at a time, keeping peak disk
-to ~2.5 GB even though the registry totals ~15 GB.
+backend (1–4.5 GB Q4_K) comes + goes one at a time, keeping peak disk
+to ~5 GB even though the registry's 62 backends total ~85 GB of
+`approx_size_mb` hints.
 
 ## Skip-missing — `--skip-missing`
 

@@ -24,6 +24,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `MOONSHINE_BENCH=1` for per-stage timings.
@@ -200,13 +201,13 @@ struct moonshine_context* moonshine_init_with_params(struct moonshine_init_param
     core_gguf::free_metadata(ctx_gguf);
 
     // ── Init backends ──
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (!ctx->backend_cpu) {
         fprintf(stderr, "%s: failed to init CPU backend\n", __func__);
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
 
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (!ctx->backend)
@@ -577,7 +578,7 @@ static bool moonshine_kv_cache_init(moonshine_kv_cache& cache, int n_layers, int
         cache.v[i] = ggml_new_tensor_3d(cache.ctx, GGML_TYPE_F32, head_dim, max_len, n_kv_heads);
     }
 
-    cache.buf = ggml_backend_alloc_ctx_tensors_from_buft(cache.ctx, ggml_backend_cpu_buffer_type());
+    cache.buf = ggml_backend_alloc_ctx_tensors_from_buft(cache.ctx, core_cpu_backend::buffer_type());
     if (!cache.buf) {
         return false;
     }
@@ -602,7 +603,7 @@ static int moonshine_run_encoder(struct moonshine_context* ctx, const float* aud
     // reuse to CPU; on GPU rebuild the (tiny) encoder graph each call and free
     // it after compute. moonshine's GPU encoder is marginal anyway (§232), so
     // the per-call rebuild costs nothing measurable.
-    const bool cache_ok = ggml_backend_is_cpu(ctx->backend);
+    const bool cache_ok = core_cpu_backend::is_cpu(ctx->backend);
     struct ggml_cgraph* graph;
     struct ggml_context* ctx0 = nullptr;
     struct ggml_context* transient_ctx = nullptr; // freed after compute when not cached (GPU)
@@ -1541,7 +1542,7 @@ void moonshine_set_n_threads(struct moonshine_context* ctx, int n_threads) {
     }
     ctx->n_threads = n_threads;
     if (ctx->backend_cpu) {
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, n_threads);
     }
 }
 

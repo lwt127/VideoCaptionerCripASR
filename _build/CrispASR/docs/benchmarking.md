@@ -116,7 +116,7 @@ Per-backend stage timers are env-gated:
 | `CRISPASR_VERBOSE=1` (or `--verbose`) | Turns on every backend's debug/bench vars at once |
 | `CRISPASR_<BACKEND>_BENCH=1` | Per-backend stage timings (e.g. `CRISPASR_CANARY_BENCH=1`) |
 | `CRISPASR_METAL_PROFILE=1` | Metal host-encode vs GPU split |
-| `CRISPASR_FC_PROFILE=1` | Per-node profile for the FastConformer family (parakeet/canary/…) |
+| `CRISPASR_FC_PROFILE=1` | Per-node profile for the `canary_ctc` runtime — the `fastconformer-ctc` / `canary-ctc` backend and the forced aligner (`src/canary_ctc.cpp`). Not read by `parakeet` or the canary AED decoder. |
 
 Existing harnesses:
 

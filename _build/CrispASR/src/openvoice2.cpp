@@ -42,6 +42,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `OPENVOICE2_BENCH=1` for per-stage timings.
@@ -371,7 +372,7 @@ extern "C" struct openvoice2_context* openvoice2_init_from_file(const char* path
     }
 
     // Pass 2: load weights via core_gguf
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     ctx->backend = ctx->backend_cpu;
 
     core_gguf::WeightLoad wl;
@@ -1419,7 +1420,7 @@ extern "C" void openvoice2_free(struct openvoice2_context* ctx) {
     if (ctx->ctx_perm)
         ggml_free(ctx->ctx_perm);
     if (ctx->w_buf)
-        ggml_backend_buffer_free(ctx->w_buf);
+        core_gguf::release_weight_buffer(ctx->w_buf);
     if (ctx->w_ctx)
         ggml_free(ctx->w_ctx);
     if (ctx->backend_cpu)

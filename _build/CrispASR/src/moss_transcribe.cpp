@@ -47,6 +47,7 @@
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "core/ngram_loop_fix.h"   // core_ngram::fix_loops (issue #218)
 #include "core/crispasr_env.h"
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1543,12 +1544,12 @@ extern "C" struct moss_transcribe_context* moss_transcribe_init_from_file(
     ctx->n_threads = params.n_threads;
     ctx->model_path = path_model;
 
-    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init();
     if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
-    ctx->backend_cpu = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (ctx->backend_cpu)
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
 
     // #215 resolved: the native-Vulkan (RADV/NVIDIA) segfault was a use-after-free
     // in run_encoder's conv-stem graph cached across encoder invocations (see the
@@ -1559,8 +1560,8 @@ extern "C" struct moss_transcribe_context* moss_transcribe_init_from_file(
         if (force_cpu && force_cpu[0] == '1')
             ctx->backend = ctx->backend_cpu;
     }
-    if (ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
 
     // Encoder attention path (issue #215). On Vulkan the encoder uses the manual
     // soft_max_ext attention rather than flash_attn_ext (avoids the FA split-k /
@@ -1613,7 +1614,7 @@ extern "C" void moss_transcribe_free(struct moss_transcribe_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)

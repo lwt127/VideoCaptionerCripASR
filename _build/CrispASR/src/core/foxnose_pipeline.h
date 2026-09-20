@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -77,6 +78,23 @@ using EmbedFn = int (*)(void* userdata, int worker, const float* pcm, int n_samp
 using EmbedWindowsFn = int (*)(void* userdata, int worker, const float* pcm, int n_samples, const int* ws,
                                const int* we, int n_win, float* out);
 
+// Batched embedding (#324 perf): embed SEVERAL independent windows in one
+// call, each an (offset, length) slice of `pcm`, writing n_win * embed_dim
+// floats in window order. UNLIKE EmbedWindowsFn the windows share nothing —
+// no span CMN, no conv context — so this path is arithmetic-identical to
+// per-window EmbedFn and needs no DER gate; the implementation merely fuses
+// the forward passes (see wespeaker_embed_batch). Return 0 only when every
+// window succeeded; on non-zero diarize() retries the chunk window by window
+// through EmbedFn, so a single bad window degrades to the old path instead of
+// dropping its neighbours.
+using EmbedBatchFn = int (*)(void* userdata, int worker, const float* pcm, int64_t n_samples, const int64_t* offsets,
+                             const int* lengths, int n_win, float* out);
+
+// Windows handed to one EmbedBatchFn call. Purely a scheduling unit — chunk
+// boundaries are fixed by window index so results never depend on the worker
+// count — and the embedder may sub-batch however it likes.
+constexpr int kWindowsPerBatch = 32;
+
 // Windows per trunk pass when EmbedWindowsFn is used. Fixed, so the result does
 // not depend on the worker count: cepstral mean normalisation is computed over
 // the span, so span size is part of the answer, not just of the schedule.
@@ -109,7 +127,13 @@ std::vector<Speech> window_speech(const Speech& seg);
 std::vector<Speech> window_boundaries(const Speech& seg, const std::vector<Speech>& windows);
 
 // Run the whole pipeline over pre-computed speech regions.
+//
+// Embedding strategy, in priority order: `embed_windows` (span sharing, the
+// DER-trading opt-in) > `embed_batch` (fused independent windows, DER-neutral)
+// > plain per-window `embed`. `embed` is always required — it is the fallback
+// when a batch call fails.
 Result diarize(const float* pcm, int n_samples, int sample_rate, const std::vector<Speech>& speech, EmbedFn embed,
-               void* userdata, int embed_dim, const Params& params, EmbedWindowsFn embed_windows = nullptr);
+               void* userdata, int embed_dim, const Params& params, EmbedWindowsFn embed_windows = nullptr,
+               EmbedBatchFn embed_batch = nullptr);
 
 } // namespace core_foxnose

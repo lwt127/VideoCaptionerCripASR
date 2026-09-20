@@ -21,8 +21,34 @@ BUILD = REPO / "build"
 MODELS = Path("/kaggle/temp/models")
 RESULTS = WORK / "results.json"
 
-REFERENCE_TEXT = "And so, my fellow Americans, ask not what your country can do for you — ask what you can do for your country."
-JFK_AUDIO = "samples/jfk.wav"  # relative to REPO
+# Validation corpus.
+#
+# This used to be JFK alone, in English, and the model card that came out of it
+# said "quality is identical across all variants -- pick any file". VibeVoice-ASR
+# advertises English, Chinese, French, Italian, Korean, Portuguese and
+# Vietnamese, and #369 reported Korean degrading badly on the same variants that
+# transcribe JFK perfectly: on borderline audio the output flipped language
+# entirely (Korean -> Italian). One English clip cannot support a claim about
+# seven languages, and the equivalence it "verified" was never in question for
+# English.
+#
+# Each entry is (label, audio path relative to REPO, language, reference text).
+# A clip is skipped with a warning if it is missing rather than failing the
+# sweep, so this runs on a checkout that has only some fixtures — but the
+# summary reports which languages actually ran, so a claim can never be made
+# from a corpus that silently shrank to English.
+CORPUS = [
+    ("en-jfk", "samples/jfk.wav", "en",
+     "And so, my fellow Americans, ask not what your country can do for you — ask what you can do for your country."),
+    ("ko-369", "samples/ko-369.wav", "ko",
+     "\ub0b4\uc77c \uc624\uc804\uc5d0 \ud68c\uc758 \uc790\ub8cc\ub97c \ubcf4\ub0b4 \uc8fc\uc138\uc694"),  # synthetic TTS clip from #369
+    ("zh-paraformer", "samples/paraformer_zh.wav", "zh", None),
+    ("multi", "samples/multispeaker.wav", "en", None),
+]
+
+# Kept for the English overlap score, which is the only entry with a reference.
+REFERENCE_TEXT = CORPUS[0][3]
+JFK_AUDIO = CORPUS[0][1]  # relative to REPO
 
 VARIANTS = [
     ("vibevoice-asr-bitnet-tq2",      "q8_0", "f16"),
@@ -159,7 +185,34 @@ for label, vae_q, embed_q in VARIANTS:
     file_size_mb = out_gguf.stat().st_size / (1024 * 1024)
     print(f"  File size: {file_size_mb:.1f} MB")
 
-    # ── Transcribe ──
+    # ── Transcribe every clip in the corpus ──
+    #
+    # Variant equivalence is a per-language claim. Transcribing one clip and
+    # generalising is what produced #369, so each variant now runs the whole
+    # corpus and the per-clip text is recorded; comparing variants against each
+    # other is what shows a quantisation choice costing a language.
+    per_clip = {}
+    for clip_label, clip_path, clip_lang, _clip_ref in CORPUS:
+        wav = REPO / clip_path
+        if not wav.exists():
+            print(f"  SKIP {clip_label}: {clip_path} not present")
+            per_clip[clip_label] = None
+            continue
+        c = [
+            str(CRISPASR_BIN), "-m", str(out_gguf), "--backend", "vibevoice",
+            "-f", str(wav), "-t", "4", "--language", clip_lang, "--no-prints",
+        ]
+        try:
+            rr = subprocess.run(c, capture_output=True, text=True, timeout=900)
+            tl = [ln.strip() for ln in rr.stdout.strip().split("\n")
+                  if ln and not any(k in ln for k in ["firered", "whisper", "crispasr:", "Maximum"])]
+            per_clip[clip_label] = " ".join(tl).strip()
+            print(f"  [{clip_label}] {per_clip[clip_label][:90]}")
+        except Exception as e:
+            per_clip[clip_label] = None
+            print(f"  [{clip_label}] FAILED: {e}")
+
+    # ── Transcribe (English reference clip, scored) ──
     t0 = time.time()
     cmd = [
         str(CRISPASR_BIN),
@@ -190,6 +243,7 @@ for label, vae_q, embed_q in VARIANTS:
         overlap = len(ref_words & out_words) / len(ref_words) if ref_words else 0.0
 
         results.append({
+            "per_clip": per_clip,
             "label": label,
             "vae_quant": vae_q,
             "embed_quant": embed_q,

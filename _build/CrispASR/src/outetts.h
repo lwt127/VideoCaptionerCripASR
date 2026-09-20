@@ -2,7 +2,7 @@
 //
 // OuteAI/OuteTTS-0.3-1B: OLMo-1B (Llama-compatible) finetuned to emit
 // interleaved text + audio tokens, decoded by the WavTokenizer single-
-// codebook VQ-GAN into 24 kHz PCM.  CC BY 4.0 license.
+// codebook VQ-GAN into 24 kHz PCM.  CC-BY-NC-SA-4.0 model license.
 //
 // V2 prompt format:
 //   <|im_start|>\n

@@ -54,6 +54,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `PARLER_TTS_BENCH=1` for per-stage timings.
@@ -763,13 +764,13 @@ struct parler_tts_context* parler_tts_init_from_file(const char* path_model, str
     core_gguf::free_metadata(meta);
 
     // Pass 2: allocate backend buffer and load weights
-    ctx->backend_cpu = ggml_backend_cpu_init();
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads);
+    ctx->backend_cpu = core_cpu_backend::init();
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, params.n_threads);
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (!ctx->backend)
         ctx->backend = ctx->backend_cpu;
-    if (ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, params.n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, params.n_threads);
 
     core_gguf::WeightLoad wl;
     if (!core_gguf::load_weights(path_model, ctx->backend, "parler_tts", wl)) {
@@ -2185,7 +2186,7 @@ void parler_tts_free(struct parler_tts_context* ctx) {
     if (ctx->ctx_perm)
         ggml_free(ctx->ctx_perm);
     if (ctx->buf_w)
-        ggml_backend_buffer_free(ctx->buf_w);
+        core_gguf::release_weight_buffer(ctx->buf_w);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)
@@ -2197,7 +2198,7 @@ void parler_tts_free(struct parler_tts_context* ctx) {
 
 void parler_tts_set_n_threads(struct parler_tts_context* ctx, int n_threads) {
     if (ctx && ctx->backend_cpu)
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, n_threads);
 }
 
 void parler_tts_set_temperature(struct parler_tts_context* ctx, float temperature) {

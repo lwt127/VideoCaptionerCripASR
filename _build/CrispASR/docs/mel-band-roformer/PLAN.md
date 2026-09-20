@@ -64,6 +64,71 @@ Fixtures (persisted off /tmp, survive reboot):
 `/Volumes/backups/ai/crispasr-models/melbandroformer/{MelBandRoformer.ckpt,
 config.yaml, mel-band-roformer-vocals-f16.gguf, ref_mbr.gguf, clip2s.wav}`
 
+## §422 segmentation evidence — MEASURED 2026-09-03 (do not re-derive)
+
+PR #422 added Demucs-style segmentation (25% overlap, triangular weight,
+normalised by accumulated weight) for audio longer than the trained chunk. It
+shipped with NO reference-anchored evidence, for a structural reason rather
+than an oversight:
+
+* the PR's 30 s arm compares per-layer vs fused graphs, but the gates are
+  resolved once at init (`ctx->use_fused`) while segmentation wraps
+  `separate_full` per segment — so BOTH arms segment identically and an
+  overlap-add error is exactly common-mode between them;
+* the golden10s fixture sits at the threshold (guard is `n_samples <= seg_len`)
+  and takes the whole-buffer path, so it never segments.
+
+Kernel `tools/kaggle/melband-seg-evidence-v2/`, run
+`chr1s4/crispasr-melband-seg-evidence-v2`. 20 s of real music with vocals
+(librosa `fishin`, ccMixter/CC; ASR-verified to contain sung content, because
+solo speech is near pass-through through a vocals separator and instrumental
+music is degenerate the other way). Arm B gets 4 chunks / 3 internal
+boundaries. Reference = the unsegmented lucidrains model, `bs-roformer==0.3.10`.
+
+    arm            SDR vs ref   cosine    |est|/|ref|
+    A no-seg          50.83     0.999996     1.0001
+    B default (8 s)   27.91     0.999256     1.0107
+    C seg=3 s         26.89     0.999046     1.0108
+
+    within-arm (ref = arm A)   boundary  interior   delta   #bnd
+    B default                    31.00     27.25    +3.75      3
+    C seg=3                      25.20     27.82    -2.62      8
+
+**1. NO BOUNDARY ARTEFACT — and as a positive measurement, not a null.** Arm B's
+crossfades reconstruct 3.75 dB BETTER than its interiors. That is the EXPECTED
+signature of a healthy overlap-add: the crossfade averages two independent
+segment estimates, halving noise variance for a predicted 10*log10(2) = 3.01 dB
+gain. Measuring ~+3 dB is therefore a *test that the overlap-add is working*,
+and a crossfade that does NOT gain ~3 dB would indicate a defect even if it
+were not worse than the interior. Confirmed by two independently written
+implementations agreeing to 0.01 dB.
+
+**2. The segmentation cost is a CONTEXT effect, not an edge effect.** B differs
+from unsegmented by 22.9 dB (196x the residual energy), and that cost is broad:
+residual energy by decile tracks the vocals, and body SDR equals whole-clip SDR
+to 2 dp. Nothing is concentrated at the seams. This is the opposite of the
+intuition the PR invites, and it is why boundary-vs-interior localisation was
+the measurement worth building.
+
+**3. ⚠ THE 22.9 dB DOES NOT ESTABLISH THAT SEGMENTATION IS WRONG.** The trained
+chunk is 8 s. Arm A and the torch reference BOTH process the full 20 s
+unsegmented, i.e. both extrapolate 2.5x past the training window, and they
+agree (50.83 dB) precisely because they do the same unusual thing. The
+reference is ground truth for "what unsegmented inference produces", NOT for
+"what the model should produce on 20 s audio". Segmenting to the trained window
+may well be the more faithful path. DECISIVE FOLLOW-UP: compare arm B against a
+reference that ALSO chunks at 8 s with the same overlap — if they match,
+chunked inference is faithfully implemented and the 22.9 dB is inherent to
+chunking rather than to us.
+
+**4. A false finding, recorded so nobody re-derives it.** The final
+zero-padded segment scores -3.00 dB, which looks like a dramatic tail defect.
+It is an ill-conditioned ratio: reference vocals rms there is 0.000139 against
+0.106 in the body (near-silence), the region contributes 0.0% of total residual
+energy, and arm A itself scores only 8.48 dB in the same place. Always read
+residual ENERGY SHARE next to an SDR ratio, exactly as the harness prints
+`|mine|` next to cosine.
+
 ## Licensing (verified 2026-07-19, do not re-derive)
 
 | Artifact | License | Source of truth |

@@ -35,6 +35,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // The TitaNet speaker-embedding forward is entirely hand-rolled CPU scalar
 // math. The pointwise convs (1×1 matmuls) + the ASP TDNN/attention matmuls are
@@ -250,6 +251,9 @@ struct titanet_context {
     std::map<std::string, ggml_tensor*> tensors;
 
     ggml_backend_t backend_cpu = nullptr; // ggml-path compute backend
+    // True when backend_cpu ALIASES `backend` (the GPU backend) rather than
+    // owning a separate CPU one — so teardown must not free it twice.
+    bool compute_aliases_gpu = false;
     TitanetGgml g;
 };
 
@@ -657,9 +661,30 @@ extern "C" struct titanet_context* titanet_init(const char* model_path, int n_th
     // ggml compute path (default): upload the folded cache to a CPU backend
     // buffer once. On failure fall back to the legacy scalar path.
     if (!titanet_use_legacy()) {
-        ctx->backend_cpu = ggml_backend_cpu_init();
+        // The GPU backend already exists — crispasr_init_gpu_backend() made it
+        // above and the GGUF weights were loaded onto it. Until now the compute
+        // graph ignored it and ran on a separate CPU backend with a second,
+        // folded copy of the weights, so the GPU was doing nothing but hold
+        // memory.
+        //
+        // CRISPASR_TITANET_GPU=1 points the compute path at that same backend.
+        // Opt-in because the folded layouts were chosen for the CPU kernels
+        // (see the layout notes on titanet_upload_ggml_weights) and the graph
+        // leans on conv_1d_dw, whose GPU coverage varies by backend — measure
+        // before trusting it on a given platform.
+        const char* want_gpu = crispasr_env::get("CRISPASR_TITANET_GPU");
+        if (want_gpu && want_gpu[0] == '1' && ctx->backend && !core_cpu_backend::is_cpu(ctx->backend)) {
+            ctx->backend_cpu = ctx->backend;
+            ctx->compute_aliases_gpu = true;
+        } else {
+            ctx->backend_cpu = core_cpu_backend::init();
+        }
         if (ctx->backend_cpu) {
-            ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+            if (titanet_bench_enabled() || ctx->compute_aliases_gpu)
+                fprintf(stderr, "titanet: compute backend = %s%s\n", ggml_backend_name(ctx->backend_cpu),
+                        ctx->compute_aliases_gpu ? " (aliased GPU)" : "");
+            if (!ctx->compute_aliases_gpu)
+                core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
             if (!titanet_upload_ggml_weights(ctx)) {
                 fprintf(stderr, "titanet: ggml weight upload failed, using legacy path\n");
                 if (ctx->g.buf)
@@ -667,8 +692,10 @@ extern "C" struct titanet_context* titanet_init(const char* model_path, int n_th
                 if (ctx->g.ctx)
                     ggml_free(ctx->g.ctx);
                 ctx->g = TitanetGgml{};
-                ggml_backend_free(ctx->backend_cpu);
+                if (!ctx->compute_aliases_gpu)
+                    ggml_backend_free(ctx->backend_cpu);
                 ctx->backend_cpu = nullptr;
+                ctx->compute_aliases_gpu = false;
             }
         }
     }
@@ -683,12 +710,12 @@ extern "C" void titanet_free(struct titanet_context* ctx) {
         ggml_backend_buffer_free(ctx->g.buf);
     if (ctx->g.ctx)
         ggml_free(ctx->g.ctx);
-    if (ctx->backend_cpu)
-        ggml_backend_free(ctx->backend_cpu);
+    if (ctx->backend_cpu && !ctx->compute_aliases_gpu)
+        ggml_backend_free(ctx->backend_cpu); // aliased GPU backend is freed below
     if (ctx->weight_ctx)
         ggml_free(ctx->weight_ctx);
     if (ctx->buf)
-        ggml_backend_buffer_free(ctx->buf);
+        core_gguf::release_weight_buffer(ctx->buf);
     if (ctx->backend)
         ggml_backend_free(ctx->backend);
     delete ctx;
@@ -948,6 +975,30 @@ extern "C" int titanet_embed(struct titanet_context* ctx, const float* pcm_16k, 
             fread(mel.data(), sizeof(float), (size_t)T * c.n_mels, f);
             fclose(f);
             fprintf(stderr, "titanet: LOADED ref mel from %s (%d frames)\n", ref_path, T);
+        }
+    }
+
+    // Debug: dump the mel we computed, so the ENCODER can be compared against
+    // an upstream export independently of the front-end.
+    //
+    // The upstream ONNX (nemo_en_titanet_large.onnx) takes `audio_signal`
+    // [B, 80, T] — mel features, not PCM. Feeding it OUR mel isolates the two
+    // halves: if the embeddings then agree, any end-to-end gap is the mel
+    // front-end; if they still disagree, it is the network. Without that split
+    // a single end-to-end cosine cannot tell you which half is wrong, and this
+    // model has a documented history of exactly that ambiguity (#334 was a
+    // fused-BatchNorm bias in the sibling CAMPPlus embedder, found the same way).
+    //
+    // Layout is [T][n_mels] float32, matching what compute_mel_spectrogram
+    // produced and what CRISPASR_TITANET_REF_MEL reads back.
+    if (const char* dump_path = crispasr_env::get("CRISPASR_TITANET_DUMP_MEL")) {
+        if (*dump_path) {
+            FILE* f = fopen(dump_path, "wb");
+            if (f) {
+                fwrite(mel.data(), sizeof(float), (size_t)T * c.n_mels, f);
+                fclose(f);
+                fprintf(stderr, "titanet: DUMPED mel to %s (%d frames x %d mels)\n", dump_path, T, c.n_mels);
+            }
         }
     }
 

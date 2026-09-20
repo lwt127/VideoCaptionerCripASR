@@ -6,6 +6,8 @@
 
 #include "chatterbox_campplus.h"
 
+#include "core/campplus_segpool.h"
+
 #include "core/fft.h"
 #include "core/kaldi_fbank.h"
 #include "core/mel.h"
@@ -623,7 +625,8 @@ static void fcm_forward(const CampplusCache& cache, const float* feat_t_80, int 
 // CAMDenseTDNNLayer forward. `in` is (C_in, T) where C_in is the running
 // concatenation channel count; `out` ends up appended (concat) onto in
 // to form the next input.
-static std::vector<float> dense_layer_forward(const float* in, int C_in_actual, int T, const DenseLayerCache& l) {
+static std::vector<float> dense_layer_forward(const float* in, int C_in_actual, int T, const DenseLayerCache& l,
+                                              campplus_segpool::tail_divisor tail) {
     // nonl1.bn(in_channels) → ReLU → l1 1×1 conv → nonl2.bn → ReLU →
     // CAM layer. nonl1's BN expects the full running C_in which equals
     // l.in_channels. (Per the dense block construction in xvector.py
@@ -676,39 +679,33 @@ static std::vector<float> dense_layer_forward(const float* in, int C_in_actual, 
             s += row[t];
         gmean[(size_t)c] = s / (float)T;
     }
-    // seg_pool: avg_pool1d(k=100, s=100, ceil_mode=True). Number of
-    // segments = ceil(T / 100). For each segment, mean of the values
-    // in that segment per channel; then expand back to (bn, T) by
-    // tiling each segment value across the 100 (or remainder) frames
-    // it covered. ceil_mode behaviour: when T % 100 != 0, the last
-    // segment covers the partial tail; pytorch's avg_pool1d with
-    // ceil_mode=True averages over the actual frames present
-    // (count_include_pad=True default uses 0-padding, but kernel doesn't
-    // extend past T when ceil_mode shrinks it) — actually
-    // F.avg_pool1d with ceil_mode=True INCLUDES partial windows; the
-    // divisor is the kernel size unless count_include_pad=False.
+    // seg_pool: avg_pool1d(k=100, s=100, ceil_mode=True), n_seg = ceil(T/100),
+    // each segment value broadcast back across the frames it covered.
     //
-    // Let's keep it simple: average the actual values in each segment
-    // (matches `count_include_pad=True` default with kernel=100 stride=100;
-    // when the last segment is shorter, the divisor is still kernel=100
-    // — torch's behaviour). Then broadcast each segment value to all
-    // its frames.
+    // THE LAST SEGMENT'S DIVISOR IS THE ACTUAL FRAME COUNT, NOT THE KERNEL.
+    // This was wrong here and the comment that replaced this one argued itself
+    // into the wrong answer in prose ("actually ... the divisor is the kernel
+    // size ... Let's keep it simple"). It is settled by running torch, not by
+    // reasoning about count_include_pad:
+    //
+    //   F.avg_pool1d(torch.ones(1,1,551), kernel_size=100, stride=100,
+    //                ceil_mode=True)  ->  all six segments are exactly 1.0
+    //
+    // An all-ones input is the control: dividing the 51-frame tail by 100 would
+    // give 0.51, so the two rules are distinguishable and torch picks the count.
+    // ATen computes the window as hend = min(hstart+k, L+pad) and then takes
+    // pool_size = hend - hstart, so count_include_pad=True still divides by the
+    // CLAMPED width (51), never by k.
+    //
+    // Impact: the tail of every CAM++ dense layer got a context scaled by
+    // n_in_seg/100 -- at T=551 that is 0.51x over 9% of frames, compounded
+    // through 52 dense layers, feeding a sigmoid gate. Shared by every CAM++
+    // consumer (chatterbox, confucius4, cosyvoice3, dots, fireredtts3); their
+    // acceptance was end-to-end and never diffed this stage against upstream.
     constexpr int kSegLen = 100;
-    const int n_seg = (T + kSegLen - 1) / kSegLen;
-    std::vector<float> seg((size_t)l.bn_channels * (size_t)n_seg, 0.0f);
-    for (int c = 0; c < l.bn_channels; c++) {
-        const float* row = bo.data() + (size_t)c * (size_t)T;
-        for (int s = 0; s < n_seg; s++) {
-            const int t0 = s * kSegLen;
-            float ss = 0.0f;
-            const int n_in_seg = std::min(kSegLen, T - t0);
-            for (int t = 0; t < n_in_seg; t++)
-                ss += row[t0 + t];
-            // PyTorch's avg_pool1d(ceil_mode=True) divides by the kernel
-            // size (count_include_pad=True default).
-            seg[(size_t)c * (size_t)n_seg + (size_t)s] = ss / (float)kSegLen;
-        }
-    }
+    std::vector<float> seg((size_t)l.bn_channels * (size_t)campplus_segpool::n_segments(T, kSegLen), 0.0f);
+    campplus_segpool::avg(bo.data(), l.bn_channels, T, kSegLen, seg.data(), tail);
+    const int n_seg = campplus_segpool::n_segments(T, kSegLen);
     // ctx = mean + seg_pool(x) broadcast back to (bn, T)
     std::vector<float> ctx((size_t)l.bn_channels * (size_t)T, 0.0f);
     for (int c = 0; c < l.bn_channels; c++) {
@@ -755,15 +752,15 @@ static std::vector<float> dense_layer_forward(const float* in, int C_in_actual, 
 
 // CAMDenseTDNNBlock.forward — sequentially concat each layer's output
 // onto the running input.
-static std::vector<float> dense_block_forward(const float* in, int C_in, int T, const std::vector<DenseLayerCache>& blk,
-                                              int& C_out) {
+static std::vector<float> dense_block_forward(campplus_segpool::tail_divisor tail, const float* in, int C_in, int T,
+                                              const std::vector<DenseLayerCache>& blk, int& C_out) {
     std::vector<float> running((size_t)C_in * (size_t)T);
     std::memcpy(running.data(), in, running.size() * sizeof(float));
     int C_running = C_in;
 
     for (size_t li = 0; li < blk.size(); li++) {
         const auto& l = blk[li];
-        auto delta = dense_layer_forward(running.data(), C_running, T, l);
+        auto delta = dense_layer_forward(running.data(), C_running, T, l, tail);
         if (delta.empty())
             return {};
         std::vector<float> next((size_t)(C_running + l.cam_out) * (size_t)T, 0.0f);
@@ -797,8 +794,41 @@ static std::vector<float> unit_forward(const UnitCache& u, const float* in, int 
 
 // Helper: BN+ReLU+Conv1d (the order TransitLayer / DenseLayer use).
 // `bn` is the BN folded against C_in.
+//
+// `lin_b` is optional and usually absent — TransitLayer's Conv1d is declared
+// `bias=False`. It is NOT always absent, though, and dropping it is a silent
+// correctness bug (#334). CAMPPlus ends with
+//   … transit3.linear(Conv1d) → out_nonlinear(BN + ReLU) → StatsPool → dense
+// and an ONNX exporter is free to FOLD that trailing BatchNorm back into the
+// preceding convolution. CosyVoice3's `campplus.onnx` does exactly that: its
+// graph has a bare `/xvector/out_nonlinear/relu/Relu` with no BN parameters
+// anywhere, while `/xvector/transit3/linear/Conv` gained a fused weight AND a
+// fused bias (transit1/transit2 keep their named, bias-free weights because
+// no BN follows them). Skipping the absent out_nonlinear BN is therefore
+// right, but only if the bias that absorbed it is applied here.
+//
+// Measured on a 4.26 s reference: dropping it put the 192-d speaker embedding
+// at cos 0.737 against campplus.onnx — a real but plausible-looking vector,
+// so every WAV clone was conditioned on the wrong timbre while the baked
+// voice bank (whose embeddings come from the ONNX model in Python) was fine.
+// Zeroing the same bias in the ONNX reference reproduces the C++ output at
+// cos 0.999998, which is what pins the cause to this one term.
+//
+// The three consumers of this code ship TWO different export shapes, so read
+// the checkpoint rather than assuming either. Verified by listing the tensor
+// names in each published GGUF:
+//   chatterbox / chatterbox-turbo s3gen — 15 transit tensors, no transit
+//       `linear.bias`, and an explicit `s3.se.xv.out_nl.bn.*`
+//   dots.tts spk                        — 18 transit tensors, no transit
+//       `linear.bias`, explicit `…xvector.out_nonlinear.batchnorm.*`
+//   cosyvoice3 campplus                 — transit3 `linear.bias` present, NO
+//       out_nonlinear parameters at all (folded)
+// So this bias is a no-op for chatterbox and dots.tts — they are bit-identical
+// — and it is the whole fix for cosyvoice3. This code was written against the
+// un-folded shape and had simply never met a folded one.
 static std::vector<float> bn_relu_conv1d(const BNFolded& bn, const float* in, int C_in, int T,
-                                         const std::vector<float>& lin_w, int kw, int C_out, int s, int p) {
+                                         const std::vector<float>& lin_w, const std::vector<float>& lin_b, int kw,
+                                         int C_out, int s, int p) {
     std::vector<float> a((size_t)C_in * (size_t)T);
     std::memcpy(a.data(), in, a.size() * sizeof(float));
     apply_bn_inplace(a.data(), C_in, T, bn);
@@ -806,6 +836,7 @@ static std::vector<float> bn_relu_conv1d(const BNFolded& bn, const float* in, in
     const int T_out = (T + 2 * p - (kw - 1) - 1) / s + 1;
     std::vector<float> out((size_t)C_out * (size_t)T_out, 0.0f);
     conv1d_forward(a.data(), C_in, T, lin_w.data(), C_out, kw, s, p, 1, out.data());
+    add_channel_bias(out.data(), C_out, T_out, lin_b);
     return out;
 }
 
@@ -856,7 +887,7 @@ cb_campplus_runtime::~cb_campplus_runtime() {
 // ---------------------------------------------------------------------------
 
 std::vector<float> compute_xvector(const cb_campplus_model& m, cb_campplus_runtime& cache, const float* feat_t_80,
-                                   int T, float stats_var_floor) {
+                                   int T, float stats_var_floor, campplus_segpool::tail_divisor tail) {
     if (!feat_t_80 || T <= 0)
         return {};
     if (!m.head.conv1_w || !m.tdnn.lin_w || !m.dense.lin_w || m.block1.layers.empty()) {
@@ -873,6 +904,15 @@ std::vector<float> compute_xvector(const cb_campplus_model& m, cb_campplus_runti
     cache.initialised = true;
 
     const bool dbg = crispasr_env::get("CRISPASR_CHATTERBOX_DEBUG") != nullptr;
+    auto dbg_norm = [&](const char* name, const float* v, size_t n) {
+        if (!dbg)
+            return;
+        double s2 = 0;
+        for (size_t i = 0; i < n; i++)
+            s2 += (double)v[i] * v[i];
+        fprintf(stderr, "campplus: %-14s n=%zu |x|=%.4f first5=%.4f %.4f %.4f %.4f %.4f\n", name, n, std::sqrt(s2),
+                n > 0 ? v[0] : 0.f, n > 1 ? v[1] : 0.f, n > 2 ? v[2] : 0.f, n > 3 ? v[3] : 0.f, n > 4 ? v[4] : 0.f);
+    };
 
     // FCM head: (T, 80) → (320, T)
     int C_fcm = 0, T_fcm = 0;
@@ -883,6 +923,7 @@ std::vector<float> compute_xvector(const cb_campplus_model& m, cb_campplus_runti
     }
     if (dbg)
         fprintf(stderr, "campplus: post-FCM C=%d T=%d\n", C_fcm, T_fcm);
+    dbg_norm("fcm", fcm.data(), fcm.size());
 
     // tdnn: 320→128, k=5, s=2, p=2 → (128, T/2)
     constexpr int kTdnnPad = 2;
@@ -893,35 +934,48 @@ std::vector<float> compute_xvector(const cb_campplus_model& m, cb_campplus_runti
     relu_inplace(post_tdnn.data(), post_tdnn.size());
     if (dbg)
         fprintf(stderr, "campplus: post-tdnn C=%d T=%d\n", state->xv_tdnn.out_dim, T_tdnn);
+    dbg_norm("tdnn", post_tdnn.data(), post_tdnn.size());
 
     // block1: 12 layers, dilation=1 → 128 + 12*32 = 512
     int C_blk1 = 0;
-    auto post_blk1 = dense_block_forward(post_tdnn.data(), 128, T_tdnn, state->block1, C_blk1);
+    auto post_blk1 = dense_block_forward(tail, post_tdnn.data(), 128, T_tdnn, state->block1, C_blk1);
     if (dbg)
         fprintf(stderr, "campplus: post-block1 C=%d T=%d\n", C_blk1, T_tdnn);
+    dbg_norm("block1", post_blk1.data(), post_blk1.size());
 
     // transit1: BN(512) + ReLU + Conv1d 1×1 (512→256), bias=False
     BNFolded bn_t1 = fold_bn(m.transit1.bn_m, m.transit1.bn_v, m.transit1.bn_w, m.transit1.bn_b, C_blk1);
-    auto post_t1 = bn_relu_conv1d(bn_t1, post_blk1.data(), C_blk1, T_tdnn, state->xv_transit1.lin_w, 1, 256, 1, 0);
+    auto post_t1 = bn_relu_conv1d(bn_t1, post_blk1.data(), C_blk1, T_tdnn, state->xv_transit1.lin_w,
+                                  state->xv_transit1.lin_b, 1, 256, 1, 0);
+
+    dbg_norm("transit1", post_t1.data(), post_t1.size());
 
     // block2: 24 layers, dilation=2 → 256 + 24*32 = 1024
     int C_blk2 = 0;
-    auto post_blk2 = dense_block_forward(post_t1.data(), 256, T_tdnn, state->block2, C_blk2);
+    auto post_blk2 = dense_block_forward(tail, post_t1.data(), 256, T_tdnn, state->block2, C_blk2);
+
+    dbg_norm("block2", post_blk2.data(), post_blk2.size());
 
     // transit2: BN(1024) + ReLU + Conv1d 1×1 (1024→512)
     BNFolded bn_t2 = fold_bn(m.transit2.bn_m, m.transit2.bn_v, m.transit2.bn_w, m.transit2.bn_b, C_blk2);
-    auto post_t2 = bn_relu_conv1d(bn_t2, post_blk2.data(), C_blk2, T_tdnn, state->xv_transit2.lin_w, 1, 512, 1, 0);
+    auto post_t2 = bn_relu_conv1d(bn_t2, post_blk2.data(), C_blk2, T_tdnn, state->xv_transit2.lin_w,
+                                  state->xv_transit2.lin_b, 1, 512, 1, 0);
+
+    dbg_norm("transit2", post_t2.data(), post_t2.size());
 
     // block3: 16 layers, dilation=2 → 512 + 16*32 = 1024
     int C_blk3 = 0;
-    auto post_blk3 = dense_block_forward(post_t2.data(), 512, T_tdnn, state->block3, C_blk3);
+    auto post_blk3 = dense_block_forward(tail, post_t2.data(), 512, T_tdnn, state->block3, C_blk3);
 
     if (dbg)
         fprintf(stderr, "campplus: post-block3 C=%d T=%d\n", C_blk3, T_tdnn);
 
+    dbg_norm("block3", post_blk3.data(), post_blk3.size());
+
     // transit3: BN(1024) + ReLU + Conv1d 1×1 (1024→512)
     BNFolded bn_t3 = fold_bn(m.transit3.bn_m, m.transit3.bn_v, m.transit3.bn_w, m.transit3.bn_b, C_blk3);
-    auto post_t3 = bn_relu_conv1d(bn_t3, post_blk3.data(), C_blk3, T_tdnn, state->xv_transit3.lin_w, 1, 512, 1, 0);
+    auto post_t3 = bn_relu_conv1d(bn_t3, post_blk3.data(), C_blk3, T_tdnn, state->xv_transit3.lin_w,
+                                  state->xv_transit3.lin_b, 1, 512, 1, 0);
 
     // out_nl: BN(512) + ReLU. Note: out_nl is a bare get_nonlinear, so its
     // GGUF tensors are at `out_nl.bn.*` (not `out_nl.nl.bn.*`); the bind
@@ -930,8 +984,11 @@ std::vector<float> compute_xvector(const cb_campplus_model& m, cb_campplus_runti
         apply_bn_inplace(post_t3.data(), 512, T_tdnn, state->xv_out_nl.bn);
     relu_inplace(post_t3.data(), post_t3.size());
 
+    dbg_norm("out_nl", post_t3.data(), post_t3.size());
+
     // StatsPool → (1024,)
     auto stats = stats_pool(post_t3.data(), 512, T_tdnn, (double)stats_var_floor);
+    dbg_norm("stats", stats.data(), stats.size());
 
     // dense: Conv1d(1024→emb_dim, k=1) + BN(affine=False). emb_dim is 192 for
     // chatterbox's CAM++ and 512 for dots.tts — inferred from the actual
@@ -952,17 +1009,18 @@ std::vector<float> compute_xvector(const cb_campplus_model& m, cb_campplus_runti
     std::vector<float> emb((size_t)emb_dim);
     for (int i = 0; i < emb_dim; i++)
         emb[(size_t)i] = dense_pre[(size_t)i];
+    dbg_norm("dense", emb.data(), emb.size());
     return emb;
 }
 
 std::vector<float> embed_speaker(const cb_campplus_model& m, cb_campplus_runtime& cache, const float* pcm_16k,
-                                 int n_samples, float stats_var_floor) {
+                                 int n_samples, float stats_var_floor, campplus_segpool::tail_divisor tail) {
     cb_campplus_bench_stage _bs_total("embed_speaker");
     int T = 0;
     auto fb = compute_fbank(pcm_16k, n_samples, T);
     if (fb.empty() || T <= 0)
         return {};
-    return compute_xvector(m, cache, fb.data(), T, stats_var_floor);
+    return compute_xvector(m, cache, fb.data(), T, stats_var_floor, tail);
 }
 
 // ---------------------------------------------------------------------------
@@ -1002,92 +1060,73 @@ static std::vector<float> reflect_pad(const float* x, int n, int pad) {
 
 } // namespace
 
-std::vector<float> compute_prompt_feat_24k(const float* pcm_24k, int n_samples, int max_samples, int& T_mel_out) {
+std::vector<float> compute_prompt_feat(const float* pcm, int n_samples, int sample_rate, int n_fft, int hop, int win,
+                                       int n_mels, float fmin, float fmax, int max_samples, int& T_mel_out) {
     T_mel_out = 0;
-    if (!pcm_24k || n_samples <= 0)
+    if (!pcm || n_samples <= 0)
         return {};
 
-    constexpr int kSr = 24000;
-    constexpr int kNFft = 1920;
-    constexpr int kHop = 480;
-    constexpr int kWin = 1920;
-    constexpr int kNMels = 80;
-    constexpr float kFmin = 0.0f;
-    constexpr float kFmax = 8000.0f;
     constexpr float kClipVal = 1e-5f;
     constexpr float kStftEps = 1e-9f;
 
-    // Truncate to max_samples (= DEC_COND_LEN = 10 * 24000 = 240000 in
-    // `prepare_conditionals`) — `s3gen_ref_wav = s3gen_ref_wav[:DEC_COND_LEN]`.
     if (max_samples > 0 && n_samples > max_samples)
         n_samples = max_samples;
 
-    // Manual reflect pad of (n_fft - hop) / 2 = 720 samples each side
-    // BEFORE the STFT (since the upstream `mel_spectrogram` passes
-    // `center=False` to `torch.stft`).
-    const int outer_pad = (kNFft - kHop) / 2;
-    auto padded = reflect_pad(pcm_24k, n_samples, outer_pad);
+    // Manual reflect pad of (n_fft - hop) / 2 samples each side BEFORE the
+    // STFT (upstream `mel_spectrogram` passes `center=False` to torch.stft).
+    const int outer_pad = (n_fft - hop) / 2;
+    auto padded = reflect_pad(pcm, n_samples, outer_pad);
 
-    // Hann window.
-    static thread_local std::vector<float> hann;
-    if ((int)hann.size() != kWin)
-        make_hann_periodic_24k(kWin, hann);
+    // Hann window (periodic).
+    std::vector<float> hann;
+    make_hann_periodic_24k(win, hann);
 
     // librosa Slaney mel basis (htk=False default, norm='slaney').
-    static thread_local std::vector<float> mel_fb;
-    if (mel_fb.empty()) {
-        mel_fb = core_mel::build_slaney_fb(kSr, kNFft, kNMels, kFmin, kFmax, core_mel::FbLayout::MelsFreqs);
-    }
+    std::vector<float> mel_fb =
+        core_mel::build_slaney_fb(sample_rate, n_fft, n_mels, fmin, fmax, core_mel::FbLayout::MelsFreqs);
 
-    // STFT parameters: stride kHop, win kWin == n_fft so no inner zero-padding.
-    // Frame count = (padded.size() - kNFft) / kHop + 1 — center=False
-    // semantics applied to the already-reflect-padded input.
     const int n_padded = (int)padded.size();
-    if (n_padded < kNFft) {
+    if (n_padded < n_fft)
         return {};
-    }
-    const int T = (n_padded - kNFft) / kHop + 1;
+    const int T = (n_padded - n_fft) / hop + 1;
     if (T <= 0)
         return {};
 
-    // STFT + magnitude + mel projection + log compression. core_mel
-    // doesn't quite fit the Matcha shape (which uses sqrt(power+1e-9)
-    // — magnitude with an additive eps inside the sqrt — and natural
-    // log with a clip-min of 1e-5, NOT log10 + max-clip(max-8) +
-    // (x+4)/4). So we do it inline, reusing core_fft for the FFT and
-    // core_mel::build_slaney_fb for the basis.
-    const int n_freqs = kNFft / 2 + 1;
-    std::vector<float> features((size_t)T * (size_t)kNMels, 0.0f);
-    std::vector<float> frame((size_t)kNFft, 0.0f);
-    std::vector<float> spec((size_t)2 * kNFft, 0.0f);
+    const int n_freqs = n_fft / 2 + 1;
+    std::vector<float> features((size_t)T * (size_t)n_mels, 0.0f);
+    std::vector<float> frame((size_t)n_fft, 0.0f);
+    std::vector<float> spec((size_t)2 * n_fft, 0.0f);
     std::vector<float> mag((size_t)n_freqs, 0.0f);
 
     for (int t = 0; t < T; t++) {
-        const int offset = t * kHop;
-        for (int i = 0; i < kNFft; i++)
+        const int offset = t * hop;
+        for (int i = 0; i < n_fft; i++)
             frame[(size_t)i] = padded[(size_t)(offset + i)] * hann[(size_t)i];
-        core_fft::fft_radix2_wrapper(frame.data(), kNFft, spec.data());
+        core_fft::fft_radix2_wrapper(frame.data(), n_fft, spec.data());
         for (int k = 0; k < n_freqs; k++) {
             const float re = spec[(size_t)2 * k];
             const float im = spec[(size_t)2 * k + 1];
-            // sqrt(power + 1e-9) — matches `torch.sqrt(spec.pow(2).sum(-1) + 1e-9)`.
+            // sqrt(power + 1e-9) -- matches `torch.sqrt(spec.pow(2).sum(-1) + 1e-9)`.
             mag[(size_t)k] = std::sqrt(re * re + im * im + kStftEps);
         }
-        // mel projection: mel_basis @ magnitudes. mel_fb is row-major
-        // (n_mels × n_freqs), so each mel bin is a contiguous row.
-        for (int m = 0; m < kNMels; m++) {
+        for (int m = 0; m < n_mels; m++) {
             const float* row = mel_fb.data() + (size_t)m * (size_t)n_freqs;
             double s = 0.0;
             for (int k = 0; k < n_freqs; k++)
                 s += (double)row[(size_t)k] * (double)mag[(size_t)k];
-            // log(clamp(mel, 1e-5)) — natural log, NOT log10.
-            const float v = (float)s;
-            features[(size_t)t * (size_t)kNMels + (size_t)m] = std::log(std::max(v, kClipVal));
+            // log(clamp(mel, 1e-5)) -- natural log, NOT log10.
+            features[(size_t)t * (size_t)n_mels + (size_t)m] = std::log(std::max((float)s, kClipVal));
         }
     }
 
     T_mel_out = T;
     return features;
+}
+
+std::vector<float> compute_prompt_feat_24k(const float* pcm_24k, int n_samples, int max_samples, int& T_mel_out) {
+    // CosyVoice/Matcha 24 kHz constants; see the generic form above.
+    return compute_prompt_feat(pcm_24k, n_samples, /*sample_rate=*/24000, /*n_fft=*/1920, /*hop=*/480,
+                               /*win=*/1920, /*n_mels=*/80, /*fmin=*/0.0f, /*fmax=*/8000.0f, max_samples, T_mel_out);
 }
 
 } // namespace chatterbox_campplus

@@ -92,4 +92,36 @@ inline std::vector<std::pair<size_t, size_t>> split_at_energy_minima(const float
     return out;
 }
 
+// Peak absolute amplitude over a mono PCM span. 0 for an empty span.
+inline float peak_abs(const float* samples, size_t n_samples) {
+    float peak = 0.0f;
+    for (size_t i = 0; i < n_samples; i++) {
+        const float a = samples[i] < 0.0f ? -samples[i] : samples[i];
+        if (a > peak)
+            peak = a;
+    }
+    return peak;
+}
+
+// Is this span DIGITALLY silent — i.e. carrying no signal at all?
+//
+// Motivation: an encoder-decoder ASR model handed a span with nothing in it
+// does not return nothing, it returns invented speech. Cohere Transcribe turns
+// 10 s of zeros into "And I'm going to go ahead and do that.", and a long file
+// whose trailing chunk is all zeros gets that sentence appended to an otherwise
+// perfect transcript.
+//
+// The default epsilon is deliberately BELOW one int16 LSB (1/32768 = 3.05e-5),
+// so a single non-zero int16 sample anywhere disables the gate. That is the
+// point: this must never silence real audio. Measured for scale — the quietest
+// real speech to hand (a FLEURS clip) peaks at 0.038, i.e. ~3800x this
+// threshold, and low-level noise at ~0.0018 does not provoke the model anyway.
+// So the gate covers exactly the observed failure (true digital silence) and
+// declines to guess about anything else.
+inline bool is_digitally_silent(const float* samples, size_t n_samples, float eps = 1e-5f) {
+    if (n_samples == 0)
+        return true;
+    return peak_abs(samples, n_samples) < eps;
+}
+
 } // namespace audio_chunking

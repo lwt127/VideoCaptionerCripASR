@@ -40,13 +40,36 @@ jobs:
         with:
           submodules: recursive
 
+      # setup-emsdk downloads emscripten-core/emsdk/archive/HEAD.zip and runs
+      # `emsdk update` on EVERY run, before installing the pinned version — so a
+      # transient GitHub outage takes out all three matrix legs at once. On
+      # 2026-08-17 a 503 on that URL failed the wasm job on three unrelated PRs
+      # (#368, #371, #372) while main was green, which reads as "your patch broke
+      # wasm" and is nobody's patch at all.
+      #
+      # Two mitigations, in order of effect:
+      #   * actions-cache-folder — the resolved toolchain is cached, so a warm run
+      #     needs no network at all. Fork PRs read the base branch's cache, so they
+      #     benefit too.
+      #   * one retry — only the FIRST attempt is continue-on-error; the retry has
+      #     no such escape, so a genuinely broken setup still fails the job.
       - name: Setup emsdk
+        id: emsdk
         uses: mymindstorm/setup-emsdk@v14
+        continue-on-error: true
         with:
           # Pin: emscripten 6.0.3 (2026-07-14) regressed the WASM backend — clang
           # crashes in isKnownNeverNaN during WebAssembly ISel of
           # voxtral_tts_synthesize (unchanged source). 6.0.2 is the last good one.
           version: 6.0.2
+          actions-cache-folder: emsdk-6.0.2
+
+      - name: Setup emsdk (retry — the fetch above is a live GitHub download)
+        if: steps.emsdk.outcome == 'failure'
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 6.0.2
+          actions-cache-folder: emsdk-6.0.2
 
       - name: Build WASM (${{ matrix.name }})
         run: ./build-wasm.sh --clean ${{ matrix.flag }}

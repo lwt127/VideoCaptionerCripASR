@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -29,6 +30,9 @@ extern "C" void crispasr_audio_free(float* pcm);
 // (crispasr_audio_load routes WAV through miniaudio, not this), so its own
 // malicious-size clamp needs a direct test.
 #include "core/wav_reader.h"
+
+// setenv/unsetenv are POSIX; MSVC and MinGW need the shim.
+#include "portable_env.h"
 
 // ── helpers ──────────────────────────────────────────────────────────
 
@@ -364,6 +368,122 @@ TEST_CASE("crispasr_audio_load decodes WebM (Opus)", "[audio][unit][webm]") {
     crispasr_audio_free(pcm);
 }
 
+// Is the WebM/Opus path built at all? The live-WebM cases below must not
+// silently skip on a decode failure — that is the very regression they guard —
+// so they ask this first and only skip when the *plain* WebM sample fails too.
+static bool webm_opus_available() {
+    float* pcm = nullptr;
+    int samples = 0, rate = 0;
+    int rc = crispasr_audio_load(sample("jfk.webm").c_str(), &pcm, &samples, &rate);
+    if (pcm)
+        crispasr_audio_free(pcm);
+    return rc == 0;
+}
+
+TEST_CASE("crispasr_audio_load decodes live/streaming WebM (Opus, unknown-size clusters)", "[audio][unit][webm]") {
+    // Issue #417 — Chrome MediaRecorder (libwebm mkvmuxer against a
+    // non-seekable writer) emits the Segment AND every Cluster with the EBML
+    // "unknown size" marker, one Cluster per timeslice. The demuxer used to
+    // bound each Cluster by that marker read as a literal length, so it stopped
+    // at the first Cluster and returned ~0.1 s of an 11 s recording.
+    if (!webm_opus_available()) {
+        WARN("WebM decoder not available — skipping");
+        return;
+    }
+
+    float* pcm = nullptr;
+    int samples = 0, rate = 0;
+    int rc = crispasr_audio_load(sample("jfk-live.webm").c_str(), &pcm, &samples, &rate);
+    REQUIRE(rc == 0);
+    REQUIRE(pcm != nullptr);
+    REQUIRE(rate == 16000);
+    REQUIRE(has_energy(pcm, samples));
+
+    auto ref = load_ref();
+
+    // The whole recording, not just the first cluster. The pre-fix decoder
+    // produced a ratio of ~0.008 here, so this bound is far tighter than the
+    // defect it guards.
+    double ratio = (double)samples / ref.samples;
+    INFO("live WebM length ratio: " << ratio);
+    REQUIRE(ratio > 0.98);
+    REQUIRE(ratio < 1.02);
+
+    double cc = cross_correlation(ref.pcm, ref.samples, pcm, samples);
+    INFO("live WebM cross-correlation: " << cc);
+    REQUIRE(cc > 0.80);
+
+    crispasr_audio_free(pcm);
+}
+
+TEST_CASE("crispasr_audio_load handles the 1-byte EBML unknown-size marker", "[audio][unit][webm]") {
+    // The unknown-size marker is "all data bits set", which is
+    // length-dependent: the 1-byte form is 0xFF, whose *value* is 127. A
+    // value-based test misreads it as a 127-byte element. No shipping muxer
+    // writes the short form today, so derive it from the live fixture rather
+    // than carrying a second one.
+    if (!webm_opus_available()) {
+        WARN("WebM decoder not available — skipping");
+        return;
+    }
+
+    std::vector<uint8_t> data;
+    {
+        FILE* f = std::fopen(sample("jfk-live.webm").c_str(), "rb");
+        REQUIRE(f != nullptr);
+        std::fseek(f, 0, SEEK_END);
+        long n = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+        REQUIRE(n > 0);
+        data.resize((size_t)n);
+        REQUIRE(std::fread(data.data(), 1, data.size(), f) == data.size());
+        std::fclose(f);
+    }
+
+    static const uint8_t kWide[8] = {0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    std::vector<uint8_t> narrow;
+    narrow.reserve(data.size());
+    int rewritten = 0;
+    for (size_t i = 0; i < data.size();) {
+        if (i + 8 <= data.size() && std::memcmp(data.data() + i, kWide, 8) == 0) {
+            narrow.push_back(0xff);
+            i += 8;
+            ++rewritten;
+        } else {
+            narrow.push_back(data[i]);
+            ++i;
+        }
+    }
+    INFO("rewritten unknown-size markers: " << rewritten);
+    REQUIRE(rewritten > 100); // Segment + one per cluster
+
+    // Fixed name: this is the only writer, and the content is deterministic,
+    // so a concurrent ctest shard racing us would write the same bytes.
+    const std::string tmp = (std::filesystem::temp_directory_path() / "crispasr-live-unknown-1b.webm").string();
+    {
+        FILE* f = std::fopen(tmp.c_str(), "wb");
+        REQUIRE(f != nullptr);
+        REQUIRE(std::fwrite(narrow.data(), 1, narrow.size(), f) == narrow.size());
+        std::fclose(f);
+    }
+
+    float* pcm = nullptr;
+    int samples = 0, rate = 0;
+    int rc = crispasr_audio_load(tmp.c_str(), &pcm, &samples, &rate);
+    std::remove(tmp.c_str());
+    REQUIRE(rc == 0);
+    REQUIRE(rate == 16000);
+    REQUIRE(has_energy(pcm, samples));
+
+    auto ref = load_ref();
+    double ratio = (double)samples / ref.samples;
+    INFO("1-byte-marker live WebM length ratio: " << ratio);
+    REQUIRE(ratio > 0.98);
+    REQUIRE(ratio < 1.02);
+
+    crispasr_audio_free(pcm);
+}
+
 TEST_CASE("crispasr_audio_load decodes WebM (Vorbis)", "[audio][unit][webm]") {
     float* pcm = nullptr;
     int samples = 0, rate = 0;
@@ -521,4 +641,106 @@ TEST_CASE("crispasr_audio_load rejects null args", "[audio][unit]") {
     REQUIRE(crispasr_audio_load(nullptr, &pcm, &samples, nullptr) == -1);
     REQUIRE(crispasr_audio_load("test.wav", nullptr, &samples, nullptr) == -1);
     REQUIRE(crispasr_audio_load("test.wav", &pcm, nullptr, nullptr) == -1);
+}
+
+// Regression: a structurally valid WAV declaring an absurd sample rate made
+// crispasr_audio_load allocate without bound.
+//
+// CI's seeded fuzzer found it (run 33840954769): 344 KB of PCM at a declared
+// `sampleRate = 1` resamples 16000x to the 16 kHz target — 2.816e9 frames,
+// 11.3 GB — and the three chunked-decode loops doubled their buffer with no
+// ceiling. The input reaches every surface that accepts a user file.
+// tests/fuzz/regressions/wav-1hz-resample-oom.wav replays the exact input;
+// this pins the behaviour hermetically, at a size that fits a unit test.
+//
+// THE POSITIVE CONTROL IS THE POINT. Byte-for-byte the same payload, with only
+// the declared sample rate changed, must LOAD — otherwise "rejected" would be
+// equally explained by a test that writes an undecodable WAV, and the arm that
+// matters would pass for the wrong reason.
+TEST_CASE("crispasr_audio_load bounds resample amplification", "[audio][unit]") {
+    // 2000 mono int16 samples. At sr=1 that is 2000 s of audio, which the
+    // 16 kHz target turns into 32e6 frames from a ~4 KB file (8000x the
+    // ~1.03e6-frame ceiling a 4 KB input earns). At sr=16000 it is 0.125 s.
+    const uint32_t kSamples = 2000;
+    auto make_wav = [&](uint32_t sample_rate) {
+        std::vector<uint8_t> w;
+        auto le16 = [&](uint16_t v) {
+            w.push_back((uint8_t)v);
+            w.push_back((uint8_t)(v >> 8));
+        };
+        auto le32 = [&](uint32_t v) {
+            for (int i = 0; i < 4; i++)
+                w.push_back((uint8_t)(v >> (8 * i)));
+        };
+        const uint32_t data_bytes = kSamples * 2;
+        w.insert(w.end(), {'R', 'I', 'F', 'F'});
+        le32(36 + data_bytes);
+        w.insert(w.end(), {'W', 'A', 'V', 'E', 'f', 'm', 't', ' '});
+        le32(16);
+        le16(1);               // PCM
+        le16(1);               // mono
+        le32(sample_rate);     // <- the only difference between the arms
+        le32(sample_rate * 2); // byte rate
+        le16(2);               // block align
+        le16(16);              // bits
+        w.insert(w.end(), {'d', 'a', 't', 'a'});
+        le32(data_bytes);
+        for (uint32_t i = 0; i < kSamples; i++) {
+            // A real 220 Hz-ish tone, not silence: a decoder that bails early
+            // would otherwise be indistinguishable from one that decodes.
+            const int16_t v = (int16_t)(8000.0 * std::sin(2.0 * 3.14159265358979 * 220.0 * (double)i / 16000.0));
+            le16((uint16_t)v);
+        }
+        return w;
+    };
+    auto write_file = [](const char* p, const std::vector<uint8_t>& bytes) {
+        FILE* f = std::fopen(p, "wb");
+        REQUIRE(f != nullptr);
+        std::fwrite(bytes.data(), 1, bytes.size(), f);
+        std::fclose(f);
+    };
+
+    const char* path = "crispasr_resample_amplification_tmp.wav";
+    unsetenv("CRISPASR_MAX_DECODED_FRAMES");
+
+    SECTION("positive control: the same payload at a sane rate decodes") {
+        write_file(path, make_wav(16000));
+        float* pcm = nullptr;
+        int samples = 0, rate = 0;
+        const int rc = crispasr_audio_load(path, &pcm, &samples, &rate);
+        REQUIRE(rc == 0);
+        REQUIRE(pcm != nullptr);
+        // No resampling at the target rate, so the count is the stored length
+        // give or take a decoder-internal frame; the point of the bound is that
+        // it is ~2000 and not ~32e6.
+        CHECK(samples > 1900);
+        CHECK(samples < 2100);
+        crispasr_audio_free(pcm);
+    }
+
+    SECTION("sampleRate = 1 is rejected instead of allocating 32e6 frames") {
+        write_file(path, make_wav(1));
+        float* pcm = nullptr;
+        int samples = 0, rate = 0;
+        const int rc = crispasr_audio_load(path, &pcm, &samples, &rate);
+        CHECK(rc != 0);
+        CHECK(pcm == nullptr);
+    }
+
+    SECTION("CRISPASR_MAX_DECODED_FRAMES is live") {
+        // Same file the positive control accepts, under a ceiling below its
+        // length: if the knob were dead this would still return 0, so the two
+        // sections together pin the bound in both directions.
+        write_file(path, make_wav(16000));
+        setenv("CRISPASR_MAX_DECODED_FRAMES", "1000", 1);
+        float* pcm = nullptr;
+        int samples = 0, rate = 0;
+        const int rc = crispasr_audio_load(path, &pcm, &samples, &rate);
+        unsetenv("CRISPASR_MAX_DECODED_FRAMES");
+        CHECK(rc != 0);
+        CHECK(pcm == nullptr);
+    }
+
+    unsetenv("CRISPASR_MAX_DECODED_FRAMES");
+    std::remove(path);
 }

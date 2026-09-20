@@ -217,6 +217,17 @@ class DiarizeSegment {
   DiarizeSegment({required this.t0, required this.t1, this.speaker = -1});
 }
 
+/// One audio-derived speaker turn returned by FoxNose.
+///
+/// Times are seconds on the same absolute timeline as [DiarizeSegment].
+class DiarizeTurn {
+  final double t0;
+  final double t1;
+  final int speaker;
+  const DiarizeTurn(
+      {required this.t0, required this.t1, required this.speaker});
+}
+
 enum DiarizeMethod {
   /// Stereo only. |L| vs |R| energy per segment, 1.1× margin.
   energy,
@@ -231,6 +242,10 @@ enum DiarizeMethod {
   /// Mono-friendly, ML-based. Runs the GGUF pyannote segmentation net.
   /// Requires [pyannoteModelPath].
   pyannote,
+
+  /// Mono-friendly, ML-based (#324): WeSpeaker embeddings + spectral
+  /// clustering (the FoxNose recipe). Requires [foxnoseEmbedderPath].
+  foxNose,
 }
 
 /// Assign a speaker index to each of [segs], based on the selected
@@ -240,14 +255,24 @@ enum DiarizeMethod {
 /// of a stereo pair. When `isStereo` is true, `right` must point at the
 /// right channel. All PCM is 16 kHz float32.
 ///
-/// Returns `true` on success. The only failure case is
-/// [DiarizeMethod.pyannote] when the GGUF model can't be loaded — all
-/// other methods always succeed (they may leave individual segments
-/// with `speaker = -1` when they had no information to decide).
+/// Returns `true` on success. The only failure cases are the
+/// model-backed methods ([DiarizeMethod.pyannote], [DiarizeMethod.foxNose])
+/// when their GGUF model can't be loaded — all other methods always
+/// succeed (they may leave individual segments with `speaker = -1` when
+/// they had no information to decide).
 ///
 /// `sliceT0` is the absolute start time (seconds) of the PCM buffer
 /// within the original audio, so absolute segment times in [DiarizeSegment]
 /// can be mapped back to sample indices.
+///
+/// [foxnoseEmbedderPath] (required for [DiarizeMethod.foxNose]) is the
+/// WeSpeaker embedder GGUF; [minSpeakers] / [maxSpeakers] bound the
+/// automatic speaker-count estimation (0 keeps the library defaults 1 / 8)
+/// and [numSpeakers] > 0 pins the count and skips estimation.
+///
+/// When [outTurns] is supplied, the function calls the CrispASR 0.8.30+
+/// turn-returning ABI and replaces that list with FoxNose's audio-derived
+/// turns. Other methods leave it empty.
 bool diarizeSegments({
   required List<DiarizeSegment> segs,
   required Float32List left,
@@ -257,8 +282,14 @@ bool diarizeSegments({
   String? pyannoteModelPath,
   int nThreads = 4,
   double sliceT0 = 0.0,
+  String? foxnoseEmbedderPath,
+  int minSpeakers = 0,
+  int maxSpeakers = 0,
+  int numSpeakers = 0,
+  List<DiarizeTurn>? outTurns,
   DynamicLibrary? lib,
 }) {
+  outTurns?.clear();
   if (segs.isEmpty || left.isEmpty) return true;
   lib ??= DynamicLibrary.open(CrispASR.defaultLibName());
 
@@ -287,9 +318,14 @@ bool diarizeSegments({
     (base + 20).cast<Int32>().value = 0;
   }
 
-  // ABI opts: int32 method, int32 n_threads, int64 slice_t0_cs, const char*.
-  // 4+4+8+8 = 24 bytes on 64-bit. We write each field explicitly.
-  final optsPtr = calloc<Uint8>(24);
+  // ABI opts layout — hand-maintained mirror of the APPEND-ONLY
+  // `crispasr_diarize_opts_abi` in src/crispasr_c_api.cpp. The C side reads
+  // every field unconditionally, so the buffer must cover the full struct:
+  // int32 method, int32 n_threads, int64 slice_t0_cs,
+  // const char* pyannote_model_path, const char* foxnose_embedder_path,
+  // int32 min_speakers, int32 max_speakers, int32 num_speakers, int32 _pad2.
+  // 4+4+8+8+8+4+4+4+4 = 48 bytes on 64-bit. We write each field explicitly.
+  final optsPtr = calloc<Uint8>(48);
   optsPtr.cast<Int32>().value = method.index;
   (optsPtr + 4).cast<Int32>().value = nThreads;
   (optsPtr + 8).cast<Int64>().value = (sliceT0 * 100).round();
@@ -299,14 +335,79 @@ bool diarizeSegments({
       ? pyannoteModelPath.toNativeUtf8()
       : nullptr;
   (optsPtr + 16).cast<IntPtr>().value = pathPtr.address;
+  final foxPathPtr = (method == DiarizeMethod.foxNose &&
+          foxnoseEmbedderPath != null &&
+          foxnoseEmbedderPath.isNotEmpty)
+      ? foxnoseEmbedderPath.toNativeUtf8()
+      : nullptr;
+  (optsPtr + 24).cast<IntPtr>().value = foxPathPtr.address;
+  (optsPtr + 32).cast<Int32>().value = minSpeakers;
+  (optsPtr + 36).cast<Int32>().value = maxSpeakers;
+  (optsPtr + 40).cast<Int32>().value = numSpeakers;
+  (optsPtr + 44).cast<Int32>().value = 0;
 
-  final fn = lib.lookupFunction<
-      Int32 Function(Pointer<Float>, Pointer<Float>, Int32, Int32,
-          Pointer<Uint8>, Int32, Pointer<Uint8>),
-      int Function(Pointer<Float>, Pointer<Float>, int, int, Pointer<Uint8>,
-          int, Pointer<Uint8>)>('crispasr_diarize_segments_abi');
-  final rc =
-      fn(leftPtr, rightPtr, n, isStereo ? 1 : 0, segsPtr, segs.length, optsPtr);
+  var rc = 0;
+  if (outTurns == null) {
+    final fn = lib.lookupFunction<
+        Int32 Function(Pointer<Float>, Pointer<Float>, Int32, Int32,
+            Pointer<Uint8>, Int32, Pointer<Uint8>),
+        int Function(Pointer<Float>, Pointer<Float>, int, int, Pointer<Uint8>,
+            int, Pointer<Uint8>)>('crispasr_diarize_segments_abi');
+    rc = fn(
+        leftPtr, rightPtr, n, isStereo ? 1 : 0, segsPtr, segs.length, optsPtr);
+  } else {
+    final fn = lib.lookupFunction<
+        Int32 Function(
+            Pointer<Float>,
+            Pointer<Float>,
+            Int32,
+            Int32,
+            Pointer<Uint8>,
+            Int32,
+            Pointer<Uint8>,
+            Pointer<Uint8>,
+            Int32,
+            Pointer<Int32>),
+        int Function(
+            Pointer<Float>,
+            Pointer<Float>,
+            int,
+            int,
+            Pointer<Uint8>,
+            int,
+            Pointer<Uint8>,
+            Pointer<Uint8>,
+            int,
+            Pointer<Int32>)>('crispasr_diarize_segments_turns_abi');
+    var turnCap = ((n + 7999) ~/ 8000) + segs.length + 16;
+    for (var attempt = 0; attempt < 2; attempt++) {
+      final turnsPtr = calloc<Uint8>(turnCap * 24);
+      final nTurnsPtr = calloc<Int32>();
+      rc = fn(leftPtr, rightPtr, n, isStereo ? 1 : 0, segsPtr, segs.length,
+          optsPtr, turnsPtr, turnCap, nTurnsPtr);
+      final required = nTurnsPtr.value;
+      if (rc == 2 && attempt == 0 && required > turnCap) {
+        calloc.free(turnsPtr);
+        calloc.free(nTurnsPtr);
+        turnCap = required;
+        continue;
+      }
+      if (rc == 0) {
+        final count = required < turnCap ? required : turnCap;
+        for (var i = 0; i < count; i++) {
+          final base = turnsPtr + i * 24;
+          outTurns.add(DiarizeTurn(
+            t0: base.cast<Int64>().value / 100.0,
+            t1: (base + 8).cast<Int64>().value / 100.0,
+            speaker: (base + 16).cast<Int32>().value,
+          ));
+        }
+      }
+      calloc.free(turnsPtr);
+      calloc.free(nTurnsPtr);
+      break;
+    }
+  }
 
   if (rc == 0) {
     for (var i = 0; i < segs.length; i++) {
@@ -319,6 +420,7 @@ bool diarizeSegments({
   calloc.free(segsPtr);
   calloc.free(optsPtr);
   if (pathPtr != nullptr) calloc.free(pathPtr);
+  if (foxPathPtr != nullptr) calloc.free(foxPathPtr);
 
   return rc == 0;
 }
@@ -397,11 +499,11 @@ RegistryBundle? registryDefaultBundle(String backend, {DynamicLibrary? lib}) {
   final info = lib.lookupFunction<
       Int32 Function(Pointer<Utf8>, Pointer<Uint8>, Int32, Pointer<Uint8>,
           Int32, Pointer<Int32>),
-      int Function(Pointer<Utf8>, Pointer<Uint8>, int, Pointer<Uint8>,
-          int, Pointer<Int32>)>(infoSymbol);
+      int Function(Pointer<Utf8>, Pointer<Uint8>, int, Pointer<Uint8>, int,
+          Pointer<Int32>)>(infoSymbol);
   try {
-    final count = info(backendPtr, canonicalBuf, 256, licenseBuf, 1024,
-        requiresAcceptancePtr);
+    final count = info(
+        backendPtr, canonicalBuf, 256, licenseBuf, 1024, requiresAcceptancePtr);
     if (count == 0) return null;
     if (count < 0) {
       throw StateError('Default registry bundle lookup failed (rc=$count).');
@@ -422,8 +524,7 @@ RegistryBundle? registryDefaultBundle(String backend, {DynamicLibrary? lib}) {
         final rc = artifactFn(backendPtr, index, kindPtr, filenameBuf, 256,
             urlBuf, 2048, sizeBuf, 64);
         if (rc != 0 || kindPtr.value < 0 || kindPtr.value > 2) {
-          throw StateError(
-              'Default registry bundle artifact $index failed '
+          throw StateError('Default registry bundle artifact $index failed '
               '(rc=$rc, kind=${kindPtr.value}).');
         }
         artifacts.add(RegistryArtifact(
@@ -2761,13 +2862,13 @@ class CrispasrSession {
             : null;
     // #300: native per-segment speaker label; probe like the others so a
     // newer package keeps working against an older dylib.
-    final segSpkFn =
-        _lib.providesSymbol('crispasr_session_result_segment_speaker')
-            ? _lib.lookupFunction<
-                Pointer<Utf8> Function(Pointer<Void>, Int32),
-                Pointer<Utf8> Function(Pointer<Void>,
-                    int)>('crispasr_session_result_segment_speaker')
-            : null;
+    final segSpkFn = _lib
+            .providesSymbol('crispasr_session_result_segment_speaker')
+        ? _lib.lookupFunction<
+            Pointer<Utf8> Function(Pointer<Void>, Int32),
+            Pointer<Utf8> Function(
+                Pointer<Void>, int)>('crispasr_session_result_segment_speaker')
+        : null;
     final nWords = _lib.lookupFunction<Int32 Function(Pointer<Void>, Int32),
         int Function(Pointer<Void>, int)>('crispasr_session_result_n_words');
     final wordText = _lib.lookupFunction<
@@ -2927,7 +3028,7 @@ class CrispasrSession {
   }
 
   // ---------------------------------------------------------------------------
-  // TTS synthesis (vibevoice, qwen3-tts, miotts, moss-tts, kokoro, orpheus, chatterbox, zonos-tts, lfm2-audio, dots-tts, and others)
+  // TTS synthesis (vibevoice, qwen3-tts, miotts, moss-tts, kokoro, orpheus, chatterbox, zonos-tts, lfm2-audio, dots-tts, fireredtts3, and others)
   // ---------------------------------------------------------------------------
 
   /// Load a separate codec GGUF (qwen3-tts, moss-tts, moss-tts-local; no-op for other backends).
@@ -3010,6 +3111,36 @@ class CrispasrSession {
     try {
       final rc = fn(_handle, p);
       if (rc != 0) throw Exception('setTargetLanguage failed (rc=$rc)');
+    } finally {
+      calloc.free(p);
+    }
+  }
+
+  /// Language a voice-cloning REFERENCE clip is spoken in (issue #329).
+  ///
+  /// Cross-lingual TTS backends (cosyvoice3) compare it to the requested output
+  /// language — [setTargetLanguage], falling back to [setSourceLanguage] — and
+  /// drop the reference transcript when they differ, so the clone speaks the
+  /// target language instead of carrying the reference's accent.
+  ///
+  /// Optional: the backend otherwise infers it from the voice bank or the
+  /// reference transcript, and that inference declines rather than guesses on a
+  /// short transcript. When it declines the requested target language has no
+  /// effect — set this to make it explicit. Empty string clears.
+  void setTtsReferenceLanguage(String lang) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_tts_reference_language')) {
+      throw UnsupportedError(
+          'session-state API not present in this libcrispasr build');
+    }
+    final fn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Pointer<Utf8>),
+        int Function(Pointer<Void>,
+            Pointer<Utf8>)>('crispasr_session_set_tts_reference_language');
+    final p = lang.toNativeUtf8();
+    try {
+      final rc = fn(_handle, p);
+      if (rc != 0) throw Exception('setTtsReferenceLanguage failed (rc=$rc)');
     } finally {
       calloc.free(p);
     }
@@ -3555,6 +3686,20 @@ class CrispasrSession {
     }
   }
 
+  /// Floor on generated audio length (MOSS TTS). Units are codec frames at 12.5 Hz (80 ms each), so n=25 floors at ~2 s. Other backends no-op (rc=-2).
+  void setMinSpeechTokens(int n) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_min_speech_tokens')) return;
+    final fn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Int32),
+        int Function(
+            Pointer<Void>, int)>('crispasr_session_set_min_speech_tokens');
+    final rc = fn(_handle, n);
+    if (rc != 0 && rc != -2) {
+      throw Exception('setMinSpeechTokens failed (rc=$rc)');
+    }
+  }
+
   /// Per-phoneme length-scale / speaking-rate scalar for TTS
   /// backends with a duration model. Honoured by kokoro today
   /// (PLAN #88); other backends silently no-op. 1.0 = upstream
@@ -3994,14 +4139,53 @@ class CrispasrSession {
   /// Act Art. 50). REQUIRED before [synthesizeRaw] will return unmarked audio;
   /// the default [synthesize] is watermarked and needs no attestation.
   /// [attestation] is a human-readable affirmation recorded for audit.
+  /// Declare whose voice a PRESET voice is: `real_person`, `synthetic` or
+  /// `unknown`.
+  ///
+  /// Cloning is not the only way to produce a deep fake: a preset voice
+  /// shipped inside a model can be an identifiable individual (a named donor,
+  /// a corpus speaker), and EU AI Act Art. 3(60) attaches to the audio
+  /// resembling that person rather than to which pipeline made it. Setting
+  /// `real_person` makes the Art. 50(4) reminder fire for a non-cloned voice.
+  ///
+  /// It does NOT require a consent attestation — whether the donor agreed to
+  /// the model being trained is a licensing matter settled upstream that you
+  /// cannot attest to.
+  ///
+  /// Throws [ArgumentError] on an unrecognised value rather than silently
+  /// treating it as `unknown`.
+  void setSpeakerIdentity(String identity) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_speaker_identity')) {
+      throw UnsupportedError(
+          'speaker-identity API not available in this libcrispasr build');
+    }
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Utf8>),
+        int Function(Pointer<Void>, Pointer<Utf8>)>(
+      'crispasr_session_set_speaker_identity',
+    );
+    final p = identity.toNativeUtf8();
+    try {
+      final rc = fn(_handle, p);
+      if (rc == -2) {
+        throw ArgumentError(
+            "unrecognised speaker_identity '$identity'; expected "
+            "'real_person', 'synthetic' or 'unknown'");
+      }
+      if (rc != 0) throw StateError('setSpeakerIdentity failed (rc=$rc)');
+    } finally {
+      calloc.free(p);
+    }
+  }
+
   void acceptMarkingResponsibility([String attestation = '']) {
     if (_closed) throw StateError('CrispasrSession is closed');
-    if (!_lib.providesSymbol('crispasr_session_accept_marking_responsibility')) {
+    if (!_lib
+        .providesSymbol('crispasr_session_accept_marking_responsibility')) {
       throw UnsupportedError(
           'marking-attestation API not available in this libcrispasr build');
     }
-    final fn = _lib.lookupFunction<
-        Int32 Function(Pointer<Void>, Pointer<Utf8>),
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Utf8>),
         int Function(Pointer<Void>, Pointer<Utf8>)>(
       'crispasr_session_accept_marking_responsibility',
     );
@@ -4548,6 +4732,40 @@ class CrispasrSession {
     return fn(_handle);
   }
 
+  /// Sample rate (Hz) this backend expects for input PCM.
+  ///
+  /// [speechToSpeech] and the other PCM entry points want audio at the
+  /// backend's native rate, and it varies by backend — so telling callers to
+  /// resample without giving them a way to ask the rate is not actionable
+  /// (issue #321).
+  ///
+  /// Returns 0 on a dylib that predates the symbol, matching
+  /// [separateSampleRate]: a capability probe that never throws.
+  int get inputSampleRate {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_input_sample_rate')) {
+      return 0;
+    }
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
+        int Function(Pointer<Void>)>('crispasr_session_input_sample_rate');
+    return fn(_handle);
+  }
+
+  /// Sample rate (Hz) of PCM this backend returns — what [speechToSpeech]
+  /// and [synthesize] hand back. 24 kHz for conversational S2S, 48 kHz for
+  /// Sidon and VoxCPM2 AudioVAE.
+  ///
+  /// Returns 0 on a dylib that predates the symbol.
+  int get outputSampleRate {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_output_sample_rate')) {
+      return 0;
+    }
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>),
+        int Function(Pointer<Void>)>('crispasr_session_output_sample_rate');
+    return fn(_handle);
+  }
+
   /// Set hotwords for contextual biasing.
   ///
   /// [hotwords] is a comma-separated list of words/phrases. For CTC/TDT
@@ -4573,6 +4791,40 @@ class CrispasrSession {
     try {
       final rc = fn(_handle, p, boost);
       if (rc != 0) throw Exception('setHotwords failed (rc=$rc)');
+    } finally {
+      calloc.free(p);
+    }
+  }
+
+  /// Apply a named bundle of the four decoder fallback thresholds:
+  /// `"conservative"`, `"balanced"` (the shipped defaults, a no-op) or
+  /// `"aggressive"`. `"strict"`/`"default"`/`"loose"` are aliases. Mirrors the
+  /// CLI's `--sensitivity`.
+  ///
+  /// The four thresholds interact — a decode is only retried when the logprob
+  /// *and* no-speech bars are both crossed — so they move as a set. A later
+  /// [setFallbackThresholds] overrides this.
+  ///
+  /// Throws [ArgumentError] for an unrecognised preset: a typo must not be
+  /// silently treated as `"balanced"`. Gracefully degrades on older dylibs
+  /// that don't have the symbol.
+  void setSensitivity(String preset) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_sensitivity')) {
+      return;
+    }
+    final fn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Pointer<Utf8>),
+        int Function(
+            Pointer<Void>, Pointer<Utf8>)>('crispasr_session_set_sensitivity');
+    final p = preset.toNativeUtf8();
+    try {
+      final rc = fn(_handle, p);
+      if (rc == -2) {
+        throw ArgumentError('unknown sensitivity preset "$preset" '
+            '(expected: conservative, balanced, aggressive)');
+      }
+      if (rc != 0) throw Exception('setSensitivity failed (rc=$rc)');
     } finally {
       calloc.free(p);
     }
@@ -4977,18 +5229,39 @@ class CrispasrSpeakerDB {
 
   /// Enroll a speaker with the given name and embedding. The consent
   /// attestation given at construction is recorded in the profile.
+  ///
+  /// On libcrispasr builds that export `crispasr_speaker_db_enroll_into`
+  /// the enrolled name becomes matchable on THIS handle immediately
+  /// (subject to the retained roster). Older dylibs only write the
+  /// profile to disk — there a caller must close and reopen the DB
+  /// before [match] can resolve the new name (the contract
+  /// SpeakerIdService has always followed).
   bool enroll(String name, Float32List embedding) {
-    final enrollFn = _lib.lookupFunction<
-        Int32 Function(
-            Pointer<Utf8>, Pointer<Utf8>, Pointer<Float>, Int32, Int32),
-        int Function(Pointer<Utf8>, Pointer<Utf8>, Pointer<Float>, int,
-            int)>('crispasr_speaker_db_enroll2');
-    final dp = dirPath.toNativeUtf8();
     final np = name.toNativeUtf8();
     final embPtr = malloc<Float>(embedding.length);
     embPtr.asTypedList(embedding.length).setAll(0, embedding);
-    final rc = enrollFn(dp, np, embPtr, embedding.length, 1);
-    malloc.free(dp);
+    int rc;
+    if (_lib.providesSymbol('crispasr_speaker_db_enroll_into')) {
+      final fn = _lib.lookupFunction<
+          Int32 Function(
+              Pointer<Void>, Pointer<Utf8>, Pointer<Float>, Int32, Int32),
+          int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Float>, int,
+              int)>('crispasr_speaker_db_enroll_into');
+      rc = fn(_handle, np, embPtr, embedding.length, 1);
+      // rc 3 = written to disk but outside this handle's retained roster;
+      // the profile exists, so report success — matching it needs a
+      // reopen with the name claimed, which the C side logs.
+      if (rc == 3) rc = 0;
+    } else {
+      final enrollFn = _lib.lookupFunction<
+          Int32 Function(
+              Pointer<Utf8>, Pointer<Utf8>, Pointer<Float>, Int32, Int32),
+          int Function(Pointer<Utf8>, Pointer<Utf8>, Pointer<Float>, int,
+              int)>('crispasr_speaker_db_enroll2');
+      final dp = dirPath.toNativeUtf8();
+      rc = enrollFn(dp, np, embPtr, embedding.length, 1);
+      malloc.free(dp);
+    }
     malloc.free(np);
     malloc.free(embPtr);
     return rc == 0;
@@ -5516,12 +5789,19 @@ class CrispasrWatermark {
 
   /// Embed a watermark into float32 mono PCM (in-place).
   ///
-  /// [alpha] controls spread-spectrum strength (0.005 default); ignored
-  /// when AudioSeal is loaded.
+  /// [alpha] controls spread-spectrum strength; ignored when AudioSeal is
+  /// loaded. The default (`<= 0`) selects the band-limited strength that makes
+  /// the mark reliably *detectable* — the property EU AI Act Art. 50(2)
+  /// requires, and the reason this is the call `synthesizeRaw` callers use to
+  /// discharge marking themselves.
+  ///
+  /// This defaulted to `0.005`, which the C ABI documents as too faint to
+  /// reliably detect on real speech. An explicit positive alpha is used
+  /// verbatim and bypasses the robust default; only pass one to A/B strength.
   ///
   /// Returns a new [Float32List] with the watermark applied.
   static Float32List embed(Float32List pcm,
-      {double alpha = 0.005, DynamicLibrary? lib}) {
+      {double alpha = -1.0, DynamicLibrary? lib}) {
     lib ??= DynamicLibrary.open(CrispASR.defaultLibName());
     final fn = lib.lookupFunction<Void Function(Pointer<Float>, Int32, Float),
         void Function(Pointer<Float>, int, double)>('crispasr_watermark_embed');
@@ -5753,13 +6033,12 @@ List<SessionSegment> drainStreamedSegments({String? libPath}) {
           : null;
   // #300: native per-segment speaker label; probe like the others so a
   // newer package keeps working against an older dylib.
-  final segSpkFn =
-      lib.providesSymbol('crispasr_session_result_segment_speaker')
-          ? lib.lookupFunction<
-              Pointer<Utf8> Function(Pointer<Void>, Int32),
-              Pointer<Utf8> Function(Pointer<Void>,
-                  int)>('crispasr_session_result_segment_speaker')
-          : null;
+  final segSpkFn = lib.providesSymbol('crispasr_session_result_segment_speaker')
+      ? lib.lookupFunction<
+          Pointer<Utf8> Function(Pointer<Void>, Int32),
+          Pointer<Utf8> Function(
+              Pointer<Void>, int)>('crispasr_session_result_segment_speaker')
+      : null;
 
   final out = <SessionSegment>[];
   for (var i = 0; i < nSegs; i++) {

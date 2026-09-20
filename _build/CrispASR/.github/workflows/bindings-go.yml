@@ -4,6 +4,11 @@ on:
     paths:
       - bindings/go/**
       - crispasr.h
+      # The Go binding also binds the chat C ABI (bindings/go/chat.go), so a
+      # change to that header or its implementation can break the cgo build
+      # without touching anything else listed here.
+      - include/crispasr_chat.h
+      - src/chat.cpp
       - src/CMakeLists.txt
       - tools/cmake_graphviz_targets.py
       - tools/sync_go_cgo_ldflags.py
@@ -11,6 +16,11 @@ on:
     paths:
       - bindings/go/**
       - crispasr.h
+      # The Go binding also binds the chat C ABI (bindings/go/chat.go), so a
+      # change to that header or its implementation can break the cgo build
+      # without touching anything else listed here.
+      - include/crispasr_chat.h
+      - src/chat.cpp
       - src/CMakeLists.txt
       - tools/cmake_graphviz_targets.py
       - tools/sync_go_cgo_ldflags.py

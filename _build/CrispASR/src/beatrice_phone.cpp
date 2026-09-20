@@ -22,6 +22,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 using namespace beatrice_ops;
 
@@ -287,7 +288,7 @@ beatrice_phone_context* beatrice_phone_init_from_file(const char* model_path, be
 
     c->backend = params.use_gpu ? crispasr_init_gpu_backend() : nullptr;
     if (!c->backend)
-        c->backend = ggml_backend_cpu_init();
+        c->backend = core_cpu_backend::init();
 
     core_gguf::WeightLoad wl;
     if (!core_gguf::load_weights(model_path, c->backend, "beatrice", wl)) {
@@ -308,7 +309,7 @@ void beatrice_phone_free(beatrice_phone_context* c) {
     if (!c)
         return;
     if (c->buf_w)
-        ggml_backend_buffer_free(c->buf_w);
+        core_gguf::release_weight_buffer(c->buf_w);
     if (c->ctx_w)
         ggml_free(c->ctx_w);
     if (c->backend)
@@ -357,7 +358,7 @@ beatrice_phone_result* beatrice_phone_extract(beatrice_phone_context* c, const f
     const std::vector<float> mask = causal_mask(T4);
     ggml_backend_tensor_set(io.mask, mask.data(), 0, mask.size() * sizeof(float));
     if (c->params.n_threads > 0)
-        ggml_backend_cpu_set_n_threads(c->backend, c->params.n_threads);
+        core_cpu_backend::set_n_threads(c->backend, c->params.n_threads);
     ggml_backend_graph_compute(c->backend, gf);
 
     auto* r = new beatrice_phone_result();

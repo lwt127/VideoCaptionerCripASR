@@ -28,6 +28,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `OMNIASR_BENCH=1` for per-stage timings.
@@ -450,9 +451,9 @@ extern "C" struct omniasr_context* omniasr_init_from_file(const char* path_model
         ctx->backend = crispasr_init_gpu_backend();
     }
     if (!ctx->backend) {
-        ctx->backend = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
     }
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (!ctx->backend_cpu) {
         if (ctx->backend) {
             ggml_backend_free(ctx->backend);
@@ -460,9 +461,9 @@ extern "C" struct omniasr_context* omniasr_init_from_file(const char* path_model
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads > 0 ? params.n_threads : 4);
-    if (ggml_backend_is_cpu(ctx->backend)) {
-        ggml_backend_cpu_set_n_threads(ctx->backend, params.n_threads > 0 ? params.n_threads : 4);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, params.n_threads > 0 ? params.n_threads : 4);
+    if (core_cpu_backend::is_cpu(ctx->backend)) {
+        core_cpu_backend::set_n_threads(ctx->backend, params.n_threads > 0 ? params.n_threads : 4);
     }
 
     // PLAN #69a: when CRISPASR_N_GPU_LAYERS is set and < total decoder
@@ -573,10 +574,11 @@ extern "C" void omniasr_free(struct omniasr_context* ctx) {
         ggml_backend_sched_free(ctx->sched);
     if (ctx->weight_ctx)
         ggml_free(ctx->weight_ctx);
-    if (ctx->buf)
-        ggml_backend_buffer_free(ctx->buf);
-    if (ctx->buf_cpu)
-        ggml_backend_buffer_free(ctx->buf_cpu);
+    // Weight buffers come from core_gguf::load_weights, so on a zero-copy
+    // backend they carry a host mmap the backend does not own. Release them
+    // through the loader rather than ggml_backend_buffer_free().
+    core_gguf::release_weight_buffer(ctx->buf);
+    core_gguf::release_weight_buffer(ctx->buf_cpu);
     if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
         ggml_backend_free(ctx->backend_cpu);
     if (ctx->backend)

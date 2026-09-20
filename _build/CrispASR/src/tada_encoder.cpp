@@ -41,6 +41,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -704,7 +705,7 @@ tada_encoder_context* tada_encoder_init(const char* path, tada_encoder_params pa
     core_gguf::free_metadata(meta);
 
     // Load weights
-    c->backend = ggml_backend_cpu_init();
+    c->backend = core_cpu_backend::init();
     if (!c->backend) {
         delete c;
         return nullptr;
@@ -746,7 +747,7 @@ void tada_encoder_free(tada_encoder_context* ctx) {
     if (ctx->ctx_inv)
         ggml_free(ctx->ctx_inv);
     if (ctx->buf_w)
-        ggml_backend_buffer_free(ctx->buf_w);
+        core_gguf::release_weight_buffer(ctx->buf_w);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
     if (ctx->backend)
@@ -810,7 +811,7 @@ int tada_encoder_encode_with_positions(tada_encoder_context* ctx, const float* a
     ggml_backend_tensor_set(pos_t, pos_ids.data(), 0, n_frames * sizeof(int32_t));
 
     // Compute
-    ggml_backend_cpu_set_n_threads(ctx->backend, ctx->params.n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend, ctx->params.n_threads);
     if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "[tada-encoder] graph compute failed\n");
         ggml_gallocr_free(alloc);
@@ -1160,7 +1161,7 @@ float* tada_encoder_extract_stage(tada_encoder_context* ctx, const float* audio_
     ggml_tensor* pos_t = ggml_graph_get_tensor(gf, "pos_ids");
     ggml_backend_tensor_set(pos_t, pos_ids.data(), 0, n_frames * sizeof(int32_t));
 
-    ggml_backend_cpu_set_n_threads(ctx->backend, ctx->params.n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend, ctx->params.n_threads);
     if (ggml_backend_graph_compute(ctx->backend, gf) != GGML_STATUS_SUCCESS) {
         ggml_gallocr_free(alloc);
         return nullptr;
@@ -1186,7 +1187,7 @@ float* tada_encoder_extract_stage(tada_encoder_context* ctx, const float* audio_
 // ──────────── GGUF writer for voice reference ─────────────────────
 
 int tada_encoder_write_ref_gguf(const char* path, const tada_encoder_result& result, const char* transcript,
-                                const char* language) {
+                                const char* language, bool cloned_from_recording, const char* consent_attestation) {
     if (result.n_tokens <= 0 || result.token_values.empty())
         return -1;
 
@@ -1204,6 +1205,16 @@ int tada_encoder_write_ref_gguf(const char* path, const tada_encoder_result& res
         gguf_set_val_str(gw, "crispasr.ref.tada_tts_prompt_text", transcript);
     if (language && language[0])
         gguf_set_val_str(gw, "crispasr.ref.tada_tts_language", language);
+    // Voice-clone provenance. A pack baked from a person's recording is exactly
+    // as much a deepfake as the recording; stamping it is what lets the consent
+    // and Art. 50(4) disclosure gates see that, since they can no longer tell
+    // from the .gguf suffix alone. Key names are mirrored in
+    // examples/cli/crispasr_voice_clone_policy.h — change both together.
+    if (cloned_from_recording) {
+        gguf_set_val_bool(gw, "crispasr.voice.cloned_from_recording", true);
+        if (consent_attestation && consent_attestation[0])
+            gguf_set_val_str(gw, "crispasr.voice.consent_attestation", consent_attestation);
+    }
 
     // prompt_token_values: (n_tokens, embed_dim) F32
     {

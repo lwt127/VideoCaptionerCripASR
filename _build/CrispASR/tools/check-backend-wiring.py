@@ -75,6 +75,14 @@ def main():
                     help="path to the crispasr binary (default: build/bin/crispasr)")
     ap.add_argument("--verbose", action="store_true",
                     help="print every backend, not just problems")
+    # The shipped-library check needs the .so/.dylib that BELONGS TO the binary
+    # being audited. Two escapes from the hardcoded <repo>/build/src guess:
+    ap.add_argument("--lib", default=None,
+                    help="path to the built libcrispasr shared library "
+                         "(default: found next to --crispasr, then <repo>/build/src)")
+    ap.add_argument("--require-lib", action="store_true",
+                    help="fail instead of silently skipping when no shared "
+                         "libcrispasr can be found (use in CI)")
     args = ap.parse_args()
 
     if not Path(args.crispasr).exists():
@@ -99,6 +107,55 @@ def main():
     tests_dir = sorted(p.name for p in (ROOT / "tests").glob("*"))
     refs_dir = sorted(p.name for p in (ROOT / "tools/reference_backends").glob("*.py"))
     adapters = {p.name for p in (ROOT / "examples/cli").glob("crispasr_backend_*.cpp")}
+
+    # ADAPTERS THAT CLAIM A NAME THE ROSTER DOES NOT LIST.
+    #
+    # Canonicality in the rest of this file is derived FROM the roster, which is
+    # circular: a backend absent from crispasr_list_backends() is not canonical,
+    # so it is never iterated, so nothing checks it. The reverse c_api check
+    # above does not close this either, because it accepts any name the FACTORY
+    # resolves -- and a forgotten roster entry is still factory-resolvable.
+    #
+    # Caught two real cases: supertonic (#434) shipped a working backend, a
+    # factory entry, a c_api entry and a dedicated adapter while --list-backends
+    # did not know it existed, so it was missing from the feature matrix and
+    # from backend_caps_table.h, and the audit reported PASS. irodori-tts had
+    # been in that state already, and a comment in this very file listed it as
+    # an "alias" -- it is not: canary-ctc, omniasr-llm-unlimited and
+    # vibevoice-tts each have a BASE entry in the roster (canary, omniasr,
+    # vibevoice), while irodori-tts had no related roster entry at all.
+    #
+    # The authority is the adapter's own name() -- matching on FILENAME STEMS
+    # gives 7 false positives (btc -> btc-chords, rvc -> rvc-svc, ...), while
+    # name() gives an exact answer with none.
+    adapter_claims = {}
+    for ap in (ROOT / "examples/cli").glob("crispasr_backend_*.cpp"):
+        try:
+            src = ap.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for nm in re.findall(r'const char\*\s*name\(\)\s*const\s*override\s*\{\s*return\s*"([^"]+)"', src):
+            adapter_claims.setdefault(nm, ap.name)
+
+    # Prose names a backend the way a READER would, not the way the CLI does:
+    # `crepe` appears as "CREPE", `tabcnn` as "TabCNN", `beat-this` as
+    # "Beat This!". A raw case-sensitive substring test called all three
+    # undocumented when the README documents every one of them, under `--pitch`,
+    # `--tab` and `--beats`. Three false positives out of four advisory gaps is
+    # exactly the noise ratio that teaches people to ignore the audit.
+    #
+    # So compare case-insensitively, and also with separators removed on BOTH
+    # sides so "beat-this" finds "Beat This!". Kept as explicit variants rather
+    # than stripping the whole document once, to limit the chance of a short
+    # name matching inside an unrelated word.
+    def mentioned(haystack, name):
+        hay = haystack.lower()
+        if name.lower() in hay:
+            return True
+        if name.replace("-", " ").replace("_", " ").lower() in hay:
+            return True
+        squash = lambda t: t.replace("-", "").replace("_", "").replace(" ", "")
+        return squash(name.lower()) in squash(hay)
 
     def in_available_backends(name):
         # entries look like:  list += ",moss-transcribe";  or packed:
@@ -130,9 +187,15 @@ def main():
     cli_names = {name for name, _caps in backends}
     # A name is fine if the CLI ROSTER lists it *or* the CLI FACTORY resolves it
     # as an alias -- several backends are advertised by the c_api under an alias
-    # (canary-ctc, irodori-tts, vibevoice-tts, omniasr-llm-unlimited) and are
-    # genuinely reachable. Only a name with NEITHER is unreachable from the CLI,
-    # which is the state btc-chords was in.
+    # (canary-ctc, vibevoice-tts, omniasr-llm-unlimited) and are genuinely
+    # reachable. Only a name with NEITHER is unreachable from the CLI, which is
+    # the state btc-chords was in.
+    #
+    # irodori-tts USED TO BE LISTED HERE and did not belong: the test for a real
+    # alias is that its BASE name is in the roster (canary, vibevoice, omniasr
+    # all are), and irodori-tts had no related roster entry at all. It was a
+    # missing roster line wearing an alias label, which is why this check kept
+    # passing over it. See the adapter_claims check above.
     # Reachability is decided by ASKING THE BINARY, not by parsing the dispatch
     # chain: some backends resolve by prefix (`name.rfind("omniasr", 0) == 0`)
     # or through multi-alias conditions that no regex will reliably cover.
@@ -161,32 +224,151 @@ def main():
     # unlike name-matching, which produced 21/76 noise. Demangling matters:
     # some runtimes are C++-linkage, so `sidon_init_from_file` appears only as
     # `__Z20sidon_init_from_file...` and a raw grep misses it.
+    # Scanned once and used by BOTH the shipped-library check and the
+    # orphan-runtime check below; the latter must run even with no built library.
+    inits_all = {}
+    for h in (ROOT / "src").glob("*.h"):
+        try:
+            for m in re.finditer(r"\b([a-z0-9_]+)_init_from_file\s*\(", h.read_text(errors="ignore")):
+                inits_all[m.group(1)] = h.name
+        except OSError:
+            pass
+
     lib_fail = []
+    lib_unreadable = None
     libpath = None
-    for c in ("build/src/libcrispasr.dylib", "build/src/libcrispasr.so",
-              "build/src/libcrispasr.1.dylib"):
-        if (ROOT / c).exists():
-            libpath = ROOT / c
+
+    # WHERE THE LIBRARY IS LOOKED FOR, AND WHY THE ORDER MATTERS.
+    #
+    # This used to test ONLY <repo>/build/src/libcrispasr.{so,dylib}, with no
+    # relation to the --crispasr binary it was auditing. That makes two silent
+    # wrong answers possible, and both have been observed:
+    #
+    #   * SILENT SKIP. Every out-of-tree build (Kaggle builds into
+    #     /kaggle/temp/build-cuda; ci.yml's own audit builds into ./build but
+    #     with BUILD_SHARED_LIBS off, so no .so is produced at all) leaves
+    #     <repo>/build/src empty, the check prints "skipped" and the run passes
+    #     while proving nothing. The gate had never once executed in CI.
+    #   * STALE FALSE POSITIVES. A months-old <repo>/build/src/libcrispasr.so
+    #     left over from an earlier checkout, audited against a freshly built
+    #     binary, reports every backend added since as "absent from the shipped
+    #     library" -- a list of ~23 names that are all correctly wired. Symbol
+    #     presence is only ground truth when the symbols come from the SAME
+    #     build as the roster they are checked against.
+    #
+    # So: an explicit --lib wins, then the library that sits in the binary's own
+    # build tree (build/bin/crispasr -> build/src/libcrispasr.so), and only then
+    # the legacy repo-relative guess.
+    cli_dir = Path(args.crispasr).resolve().parent          # <build>/bin
+    cands = []
+    if args.lib:
+        cands.append(Path(args.lib))
+    for d in (cli_dir.parent / "src", cli_dir.parent, cli_dir):
+        cands += [d / n for n in ("libcrispasr.dylib", "libcrispasr.so",
+                                  "libcrispasr.1.dylib")]
+    cands += [ROOT / c for c in ("build/src/libcrispasr.dylib",
+                                 "build/src/libcrispasr.so",
+                                 "build/src/libcrispasr.1.dylib")]
+    for c in cands:
+        if c.exists():
+            libpath = c
             break
+    if args.lib and libpath != Path(args.lib):
+        sys.exit(f"error: --lib {args.lib} does not exist.")
+
     if libpath:
-        raw = subprocess.run(["nm", "-gU", str(libpath)], capture_output=True, text=True).stdout
-        dem = subprocess.run(["c++filt"], input=raw, capture_output=True, text=True).stdout
-        inits = {}
-        for h in (ROOT / "src").glob("*.h"):
-            try:
-                for m in re.finditer(r"\b([a-z0-9_]+)_init_from_file\s*\(", h.read_text(errors="ignore")):
-                    inits[m.group(1)] = h.name
-            except OSError:
-                pass
+        # `nm -gU` IS NOT PORTABLE, AND ITS FAILURE IS SILENT-SHAPED.
+        # -U means --defined-only on macOS nm and on binutils >= 2.39, but on
+        # binutils 2.38 (ubuntu-22.04, which is what bindings-rust.yml runs on)
+        # -U is --unicode and `nm -gU lib.so` exits 1 with "invalid argument to
+        # -U/--unicode". stdout is then empty, which reads as "no backend
+        # symbols are present" -- a fabricated list of ~70 missing backends from
+        # a library that contains every one of them.
+        #
+        # So ask nm for nothing but the global symbols, which every nm spells
+        # the same way, and do the defined/undefined split here: the type column
+        # is U (undefined), v/w (weak undefined) for symbols that are merely
+        # REFERENCED. That distinction is the whole point of the check -- a
+        # backend whose object was dropped still leaves an undefined reference
+        # behind in a shared library, so counting those as present would make
+        # the check pass on exactly the bug it exists to catch.
+        nmr = subprocess.run(["nm", "-g", str(libpath)], capture_output=True, text=True)
+        sym_re = re.compile(r"^\s*(?:[0-9a-fA-F]+)?\s*([A-Za-z?])\s+(\S+)\s*$")
+        defined = [m.group(2) for m in (sym_re.match(l) for l in nmr.stdout.splitlines())
+                   if m and m.group(1) not in "UuvwV"]
+        dem = subprocess.run(["c++filt"], input="\n".join(defined),
+                             capture_output=True, text=True).stdout
 
-        def runtime_stem(n):
-            b = n.replace("-", "_")
-            return [b, b.replace("_tts", ""), b + "_tts", b.replace("_asr", ""), b + "_asr"]
+        # A READOUT THAT CANNOT REPORT ITS OWN FAILURE IS NOT A GATE.
+        # Three ways to end up with an empty/garbage symbol list: nm errored,
+        # the library is stripped ("no symbols"), or the output format did not
+        # parse. All three make EVERY backend look absent, and 100+ bogus
+        # failures are indistinguishable from a real regression.
+        #
+        # The last line is a POSITIVE CONTROL, not a formality: crispasr_session_open
+        # is in this library in every configuration that can build it at all, so
+        # if the table cannot produce it the table is wrong, whatever else it
+        # seems to say about backends.
+        if nmr.returncode != 0 or not dem.strip():
+            lib_unreadable = (nmr.stderr.strip().splitlines() or ["nm produced no output"])[-1]
+            libpath = None
+        elif "crispasr_session_open" not in dem:
+            lib_unreadable = (f"{len(defined)} defined symbols read from {libpath.name}, "
+                              f"but not crispasr_session_open — the symbol table is not "
+                              f"being parsed correctly")
+            libpath = None
+        else:
+            inits = dict(inits_all)
 
-        for name, _caps in backends:
-            hit = next((v for v in runtime_stem(name) if v in inits), None)
-            if hit and (hit + "_init_from_file") not in dem:
-                lib_fail.append((name, hit))
+            def runtime_stem(n):
+                b = n.replace("-", "_")
+                return [b, b.replace("_tts", ""), b + "_tts", b.replace("_asr", ""), b + "_asr"]
+
+            for name, _caps in backends:
+                hit = next((v for v in runtime_stem(name) if v in inits), None)
+                if hit and (hit + "_init_from_file") not in dem:
+                    lib_fail.append((name, hit))
+
+    # ---------------------------------------------------------------------
+    # ORPHAN-RUNTIME check: a runtime in NEITHER the CLI roster NOR the c_api
+    # list is invisible to every check above — the state mel-band-roformer was
+    # in while being the default `--separate` model.
+    #
+    # The signal is "src/*.h declares <x>_init_from_file but nothing is named
+    # <x>". Raw, it fires on 20 of 82 stems and 17 are legitimate components, so
+    # it was long left unshipped: a gate with 17 false positives trains everyone
+    # to ignore the audit. tools/backend-components.txt names those 17 once, with
+    # their consumer, which turns each into a recorded decision and drops the
+    # false-positive count to zero — so this CAN fail the run.
+    #
+    # Alias-reachable backends (canary-ctc, irodori-tts, t5-translate) are NOT
+    # allowlisted: cli_resolves() asks the binary about them, and allowlisting
+    # would hide a real regression if an alias ever broke.
+    components, comp_missing = set(), None
+    comp_path = ROOT / "tools/backend-components.txt"
+    if comp_path.exists():
+        for line in comp_path.read_text(encoding="utf-8").splitlines():
+            line = line.split("#", 1)[0].strip()
+            if line:
+                components.add(line)
+    else:
+        comp_missing = str(comp_path)
+
+    def name_variants(stem):
+        b = stem.replace("_", "-")
+        return {stem, b, b.replace("-tts", ""), b + "-tts", b.replace("-asr", ""), b + "-asr", b.replace("-", "")}
+
+    orphans = []
+    for stem in sorted(inits_all):
+        if name_variants(stem) & cli_names:
+            continue
+        if stem in components:
+            continue
+        # Ask the binary before calling it an orphan — several runtimes are
+        # reachable only under an alias.
+        if any(cli_resolves(v) for v in (stem, stem.replace("_", "-"))):
+            continue
+        orphans.append((stem, inits_all[stem]))
 
     required_fail = []   # (name, [missing required checks])
     advisory_gap = []    # (name, [missing advisory checks])
@@ -220,7 +402,7 @@ def main():
             required_fail.append((name, req_missing))
 
         adv_missing = []
-        if name not in readme:
+        if not mentioned(readme, name):
             adv_missing.append("README")
         if not any_file_has(tests_dir, name):
             adv_missing.append("test")
@@ -291,8 +473,14 @@ def main():
         print("   The linker drops a static-lib object nothing references, so CMake linkage\n"
               "   is NOT evidence the code ships. Reference it from src/crispasr_c_api.cpp\n"
               "   (a session arm), then rebuild and re-check.")
+    elif lib_unreadable:
+        print(f"\n❌ shipped-library check could not read symbols: {lib_unreadable}")
+        print("   (stripped library, or an `nm` without -U/--defined-only — the check\n"
+              "    is NOT passing, it is blind. Do not read this as a green run.)")
     elif not libpath:
         print("\n(shipped-library check skipped: no built libcrispasr found — build it to enable)")
+    else:
+        print(f"✅ Shipped library: every backend runtime is present in {libpath.name}.")
 
     if capi_only:
         print(f"\n❌ Advertised by the C ABI but ABSENT from the CLI roster ({len(capi_only)}):")
@@ -301,6 +489,17 @@ def main():
         print("   (A task-shaped backend still needs a redirect shim + capability bit so it\n"
               "    appears in --list-backends and the generated docs/feature-matrix.md.\n"
               "    See examples/cli/crispasr_backend_btc.cpp for the pattern.)")
+
+    if comp_missing:
+        print(f"\n⚠️  component allowlist not found at {comp_missing} — orphan-runtime check skipped")
+    elif orphans:
+        print(f"\n❌ Runtime declared in src/ but reachable from NOWHERE ({len(orphans)}):")
+        for stem, hdr in orphans:
+            print(f"   {stem:24} {hdr}: not a backend name, no alias resolves, not in tools/backend-components.txt")
+        print("   Either wire it up (CLI factory + roster + c_api) so users can select it,\n"
+              "   or record it as a sub-module in tools/backend-components.txt with its consumer.")
+    else:
+        print(f"✅ Orphan runtimes: none ({len(components)} known components allowlisted).")
 
     if required_fail:
         print(f"\n❌ REQUIRED wiring gaps ({len(required_fail)}):")
@@ -329,13 +528,74 @@ def main():
     # four conditions, so a run whose only problem was Go LDFLAGS drift reported
     # a required *wiring* gap two lines below "✅ REQUIRED wiring: ..." — the
     # reader then hunts through the advisory list for a gap that isn't there.
+    # Compare adapter claims against the roster IN SOURCE, not against the
+    # binary's --list-backends-json.
+    #
+    # cli_names comes from the BINARY, and a binary older than the roster it is
+    # being judged against manufactures false positives: a local build from
+    # 04:19 audited against a roster committed at 10:44 reported supertonic,
+    # irodori-tts and fireredtts3 as "claimed by an adapter but absent from the
+    # roster" when the source roster listed all three. That is the same
+    # stale-artifact failure as the shipped-library check above, in the check
+    # written to catch roster omissions -- so it is fixed the same way: both
+    # sides of THIS comparison are source-derived, and cannot skew apart.
+    roster_src = set()
+    try:
+        _be = (ROOT / "examples/cli/crispasr_backend.cpp").read_text(errors="ignore")
+        _i = _be.index("std::vector<std::string> crispasr_list_backends()")
+        roster_src = set(re.findall(r'"([^"]+)"', _be[_i:_be.index("};", _i)]))
+    except (OSError, ValueError):
+        roster_src = set(cli_names)  # fall back rather than fabricate a gap
+    unrostered = sorted(n for n in adapter_claims if n not in roster_src)
+    if unrostered:
+        print()
+        print(f"\u274c Adapters claiming a name the CLI roster omits ({len(unrostered)}):")
+        for n in unrostered:
+            print(f"   {n:24s} {adapter_claims[n]}")
+        print("   These are NOT aliases: an alias has a base name in the roster.")
+        print("   Add them to crispasr_list_backends() in examples/cli/crispasr_backend.cpp,")
+        print("   then regenerate docs/feature-matrix.* and src/core/backend_caps_table.h.")
+        print("   Until then --list-backends cannot see them and this audit skips them.")
+
+    # STALENESS GUARD. Several checks below ask the BINARY what it knows, which
+    # is the right design -- some backends resolve by prefix or through
+    # multi-alias conditions no regex covers. But a binary older than the
+    # sources it is judged against turns every backend added since into a
+    # fabricated gap, and the report then names backends instead of naming the
+    # stale artifact. Observed: a build from 04:19 audited against a roster
+    # committed at 10:44 produced six findings across three checks, all of them
+    # the same two new backends.
+    try:
+        _bin_mtime = os.path.getmtime(args.crispasr)
+        _newer = [
+            rel for rel in ("examples/cli/crispasr_backend.cpp", "src/crispasr_c_api.cpp")
+            if (ROOT / rel).is_file() and os.path.getmtime(ROOT / rel) > _bin_mtime
+        ]
+        if _newer:
+            print()
+            print("\u26a0\ufe0f  THE BINARY IS OLDER THAN THE SOURCES IT IS BEING JUDGED AGAINST:")
+            for rel in _newer:
+                print(f"   {rel} is newer than {args.crispasr}")
+            print("   Any backend added since that build will be reported as missing from the")
+            print("   roster / unreachable / orphaned. REBUILD before believing the gaps below.")
+    except OSError:
+        pass
+
     causes = []
     if required_fail:
         causes.append("required wiring gap")
+    if unrostered:
+        causes.append("adapter missing from the CLI roster")
     if capi_only:
         causes.append("c_api-only backend")
     if lib_fail:
         causes.append("missing symbol in shipped library")
+    if lib_unreadable:
+        causes.append("shipped library symbols unreadable")
+    if args.require_lib and not libpath and not lib_unreadable:
+        causes.append("--require-lib: no shared libcrispasr to audit")
+    if not comp_missing and orphans:
+        causes.append("orphan runtime")
     if not go_ok and not is_macos:
         causes.append("Go cgo LDFLAGS drift")
     print()

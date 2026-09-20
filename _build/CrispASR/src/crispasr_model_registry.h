@@ -62,6 +62,13 @@ bool crispasr_license_requires_acceptance(const std::string& license);
 /// Falls back to the CRISPASR_ACCEPT_LICENSE env var.
 bool crispasr_license_accepted(const std::string& license, const std::string& accepted);
 
+/// Download a CrispASR-managed auxiliary artifact after applying the same
+/// license gate and notice policy as registry models. `accepted_license` may
+/// be empty to use CRISPASR_ACCEPT_LICENSE.
+std::string crispasr_managed_download(const std::string& filename, const std::string& url, const std::string& license,
+                                      bool quiet, const char* label, const std::string& cache_dir_override = "",
+                                      const std::string& accepted_license = "");
+
 /// Look up a registry entry by backend name. Returns true on hit.
 bool crispasr_registry_lookup(const std::string& backend, CrispasrRegistryEntry& out,
                               const std::string& preferred_quant = "");

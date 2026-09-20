@@ -11,6 +11,39 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The configuration the shipped CUDA packages are built in — and, until
+  # v0.8.30, the one configuration NOTHING compiled before release day.
+  #
+  # GGML_BACKEND_DL makes every ggml backend a dlopen'd module, including
+  # ggml-cpu, so `ggml_cpu_has_*` / `ggml_backend_is_cpu` stop being linkable
+  # and must go through src/core/ggml_cpu_backend.h. Two files added after
+  # v0.8.29 called them directly; nothing noticed until
+  # `build-linux-x86_64-cuda` failed to link during the v0.8.30 release run,
+  # after the tag was already public. x86-64 specifically: the ISA predicates
+  # live behind `#if CRISPASR_ISA_X86`, so an arm64 build compiles the whole
+  # block out and links clean either way.
+  linux-backend-dl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake g++
+
+      - name: Configure (GGML_BACKEND_DL, as the CUDA packages are built)
+        run: |
+          cmake -S . -B build-dl -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF \
+            -DCRISPASR_BUILD_TESTS=OFF -DCRISPASR_BUILD_SERVER=OFF
+
+      - name: Build (the link is the test)
+        run: cmake --build build-dl --target crispasr-cli -j $(nproc)
+
+      - name: Smoke test - the CPU backend still loads as a module
+        run: ./build-dl/bin/crispasr --list-backends
+
   # ===========================================================================
   # Linux x86_64 (CPU)
   # ===========================================================================
@@ -43,6 +76,13 @@ jobs:
       # only on a REQUIRED gap; registry/test/README gaps stay advisory. Run on
       # Linux deliberately: the script's Go cgo-LDFLAGS drift check is unreliable
       # on macOS, where Metal/BLAS default on and pollute the linux link line.
+      #
+      # NOT covered here: the script's shipped-library check, which reads a
+      # built libcrispasr's symbol table. This job configures without
+      # BUILD_SHARED_LIBS, so there is no .so to read and that one check prints
+      # "skipped". It has teeth in bindings-rust.yml, the job that does build a
+      # shared libcrispasr on Linux — and which triggers on exactly the paths a
+      # new backend touches (src/crispasr_c_api.cpp, src/CMakeLists.txt).
       - name: Backend wiring audit
         run: python3 tools/check-backend-wiring.py --crispasr ./build/bin/crispasr
 
@@ -75,8 +115,12 @@ jobs:
         with:
           submodules: recursive
 
+      # patchelf is for test-bundle-linux-runtime, which exercises the release
+      # packaging scripts. Without it that test SKIPs, and a skip is
+      # indistinguishable from a pass in the summary — which is how the release
+      # packaging went unobserved in the first place.
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build g++ libopenblas-dev
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build g++ libopenblas-dev patchelf
 
       # Examples/server stay at their defaults: some tests link `common`, which
       # lives under examples/, so switching them off would break configure.
@@ -272,11 +316,44 @@ jobs:
           # the fuzzing-standard config for parsers over untrusted size fields.
           ASAN_OPTIONS: detect_leaks=0:allocator_may_return_null=1
         run: |
-          mkdir -p fuzz-corpus
+          mkdir -p fuzz-corpus fuzz-artifacts
           cp samples/jfk.wav samples/jfk.au samples/jfk.amr samples/jfk.webm \
              samples/jfk-vorbis.webm samples/jfk.m4a fuzz-corpus/ 2>/dev/null || true
+          # Inputs that once crashed a parser. A seeded 45 s run rediscovers a
+          # crash only by luck — replaying these makes each fixed bug a
+          # deterministic gate instead of a coin flip.
+          #
+          # COUNTED, not globbed-and-hoped. The previous form was
+          # `cp .../*.ogg ... || true`, and tests/.gitignore excludes *.ogg, so
+          # the one documented seed was never committed and the glob matched
+          # nothing on every run since. A gate that replays an empty set reports
+          # exactly what a passing gate reports, so it has to be able to say so.
+          n_seeds=0
+          for f in tests/fuzz/regressions/*; do
+            case "$f" in *README.md|*.gitignore) continue ;; esac
+            [ -f "$f" ] || continue
+            cp "$f" fuzz-corpus/
+            n_seeds=$((n_seeds + 1))
+          done
+          echo "replaying $n_seeds regression seed(s)"
+          if [ "$n_seeds" -eq 0 ]; then
+            echo "::error::tests/fuzz/regressions/ contributed no seeds — check tests/.gitignore"
+            exit 1
+          fi
           ./build-fuzz/bin/crispasr-fuzz-audio -max_total_time=45 -max_len=1048576 \
-             -rss_limit_mb=4096 fuzz-corpus
+             -rss_limit_mb=4096 -artifact_prefix=fuzz-artifacts/ fuzz-corpus
+
+      # Without this the crash input dies with the runner and all you have is a
+      # stack trace — which is how the stb_vorbis SEGV went unchased: the job
+      # is stochastic, so "re-run it" is not a reproduction strategy. Keep the
+      # input that actually crashed.
+      - name: Upload the crashing input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-audio
+          path: fuzz-artifacts/
+          if-no-files-found: ignore
 
   # ===========================================================================
   # Linux x86_64 + Vulkan

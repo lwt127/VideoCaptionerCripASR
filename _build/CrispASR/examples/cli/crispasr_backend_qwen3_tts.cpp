@@ -90,7 +90,13 @@ public:
     const char* name() const override { return "qwen3-tts"; }
 
     uint32_t capabilities() const override {
-        uint32_t caps = CAP_TTS | CAP_AUTO_DOWNLOAD | CAP_TEMPERATURE | CAP_FLASH_ATTN | CAP_STREAMING;
+        // #329: CAP_SRC_TGT_LANGUAGE — the talker's prefill carries an explicit
+        // codec_language_id, so `-tl`/`--target-lang` picks the OUTPUT language
+        // (including when cloning a reference in another language). Without the
+        // bit the CLI warned "--target-lang ignored by this backend" and dropped
+        // it on the floor, which is how #329 came to read as "no such option".
+        uint32_t caps =
+            CAP_TTS | CAP_AUTO_DOWNLOAD | CAP_TEMPERATURE | CAP_FLASH_ATTN | CAP_STREAMING | CAP_SRC_TGT_LANGUAGE;
         if (is_base_)
             caps |= CAP_VOICE_CLONING;
         return caps;
@@ -161,8 +167,14 @@ public:
         // qwen3tts.codec_language_names is keyed by ("German", "Chinese",
         // …). "auto"/empty leaves the model's default ("nothink") path so
         // behaviour is unchanged when the user doesn't ask for a language.
-        if (!params.language.empty() && params.language != "auto") {
-            const std::string lang_name = crispasr_iso_to_english_lang(params.language);
+        //
+        // #329: prefer -tl/--target-lang over -l, matching cosyvoice3. For a TTS
+        // backend the two mean the same thing — the language to SPEAK — but a
+        // dubbing caller naturally reaches for "target", and it used to be
+        // silently discarded here while `-l` worked.
+        const std::string out_lang = !params.target_lang.empty() ? params.target_lang : params.language;
+        if (!out_lang.empty() && out_lang != "auto") {
+            const std::string lang_name = crispasr_iso_to_english_lang(out_lang);
             if (qwen3_tts_set_language_by_name(ctx_, lang_name.c_str()) != 0 && !params.no_prints)
                 fprintf(stderr,
                         "crispasr[qwen3-tts]: language '%s' not in the model's codec_language table; using auto\n",

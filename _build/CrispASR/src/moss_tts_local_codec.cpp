@@ -560,7 +560,7 @@ void free(Codec* c) {
     if (c->w_ctx)
         ggml_free(c->w_ctx);
     if (c->buf)
-        ggml_backend_buffer_free(c->buf);
+        core_gguf::release_weight_buffer(c->buf);
     if (c->ctx)
         ggml_free(c->ctx);
     delete c;

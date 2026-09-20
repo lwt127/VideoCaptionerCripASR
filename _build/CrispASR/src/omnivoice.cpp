@@ -23,6 +23,7 @@
 
 #include <cctype>
 #include "core/activation.h"
+#include "core/parallel_for.h"
 #include "core/attention.h"
 #include "core/bpe.h"
 #include "core/conv.h"
@@ -33,8 +34,12 @@
 #include "core/wav_reader.h"
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h"
-#include "core/tts_ref_cache.h" // shared content-addressed reference-voice cache (issue #265)
+#include "core/omnivoice_instruct.h" // closed-vocabulary voice-design validation (#13273)
+#include "core/omnivoice_lang.h"     // ISO-639-3 resolution for the <|lang_start|> tag (#13273)
+#include "core/omnivoice_prompt.h"   // style-prefix assembly, unit-testable (#13273)
+#include "core/tts_ref_cache.h"      // shared content-addressed reference-voice cache (issue #265)
 #include "core/crispasr_env.h"
+#include "core/omnivoice_duration.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -58,6 +63,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 namespace {
 
@@ -72,6 +78,13 @@ bool env_bool(const char* k) {
 const char* env_str(const char* k) {
     const char* v = crispasr_env::get(k);
     return (v && *v) ? v : nullptr;
+}
+// For default-ON gates: unset means `dflt`, an explicit "0" always disables.
+bool env_bool_default(const char* k, bool dflt) {
+    const char* v = crispasr_env::get(k);
+    if (!v || !*v)
+        return dflt;
+    return std::strcmp(v, "0") != 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -104,25 +117,6 @@ struct ov_bench_stage {
 // Parallel-for over [0, n) in contiguous chunks (scoring hot loop)
 // ---------------------------------------------------------------------------
 
-static void ov_parallel_for(int n_threads, int n, const std::function<void(int, int)>& fn) {
-    n_threads = std::max(1, std::min(n_threads, n));
-    if (n_threads == 1) {
-        fn(0, n);
-        return;
-    }
-    const int chunk = (n + n_threads - 1) / n_threads;
-    std::vector<std::thread> workers;
-    workers.reserve(n_threads);
-    for (int i = 0; i < n_threads; i++) {
-        const int a = i * chunk;
-        const int b = std::min(n, a + chunk);
-        if (a >= b)
-            break;
-        workers.emplace_back(fn, a, b);
-    }
-    for (auto& w : workers)
-        w.join();
-}
 
 // ---------------------------------------------------------------------------
 // Hyperparameters
@@ -384,7 +378,9 @@ struct omnivoice_context {
 
     // Language / instruct
     std::string language;
-    std::string instruct;
+    // Validated at set time; the final string is rendered per synthesis because
+    // the EN/ZH choice depends on the text being spoken (see omnivoice_instruct.h).
+    core_omnivoice_instruct::Parsed instruct;
 
     // Speaking-rate multiplier for the target-length estimate (>1 faster/shorter).
     float speed = 1.0f;
@@ -552,15 +548,15 @@ static bool load_model(omnivoice_context* ctx, const char* path) {
         const bool force_cpu = e && *e && *e != '0';
         ctx->backend = (ctx->use_gpu && !force_cpu) ? crispasr_init_gpu_backend() : nullptr;
         if (!ctx->backend)
-            ctx->backend = ggml_backend_cpu_init();
+            ctx->backend = core_cpu_backend::init();
     }
     if (!ctx->backend) {
         fprintf(stderr, "omnivoice: failed to init backend\n");
         gguf_free(gf);
         return false;
     }
-    if (ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
     if (ctx->verbosity >= 1)
         fprintf(stderr, "omnivoice: compute backend = %s\n", ggml_backend_name(ctx->backend));
 
@@ -860,9 +856,9 @@ static bool load_tokenizer(omnivoice_context* ctx, const char* path) {
     const bool codec_gpu = ctx->use_gpu && codec_gpu_enabled(ctx);
     tok.backend = codec_gpu ? crispasr_init_gpu_backend() : nullptr;
     if (!tok.backend)
-        tok.backend = ggml_backend_cpu_init();
-    if (ggml_backend_is_cpu(tok.backend))
-        ggml_backend_cpu_set_n_threads(tok.backend, ctx->n_threads);
+        tok.backend = core_cpu_backend::init();
+    if (core_cpu_backend::is_cpu(tok.backend))
+        core_cpu_backend::set_n_threads(tok.backend, ctx->n_threads);
     if (ctx->verbosity >= 1)
         fprintf(stderr, "omnivoice: codec backend = %s\n", ggml_backend_name(tok.backend));
     tok.buf_w = ggml_backend_alloc_ctx_tensors(tok.ctx_w, tok.backend);
@@ -1133,119 +1129,12 @@ static std::vector<int32_t> tokenize(const ov_vocab& vocab, const std::string& t
 // Estimate target audio length (frames) from text length
 // ---------------------------------------------------------------------------
 
-// Per-codepoint "phonetic weight" (relative speech duration). Adapted from
-// OmniVoice's rule-based estimator (omnivoice/utils/duration.py — Apache-2.0,
-// © Xiaomi/k2-fsa; C++ mirror in ServeurpersoCom/omnivoice.cpp — MIT). Weights:
-// mark 0, separator 0.2, punct/symbol 0.5, digit 3.5 (spoken as words),
-// latin/cyrillic/greek 1.0, arabic/hebrew/thai 1.5, indic 1.8, kana 2.2,
-// hangul 2.5, cjk 3.0.
-static double duration_cp_weight(uint32_t cp) {
-    if ((cp >= 0x30 && cp <= 0x39) || (cp >= 0xFF10 && cp <= 0xFF19))
-        return 3.5; // digits — spoken as words
-    if ((cp >= 0x41 && cp <= 0x5A) || (cp >= 0x61 && cp <= 0x7A))
-        return 1.0; // ASCII letters
-    if (cp < 0x80)
-        return (cp == 0x20 || cp == 0x09 || cp == 0x0A || cp == 0x0D) ? 0.2 : 0.5;
-    if ((cp >= 0x0300 && cp <= 0x036F) || (cp >= 0x1DC0 && cp <= 0x1DFF) || (cp >= 0x20D0 && cp <= 0x20FF))
-        return 0.0; // combining marks — silent
-    if (cp == 0x3000)
-        return 0.2; // ideographic space
-    if ((cp >= 0x3001 && cp <= 0x303F) || (cp >= 0xFF00 && cp <= 0xFF0F) || (cp >= 0xFF1A && cp <= 0xFF20) ||
-        (cp >= 0xFF3B && cp <= 0xFF40) || (cp >= 0xFF5B && cp <= 0xFF65))
-        return 0.5; // CJK punctuation
-    if (cp >= 0x00C0 && cp <= 0x024F)
-        return 1.0; // Latin extended
-    if (cp >= 0x0370 && cp <= 0x03FF)
-        return 1.0; // Greek
-    if (cp >= 0x0400 && cp <= 0x04FF)
-        return 1.0; // Cyrillic
-    if (cp >= 0x0590 && cp <= 0x06FF)
-        return 1.5; // Hebrew + Arabic
-    if (cp >= 0x0E00 && cp <= 0x0EFF)
-        return 1.5; // Thai + Lao
-    if (cp >= 0x0900 && cp <= 0x0DFF)
-        return 1.8; // Indic (Devanagari..Sinhala)
-    if (cp >= 0x3040 && cp <= 0x30FF)
-        return 2.2; // Hiragana + Katakana
-    if ((cp >= 0xAC00 && cp <= 0xD7AF) || (cp >= 0x1100 && cp <= 0x11FF))
-        return 2.5; // Hangul
-    if ((cp >= 0x4E00 && cp <= 0x9FFF) || (cp >= 0x3400 && cp <= 0x4DBF) || (cp >= 0x20000 && cp <= 0x2FA1F))
-        return 3.0; // CJK ideographs
-    return 1.0;     // default letter-ish
-}
-
-static double duration_text_weight(const std::string& text) {
-    double w = 0.0;
-    for (size_t i = 0; i < text.size();) {
-        unsigned char c = text[i];
-        uint32_t cp;
-        int adv;
-        if (c < 0x80) {
-            cp = c;
-            adv = 1;
-        } else if (c < 0xE0) {
-            cp = c & 0x1F;
-            adv = 2;
-        } else if (c < 0xF0) {
-            cp = c & 0x0F;
-            adv = 3;
-        } else {
-            cp = c & 0x07;
-            adv = 4;
-        }
-        for (int k = 1; k < adv && i + (size_t)k < text.size(); k++)
-            cp = (cp << 6) | ((unsigned char)text[i + k] & 0x3F);
-        w += duration_cp_weight(cp);
-        i += adv;
-    }
-    return w;
-}
-
-// Estimate target length (in ref_dur's unit) from a reference (text, dur) pair,
-// mirroring RuleDurationEstimator.estimate_duration:
-//   speed = weight(ref_text) / ref_dur;  est = weight(target) / speed
-// with a power-curve BOOST when the linear estimate is short (< low_threshold):
-//   est = low_threshold * (est/low_threshold)^(1/boost_strength)
-// The boost lengthens short clips so they don't render too fast / skip
-// characters (#254). Defaults (low_threshold=50, boost_strength=3) match Python.
-static double duration_estimate(const std::string& target_text, const std::string& ref_text, double ref_dur,
-                                double low_threshold = 50.0, double boost_strength = 3.0) {
-    if (ref_dur <= 0.0 || ref_text.empty())
-        return 0.0;
-    double ref_weight = duration_text_weight(ref_text);
-    if (ref_weight == 0.0)
-        return 0.0;
-    double speed = ref_weight / ref_dur;
-    double est = duration_text_weight(target_text) / speed;
-    if (est < low_threshold)
-        return low_threshold * std::pow(est / low_threshold, 1.0 / boost_strength);
-    return est;
-}
-
-// Target audio length (frames). With a voice prompt the anchor IS the reference
-// (ref_text → ref_T frames) so the length tracks the reference speaker's actual
-// rate (fixes "duration doesn't change with a reference voice", #254). Without
-// one, fall back to the canonical "Nice to meet you." ≈ 25-frame anchor.
-// OMNIVOICE_FRAMES_PER_CHAR overrides the no-ref frames/weighted-char rate.
-static int estimate_target_tokens(const std::string& text, const std::string& ref_text = std::string(), int ref_T = 0,
-                                  float speed = 1.0f) {
-    std::string rt;
-    double rd;
-    if (ref_T > 0 && !ref_text.empty()) {
-        rt = ref_text;
-        rd = (double)ref_T;
-    } else {
-        rt = "Nice to meet you.";
-        rd = 25.0;
-        if (const char* e = crispasr_env::get("CRISPASR_OMNIVOICE_FRAMES_PER_CHAR")) {
-            float v = (float)atof(e);
-            if (v > 0.0f)
-                rd = v * duration_text_weight(rt); // env = frames per weighted char
-        }
-    }
-    double est = duration_estimate(text, rt, rd) / speed;
-    return std::max((int)est, 10);
-}
+// Extracted to src/core/omnivoice_duration.h so it can be unit-tested, and so
+// the #363 reference-rate guard lives with the weights it depends on.
+using core_omnivoice_duration::duration_estimate;
+using core_omnivoice_duration::duration_text_weight;
+using core_omnivoice_duration::estimate_target_tokens;
+using core_omnivoice_duration::ref_rate_is_plausible;
 
 // ---------------------------------------------------------------------------
 // Time steps for masked iterative schedule
@@ -1603,15 +1492,51 @@ static ov_gen_result generate_iterative(omnivoice_context* ctx, const std::strin
 
     // 3. Build style prefix. When cloning, a <|denoise|> token leads the style
     //    (Python create_voice_clone_prompt), then language + instruct.
-    std::string style_text;
-    if (ctx->ref_T > 0)
-        style_text += "<|denoise|>";
-    std::string lang_str = ctx->language.empty() ? "None" : ctx->language;
-    std::string instruct_str = ctx->instruct.empty() ? "None" : ctx->instruct;
-    style_text += "<|lang_start|>" + lang_str + "<|lang_end|>";
-    style_text += "<|instruct_start|>" + instruct_str + "<|instruct_end|>";
+    // The language the caller asked for wins outright. Only when nobody set one
+    // do we guess from the text (#13273): SubtitleEdit's language menu is still
+    // not wired to the payload upstream, so without this every dubbed line
+    // arrives language-agnostic no matter what the user picked.
+    //
+    // Computed PER CALL into a local — never written back to ctx->language.
+    // The server reuses one context across requests, so a sticky guess would
+    // leak line N's detected language onto line N+1, which is the exact
+    // per-call-vs-init bug this whole change exists to fix.
+    //
+    // ⚠ Detect over `text` (the target), NOT `combined_text` — the latter has
+    // the reference transcript glued to its front, so an English reference clip
+    // would pull every German subtitle's guess to English.
+    std::string eff_lang = ctx->language;
+    if (eff_lang.empty() && env_bool_default("CRISPASR_OMNIVOICE_AUTO_LANG", true)) {
+        eff_lang = core_omnivoice_lang::auto_detect(text);
+        if (debug && !eff_lang.empty())
+            fprintf(stderr, "omnivoice: no language requested; detected '%s' from the target text\n", eff_lang.c_str());
+    }
+
+    // Render the validated instruct for THIS text: a dialect forces Chinese, an
+    // accent forces English, otherwise it follows whether the target text is
+    // Chinese. Text-dependent, so it cannot be baked in at set time.
+    const std::string instruct_rendered =
+        core_omnivoice_instruct::render(ctx->instruct, core_omnivoice_instruct::text_is_zh(text));
+
+    // Assembly lives in a weight-free header so the exact prompt string is
+    // unit-testable (tests/test-omnivoice-prompt.cpp) instead of only
+    // observable by loading the model and reading the debug print below.
+    const std::string style_text = core_omnivoice_prompt::build_style_text(ctx->ref_T > 0, eff_lang, instruct_rendered);
     std::vector<int32_t> style_ids = tokenize(ctx->vocab, style_text);
     int T_style = (int)style_ids.size();
+
+    // The style prefix is where the language conditioning actually lives, and a
+    // BPE difference here is invisible in every downstream metric — the graph
+    // still computes, the audio still sounds like speech. Print the ids so
+    // prompt-token parity against the HF tokenizer stays a one-command check
+    // (dev-guide step 0 for any AR model):
+    //   AutoTokenizer.from_pretrained(<lm-src>)(style_text).input_ids
+    if (debug) {
+        fprintf(stderr, "omnivoice: style '%s' -> %d ids:", style_text.c_str(), T_style);
+        for (int id : style_ids)
+            fprintf(stderr, " %d", id);
+        fprintf(stderr, "\n");
+    }
 
     // 4. Build the full input sequence
     // Layout: [style_tokens | text_tokens | ref_audio_tokens? | target_mask_tokens]
@@ -2228,7 +2153,7 @@ static ov_gen_result generate_iterative(omnivoice_context* ctx, const std::strin
         // loop. This pass is ~13M exp() calls per step at T_target≈545.
         {
             ov_bench_stage b("  score_cfg");
-            ov_parallel_for(ctx->n_threads, T_target, [&](int t0, int t1) {
+            core_parallel::for_each_chunk(T_target, ctx->n_threads, [&](int t0, int t1) {
                 std::vector<float> c_lp(V), u_lp(V), guided(V), final_lp(V);
                 for (int t = t0; t < t1; t++) {
                     for (uint32_t cb = 0; cb < hp.n_codebooks; cb++) {
@@ -2266,7 +2191,7 @@ static ov_gen_result generate_iterative(omnivoice_context* ctx, const std::strin
                 for (size_t i = 0; i < pos_noise.size(); i++)
                     pos_noise[i] = gumbel_noise();
             }
-            ov_parallel_for(ctx->n_threads, T_target, [&](int t0, int t1) {
+            core_parallel::for_each_chunk(T_target, ctx->n_threads, [&](int t0, int t1) {
                 for (int t = t0; t < t1; t++) {
                     for (uint32_t cb = 0; cb < hp.n_codebooks; cb++) {
                         const float* lp = log_probs.data() + (size_t)t * out_dim + cb * V;
@@ -3029,6 +2954,9 @@ static int run_encode_diff(omnivoice_context* ctx, const char* ref_path) {
         return -1;
     }
     fprintf(stderr, "omnivoice encode-diff vs %s\n", ref_path);
+    // Failed main-chain stages; the return value reflects this so callers can
+    // gate on it (a diff that prints FAIL but exits 0 is not a gate).
+    int n_fail = 0;
 
     // --- Stage HuBERT frontend: feed ref wav16k_pad (isolates resampling) →
     //     hb_featextract + hb_featproj. Uses a separate archive via env. ---
@@ -3166,11 +3094,15 @@ static int run_encode_diff(omnivoice_context* ctx, const char* ref_path) {
             if ((int)mine.size() == T * C && T_out == T) {
                 float cmin, cmean, mabs;
                 higgs_cos(mine.data(), (const float*)r_ac->data, T, C, cmin, cmean, mabs);
+                const bool ok = cmin >= 0.999f;
+                if (!ok)
+                    n_fail++;
                 fprintf(stderr, "  acoustic_enc (→e_acoustic): cos_min=%.6f cos_mean=%.6f max_abs=%.3e  %s\n", cmin,
-                        cmean, mabs, cmin >= 0.999f ? "PASS" : "FAIL");
+                        cmean, mabs, ok ? "PASS" : "FAIL");
             } else {
                 fprintf(stderr, "  acoustic_enc: shape mismatch mine=%zu (T_out=%d) ref=(%d,%d)\n", mine.size(), T_out,
                         T, C);
+                n_fail++;
             }
         } else {
             fprintf(stderr, "  acoustic_enc: ref missing input_wav24k/e_acoustic\n");
@@ -3187,10 +3119,14 @@ static int run_encode_diff(omnivoice_context* ctx, const char* ref_path) {
             if ((int)mine.size() == T * C) {
                 float cmin, cmean, mabs;
                 higgs_cos(mine.data(), (const float*)r_es->data, T, C, cmin, cmean, mabs);
+                const bool ok = cmin >= 0.999f;
+                if (!ok)
+                    n_fail++;
                 fprintf(stderr, "  encoder_semantic (→e_semantic): cos_min=%.6f cos_mean=%.6f max_abs=%.3e  %s\n", cmin,
-                        cmean, mabs, cmin >= 0.999f ? "PASS" : "FAIL");
+                        cmean, mabs, ok ? "PASS" : "FAIL");
             } else {
                 fprintf(stderr, "  encoder_semantic: size mismatch mine=%zu ref=%d\n", mine.size(), T * C);
+                n_fail++;
             }
         } else {
             fprintf(stderr, "  encoder_semantic: ref missing sem_ds/e_semantic\n");
@@ -3220,8 +3156,11 @@ static int run_encode_diff(omnivoice_context* ctx, const char* ref_path) {
             higgs_linear(fc_w, fc_b, cat.data(), T, H, H, mine);
             float cmin, cmean, mabs;
             higgs_cos(mine.data(), (const float*)r_emb->data, T, H, cmin, cmean, mabs);
+            const bool ok = cmin >= 0.999f;
+            if (!ok)
+                n_fail++;
             fprintf(stderr, "  concat+fc (→emb_fc): cos_min=%.6f cos_mean=%.6f max_abs=%.3e  %s\n", cmin, cmean, mabs,
-                    cmin >= 0.999f ? "PASS" : "FAIL");
+                    ok ? "PASS" : "FAIL");
         } else {
             fprintf(stderr, "  concat+fc: ref missing e_acoustic/e_semantic/emb_fc or fc weights\n");
         }
@@ -3257,7 +3196,13 @@ static int run_encode_diff(omnivoice_context* ctx, const char* ref_path) {
                         match++;
                         per_cb[k]++;
                     }
-            fprintf(stderr, "  RVQ (emb_fc→codes): %ld/%ld exact (%.1f%%)  per-cb:", match, tot, 100.0 * match / tot);
+            // 99.5%: measured 99.9% on the pinned fixture; the handful of
+            // off-by-one codes are borderline nearest-centroid ties.
+            const bool ok = match * 1000 >= tot * 995;
+            if (!ok)
+                n_fail++;
+            fprintf(stderr, "  RVQ (emb_fc→codes): %ld/%ld exact (%.1f%%)  %s  per-cb:", match, tot,
+                    100.0 * match / tot, ok ? "PASS" : "FAIL");
             for (int k = 0; k < NQ; k++)
                 fprintf(stderr, " %d/%d", per_cb[k], T);
             fprintf(stderr, "\n    mine cb0[:12]:");
@@ -3292,14 +3237,23 @@ static int run_encode_diff(omnivoice_context* ctx, const char* ref_path) {
                 for (size_t i = 0; i < refc.size(); i++)
                     if (mine[i] == refc[i])
                         match++;
-                fprintf(stderr, "  FULL wav→codes: %ld/%zu exact (%.1f%%), T=%d\n", match, refc.size(),
-                        100.0 * match / refc.size(), T_out);
+                // 95%: measured 99.0% on the pinned fixture; the residual is
+                // our resampler vs torchaudio's Hann sinc, not a port bug.
+                // The corrupt-tokenizer failure mode sits at 15%.
+                const bool ok = match * 100 >= (long)refc.size() * 95;
+                if (!ok)
+                    n_fail++;
+                fprintf(stderr, "  FULL wav→codes: %ld/%zu exact (%.1f%%), T=%d  %s\n", match, refc.size(),
+                        100.0 * match / refc.size(), T_out, ok ? "PASS" : "FAIL");
             } else {
                 fprintf(stderr, "  FULL wav→codes: T_out=%d ref T=%d (align)\n", T_out, T);
+                n_fail++;
             }
         }
     }
-    return 0;
+    if (n_fail > 0)
+        fprintf(stderr, "omnivoice encode-diff: %d stage(s) FAILED\n", n_fail);
+    return n_fail == 0 ? 0 : 1;
 }
 
 } // namespace
@@ -3477,17 +3431,59 @@ int omnivoice_set_voice_prompt(struct omnivoice_context* ctx, const char* wav_pa
     return 0;
 }
 
+// The stored value goes VERBATIM into `<|lang_start|>…<|lang_end|>`, so resolve
+// it here rather than at the call sites — this is the one funnel every surface
+// (CLI, server, session ABI, bindings) passes through, and #13273 was three
+// separate surfaces each getting the wiring wrong on its own.
+//
+// Mirrors the blueprint's `_resolve_language()`: a valid ISO 639-3 ID passes
+// through, an English name maps to its ID, anything else becomes None
+// (language-agnostic) — never itself. Passing an unrecognized string through
+// is the silent failure: the prompt still builds, the graph still computes, and
+// the model is conditioned on tokens it never saw in that slot.
 int omnivoice_set_language(struct omnivoice_context* ctx, const char* lang) {
     if (!ctx)
         return -1;
-    ctx->language = lang ? lang : "";
+
+    const std::string requested = lang ? lang : "";
+    const auto resolved = core_omnivoice_lang::resolve(requested);
+    ctx->language = resolved.id;
+
+    if (resolved.status == core_omnivoice_lang::Status::unrecognized) {
+        // Not fatal — synthesis proceeds language-agnostic, exactly as upstream
+        // does — but say so, because the caller asked for something specific
+        // and is not getting it. Silence here is what made the SubtitleEdit
+        // language menu look like it worked.
+        const std::string hint = core_omnivoice_lang::suggest(requested);
+        fprintf(stderr, "crispasr[omnivoice]: language '%s' is not one of the model's %d language IDs",
+                requested.c_str(), core_omnivoice_lang::kLangTableN);
+        if (!hint.empty())
+            fprintf(stderr, " — did you mean '%s'?", hint.c_str());
+        fprintf(stderr, "\ncrispasr[omnivoice]: falling back to language-agnostic synthesis. Pass an ISO "
+                        "639-3 id (e.g. 'en', 'de', 'arb') or an English name (e.g. 'German').\n");
+        return -2;
+    }
     return 0;
 }
 
+// Upstream `_resolve_instruct()` RAISES on an unsupported item, a
+// dialect+accent mix, or two items from one category, and we mirror that rather
+// than degrade: the instruct is a closed 48-item vocabulary, and a voice-design
+// request that silently does nothing is exactly the failure this fixes. On
+// rejection the previous instruct is CLEARED, so a bad value can never leave a
+// stale one conditioning later lines on a reused server context.
 int omnivoice_set_instruct(struct omnivoice_context* ctx, const char* instruct) {
     if (!ctx)
         return -1;
-    ctx->instruct = instruct ? instruct : "";
+
+    core_omnivoice_instruct::Parsed parsed = core_omnivoice_instruct::parse(instruct ? instruct : "");
+    if (parsed.status != core_omnivoice_instruct::Status::ok &&
+        parsed.status != core_omnivoice_instruct::Status::cleared) {
+        fprintf(stderr, "crispasr[omnivoice]: %s\n", parsed.error.c_str());
+        ctx->instruct = core_omnivoice_instruct::Parsed{};
+        return -2;
+    }
+    ctx->instruct = std::move(parsed);
     return 0;
 }
 
@@ -3657,7 +3653,7 @@ int omnivoice_encode_diff(struct omnivoice_context* ctx, const char* ref_gguf_pa
 void omnivoice_set_n_threads(struct omnivoice_context* ctx, int n_threads) {
     if (ctx && n_threads > 0) {
         ctx->n_threads = n_threads;
-        if (ctx->backend && ggml_backend_is_cpu(ctx->backend))
-            ggml_backend_cpu_set_n_threads(ctx->backend, n_threads);
+        if (ctx->backend && core_cpu_backend::is_cpu(ctx->backend))
+            core_cpu_backend::set_n_threads(ctx->backend, n_threads);
     }
 }

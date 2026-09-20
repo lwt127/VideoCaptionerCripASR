@@ -4,6 +4,47 @@ Test audio: jfk.wav (11.0s), Q4_K quantization, greedy decode (`-bs 1`).
 
 ---
 
+## Metal im2col: the v0.17 sync silently dropped the batch-1 occupancy win — restored as kernel_im2col_flat, melotts hifigan back to ~1.85x (Apple M1, 2026-08-06)
+
+The v0.17 ggml sync removed `CRISPASR_METAL_IM2COL_OCC` (upstream reworked
+the dispatch; see `tools/upstream-prs/SYNC-v0.17-CONFLICTS.md` "re-derive if
+regressions appear") — which un-fixed the melotts/piper "P0 hifigan" row
+below: every batch-1 Metal conv went back to KH*KW-thread threadgroups. The
+re-derivation now lives in the shared fork as **`kernel_im2col_flat`**
+(`89a2039d`, branch `sync/upstream-v0.17`; authored against CrispEmbed's
+PP-OCR profile, where the same kernel is 2.3x on the recognizer): one thread
+per dst element from a `(ceil(OW*CHW/256), OH, N)` grid, predicate
+`N*KH*KW < 128 || IC == 1` (also covers the `conv_2d_dw` lowering the OCC
+variant missed), `CRISPASR_METAL_IM2COL_FLAT=0` restores the standard
+kernel. A first cut with int64-divmod flat indexing was SLOWER than the
+broken dispatch — Apple GPUs emulate int64 division.
+
+This pin bump (`a0f7289d` → `89a2039d`) re-activates the win. Measured, M1,
+interleaved same-binary pairs:
+
+- **melotts** (en-q8, 3.2 s utterance): hifigan_decode 2026/2019 ms →
+  **1097/1094 ms (1.85x)**, synthesize 2315/2318 → 1364/1365 ms (1.7x) on
+  the two quiet pairs; ASR round-trip reproduces the text. WAV byte-compare
+  is NOT a valid gate for melotts — the VITS flow is stochastic and two
+  legacy-arm runs already differ; the round-trip is the gate.
+- **moonshine-tiny** (jfk.wav): transcript **byte-identical** flat vs
+  legacy, RTF neutral-to-slightly-better (82.0 vs 80.0x / 73.7 vs 70.4x /
+  62.5 vs 62.6x).
+- **paraformer-zh-q4_k**: transcript **byte-identical**. Wall pairs were
+  noise-dominated (0.85–15.1 s spread; other sessions held load at 14–18,
+  and an order-reversal control still disagreed with itself) — the
+  attributable quantity is the per-op GPU time of its 2 im2col nodes:
+  **8.5–9.1 ms/node legacy → 0.4–1.0 ms/node flat (9–20x)**, ~16 ms saved
+  per run, <1.5% of wall either way. No mechanism for a regression.
+- 1473/1473 unit tests on the bumped pin.
+
+The historical OCC numbers in the melotts row below (2–3x hifigan, 1.65x
+moonshine) were measured on the pre-v0.17 variant on a quiet box; today's
+moonshine is closer to neutral because the current decode path spends its
+time elsewhere. CrispEmbed-side evidence (2.3x PP-OCR rec, 1.6x
+layout_detect, 18-fixture byte-identity) is in their `PERFORMANCE.md`.
+`tools/upstream-prs/23` should be re-drafted from this kernel for upstream.
+
 ## Backend × Optimization matrix
 
 At-a-glance view of which performance knobs each backend supports today,
@@ -832,11 +873,64 @@ needs a per-stage look).
 
 | measurement | x-RT |
 |---|---|
+| CrispASR parakeet-ctc Q4_K, manual attn, 134 s varied, load-excl | **158.6×** |
+| CrispASR parakeet-tdt Q4_K, backend joint projection, 134 s varied, load-excl | **116.1×** |
+| same TDT, scalar CPU joint projection | 52.4× |
 | CrispASR parakeet-ctc Q8_0, manual attn, warm in-process, jfk×5 55 s | **153×** (11 s: 116×) |
 | same, flash-with-CPU-fallback (old default) | 48× (11 s: 61×) |
 | CrispASR parakeet-ctc Q8_0, manual attn, **134 s varied, load-excl (honest)** | **137×** (tdt 49.5×) |
 | onnx-asr parakeet-ctc CUDA fp32, 134 s varied speech, in-process | **214×** (tdt 121×) |
 | onnx-asr parakeet-ctc CPU int8, 134 s varied | 5.8× (tdt 5.7×) |
+
+**Q4 round-2 rejected arms (P100, 2026-09-07; Kaggle
+`chr1str/crispasr-issue-81-q4-round-2`, encoder matrix v1 at `b82b7baf`,
+TDT matrix v3 at `c0527382`).** Device-side
+selection preserved exact transcripts but improved the experimental baseline by
+only 0.17% on the 134 s clip. Speculative joint batches lost 2.5–8.1%. The
+selection graph also made its argmax outputs part of the graph when the runtime
+switch was off, so that arm was removed rather than retained as a dormant option.
+
+| arm | 134 s median | x-RT | vs same-run baseline |
+|---|---:|---:|---:|
+| selection-graph baseline | 1.2062 s | 111.15× | — |
+| device argmax | 1.2042 s | 111.34× | +0.17% |
+| batch 4 | 1.2369 s | 108.39× | −2.48% |
+| batch 8 | 1.2700 s | 105.57× | −5.02% |
+| batch 4 + device argmax | 1.2284 s | 109.14× | −1.81% |
+| batch 8 + device argmax | 1.3044 s | 102.79× | −7.52% |
+
+The preceding CTC matrix rejected the other proposed Q4 levers on the same
+134 s varied clip. Direct standard/depthwise convolution reduced throughput,
+and enabling the fork's per-head flash-attention path on sm_60 was more than
+2× slower. Keeping selected FFN tensors at Q8 or F16 either failed transcript
+parity or lost speed.
+
+| CTC arm | x-RT | result |
+|---|---:|---|
+| baseline | **163.09×** | exact/stable |
+| direct initial conv | 157.78× | −3.3% |
+| direct depthwise conv | 120.94× | −25.8% |
+| both direct convs | 117.17× | −28.2% |
+| per-head flash attention | 69.87× | −57.2% |
+| flash + both direct convs | 60.11× | −63.1% |
+| selected FFN Q8 | 163.06× | transcript changed |
+| selected FFN F16 | 156.95× | transcript changed and −3.8% |
+
+**ggml v0.23 fork consolidation (P100 sm_60, 2026-09-07; Kaggle
+`chr1s4/crispasr-ggml-v0-23-q4-a-b` v3).** The old fork pin and merged
+v0.23 runtime used separate source-compatible CrispASR checkouts, the same Q4
+Parakeet TDT model and audio, and an account-matched warm ccache dataset.
+Transcripts were stable and byte-identical. v0.23 was neutral-to-faster:
+
+| clip | old fork | ggml v0.23 | change |
+|---|---:|---:|---:|
+| JFK, 11.00 s | 85.44× | **87.44×** | +2.34% |
+| varied speech, 134.07 s | 115.38× | **115.99×** | +0.53% |
+
+The benchmark exercised ggml runtime commit `069a517d`; the merged default
+commit `2dd13edd` has the same runtime source tree (later commits only add
+patch guards, CI, and merge ancestry). Kaggle validation passed and the
+`chr1s4/crispasr-ccache` seed was refreshed to version 13.
 
 CUDA rows resolved (2026-07-12, kernel `issue81-onnx-bench` v16, real
 134 s varied LibriSpeech, load-excluded, 301-word proof-of-work,
@@ -848,6 +942,18 @@ handover's "~1.4×" claim on independent honest methodology. (The 153×
 in-process row is repeat-audio jfk×5, ~6% cache-friendly and warm —
 kept as the best-case in-process figure; the 137× row is the fair
 varied-audio comparison against onnx.)
+
+Q4 follow-up (2026-09-07, kernel
+`chr1str/crispasr-issue-81-q4-p100-profile` v4, commit `39c2a7b2`, P100
+sm_60): profiling found that TDT spent about 1.40 s of its 2.56 s wall time in
+the encoder-to-joint projection, which still ran as scalar CPU code before the
+GPU decoder loop. One backend matmul reduced that projection to 4.0 ms and the
+total to 1.155 s: **52.4× → 116.1×**, 2.21× faster overall and about 4% below
+the historical 121× onnx-asr TDT CUDA result. Every repeat produced the same
+301-word transcript across both arms. CTC remained encoder-bound at **158.6×**.
+Stable graph buckets of 25/50/100 mel frames reached 156.5×/158.2×/154.9× on
+the varied set, all below the unbucketed control, so `CRISPASR_FC_BUCKET`
+remains opt-in.
 
 **VPS 4-core x86 re-bench (2026-07-12, DONE)**: parakeet-ctc-0.6b q8_0,
 jfk 11 s, same-box A/B (load ~2.5) — new defaults **5.43 s (2.0× RT)**
@@ -2239,7 +2345,15 @@ core infrastructure.
 **VibeVoice** (`vibevoice.cpp`):
 - Has: layer offload, pre-permuted ConvT weights, flash attn (decoder),
   dual CFG KV caches, pre-filled voice prompt KV, PyTorch-exact MT19937
-  Gaussian noise
+  Gaussian noise. **Streaming ASR 1.5B (2026-09-07, Kaggle P100):** native
+  2.93 s chunks + 0.53 s lookahead with persistent decoder KV; Q4_K decoded
+  the four-chunk JFK fixture in 6.82 s versus 8.26 s F16. Both emitted the
+  official transcript and all 34 official token IDs exactly. F16 prompt-logit
+  cosine was 0.9999998 and its four post-delimiter KV-tail cosines were all
+  above 0.99999997. Plain Q4_K is 1.86 GB; retaining both acoustic encoders in
+  F16 grew it to 2.73 GB without changing the transcript or token IDs, so the
+  plain Q4_K arm is the shipped artifact. Kernel:
+  `chr1str/crispasr-vibevoice-streaming-426-q4`, commit `f9f96dd2`.
 - Gap: acoustic+semantic encoders run serial (could fuse/parallel),
   pred head graph rebuilt per DPM step, no CPU embd cache, DPM schedule
   coefficients recomputed per call

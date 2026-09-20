@@ -246,6 +246,7 @@ struct canary_qwen_context {
 // ===========================================================================
 
 #include "core/gguf_loader.h"
+#include "core/ggml_cpu_backend.h"
 
 static ggml_tensor* try_get(canary_qwen_model& m, const char* name) {
     return core_gguf::try_get(m.tensors, name);
@@ -1292,7 +1293,7 @@ extern "C" struct canary_qwen_context* canary_qwen_init_from_file(const char* pa
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, params.n_threads);
 
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : nullptr;
     if (!ctx->backend)
@@ -1332,9 +1333,9 @@ extern "C" void canary_qwen_free(struct canary_qwen_context* ctx) {
     ctx->model.pw_q8.free();
     ctx->model.qkv_fused.free();
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.buf_cpu)
-        ggml_backend_buffer_free(ctx->model.buf_cpu);
+        core_gguf::release_weight_buffer(ctx->model.buf_cpu);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)

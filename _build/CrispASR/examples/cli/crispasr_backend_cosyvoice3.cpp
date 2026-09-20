@@ -9,9 +9,13 @@
 
 #include "crispasr_backend.h"
 #include "crispasr_backend_utils.h"
+#include "crispasr_tts_ref_text.h" // #334 auto-transcribe a --voice WAV
 #include "whisper_params.h"
 
 #include "cosyvoice3_tts.h"
+
+#include "core/audio_resample.h"
+#include "core/wav_reader.h"
 
 #include <cctype>
 #include <cstdio>
@@ -74,6 +78,10 @@ public:
     }
 
     int tts_sample_rate() const override { return 24000; }
+
+    // The voices.gguf this backend resolved at load. `--voice <name>` selects an
+    // entry inside it, so this is the only path the clone gate can read.
+    std::string voice_bank_path() const override { return voices_path_; }
 
     std::vector<crispasr_segment> transcribe(const float* /*samples*/, int /*n_samples*/, int64_t /*t_offset_cs*/,
                                              const whisper_params& /*params*/) override {
@@ -184,6 +192,11 @@ public:
             fprintf(stderr, "crispasr[cosyvoice3-tts]: failed to load voices '%s'\n", voices_path.c_str());
             return false;
         }
+        // Hand the bundle to the voice-clone gate. Every entry in here was baked
+        // from a reference recording, and --voice names one of them rather than
+        // a file, so without this the gate sees an unresolvable bare name and
+        // calls a zero-shot voice clone a preset. See voice_bank_path().
+        voices_path_ = voices_path;
         if (!p.no_prints) {
             int nv = cosyvoice3_tts_n_voices(ctx_);
             fprintf(stderr, "crispasr[cosyvoice3-tts]: %d voice(s) available:", nv);
@@ -209,18 +222,34 @@ public:
                                    ? params.target_lang
                                    : (params.language != "auto" ? params.language : std::string());
         cosyvoice3_tts_set_target_language(ctx_, tgt_lang.c_str());
+        // #329: --source-lang names the language of the REFERENCE clip. Without
+        // it the backend infers one from the voice-bank name or the reference
+        // transcript, which cannot always answer — and when it cannot, the
+        // target language is silently ignored and the clone keeps the
+        // reference's accent (exactly the report in #329).
+        cosyvoice3_tts_set_reference_language(ctx_, params.source_lang.c_str());
 
         int n = 0;
         float* pcm = nullptr;
         if (ends_with_ci(params.tts_voice, ".wav")) {
-            if (params.tts_ref_text.empty()) {
-                fprintf(stderr, "crispasr[cosyvoice3-tts]: --voice is a WAV but --ref-text was not set.\n");
+            // #334: the talker is conditioned on the (reference transcript,
+            // reference speech) pair and reads the speaker's rate off it, so a
+            // transcript that does not match the clip is the single most
+            // damaging input here — it stops the decode dead or rushes the
+            // requested line. Refusing to run without one only pushed that job
+            // onto the caller, who typically approximates. Transcribe it
+            // ourselves instead (cached beside the clip), exactly as f5-tts
+            // already does; an explicit --ref-text still wins.
+            const std::string ref_text = resolve_ref_text(params);
+            if (ref_text.empty()) {
+                fprintf(stderr,
+                        "crispasr[cosyvoice3-tts]: --voice is a WAV and --ref-text was not set, and the reference "
+                        "could not be auto-transcribed. Pass --ref-text \"<exact transcript of the clip>\".\n");
                 return {};
             }
             if (!ensure_cloning_models())
                 return {};
-            pcm = cosyvoice3_tts_synth_from_wav(ctx_, text.c_str(), params.tts_voice.c_str(),
-                                                params.tts_ref_text.c_str(), &n);
+            pcm = cosyvoice3_tts_synth_from_wav(ctx_, text.c_str(), params.tts_voice.c_str(), ref_text.c_str(), &n);
         } else {
             const char* voice = params.tts_voice.empty() ? nullptr : params.tts_voice.c_str();
             pcm = cosyvoice3_tts_synth(ctx_, text.c_str(), voice, &n);
@@ -243,6 +272,25 @@ public:
     }
 
 private:
+    // An explicit --ref-text wins; otherwise read the clip, resample to 16 kHz
+    // and hand it to the ASR backend behind the shared ref-text cache. Returns
+    // "" only when both are unavailable.
+    std::string resolve_ref_text(const whisper_params& p) {
+        if (!p.tts_ref_text.empty())
+            return p.tts_ref_text;
+        std::vector<float> pcm;
+        int sr = 0;
+        if (!crispasr::core::read_wav_mono_pcm16(p.tts_voice, pcm, sr) || pcm.empty() || sr <= 0) {
+            fprintf(stderr, "crispasr[cosyvoice3-tts]: could not read '%s' as PCM16 WAV for auto-transcription\n",
+                    p.tts_voice.c_str());
+            return "";
+        }
+        if (sr != 16000)
+            pcm = core_audio::resample_polyphase(pcm.data(), (int)pcm.size(), sr, 16000);
+        return crispasr_ref_text::resolve_cached(p.tts_voice, pcm, p, "crispasr[cosyvoice3-tts]",
+                                                 crispasr_ref_cache::kCv3RefTextSuffix);
+    }
+
     bool ensure_cloning_models() {
         std::lock_guard<std::mutex> lock(cloning_models_mutex_);
         if (cloning_models_loaded_)
@@ -267,6 +315,7 @@ private:
     struct cosyvoice3_tts_context* ctx_ = nullptr;
     std::string campplus_path_;
     std::string s3tok_path_;
+    std::string voices_path_;
     bool cloning_models_loaded_ = false;
     std::mutex cloning_models_mutex_;
 };

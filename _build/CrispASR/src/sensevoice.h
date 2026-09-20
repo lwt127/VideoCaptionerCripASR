@@ -1,9 +1,12 @@
 // sensevoice.h — FunAudioLLM/SenseVoiceSmall ggml runtime
 //
-// Multi-task ASR: transcript + language ID + emotion + audio-event tags
-// in one forward pass through a single CTC head. Encoder-only (no AR
-// decode); same SenseVoiceEncoderSmall topology as Fun-ASR-Nano-2512
-// but with an attached CTC head instead of an LLM decoder.
+// Multi-task ASR: transcript + language ID + audio-event tags in one
+// forward pass through a single CTC head. Encoder-only (no AR decode);
+// same SenseVoiceEncoderSmall topology as Fun-ASR-Nano-2512 but with an
+// attached CTC head instead of an LLM decoder.
+//
+// Upstream SenseVoice is also an emotion classifier. CrispASR does not
+// expose that output — see the note on `sensevoice_result` below.
 //
 // Architecture (matches funasr/models/sense_voice/model.py exactly):
 //
@@ -84,13 +87,28 @@ char* sensevoice_transcribe(struct sensevoice_context* ctx, const float* samples
 // fields and removed from `text`. Empty strings mean the model did
 // not emit that token (e.g. degenerate audio). Upstream emits the
 // prefix in fixed order `[language, event, emotion, itn]`.
+//
+// NO EMOTION FIELD — deliberately. The model still emits an `<|HAPPY|>` /
+// `<|ANGRY|>` / ... marker, and we still parse it (so it is stripped out of
+// `text` rather than leaking into the transcript), but the value is discarded
+// and never surfaced. Inferring a person's emotions from their voice makes the
+// thing doing it an "emotion recognition system" (EU AI Act Art. 3(39)), which
+// is PROHIBITED in workplace and education settings (Art. 5(1)(f), in force
+// since 2 Feb 2025) and otherwise HIGH-RISK (Annex III(1)(c)) — and the AI
+// Act's open-source exemption (Art. 2(12)) does not cover either category.
+// CrispASR does not ship the capability at all, so no configuration of it is
+// an emotion recognition system. See docs/eu-ai-act.md. Do not re-add this
+// field; the regression guard is tests/test-no-emotion-recognition.cpp.
 struct sensevoice_result {
     char* language;    // e.g. "en", "zh", "yue", "ja", "ko", "nospeech"
-    char* emotion;     // e.g. "HAPPY", "NEUTRAL", "ANGRY", "SAD", "EMO_UNKNOWN"
-    char* audio_event; // e.g. "Speech", "Music", "BGM", "Laughter", "Cough"
+    char* audio_event; // e.g. "Speech", "Music", "BGM", "Applause"
     char* itn;         // "withitn" or "woitn"
     char* text;        // transcript with the prefix stripped
-    char* raw;         // original transcribe() output, prefix included
+    // Unfiltered model output, annotation prefix included — so it still carries
+    // the raw `<|HAPPY|>` token. It exists ONLY for byte-exact parity against
+    // the FunASR reference in the diff harness; nothing in CrispASR surfaces it
+    // and nothing should. Use `text`.
+    char* raw;
 };
 
 // Caller owns; release with sensevoice_result_free(). nullptr on failure.

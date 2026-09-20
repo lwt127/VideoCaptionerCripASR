@@ -90,11 +90,13 @@ These are not tied to a single backend.
 | Variable | Purpose |
 |----------|---------|
 | `CRISPASR_MODELS_DIR` | Directory searched for GGUF models (also the auto-download target root). |
-| `CRISPASR_CACHE_DIR` | Base cache directory for auto-downloaded models/assets (default `~/.cache/crispasr`). |
+| `CRISPASR_CACHE_DIR` | Base cache directory for auto-downloaded models/assets. Resolution order is `CRISPASR_CACHE_DIR` → `CRISPASR_MODELS_DIR` → platform default (`$HOME/.cache/crispasr`; `%USERPROFILE%\.cache\crispasr` on Windows). |
 | `CRISPASR_SCRATCH_DIR` | Scratch directory for temporary run artifacts. |
 | `CRISPASR_DUMP_DIR` | Global tensor-dump directory (diagnostics). |
 | `CRISPASR_GGUF_MMAP` / `CRISPASR_GGUF_PRELOAD` | Control GGUF mmap vs. preload-into-RAM loading. |
+| `CRISPASR_GGUF_MAX_ALLOC_CHUNK` | Lower the per-buffer allocation cap in bytes (default 1.5 GiB) used to split a model across several backend buffers on drivers with a small `maxMemoryAllocationSize` (#276). |
 | `CRISPASR_MLOCK` | mlock model weights into RAM. |
+| `CRISPASR_IGNORE_CPU_ISA` | `=1` exactly (no other value works) continues past the startup build-vs-host CPU instruction-set check (#380) instead of exiting; the process will SIGILL at the first compute op the CPU can't run. |
 
 ### GPU / device placement
 
@@ -104,6 +106,8 @@ These are not tied to a single backend.
 | `CRISPASR_ARG_DEVICE` | Default device selection for the CLI. |
 | `CRISPASR_KV_ON_CPU` | Keep the KV cache on the CPU. |
 | `CRISPASR_KV_QUANT` / `_KV_QUANT_K` / `_KV_QUANT_V` / `_KV_READ_F32` | KV-cache quantization / read format. |
+| `CRISPASR_GPU_PREF_CPU_LEGACY` | `1` restores the pre-T18 behaviour where `--gpu-backend cpu` fell through to the best GPU. Off by default: the fall-through silently constructed a Metal device the flag exists to avoid. |
+| `CRISPASR_METAL_PIPELINE_CACHE_MAX_MB` | Size cap in MiB (default `64`) above which the on-disk Metal pipeline-cache archive is skipped at init — opening it costs ~1 ms/MB. `0` = uncapped (always use it). macOS only. |
 
 > Device *selection* across compiled backends also honors the standard ggml /
 > CUDA variables `CUDA_VISIBLE_DEVICES` and `GGML_VK_VISIBLE_DEVICES` — see
@@ -117,6 +121,36 @@ These are not tied to a single backend.
 | `CRISPASR_SESSION_CHUNK_SECONDS` | Chunk length (seconds) for session auto-chunking. |
 | `CRISPASR_SESSION_PERBACKEND_CHUNK` | Use per-backend chunk-window tuning instead of a flat window. |
 | `CRISPASR_SESSION_UNIFIED_DISPATCH` | Route surfaces through the unified library dispatch path. |
+| `CRISPASR_SLICE_PIPELINE` | Force the CLI's encode ∥ decode slice pipeline on/off. The override may only turn it OFF, or ON where it is *already* safe — it can never switch off one of the safety conditions (`-p N`, `--return-logits`, gap-fill re-entry, single slice). |
+
+### Post-decode hygiene (PLAN.md §W2–W7)
+
+All OFF unless set. Each of these can delete or alter user-visible text, so
+none of them switches on by surprise; a wrong deletion is worse than a
+surviving artifact. Applied on both the CLI and the session C-ABI.
+
+| Variable | Purpose |
+|----------|---------|
+| `CRISPASR_SEG_MAX_CHARS` | Truncate any segment longer than N **code points**, backing up to the last `。．.！!？?、,` but never below 75% of the cap. A line past the cap is almost always a repetition hallucination that survived the n-gram collapse. |
+| `CRISPASR_SEG_DROP_NONVERBAL` | Drop segments that are entirely a non-verbal marker — `[Music]`, `(applause)`, `（喘ぎ声）`, `♪`. Running speech merely *containing* such a word is never dropped. |
+| `CRISPASR_SEG_LOGPROB_THOLD` | Drop segments whose average log-probability is below this. Post-hoc, on top of the decoder's own fallback gate. |
+| `CRISPASR_SEG_LOGPROB_MARGIN` | Loosen that threshold by this much for segments ≤1.6 s — a short segment's mean logprob is noisier, so it gets more room, not less. |
+| `CRISPASR_SEG_MERGE_REPEATS` | Collapse runs of near-identical adjacent segments into one spanning the whole run. Catches a phrase repeating *across* segment boundaries, which per-segment loop fixes cannot see. |
+| `CRISPASR_SEG_MERGE_SIMILARITY` | Similarity bar for the above (default 0.90; LCS over code points). |
+| `CRISPASR_SEG_MERGE_GAP_CS` | Never merge across a gap wider than this many centiseconds (default 200). Two identical lines a minute apart are two real utterances. |
+| `CRISPASR_SEG_MERGE_MIN_RUN` | Minimum consecutive similar segments before merging (default 3), so an ordinary repeated "yes." pair survives. |
+
+### Alignment and VAD sanity checks
+
+| Variable | Purpose |
+|----------|---------|
+| `CRISPASR_ALIGN_SENTINEL` | `0` disables the forced-alignment collapse check. On by default, **detect + warn only**. Catches `ctc_forced_align()` returning words at `t0 == t1 == 0` — its two silent-zero paths (characters absent from the CTC vocab, or a word the Viterbi path never visited) produce garbage timestamps inside a *successful* return. |
+| `CRISPASR_ALIGN_SENTINEL_REDISTRIBUTE` | `1` opts into repair: respace the words across the clip in proportion to character count. Off by default — a wrong auto-repair would be just as invisible as the collapse. |
+| `CRISPASR_VAD_FAILOVER` | `0` disables the VAD sanity check. On by default: if a clip over 120 s comes back with under 1% speech coverage (or a couple of segments covering under 10% of a very long clip), the VAD is wrong and the run falls back to fixed full-clip chunks rather than losing the transcript. |
+| `CRISPASR_NGRAM_LOOPFIX_OFF` | `1` disables the repeated-n-gram collapse entirely, exposing the RAW decoded text. Diagnostic: for telling whether a loop originates in the decode itself or is merely being masked. |
+| `CRISPASR_ORDER_WARN` | `0` disables the one-shot "segment timestamps go backwards" warning. On by default; detect + warn only. Cues that merely *overlap* are deliberately not flagged (gap-fill jitter). |
+| `CRISPASR_ALIGN_NO_ROMANIZE` | `1` passes non-Latin reference text through raw instead of auto-romanizing it for a CTC aligner with a Latin vocabulary (#252). Since #419 the romanization is only the aligner's internal label — aligned words hand back the original script, so srt/vtt/`-sp`/`-sow` output no longer flips Cyrillic/CJK transcripts to transliteration. |
+| `CRISPASR_ALIGN_DEBUG` | `1` prints the romanized reference transcript the aligner actually used. |
 
 ### Decoding / beam search (shared)
 
@@ -125,19 +159,31 @@ These are not tied to a single backend.
 | `CRISPASR_MAES_BETA` / `_MAES_GAMMA` / `_MAES_NUM_STEPS` | MAES beam-search parameters. |
 | `CRISPASR_TDT_BATCH` / `CRISPASR_RNNT_BATCH` | Batch the TDT / RNNT joint decode. |
 | `CRISPASR_RNNT_GGML_PERSTEP` | Per-step (vs. persistent-graph) ggml RNNT decode. |
+| `CRISPASR_RNNT_GPU_ENC_PROJ` | Parakeet's backend encoder-to-joint projection is default on CUDA. `0` restores the scalar CPU projection; `1` opts other GPU backends in. |
 | `CRISPASR_NGRAM_LOOPFIX_OFF` | Disable the n-gram decode-loop breaker. |
-| `CRISPASR_GAP_FILL` / `_GAP_FILL_MIN_CS` | Gap-fill between segments (long audio). |
+| `CRISPASR_STREAM_SLICE_MEMO` | Memoize per-slice streaming partial decodes by absolute sample range (#404). **Default ON** — finals byte-equal, wall −12 % CPU / −6 % GPU in the quiet-box A/B; `=0` re-decodes closed slices every step. |
+| `CRISPASR_GAP_FILL` / `_GAP_FILL_MIN_CS` | Re-transcribe spans a first pass left empty (long audio); on by default for parakeet, threshold non-JA 300 cs / JA 100 cs. |
 
 ### G2P / phonemizer
 
 | Variable | Purpose |
 |----------|---------|
 | `CRISPASR_CMUDICT_PATH` | Path to the CMUdict pronunciation dictionary. |
-| `CRISPASR_DE_DICT_PATH` / `_FR_DICT_PATH` / `_ES_DICT_PATH` | Language-specific pronunciation dictionaries. |
+| `CRISPASR_DE_DICT_PATH` / `_FR_DICT_PATH` / `_ES_DICT_PATH` / `_RU_DICT_PATH` | Language-specific pronunciation dictionaries. |
+| `CRISPASR_RU_HETERONYMS_PATH` | Path to the Russian heteronym list. Only read when `CRISPASR_G2P_RU_HETERONYM_WARN` is on — it is diagnostic data, not a lookup tier. |
+| `CRISPASR_G2P_RU_HETERONYM_WARN` | `1` prints one line per input word that the upstream project flagged as genuinely ambiguous. Those 17,359 words are DISJOINT from the 812,953-entry vocabulary — they were removed because upstream could not choose a reading — so they have no dictionary entry and the letter-to-sound rules pick one reading from spelling alone. Common words are in that set (`все`, `уже`, `потом`, `чем`, `небо`, `тест`). Off by default; on, it turns a mispronunciation that looks like a rule bug into a named, explained limitation. Writing the `ё` or an explicit combining acute (`замо́к`) in the input resolves many of them, and both are honoured. |
+| `CRISPASR_G2P_RU_ANALOGY` | `0` disables the Russian stress-analogy tier, which finds a known relative of an OOV word (strip up to 3 letters, glue a short list of inflectional endings back on) and borrows its stress. On by default and measured on 10,000 held-out dictionary words: stressed-syllable index right 93.9% with it and 47.1% without; exact IPA match 79.4% vs 40.9%. The lever exists because it is the one tier that can take a stress from a word that merely LOOKS related. |
 | `CRISPASR_G2P_DICT_SOURCE` / `_G2P_MODEL_PATH` | G2P dictionary source / neural G2P model path. |
 | `CRISPASR_ESPEAK_DATA_PATH` | eSpeak-NG data directory. |
+| `CRISPASR_MISAKI_DICT_PATH` | Path to the misaki US contextual-word dictionary (default `~/.cache/crispasr/misaki-us.txt`) used by the English misaki G2P (#316). |
 | `CRISPASR_KOKORO_G2P` | Kokoro G2P backend selection. |
 | `CRISPASR_KOKORO_MISAKI_IPA` | `0` disables the espeak-IPA → misaki-alphabet conversion Kokoro needs (#316), restoring the raw G2P spelling for A/B. On by default. |
+| `CRISPASR_G2P_DE_UNSTRESS` | `1` reads the German closed class the way espeak reads it in a SENTENCE (`sie` → `ziː`) instead of the citation form our per-word dictionary stores (`zˈiː`). Off by default: it takes phoneme agreement with espeak from 45.9% to 87.1%, but the ASR round-trip could not resolve a difference, and that metric measures intelligibility rather than naturalness (#316). |
+| `CRISPASR_KOKORO_DE_MISAKI_ALPHABET` | `1` applies misaki's tied-sequence collapse for German (`tsvˈaɪ` → `ʦvˈI`), which is what the published training recipe does. Off by default: it made the ASR round-trip worse on the `kokoro-de-hui-base` model we ship, which appears to predate that part of the recipe (#316). The `ʏ`→`y` vocabulary fixup is applied either way. |
+| `CRISPASR_T5_REPEAT_BREAK` | `0` disables the decode-loop break for madlad/T5 translation, restoring exact PyTorch-blueprint behaviour. On by default: MADLAD greedy-decodes into a repeated token cycle on some short inputs and burns the whole token budget on it. The blueprint does the same — this is a deliberate improvement on it, not a parity fix (#333). |
+| `CRISPASR_T5_NO_KV_REUSE` | `1` re-forwards the whole decoder prefix each step instead of appending to the KV cache. Same output, much slower; an A/B lever for isolating cache bugs (#333). |
+| `CRISPASR_T5_KEEP_EMBED` | `1` keeps `shared.embed.*` and `lm_head.*` at source precision when quantizing a T5 model. **Off by default because it was measured and loses**: on madlad400 it makes q8_0 3.38→3.62 GB and q4_k 2.04→2.41 GB for a worst-stage cosine that does not improve (0.999922→0.999920, 0.992929→0.992606). The Q4_K loss accumulates through the 32 encoder blocks, not in the embedding lookup (#333). |
+| `CRISPASR_KOKORO_PUNCT` | `0` drops punctuation from the phoneme string for the German/French/Spanish built-in G2Ps, restoring pre-0.8.26 behaviour for A/B. On by default: Kokoro's vocabulary contains `,.;:!?` and they are how it pauses (#316). English is not gated — it is settled against misaki. |
 
 ### Watermark / provenance
 
@@ -145,7 +191,9 @@ These are not tied to a single backend.
 |----------|---------|
 | `CRISPASR_NO_WATERMARK` | Disable the audio watermark. |
 | `CRISPASR_WATERMARK_LEGACY` | Use the legacy watermark path. |
+| `CRISPASR_WATERMARK_DETECT` | Which statistic `--detect-watermark` uses: `frames` (per-frame *t* + decoy specificity) or `sign` / `0` (the older averaged-spectrum sign test, kept for A/B and for re-reading an older release's score). |
 | `CRISPASR_NO_C2PA_REMUX` | Skip the C2PA MP4 remux step. |
+| `CRISPASR_CONSENT_LOG` | Path to a JSON-Lines sink for voice-cloning consent records. Without it the records only go to stderr, which is interleaved with model-load noise and so a poor evidential artefact. |
 
 ### Quantization / diff-harness / misc
 
@@ -155,10 +203,43 @@ These are not tied to a single backend.
 | `CRISPASR_IMATRIX_OUT` | Importance-matrix output path. |
 | `CRISPASR_ACTDUMP_OUT` / `_ACTDUMP_TENSOR` | Activation dump output / target tensor. |
 | `CRISPASR_DIFF_NO_GPU` / `_DIFF_USE_GPU` / `_DIFF_SLICES` / `_DIFF_STAGES` | `crispasr-diff` harness controls. |
-| `CRISPASR_MEL_PARALLEL` / `_MEL_TIMING` | Parallelize / time mel-spectrogram computation. |
+| `CRISPASR_MEL_SERIAL` | Force the serial STFT. The parallel mel/STFT path is DEFAULT ON since #305; this is the opt-out. (The older opt-in `CRISPASR_MEL_PARALLEL` is no longer read.) |
+| `CRISPASR_MEL_TIMING` | Print mel/STFT stage timings. |
+| `CRISPASR_HQ_RESAMPLE` | `0` selects the cheap linear resampler for CLI input decoding instead of the high-quality one. |
+| `CRISPASR_CORE_ATTN_EAGER_F32` | Force the shared attention helper's eager (non-flash) path to F32 accumulation. |
+| `CRISPASR_CORE_ATTN_DUMP_FA_LAYER` | Dump the shared attention helper's flash-attn inputs/outputs for one layer index. |
 | `CRISPASR_VERBOSE` | Global verbose output. |
 | `CRISPASR_NO_WARMUP` / `CRISPASR_WARMUP` | Skip / force the model warmup pass. |
 | `CRISPASR_SERVER_WORKERS` / `CRISPASR_API_KEYS` | HTTP server worker count / API keys. |
+| `CRISPASR_TEST_STREAM_THROW` | Test-only: lets the server's streaming worker throw on the magic input `__throw_test__` (both the variable *and* the input are required, so it cannot fire in production). |
+
+### Container / launcher
+
+Read by the Docker images and `.devops/run-server.sh`, not by the C++ itself —
+`crispasr-diagnostics` echoes them so a support dump shows how the container was
+started.
+
+| Variable | Purpose |
+|----------|---------|
+| `CRISPASR_BACKEND` | Backend the container's entrypoint should select (`docker-compose*.yml`, `.env.example`). |
+| `CRISPASR_USE_CUDA_COMPAT` | `1` prepends `/usr/local/cuda/compat` to `LD_LIBRARY_PATH` in the CUDA images — for hosts whose driver is older than the image's CUDA runtime. |
+
+### Vendored ggml (CrispASR-added)
+
+CrispASR's in-tree `ggml/` carries a few CrispASR-prefixed knobs on top of
+upstream's `GGML_*` set. They are read by `getenv` directly (no legacy alias).
+
+| Variable | Purpose |
+|----------|---------|
+| `CRISPASR_GGML_ALLOC_TRACE` | Trace `ggml-alloc` graph-allocation decisions. |
+| `CRISPASR_GGML_ALLOC_TRACE_MAX_PASSES` | Number of allocation passes that trace prints (default: unlimited once the trace is on). |
+| `CRISPASR_METAL_N_CB` | Override the Metal backend's command-buffer count (#83). |
+| `CRISPASR_METAL_PROFILE` | `1` whole-graph host/GPU split, `2` per-op breakdown, `3` per-op plus a per-node trace announced *before* each encode — with `3` the last line names the node an encode faulted on. |
+| `CRISPASR_METAL_STRICT_FP` | Compile the Metal kernels with fast-math OFF (#83). Costs throughput; buys bit-identical CPU/GPU output where operand reordering was downconverting F32 intermediates. |
+| `CRISPASR_METAL_FORCE_BARRIER` | `1` forces a memory barrier before every Metal op (concurrency-hazard bisection, #83). |
+| `CRISPASR_METAL_IM2COL_FLAT` | `0` restores the legacy IM2COL Metal kernel. The flat kernel (one thread per dst element) is the default. |
+| `CRISPASR_FORCE_BLIT_COPY` | Use the blit-encoder copy path even for a shared (unified-memory) Metal buffer (#83). |
+| `CRISPASR_FORCE_DMB` | Insert a full memory barrier after the host memcpy into a shared Metal buffer (#83). |
 
 ## Reference-voice cache (voice cloning)
 
@@ -237,12 +318,15 @@ suffixes.
 
 ### ARK-ASR
 
+- `CRISPASR_ARKASR_BLOCK_FROM_ID`
 - `CRISPASR_ARKASR_CPU`
 - `CRISPASR_ARKASR_DEBUG_GEN`
 - `CRISPASR_ARKASR_GPU`
+- `CRISPASR_ARKASR_INSTRUCTION`
 - `CRISPASR_ARKASR_MAX_SINGLE_PASS_S`
 - `CRISPASR_ARKASR_NO_CHUNK_CONTEXT`
 - `CRISPASR_ARKASR_NO_EOS_SUPPRESS`
+- `CRISPASR_ARKASR_NO_SPECIAL_SUPPRESS`
 - `CRISPASR_ARKASR_TIMING`
 
 ### AudioSeal watermark
@@ -262,12 +346,18 @@ suffixes.
 - `CRISPASR_BARK_DECODE_CODES`
 - `CRISPASR_BARK_DUMP_DIR`
 
+### Beat-This (beat tracking)
+
+- `CRISPASR_BEAT_THIS_DEBUG`
+
 ### BERT encoder
 
 - `CRISPASR_BERT_ENCODER_BENCH`
 
 ### BTC chord recognition
 
+- `CRISPASR_BTC_DEBUG`
+- `CRISPASR_BTC_DUMP_FEAT`
 - `CRISPASR_BTC_MAJ_MIN` — collapse the 170-class chord output to the 25-class
   maj/min vocabulary. Default off (full 170-class output): 170 reduces to
   maj/min at runtime, but a 25-class model can never be expanded, so the
@@ -287,6 +377,8 @@ suffixes.
 - `CRISPASR_CANARY_QWEN_DEBUG`
 - `CRISPASR_CANARY_QWEN_MIN_ENC_FRAMES`
 - `CRISPASR_CANARY_QWEN_NO_ECHO_STRIP`
+- `CRISPASR_CANARY_LEGACY_STREAM`
+- `CRISPASR_CANARY_SEAM_DEDUP`
 - `CRISPASR_CANARY_STREAM_THRESHOLD_S`
 
 ### Chatterbox
@@ -307,8 +399,22 @@ suffixes.
 - `CRISPASR_CHATTERBOX_DUMP_QPROJ_AT`
 - `CRISPASR_CHATTERBOX_DUMP_VPROJ_AT`
 - `CRISPASR_CHATTERBOX_DUMP_WK`
+- `CRISPASR_CHATTERBOX_FLASH_ATTN` — force `ggml_flash_attn_ext` for the T3
+  GPT-2 (turbo/nano) attention even on Vulkan, where naive attention is the
+  default since issue #402 (RADV 780M crashes in the Vulkan FLASH_ATTN_EXT
+  pipeline; the explicit softmax(QK^T)V path is verified working there).
+- `CRISPASR_CHATTERBOX_FORCE_GPU`
+- `CRISPASR_CHATTERBOX_FULL_CPU`
 - `CRISPASR_CHATTERBOX_LANG`
-- `CRISPASR_CHATTERBOX_NAIVE_ATTN`
+- `CRISPASR_CHATTERBOX_KV_CONT` — materialize GPT-2 K/V layer views before
+  flash attention, reproducing the pre-PR-410 path for correctness/performance
+  A/Bs. The default passes the views directly; naive attention still
+  materializes them because its matrix operations require that layout.
+- `CRISPASR_CHATTERBOX_NAIVE_ATTN` — force the explicit softmax(QK^T)V T3
+  attention on every backend (debug gate; outranks `_FLASH_ATTN`).
+- `CRISPASR_CHATTERBOX_S3GEN_CPU`
+- `CRISPASR_CHATTERBOX_T3_CPU_S3GEN_GPU`
+- `CRISPASR_CHATTERBOX_T3_GPU`
 - `CRISPASR_CHATTERBOX_SEED`
 - `CRISPASR_CHATTERBOX_SYN_TEXT`
 - `CRISPASR_CHATTERBOX_T3_BUCKET_REUSE`
@@ -324,9 +430,13 @@ suffixes.
 - `CRISPASR_S3GEN_DUMP`
 - `CRISPASR_S3GEN_DUMP_UNET`
 - `CRISPASR_S3GEN_DUMP_UNET_NO_AUTO_MARK`
+- `CRISPASR_S3GEN_ENCODER_CPU`
 - `CRISPASR_S3GEN_FASTCONV`
 - `CRISPASR_S3GEN_FASTCONV_DEBUG`
+- \`CRISPASR_S3GEN_SIMDCONV\` — opt into the CPU HiFT packed SIMD path for all 72 ResBlock Conv1d kernels; default off. Stays OPT-IN deliberately: the Kaggle A/B measured a 5.4 % s3gen REGRESSION on Xeon avx512f against the contributor's 1.25x win on Zen 4 — micro-arch dependent; A/B on your own hardware before enabling.
+- `CRISPASR_S3GEN_SIMDCONV_DEBUG` — print pack count, selected ISA, and CPU/GPU fallback status.
 - `CRISPASR_S3GEN_RC_AS_MUL_MAT`
+- `CRISPASR_S3GEN_VOCODER_CPU`
 - `CRISPASR_S3GEN_UNET_CFG_SINGLE`
 - `CRISPASR_S3GEN_UNET_CPU`
 - `CRISPASR_S3GEN_UNET_GALLOCR`
@@ -363,9 +473,38 @@ suffixes.
 - `CRISPASR_COHERE_DUMP_STAGES`
 - `CRISPASR_COHERE_FLASH`
 - `CRISPASR_COHERE_GAPS`
+- `CRISPASR_COHERE_LANGS`
 - `CRISPASR_COHERE_LEGACY_SA`
+- `CRISPASR_COHERE_PROBE_MAX_LANGS`
+- `CRISPASR_COHERE_PROBE_REUSE_ENC`
+- `CRISPASR_COHERE_PROBE_TEXTLID`
 - `CRISPASR_COHERE_PROF`
+- `CRISPASR_COHERE_SILENCE_GATE`
 - `CRISPASR_COHERE_THREADS`
+
+### Confucius4 TTS
+
+- `CRISPASR_CONFUCIUS4_BEAMS`
+- `CRISPASR_CONFUCIUS4_CFG_FUSE`
+- `CRISPASR_CONFUCIUS4_CFG_RATE`
+- `CRISPASR_CONFUCIUS4_COND_DIR`
+- `CRISPASR_CONFUCIUS4_COND_PYEMB`
+- `CRISPASR_CONFUCIUS4_DUMP_S2A`
+- `CRISPASR_CONFUCIUS4_FLASH` — `1` opts the flow-matching estimator (DiT)
+  attention into the fused `ggml_flash_attn_ext` kernel. Default is a manual
+  softmax(QKᵀ)·V path in F32 (via `core/sdpa.h`), correct on every backend; the
+  fused kernel accumulates KQ in F16 and its precision hint is ignored on some
+  GPUs (P100/sm_60), which corrupts the ODE integration for a flow model. Set
+  only where the hint is honoured (read per call).
+- `CRISPASR_CONFUCIUS4_GRAPH_EMBED`
+- `CRISPASR_CONFUCIUS4_LR_LEGACY`
+- `CRISPASR_CONFUCIUS4_MAX_LAYERS`
+- `CRISPASR_CONFUCIUS4_PERSIST`
+- `CRISPASR_CONFUCIUS4_REP_PEN`
+- `CRISPASR_CONFUCIUS4_S2A_TEMP`
+- `CRISPASR_CONFUCIUS4_SCHED`
+- `CRISPASR_CONFUCIUS4_TEXT_IDS`
+- `CRISPASR_CONFUCIUS4_T_SCHEDULE`
 
 ### CosyVoice3
 
@@ -374,19 +513,44 @@ suffixes.
 - `CRISPASR_COSYVOICE3_CFG_BATCH`
 - `CRISPASR_COSYVOICE3_CFG_INTERVAL`
 - `CRISPASR_COSYVOICE3_CFG_INTERVAL_DEBUG`
+- `CRISPASR_COSYVOICE3_DUMP_HIFT`
+- `CRISPASR_COSYVOICE3_DUMP_MEL`
 - `CRISPASR_COSYVOICE3_DUMP_TOKENS`
 - `CRISPASR_COSYVOICE3_FASTCONV`
 - `CRISPASR_COSYVOICE3_FASTCONV_DEBUG`
+- `CRISPASR_COSYVOICE3_SIMDCONV` — CPU-only direct SIMD Conv1d path for the 72 HiFT ResBlock convolutions; **default ON** since the Kaggle quiet-box A/B (1.07x on Xeon avx512f, 1.34x on Zen 4, output 1-LSB-equal, roundtrip exact). Set `=0` for the ggml path.
+- `CRISPASR_COSYVOICE3_SIMDCONV_DEBUG` — print pack count, selected ISA, and GPU fallback status.
 - `CRISPASR_COSYVOICE3_FLOW_STEPS`
+- `CRISPASR_COSYVOICE3_FORCE_GALLOCR`
+- `CRISPASR_COSYVOICE3_GREEDY`
+- `CRISPASR_COSYVOICE3_HIFT_ON_GPU`
 - `CRISPASR_COSYVOICE3_HIFT_PATH`
 - `CRISPASR_COSYVOICE3_KV_BUCKET`
+- `CRISPASR_COSYVOICE3_NO_CLONE_CACHE` — re-extract the `--voice ref.wav`
+  speaker (s3tokenizer + CAMPPlus + prompt mel) on every synthesis instead of
+  once per reference. Output-identical; the cached path is ~30% faster on a
+  multi-sentence `--tts` (#334).
+- `CRISPASR_COSYVOICE3_NO_MIN_LEN` — drop the decode's minimum-length floor
+  (2 speech tokens per target text token, upstream's `min_token_text_ratio`).
+  Without the floor a single unlucky sample at step 0 ends the decode with no
+  audio at all (#334).
+- `CRISPASR_COSYVOICE3_UPSTREAM_DIR`
 - `CRISPASR_COSYVOICE3_VOICES_PATH`
+- `CRISPASR_COSYVOICE3_VULKAN_NATIVE`
 
 ### CosyVoice3 (diff-harness assets)
 
+- `CRISPASR_CV3_CAMPPLUS_GGUF`
 - `CRISPASR_CV3_FLOW_GGUF`
 - `CRISPASR_CV3_HIFT_GGUF`
 - `CRISPASR_CV3_S3TOK_GGUF`
+
+### CREPE (pitch)
+
+- `CRISPASR_CREPE_BATCH`
+- `CRISPASR_CREPE_DEBUG`
+- `CRISPASR_CREPE_NO_BAKE_F32`
+- `CRISPASR_CREPE_NO_GPU`
 
 ### CSM TTS
 
@@ -415,6 +579,7 @@ suffixes.
 - `CRISPASR_DOTS_DIFF_GPU`
 - `CRISPASR_DOTS_DIT_DEBUG`
 - `CRISPASR_DOTS_EOS_THRESHOLD`
+- `CRISPASR_DOTS_FAST`
 - `CRISPASR_DOTS_FM_AB`
 - `CRISPASR_DOTS_FM_DUMP`
 - `CRISPASR_DOTS_FUSED_STEP`
@@ -439,10 +604,19 @@ suffixes.
 - `CRISPASR_F5_BATCH_CFG`
 - `CRISPASR_F5_BENCH`
 - `CRISPASR_F5_CFG_INTERVAL`
+- `CRISPASR_F5_DIT_SKIP`
 - `CRISPASR_F5_DURATION_CLAMP` — clamp the per-char speech rate into a sane English band so a reference whose audio/transcript lengths are mismatched can't truncate (or balloon) the output (#294). Default on; set `0` to restore the exact upstream `ref_T / ref_text_len * gen_text_len / speed` estimate.
+- `CRISPASR_F5_EMBED_GPU`
+- `CRISPASR_F5_F16_ACT`
+- `CRISPASR_F5_HIFIGAN_CPU` — `1` restores the pre-`a72fb66d` CPU-loop
+  HiFi-GAN decode (A/B fallback; the default ggml `core_hifigan` graph path
+  is ~250x faster on GPU and cosine-1.000000 identical).
+- `CRISPASR_F5_VOCODE_MEL` — debug probe: vocode this mel dump directly,
+  bypassing the DiT (used for the CPU-vs-graph vocoder parity A/B).
 - `CRISPASR_F5_FORCE_SCALAR`
 - `CRISPASR_F5_REF_MAX_SEC` — clip the reference audio to this many seconds before it drives the duration estimate (upstream parity: 12 s). Default `12`; set `0` to disable the clip.
 - `CRISPASR_F5_REF_TRIM_SILENCE` — strip leading/trailing silence and collapse internal silences >~1 s in the reference audio (upstream parity). Default on; set `0` to disable.
+- `CRISPASR_F5_TEXT_LEN_BYTES`
 
 ### FastConformer (shared encoder)
 
@@ -484,6 +658,7 @@ suffixes.
 - `CRISPASR_FIRERED_VAD_BENCH`
 - `CRISPASR_FIRERED_VAD_DEBUG`
 - `CRISPASR_FIRERED_VAD_FORCE_SCALAR`
+- `CRISPASR_FIRERED_VAD_SERIAL`
 
 ### FunASR / SenseVoice
 
@@ -494,13 +669,22 @@ suffixes.
 - `CRISPASR_FUNASR_LLM_LAYERS`
 - `CRISPASR_FUNASR_NAN_CHECK`
 - `CRISPASR_FUNASR_NO_FA`
-- `CRISPASR_FUNASR_STEP_CACHE`
+- `CRISPASR_FUNASR_ENC_CACHE` — `0` disables the exact-T_lfr encoder graph
+  cache (repeat-length calls skip the 7.5–23.9 ms graph rebuild). Default on.
+- `CRISPASR_FUNASR_STEP_BUCKET` — width of the cached decode-graph Lk buckets
+  (default 16, the measured optimum; `>= kv_max_ctx` reproduces the old
+  fixed-Lk design, which is a ~69% decode regression — A/B arm only).
+- `CRISPASR_FUNASR_STEP_CACHE` — `0` disables the bucketed per-step decode
+  graph cache (bit-identical either way). Default on.
 
 ### Gemma-4 E2B
 
 - `CRISPASR_GEMMA4_AUTO_CHUNK`
 - `CRISPASR_GEMMA4_E2B_BENCH`
 - `CRISPASR_GEMMA4_E2B_EMBED_FAST`
+- `CRISPASR_NO_REL_POS` — drop the relative-position (matrix BD) term from the
+  Gemma-4 E2B encoder attention scores, leaving only the content term. Parity
+  bisection aid; not prefixed per-backend for historical reasons.
 
 ### GLM-ASR
 
@@ -538,17 +722,34 @@ suffixes.
 - `CRISPASR_HTDEMUCS_WCACHE` — cache F32 copies of weight tensors by pointer
   (default **ON**). `=0` re-reads and re-converts on every access, which the
   DConv stacks do ~6k times per encoder layer.
-- `CRISPASR_HTDEMUCS_GGML` — run the CrossTransformer as a ggml graph instead of
-  the CPU/BLAS path (default **OFF**). Verified correct on CPU and Metal (45/45
-  stages, every layer cos 1.000000) but not yet proven faster overall, so it
-  stays opt-in per the inverse-default rule.
-- `CRISPASR_HTDEMUCS_GPU` — request a GPU backend (CUDA > Metal > Vulkan, CPU
-  fallback). Only meaningful together with `_GGML=1`: under the CPU/BLAS path
-  the weights would sit on the device and every kernel would pay a read back.
+- `CRISPASR_HTDEMUCS_GGML` — run the ggml graph path instead of CPU/BLAS.
+  Since #414 the default is **AUTO**: ON exactly when a real GPU backend is
+  present and permitted (where the fused graph measured ~20x faster than
+  BLAS — RTF 0.37 vs 7.4 on an RTX 3090 Ti), OFF on CPU-only hosts (where
+  graphs measured slower than BLAS). `=1`/`=0` force either way.
+- `CRISPASR_HTDEMUCS_GPU` — GPU permission (CUDA > Metal > Vulkan). Default
+  AUTO follows the caller's use_gpu (CLI default on); an explicit `=0`/`=1`
+  beats the caller in both directions — so `=0` genuinely opts out even
+  though the CLI defaults `use_gpu=true` (#414 review catch). On GPU-less
+  hosts everything resolves to the BLAS path regardless.
+- `CRISPASR_HTDEMUCS_NO_BCAST_CAST` — disable the issue-#398 fix that casts
+  non-F32 affine/bias weights to F32 in-graph before broadcast add/mul sites
+  (bisection aid). With `=1` the pre-fix graph is rebuilt, which on CUDA
+  aborts in `binbcast.cu` (`nb10 % sizeof(src1_t)`) because the F16 GGUF
+  stores the DConv GroupNorm affines (`*.dconv.layers.N.4.weight`) as F16.
 - `CRISPASR_HTDEMUCS_PROFILE` — print a per-phase wall-time breakdown of one
   forward pass (stft / enc / transformer / dec / istft).
 - `CRISPASR_HTDEMUCS_DEBUG` — verbose per-layer shape and NaN diagnostics.
 - `CRISPASR_HTDEMUCS_SKIP_TIME` — skip the time branch (bisection aid).
+- `CRISPASR_HTDEMUCS_FUSED` — single fused graph (encoder+transformer+decoder
+  on-device, no per-layer host↔device roundtrips). Default **AUTO**: ON with
+  the GPU graph path (#414), OFF otherwise. `=1` alone implies the graph path
+  it needs; `=0` on GPU keeps the per-layer-graph bisection arm.
+  The full decision table is unit-locked in tests/test-htdemucs-gates.cpp.
+- `CRISPASR_HTDEMUCS_MEMSTATS` — log each weight-cache admission and the running
+  cache total in MB.
+- `CRISPASR_HTDEMUCS_NO_SEGMENT` — process the whole track in one pass instead of
+  the 25%-overlap segment schedule (A/B against the old behaviour).
 
 All three optimisation gates are output-equivalent: the per-stage diff reports
 45/45 stages passing with them ON or OFF.
@@ -619,6 +820,8 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 - `CRISPASR_KOKORO_FASTCONV`
 - `CRISPASR_KOKORO_FASTCONV_DEBUG`
 - `CRISPASR_KOKORO_G2P`
+- `CRISPASR_KOKORO_GEN_FORCE_METAL` / `CRISPASR_KOKORO_GEN_GPU` — either one puts
+  the generator (vocoder) stage on Metal.
 - `CRISPASR_KOKORO_SEED`
 - `CRISPASR_KOKORO_USE_GPU`
 - `CRISPASR_KOKORO_VOICE_GGUF`
@@ -647,6 +850,38 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 ### MarbleNet VAD
 
 - `CRISPASR_MARBLENET_VAD_BENCH`
+- `CRISPASR_MARBLENET_VAD_SERIAL`
+
+### Mel-Band RoFormer (source separation)
+
+- `CRISPASR_MBR_PROFILE` — print a per-stage wall-time breakdown of one forward
+  pass (stft+pack / band_split / run_time / run_freq / mask_est / synthesize).
+- `CRISPASR_MELBAND_GGML` — run the ggml graph path instead of the legacy CPU
+  path. Since the Change-176 graph port the default is **AUTO**: ON exactly
+  when a real GPU backend is present and permitted (the fused single graph
+  measured ~112x faster than the per-layer graphs — RTF ~0.09 vs ~10 on an
+  RTX 3090 Ti), OFF on CPU-only hosts. `=1`/`=0` force either way.
+- `CRISPASR_MELBAND_GPU` — GPU permission (CUDA > Metal > Vulkan). Default
+  AUTO follows the caller's use_gpu (CLI default on); an explicit `=0`/`=1`
+  beats the caller in both directions — so `=0` genuinely opts out even
+  though the CLI defaults `use_gpu=true` (#414 review semantics). On GPU-less
+  hosts everything resolves to the CPU path regardless.
+- `CRISPASR_MELBAND_FUSED` — single fused graph: band-split + the full
+  time/freq transformer stack + mask estimator on-device in one graph, no
+  per-layer host↔device roundtrips (the measured-fastest path on GPU).
+  Default **AUTO**: ON with the GPU graph path, OFF otherwise. `=1` alone
+  implies the graph path it needs; `=0` on GPU keeps the per-layer-graph
+  bisection arm. The full decision table is unit-locked in
+  tests/test-mel-band-gates.cpp.
+- `CRISPASR_MELBAND_SEG_S` — override the Demucs-style segment length in
+  seconds (`params.segment_seconds`; <=0 → the checkpoint's trained
+  `chunk_size` from GGUF metadata, 8 s Kim fallback — do NOT expect 10 s: the
+  earlier hardcoded 10 s ran RoPE 25% past the trained window, review #422).
+  The attention matrix is O(T²·bands·heads), so long inputs are split into
+  segments with 25% overlap and a triangular weight (bounds VRAM; the
+  unsegmented whole-buffer path OOMs on any clip beyond ~10 s).
+- `CRISPASR_MELBAND_NO_SEGMENT` — process the whole track in one pass instead
+  of the segmented overlap-add schedule (A/B against the old behaviour).
 
 ### MeloTTS
 
@@ -670,6 +905,8 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 - `CRISPASR_MIMO_SMOKE_GPU`
 - `CRISPASR_MIMO_TOKENIZER_GPU`
 - `CRISPASR_MIMO_TOK_CPU`
+- `CRISPASR_MIMO_TOK_CPU_RVQ`
+- `CRISPASR_MIMO_TOK_VERIFY_RVQ`
 
 ### mini-omni2
 
@@ -710,7 +947,19 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 - `CRISPASR_MOSS_TRANSCRIBE_NO_LOOPFIX`
 - `CRISPASR_MOSS_TTS_BENCH`
 - `CRISPASR_MOSS_TTS_LOCAL_DEBUG`
+- `CRISPASR_MOSS_TTS_LOCAL_DUMP_FA_PATH`
+- `CRISPASR_MOSS_TTS_LOCAL_DUMP_HIDDEN`
+- `CRISPASR_MOSS_TTS_LOCAL_DUMP_LAYERS`
+- `CRISPASR_MOSS_TTS_LOCAL_DUMP_PROMPT_IDS`
+- `CRISPASR_MOSS_TTS_LOCAL_DUMP_STOP`
+- `CRISPASR_MOSS_TTS_LOCAL_DUMP_SUBLAYER`
+- `CRISPASR_MOSS_TTS_LOCAL_DUMP_SUBLAYER_PATH`
+- `CRISPASR_MOSS_TTS_LOCAL_FORCE_FRAMES`
 - `CRISPASR_MOSS_TTS_LOCAL_GREEDY_AUDIO`
+- `CRISPASR_MOSS_TTS_LOCAL_GREEDY_TEXT`
+- `CRISPASR_MOSS_TTS_LOCAL_INJECT_LAYER`
+- `CRISPASR_MOSS_TTS_LOCAL_INJECT_PATH`
+- `CRISPASR_MOSS_TTS_LOCAL_MAX_FRAMES`
 - `CRISPASR_MOSS_TTS_LOCAL_NO_GPU`
 
 ### MP3 codec
@@ -737,6 +986,8 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
   count: on a borderline file the decision can rest on a <1 % score gap
 - `CRISPASR_DIARIZE_EMBED_WORKERS` — windows embedded concurrently (default:
   `-t`). Each worker gets its own context sharing one copy of the weights
+- `CRISPASR_SPEAKER_EMBED_WORKERS` — the same worker count for the standalone
+  `crispasr-diarize` CLI's speaker-embedding stage
 - `CRISPASR_SPEAKER_EMBED_THREADS` — ggml threads per embedder context
   (default: `-t`). Honoured by the pluggable embedders and by wespeaker
 - `CRISPASR_DIARIZE_SPAN_EMBED=1` — run ONE network pass per span of windows
@@ -746,6 +997,27 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 - `CRISPASR_DIARIZE_SPAN_WINDOWS` — windows per span (default 32). Measured NOT
   to affect the accuracy cost — identical from N=2 to N=32 — so there is
   nothing to tune here; larger is simply faster
+- `CRISPASR_WESPEAKER_CONV` — conv lowering for the WeSpeaker embedder:
+  `im2col` (default) lowers each conv to explicit IM2COL + MUL_MAT nodes so
+  the GEMMs reach the Accelerate BLAS backend on CPU and the simdgroup
+  mul_mm kernels on Metal; `direct` restores GGML_OP_CONV_2D. Measured on
+  esrit.wav (215 s, `-t 8`): diarization delta 9.8 s -> 5.9 s (~1.6x),
+  embeddings cosine 1.0 vs direct, DER identical per file (7.32 % shard mean)
+- `CRISPASR_WESPEAKER_GPU=1` — run the WeSpeaker embedder on the GPU backend
+  (single context; the CPU worker pool is stood down because workers borrow
+  weights that now live in a GPU buffer). With the im2col default and batched
+  windows Metal reaches parity with the 8-worker CPU schedule on an M-series
+  (8.5 s vs 8.7 s wall on esrit.wav) but does not beat it, so CPU stays the
+  default; the switch exists for machines where the GPU/CPU balance differs
+- `CRISPASR_DIARIZE_BATCH_EMBED` — batch independent 1.2 s windows into one
+  graph along ne[3] (arithmetic-identical to per-window; cosine 1.0). Default:
+  ON under `CRISPASR_WESPEAKER_GPU=1` (collapses ~350 Metal dispatches into
+  ~11 and is what got Metal from a 2x loss to parity), OFF on CPU (measured
+  12.1 -> 14.9 s wall on esrit.wav: ggml's CPU conv loops ne[3], so fusing
+  buys no GEMM shape and the 32-window chunks starve the worker schedule).
+  `1`/`0` forces either way
+- `CRISPASR_WESPEAKER_BATCH` — max windows per batched graph (default 32 on
+  GPU, 16 on CPU; cap 32). Only meaningful where the batch path is active
 
 ### GigaAM-v3
 
@@ -763,11 +1035,31 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 - `CRISPASR_NEMOTRON_CONTEXT_PRESET`
 - `CRISPASR_NEMOTRON_DEBUG`
 - `CRISPASR_NEMOTRON_DECODE_TIMING`
+- `CRISPASR_NEMOTRON_FLASH` — `1` opts the conformer self-attention into the
+  fused `ggml_flash_attn_ext` kernel. Default is a manual softmax(QKᵀ)·V path in
+  F32, which is correct on every backend; the fused kernel is faster but
+  accumulates the KQ product in F16 and its `GGML_PREC_F32` hint is silently
+  ignored on some GPUs (P100/sm_60), where it drifts the RNNT emission. Set only
+  where the precision hint is honoured (read per call).
 - `CRISPASR_NEMOTRON_FORCE_SCALAR`
 - `CRISPASR_NEMOTRON_GGML_DECODE`
+- `CRISPASR_NEMOTRON_GPU_DIRECT_CONV` — `1` enables direct-convolution kernels in
+  the GPU pre-encode (part of the #424 fast path; off by default).
+- `CRISPASR_NEMOTRON_GPU_FASTPATH` — `1` enables all four #424 GPU
+  optimizations at once (joint precompute + direct conv + streaming cache +
+  prompt MLP). Off by default: the streamed variant measurably changed output
+  in the audit, so the fast path ships opt-in until proven transcript-neutral.
+- `CRISPASR_NEMOTRON_GPU_JOINT` — `1` precomputes the RNNT joint's encoder
+  projection as one batched GPU matmul (off by default; the most
+  borderline-emission-sensitive of the fast-path pieces).
+- `CRISPASR_NEMOTRON_GPU_PROMPT` — `1` runs the language-prompt MLP on the GPU
+  (off by default).
+- `CRISPASR_NEMOTRON_GPU_STREAM_CACHE` — `1` keeps the per-layer streaming state
+  in a device-resident ping-pong cache across chunks (off by default).
 - `CRISPASR_NEMOTRON_MAES`
 - `CRISPASR_NEMOTRON_NO_WINDOW_MASK`
 - `CRISPASR_NEMOTRON_STREAMING`
+- `CRISPASR_NEMOTRON_STREAM_DEBUG`
 
 ### OmniASR
 
@@ -781,6 +1073,13 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 ### OmniVoice
 
 - `CRISPASR_OMNIVOICE_ACENC_BISECT`
+- `CRISPASR_OMNIVOICE_AUTO_LANG` — **default on.** When no language was requested
+  (`-l` / `-tl` / the server's `"language"` / `set_target_language`), guess one
+  from the text being spoken and use it if it maps to an id the model knows.
+  An explicitly requested language always wins; a low-confidence guess resolves
+  to nothing and behaves exactly as before. `=0` restores the old
+  always-language-agnostic behaviour. Exists because SubtitleEdit's language
+  menu is not yet wired to its request payload (#13273).
 - `CRISPASR_OMNIVOICE_BENCH`
 - `CRISPASR_OMNIVOICE_CFG_INTERVAL`
 - `CRISPASR_OMNIVOICE_CHUNK`
@@ -789,8 +1088,10 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 - `CRISPASR_OMNIVOICE_CODEC_GPU` — codec placement override (`1` = GPU, `0` = CPU). Unset defaults to GPU on
   CUDA and CPU on Metal/CPU.
 - `CRISPASR_OMNIVOICE_CPU`
+- `CRISPASR_OMNIVOICE_DEBUG`
 - `CRISPASR_OMNIVOICE_DEBUG_CODES`
 - `CRISPASR_OMNIVOICE_DEBUG_SUM`
+- `CRISPASR_OMNIVOICE_DUMP_CODES`
 - `CRISPASR_OMNIVOICE_ENCODE_DIFF`
 - `CRISPASR_OMNIVOICE_FRAMES_PER_CHAR`
 - `CRISPASR_OMNIVOICE_FUSED_STEP`
@@ -799,15 +1100,15 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 - `CRISPASR_OMNIVOICE_NUM_STEPS`
 - `CRISPASR_OMNIVOICE_PERSISTENT_GRAPH`
 - `CRISPASR_OMNIVOICE_POS_TEMP`
+- `CRISPASR_OMNIVOICE_REF_RATE_CHECK`
+- `CRISPASR_OMNIVOICE_TOKENIZER_GGUF`
 - `CRISPASR_OMNIVOICE_UNIFIED_CFG`
+- `CRISPASR_OMNIVOICE_UPSTREAM_WEIGHTS`
 - `CRISPASR_OMNIVOICE_VOICE_CACHE`
 
 ### OpenVoice2
 
 - `CRISPASR_OPENVOICE2_BENCH`
-
-### OpenVoice2
-
 - `CRISPASR_OV2_DUMP_DIR`
 - `CRISPASR_OV2_FORCE_SCALAR`
 - `CRISPASR_OV2_NO_NORMALIZE`
@@ -854,9 +1155,13 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 - `CRISPASR_PARAKEET_GGML_DECODE`
 - `CRISPASR_PARAKEET_INTERNAL_CHUNKING`
 - `CRISPASR_PARAKEET_LONGFORM`
+- `CRISPASR_PARAKEET_LONGFORM_WINDOW`
 - `CRISPASR_PARAKEET_MAES`
 - `CRISPASR_PARAKEET_MEM_COEFF`
-- `CRISPASR_PARAKEET_MEM_POLICY`
+- `CRISPASR_PARAKEET_MEM_POLICY` — `auto` (default), `streamed`, or `off`.
+  `off` disables proactive routing but cannot disable the encoder's
+  physical-memory allocation guard.
+- `CRISPASR_PARAKEET_PIPELINE`
 - `CRISPASR_PARAKEET_QUANT_ALL`
 - `CRISPASR_PARAKEET_SIMULATE_ENCODE_OOM`
 - `CRISPASR_PARAKEET_STREAM_CHUNK`
@@ -874,6 +1179,11 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 - `CRISPASR_PARLER_DUMP_ENC`
 - `CRISPASR_PARLER_PROMPT_IDS`
 - `CRISPASR_PARLER_TTS_BENCH`
+
+### Piano transcription
+
+- `CRISPASR_PIANO_SERIAL` — `1` restores the single-threaded conv/GRU/linear
+  compute (the default parallel path is bit-identical; #305, ~1.7x).
 
 ### Piper
 
@@ -923,11 +1233,48 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 - `CRISPASR_QWEN3_TTS_CODEC_CHUNK`
 - `CRISPASR_QWEN3_TTS_CODEC_CPU`
 - `CRISPASR_QWEN3_TTS_CODEC_CTX`
+- `CRISPASR_QWEN3_TTS_CODEC_FASTCONV` — codec conv fast path. **Default ON**; `0` opts out.
 - `CRISPASR_QWEN3_TTS_CODEC_FORCE_METAL`
 - `CRISPASR_QWEN3_TTS_CODEC_GGUF`
 - `CRISPASR_QWEN3_TTS_CODEC_GPU`
+- `CRISPASR_QWEN3_TTS_HIP_CODEC_NATIVE` — bypass the #337 ROCm codec-encoder
+  correctness fallback and run it natively on HIP. Diagnostic/A/B only until
+  the triggering Daphne spans pass on a real AMD GPU.
+- `CRISPASR_QWEN3_TTS_HIP_CP_NATIVE` — bypass the #337 CPU fallback for the
+  ROCm 0.6B-F16 code predictor. Diagnostic/A/B only; its native gfx1100 path
+  was observed to emit all-NaN logits.
 - `CRISPASR_QWEN3_TTS_CODEC_TRACE`
+- `CRISPASR_QWEN3_TTS_CP_BACKEND`
+- `CRISPASR_QWEN3_TTS_CP_DIRECT`
+- `CRISPASR_QWEN3_TTS_CP_MTP_NOFUSE`
+- `CRISPASR_QWEN3_TTS_CP_STEP0_CACHE`
+- `CRISPASR_QWEN3_TTS_DEBUG`
+- `CRISPASR_QWEN3_TTS_DUMP_DIR`
 - `CRISPASR_QWEN3_TTS_EMBD_CHECK`
+- `CRISPASR_QWEN3_TTS_FUSED_QKV`
+- `CRISPASR_QWEN3_TTS_LK_BUCKET`
+- `CRISPASR_QWEN3_TTS_NO_EMBD_CACHE`
+- `CRISPASR_QWEN3_TTS_O15` / `_O15_SKIP_REALLOC`
+- `CRISPASR_QWEN3_TTS_PROF`
+- `CRISPASR_QWEN3_TTS_SEED`
+- `CRISPASR_QWEN3_TTS_TALKER_SCHED`
+- `CRISPASR_QWEN3_TTS_VULKAN_NATIVE`
+- `CRISPASR_QWEN3_TTS_DUMP_LOGITS=<dir>` — write the raw per-frame talker
+  logits (f32, before the repetition penalty and the suppress mask) plus a
+  top-5 line to stderr. The instrument for a cross-backend diff: tokens
+  alone cannot tell a miscompute from amplified rounding (#337).
+- `CRISPASR_QWEN3_TTS_REPLAY_CODES=<file>` — 16 whitespace-separated codec ids
+  per frame; the decode uses them instead of sampling. Teacher forcing, and
+  the ONLY way to compare two backends step by step: pin the whole frame or
+  the 15 residual codebooks (which must be sampled) diverge and the diff
+  measures trajectory, not arithmetic (#337).
+- `CRISPASR_QWEN3_TTS_REPLAY_TOKENS=<file>` — the weaker form: codebook-0 ids
+  only. Useful for forcing a trajectory, NOT sufficient for a logits diff.
+- `CRISPASR_QWEN3_TTS_GREEDY` — force the talker's codebook-0 sampler to argmax
+  (top_k=1). The frame sequence then depends only on the logits, so two
+  backends agree if and only if their logits agree — this is the lever for
+  telling a GPU miscompute apart from a sampling difference, and without it a
+  CPU-vs-GPU token comparison proves nothing (#337).
 - `CRISPASR_QWEN3_TTS_MAX_FRAMES`
 - `CRISPASR_QWEN3_TTS_SKIP_REF_DECODE`
 
@@ -938,11 +1285,28 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 
 ### Sidon
 
+- `CRISPASR_SIDON_SPLIT` — **default on.** When the input exceeds the predictor's
+  frame cap, restore it as several EXACT chunks cut at energy minima, each given
+  real neighbouring audio as context, instead of refusing. Set to `0` to restore
+  the old hard refusal. It engages only past the cap, so it cannot change the
+  result for input that already fit (#431 — a 60 s clip is 3075 frames against a
+  3000-frame cap, so even one minute was refused).
+- `CRISPASR_SIDON_SPLIT_CONTEXT_MS` — context given to each side of a split chunk
+  (default 500 ms).
 - `CRISPASR_SIDON_FASTCONV` — DAC convolution mode (`off`, `k1-f16`, `k1-f32`, or `full`). Unset defaults to
   `k1-f16` on CUDA and `off` on Vulkan/CPU.
-- `CRISPASR_SIDON_RPE` — relative-position-bias formulation: `bucket-direct` (default), `bucket`, or `expand`
-  (legacy `[head_dim, T, T]` expansion, ~1 GiB more predictor workspace at `T≈2825`; keeps the Vulkan
-  `mul_mat` batching branch). All three are algebraically equivalent.
+- `CRISPASR_SIDON_RPE` — relative-position-bias formulation: `bucket-direct`, `bucket`, or `expand` (legacy
+  `[head_dim, T, T]` expansion; keeps the Vulkan `mul_mat` batching branch). All three are algebraically
+  equivalent. Unset defaults to **AUTO**, resolved per graph build because the choice depends on the input
+  length: `expand` on a GPU backend while its extra transient footprint (`4·T²·(head_dim+1−heads)`, i.e.
+  `196·T²` bytes for the shipped model — 58 MiB at `T=557`, 1.64 GiB at the 3000-frame cap) fits
+  `CRISPASR_SIDON_RPE_BUDGET_MB`, and `bucket-direct` otherwise. AUTO exists because `expand` measured **2.7×
+  faster in the predictor** on the #416 reporter's GTX 1660 SUPER (213.80 ms vs 575.25 ms at `T=557`, same
+  file and binary). AUTO stays off on CPU: that speedup is one device's measurement and CPU behaviour is
+  left exactly as it was. An explicit value is honoured as given and never auto-overridden — it is the #416
+  bisection handle. The decision table is unit-locked in `tests/test-sidon-rpe-gates.cpp`.
+- `CRISPASR_SIDON_RPE_BUDGET_MB` — AUTO's budget in MiB for `expand`'s extra transient footprint (default
+  `256`, which admits `expand` up to `T≈1170`, ~23 s of audio). `0` disables AUTO, pinning `bucket-direct`.
 - `CRISPASR_SIDON_DECODER_CHUNK_FRAMES` — maximum DAC core size in feature frames (default `512`). `0` decodes
   the whole utterance in one graph (~4.5 GiB at `T≈2825` vs ~0.79 GiB chunked). Chunked output is bit-exact
   against the whole-utterance decode.
@@ -951,11 +1315,30 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
   transient.
 - `CRISPASR_SIDON_MAX_FRAMES` — predictor input cap in feature frames (default `3000`, ~58.5 s after the
   lookahead). Guards the `O(T^2)` attention.
+- `CRISPASR_SIDON_WINDOW_FRAMES` — predictor window size in feature frames.
+  **Default `0` = off**, i.e. input past `CRISPASR_SIDON_MAX_FRAMES` is refused as
+  before. Set to e.g. `1500` to process long input as overlapping windows
+  instead (#431). Off by default because the evidence is incomplete: windowed
+  output beat the whole-utterance path on a 50 s ASR roundtrip, but an ASR
+  roundtrip measures "sounds better to a small ASR", not "faithful to upstream",
+  and those can disagree. `tools/kaggle/sidon-length-parity` is the experiment
+  that settles it. The window doubles as the threshold — at `T <= window` there
+  is one window and the split is a no-op — and it is clamped to
+  `CRISPASR_SIDON_MAX_FRAMES` so raising one cannot silently violate the other.
+- `CRISPASR_SIDON_PREDICTOR_CONTEXT_FRAMES` — context frames on each side of a
+  window (default `300`), cropped away after the run. Unlike the DAC's chunking,
+  whose cores are exact because the decoder is fully convolutional with a finite
+  receptive field (`dac_receptive_frames()`), attention has no receptive field,
+  so no context size makes a windowed core exact — this trades compute for
+  boundary quality rather than buying correctness.
 - `CRISPASR_SIDON_DEBUG` — print per-stage scheduler workspace sizes (per backend) after graph allocation.
+- `CRISPASR_SIDON_DUMP_HANDOFF` — directory/path for the predictor→DAC handoff tensor dump.
 
 ### Sherpa
 
 - `CRISPASR_SHERPA_LID_BIN`
+- `CRISPASR_SHERPA_LID_TIMEOUT_SEC` / `CRISPASR_SHERPA_TIMEOUT_SEC` — wall-clock
+  timeout for the external sherpa LID / diarize helper, scaled by audio length.
 
 ### Silero LID
 
@@ -965,6 +1348,7 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 - `CRISPASR_SILERO_LID_DUMP`
 - `CRISPASR_SILERO_LID_LEGACY`
 - `CRISPASR_SILERO_LID_MAX_S`
+- `CRISPASR_SILERO_LID_MIN_LOGIT` — evidence gate (#409): discard a silero LID answer whose top-1 RAW logit is below this floor (default `-2.0`; `-999` disables) and fall back to whisper-tiny LID. The raw-logit magnitude separates in-domain from out-of-domain audio where the softmax probability does not.
 - `CRISPASR_SILERO_LID_TRACE`
 - `CRISPASR_SILERO_LID_TRACE_OFF`
 - `CRISPASR_SILERO_LID_TRUNC`
@@ -979,8 +1363,14 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 
 ### T5 translate
 
+- `CRISPASR_T5_DIFF`
 - `CRISPASR_T5_GPU`
 - `CRISPASR_T5_TRANSLATE_BENCH`
+
+### TabCNN (guitar tablature)
+
+- `CRISPASR_TABCNN_DEBUG`
+- `CRISPASR_TABCNN_NO_GPU`
 
 ### TaDa TTS
 
@@ -1022,27 +1412,88 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 - `CRISPASR_TADA_TOP_K`
 - `CRISPASR_TADA_TOP_P`
 - `CRISPASR_TADA_VULKAN_NATIVE`
+- `CRISPASR_TADA_WAV_CLONE` — `1` enables on-the-fly TaDa voice cloning from a
+  reference `.wav` + transcript through the session C-ABI (#201). Off by default:
+  without it a `.wav` voice reference is still rejected with `-2`, preserving the
+  historical behaviour until the decoded-output roundtrip has validated the path.
 
 ### TitaNet speaker
 
 - `CRISPASR_TITANET_BENCH`
 - `CRISPASR_TITANET_DUMP`
+- `CRISPASR_TITANET_DUMP_MEL`
 - `CRISPASR_TITANET_FORCE_SCALAR`
 - `CRISPASR_TITANET_GGML`
+- `CRISPASR_TITANET_GPU`
 - `CRISPASR_TITANET_LEGACY`
 - `CRISPASR_TITANET_REF_MEL`
 
+Three compute paths exist and all are kept working; the default is the fastest
+one measured per platform.
+
+| path | selected by | measured, M1, 2 s segment |
+| --- | --- | --- |
+| legacy (Accelerate / hand-rolled) | default where `HAVE_ACCELERATE` | **71.7 ms** |
+| ggml graph, CPU | default elsewhere; `CRISPASR_TITANET_GGML=1` | 277.3 ms |
+| ggml graph, GPU | `CRISPASR_TITANET_GGML=1 CRISPASR_TITANET_GPU=1` | 31.9 ms *(but see below)* |
+
+All three agree to cosine **1.000000** with each other and **0.999996** against
+NVIDIA's `nemo_en_titanet_large.onnx` export fed the same mel — so the choice is
+purely about speed.
+
+⚠ **`CRISPASR_TITANET_GPU=1` is opt-in because it loses on real workloads
+despite winning the micro-benchmark.** Diarization embeds one segment per call
+at *variable* lengths, so every call reshapes the graph and the GPU allocator
+re-reserves; and `CRISPASR_SPEAKER_EMBED_WORKERS` runs several embedders at once,
+which contend for the one GPU. End-to-end on a 600 s clip, 47 segments:
+
+```
+workers=4, legacy   9994 ms    <- default, fastest
+workers=1, legacy  12673 ms
+workers=1, GPU     15275 ms
+workers=4, GPU     49866 ms
+```
+
+Keep it for evaluating a discrete GPU (where the balance may differ) or for
+`CRISPASR_SPEAKER_EMBED_WORKERS=1` on a machine with weak CPU cores. Bucketing
+segment lengths so the graph shape stops changing is the work that would make
+this path win generally.
+
+`CRISPASR_TITANET_DUMP_MEL=<path>` writes the computed mel as `[T][n_mels]`
+float32 — the counterpart to `CRISPASR_TITANET_REF_MEL`. Feeding that dump to an
+upstream ONNX export separates the front-end from the network, which a single
+end-to-end cosine cannot do.
+
 ### VibeVoice
 
+- `CRISPASR_VIBEVOICE_ASR_PROMPT`
+- `CRISPASR_VIBEVOICE_ASR_SAMPLE` — streaming ASR samples the acoustic
+  posterior by default, matching upstream. Set `0` for deterministic
+  posterior-mean reference diffs or `1` to force sampling.
+- `CRISPASR_VIBEVOICE_ATTN_PREC`
 - `CRISPASR_VIBEVOICE_BENCH`
+- `CRISPASR_VIBEVOICE_BITNET_ACT_QUANT`
 - `CRISPASR_VIBEVOICE_DEBUG`
 - `CRISPASR_VIBEVOICE_DUMP_DIR`
+- `CRISPASR_VIBEVOICE_ENC_BACKEND` — `{auto|cpu|gpu}` backend for the σ-VAE
+  tokenizer ENCODERS (the ASR direction). `auto` (default) diverts them to CPU
+  on Vulkan devices with a 65535 `maxComputeWorkGroupCount` (Intel Arc/Iris/
+  UHD, llvmpipe), where the conv dispatches over long audio overflow and abort
+  (issue #418 — the ASR twin of the decoder's #52 fallback,
+  `CRISPASR_VIBEVOICE_VAE_BACKEND`). `gpu` forces the active backend (the
+  repro arm); `cpu` forces the fallback anywhere.
 - `CRISPASR_VIBEVOICE_ENCODER_CHUNK_SECONDS`
 - `CRISPASR_VIBEVOICE_ENCODER_CONTEXT_SECONDS`
+- `CRISPASR_VIBEVOICE_GELU_TANH`
+- `CRISPASR_VIBEVOICE_GPU`
 - `CRISPASR_VIBEVOICE_LM_BUCKETS`
+- `CRISPASR_VIBEVOICE_NO_INPUT_NORM`
 - `CRISPASR_VIBEVOICE_NO_LM_BUCKETS`
 - `CRISPASR_VIBEVOICE_PRED_SCHED`
 - `CRISPASR_VIBEVOICE_QUANT_ALL`
+- `CRISPASR_VIBEVOICE_RAW_TRANSCRIPT` — `1` keeps the pre-#300 single segment
+  holding the model's raw JSON blob instead of splitting it into one segment per
+  utterance with the speaker in the structured field.
 - `CRISPASR_VIBEVOICE_REF_FEATURES`
 - `CRISPASR_VIBEVOICE_REUSE_PRED_GRAPH`
 - `CRISPASR_VIBEVOICE_TTS_CFG_SCALE`
@@ -1061,13 +1512,21 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 ### VoxCPM2
 
 - `CRISPASR_VOXCPM2_BENCH`
+- `CRISPASR_VOXCPM2_BUCKET_CUDA`
 - `CRISPASR_VOXCPM2_CFG_INTERVAL`
 - `CRISPASR_VOXCPM2_CFG_INTERVAL_DEBUG`
 - `CRISPASR_VOXCPM2_CFG_VALUE`
 - `CRISPASR_VOXCPM2_CPU_ONLY`
+- `CRISPASR_VOXCPM2_FA_CPU`
+- `CRISPASR_VOXCPM2_FORCE_SCALAR`
 - `CRISPASR_VOXCPM2_INFERENCE_STEPS`
 - `CRISPASR_VOXCPM2_MAX_LEN`
+- `CRISPASR_VOXCPM2_NAN_CHECK`
+- `CRISPASR_VOXCPM2_NO_BUCKET`
+- `CRISPASR_VOXCPM2_USE_GRAPH` — persistent-graph decode. **Default ON**; `0` opts out.
 - `CRISPASR_VOXCPM2_USE_REF`
+- `CRISPASR_VOXCPM2_VAE_ENC_DIFF`
+- `CRISPASR_VOXCPM2_VAE_TRACE`
 - `CRISPASR_VOXCPM2_VAE_MAX_SAMPLES` - maximum 16 kHz input samples accepted by one `voxcpm2-vae` upscaling call
   (default `960000`, or 60 seconds). Split longer audio, or raise this only when enough RAM/VRAM is available.
 
@@ -1075,10 +1534,27 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 
 - `CRISPASR_VOXTRAL_BENCH`
 - `CRISPASR_VOXTRAL_FUSED_QKV`
+- `CRISPASR_VOXTRAL_STEP_CACHE` — `1` enables the bucketed per-step decode
+  graph cache (cached graph per Lk bucket, driven through gallocr instead of
+  the scheduler). Bit-identical to the default per-call path: bucket padding
+  is masked `-inf`, which flash-attn skips outright. Default **off** — the
+  speed-up is measured on funasr's geometry, and on Voxtral it does NOT
+  appear: a decode-isolated A/B measured 189.8 ms/step off vs 192.0 ms/step on
+  (1.2% slower, output bit-identical). Graph prep is ~2 ms against a ~190 ms
+  step here, so there is nothing to win. Left in place as opt-in because it is
+  proven exact and the trade-off differs on cheaper decoders.
+- `CRISPASR_VOXTRAL_STEP_BUCKET` — bucket width for the above (default 16).
+  Narrow buckets matter: setting this at or above `kv_max_ctx` reproduces the
+  single fixed-Lk graph design, which measured **+69% decode CPU** on funasr
+  because each step then reads the whole KV window. It is an A/B arm, not a
+  tuning knob to raise.
 - `CRISPASR_VOXTRAL_TTS_CODEC_FROM_FILE`
+- `CRISPASR_VOXTRAL_TTS_DEBUG`
 - `CRISPASR_VOXTRAL_TTS_DIFF_DUMP`
+- `CRISPASR_VOXTRAL_TTS_FM_STEPS`
 - `CRISPASR_VOXTRAL_TTS_SEMANTIC_CB`
 - `CRISPASR_VOXTRAL_TTS_TEXT`
+- `CRISPASR_VOXTRAL_TTS_TIMING`
 - `CRISPASR_VOXTRAL_TTS_VOICE`
 
 ### Voxtral-4B
@@ -1093,11 +1569,33 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 - `CRISPASR_VOXTRAL4B_STREAM_LIVE`
 - `CRISPASR_VOXTRAL4B_STREAM_TIMING`
 
+### VAD (encoder/decoder Silero-style)
+
+- `CRISPASR_VAD_ENCDEC_CONV_CAST`
+- `CRISPASR_VAD_ENCDEC_CPU`
+- `CRISPASR_VAD_ENCDEC_DEBUG`
+- `CRISPASR_VAD_ENCDEC_PERSIST`
+- `CRISPASR_VAD_ENCDEC_SERIAL_MEL`
+
+### VAD (WebRTC)
+
+- `CRISPASR_WEBRTC_VAD_MODE` — WebRTC VAD aggressiveness, `0`–`3` (default `1`).
+  Only consulted when the caller did not pass an explicit mode.
+
 ### Wav2Vec2
 
 - `CRISPASR_WAV2VEC2_BENCH`
 - `CRISPASR_WAV2VEC2_DUMP_DIR`
 - `CRISPASR_WAV2VEC2_VERBOSE`
+
+### Whisper (Tiron speaker attribution)
+
+- `CRISPASR_WHISPER_TIRON` — `0` forces the stock whisper decode for A/B. The
+  Tiron constrained-decoding grammar is auto-on whenever the model's vocab has
+  speaker tokens; plain greedy loses ~5 cpWER.
+- `CRISPASR_WHISPER_TIRON_DEBUG`
+- `CRISPASR_WHISPER_TIRON_MAX_SPEAKERS`
+- `CRISPASR_WHISPER_TIRON_NOSPEECH` — `0` disallows an initial `<|nospeech|>`.
 
 ### WavTokenizer
 
@@ -1112,7 +1610,63 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 - `CRISPASR_ZONOS_DECODE_CTX`
 - `CRISPASR_ZONOS_DIFF_N_STEPS`
 - `CRISPASR_ZONOS_FASTCONV`
+- `CRISPASR_ZONOS_G2P` — `builtin` | `espeak` | `auto` (default). Which
+  phonemizer zonos tries first (#435). `espeak` is the pre-#435-follow-on
+  cascade bit for bit (in-process libespeak-ng → the `espeak-ng` binary → raw
+  ASCII → refuse) and never consults the built-in G2P; `builtin` puts the
+  built-in EN/DE/FR/ES/RU G2P from `crispasr-core` first; `auto` keeps espeak
+  first and uses the built-in only as a fallback below it. The default is
+  **not** `builtin`: the built-ins emit espeak-dialect IPA while zonos's
+  inventory comes from its own `conditioning.py` symbol list, and unmapped
+  codepoints are dropped silently — the failure mode that made #435 look like a
+  working backend. A language's default moves only on per-language agreement
+  and drop measurements, never on "it produced audio".
+- `CRISPASR_ZONOS_RU_DIALECT` — `native` (default) | `espeak`. Which SPELLING of
+  the Russian phonemes to hand the model when the built-in G2P produces them.
+  `native` is what `crispasr-core`'s Russian G2P emits — a narrow transcription
+  (`ɐ`/`ə` reduction gradation, `ʂ`/`ʐ` retroflexes, `lʲ` vs `ɫ`, `æ` fronting).
+  `espeak` rewrites the same sounds into espeak-ng's `ru` conventions (`ʌ`, `ʃ`,
+  `ʒ`, `ɭ`, `ɑ`, `y`). Not cosmetic and **invisible to the drop counter**: every
+  symbol on both sides is inside zonos's inventory, so nothing is dropped either
+  way — but a model conditions on the spelling it was TRAINED on, and zonos was
+  phonemised with espeak. Measured over 2,200 dictionary words phonemised both
+  ways, raw symbol agreement between the two spellings is 57.7% and the
+  conversion takes it to 88.0%. Same class of problem as `CRISPASR_KOKORO_MISAKI_IPA`
+  (#316), one language further on.
+  **Off by default because it was measured and it LOSES.** It did raise
+  phoneme-ID agreement with the espeak arm on all three test sentences
+  (0.773/0.759/0.627 → 0.818/0.852/0.847) — and took the ASR roundtrip from
+  0.293 to **0.000** on every sentence, in both the with-espeak and the
+  espeak-removed runs. Six arms, six zeros; it was the only arm that never
+  produced a recognisable transcript. Agreement with the tool a model was
+  trained on turns out not to be a proxy for the quality of its audio. Kept as
+  a lever because a different consumer (a piper or kokoro Russian voice trained
+  on espeak) may want it, but it must not be enabled for zonos without a new
+  measurement.
+- `CRISPASR_ZONOS_G2P_DEBUG` — `1` prints the phonemisation readout to stderr:
+  which path ran, the IPA, the full phoneme-ID sequence, and how many emitted
+  codepoints zonos's inventory could not map (with a histogram of which). Off
+  by default; it exists so a comparison between two G2P paths can come back
+  negative instead of "both produced a wav".
 - `CRISPASR_ZONOS_SPEAKER_EMB_PATH`
 - `CRISPASR_ZONOS_TTS_BENCH`
 - `CRISPASR_ZONOS_TTS_TEXT`
+- `CRISPASR_ZONOS_VULKAN_NATIVE`
 
+### `CRISPASR_COSYVOICE3_CAMPP_TAIL`
+
+`legacy` makes cosyvoice3's CAM++ speaker encoder use the old partial-tail
+divisor. Default is the same convention as every other CAM++ backend.
+
+Both paths synthesise correctly — the TTS→ASR roundtrip is 8/8 on each — so this
+is a CONSISTENCY switch, not a correctness one. The eight speaker embeddings
+baked into the shipped `cosyvoice3-voices.gguf` were produced with the old
+divisor, so by default a voice cloned from a WAV and the same voice taken from
+the bank differ by cos ~0.998. Set this to `legacy` if you need those two paths
+to agree.
+
+Why cosyvoice3 specifically is unsettled: its upstream is `campplus.onnx`, and
+two onnxruntime builds disagree about `AveragePool(ceil_mode=1)` on the same
+clip. `CRISPASR_CAMPP_LEGACY_SEGPOOL` also exists but is GLOBAL — it would drag
+chatterbox, confucius4, dots-tts and fireredtts3 away from their own settled
+PyTorch references to answer a cosyvoice3-only question.

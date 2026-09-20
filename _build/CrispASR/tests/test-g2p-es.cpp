@@ -18,7 +18,8 @@ TEST_CASE("Spanish LTS: ch/ll/rr/ñ", "[g2p_es][lts]") {
         CHECK(ipa.find("r") != std::string::npos);
     }
     SECTION("ñ → ɲ") {
-        std::string ipa = g2p_es::lts_word_to_ipa("espa\xC3\xB1""a");
+        std::string ipa = g2p_es::lts_word_to_ipa("espa\xC3\xB1"
+                                                  "a");
         CHECK(ipa.find("\xC9\xB2") != std::string::npos);
     }
 }
@@ -101,4 +102,47 @@ TEST_CASE("Spanish text_to_ipa", "[g2p_es][sentence]") {
         // h silent, so first sound should be 'o'
         CHECK(ipa[0] == 'o');
     }
+}
+
+// ── #316 round 2: punctuation is the consumer's choice ──────────────────────
+//
+// Kokoro's 178-symbol vocabulary contains `,.;:!?` and they are how it pauses;
+// dropping them delivered a paragraph in one breath. English proved it against
+// misaki; this is the same defect in the same shape, one language over. Off by
+// default so piper — whose espeak inventory has never been fed punctuation — is
+// unchanged.
+
+TEST_CASE("es: punctuation is dropped by default, kept on request", "[g2p_es][unit][punct]") {
+    g2p_es::context ctx;
+    const std::string plain = g2p_es::text_to_ipa(ctx, "a b, c.");
+    CHECK(plain.find(',') == std::string::npos);
+    CHECK(plain.find('.') == std::string::npos);
+    // A dropped mark still separates its neighbours — with ONE space, not the
+    // two the old loop emitted around every comma.
+    CHECK(plain.find("  ") == std::string::npos);
+
+    ctx.emit_punctuation = true;
+    const std::string kept = g2p_es::text_to_ipa(ctx, "a b, c.");
+    CHECK(kept.find(',') != std::string::npos);
+    CHECK(kept.find('.') != std::string::npos);
+    // A mark sits flush against the word before it and is followed by a space.
+    CHECK(kept.find(" ,") == std::string::npos);
+    CHECK(kept.find(", ") != std::string::npos);
+}
+
+TEST_CASE("es: the hyphen is a separator, never a mark", "[g2p_es][unit][punct]") {
+    g2p_es::context ctx;
+    ctx.emit_punctuation = true;
+    // No TTS vocabulary here has an ASCII hyphen, and misaki drops it.
+    CHECK(g2p_es::text_to_ipa(ctx, "a-b").find('-') == std::string::npos);
+}
+
+TEST_CASE("es: a quoted word is looked up without its quotes", "[g2p_es][unit][punct]") {
+    // The tokenizer split on ,.!?;:- only, so a quoted word reached every
+    // lookup tier WEARING its quotes and fell through to the letter-to-sound
+    // rules — the same defect that made English read "dramatic" as DRAM-atic.
+    g2p_es::context ctx;
+    const std::string quoted = g2p_es::text_to_ipa(ctx, "\"ab\"");
+    const std::string bare = g2p_es::text_to_ipa(ctx, "ab");
+    CHECK(quoted == bare);
 }

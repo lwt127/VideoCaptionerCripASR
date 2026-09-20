@@ -54,6 +54,8 @@ text (Qwen2 BPE) → CosyVoice3LM (Qwen2-0.5B + speech-token AR head)
 |---|---|---|
 | `cosyvoice3-llm-f16.gguf` | F16 | 1.29 GB |
 | `cosyvoice3-llm-q4_k.gguf` | Q4_K (Q4_0 fallback on 896-wide rows; head + embeddings stay F16) | 384 MB |
+| `cosyvoice3-llm-rl-f16.gguf` | F16 — **RL talker** (upstream `llm.rl.pt`) | 1.29 GB |
+| `cosyvoice3-llm-rl-q4_k.gguf` | Q4_K RL talker, same recipe as above | 384 MB |
 | `cosyvoice3-flow-f16.gguf` | F16 | 665 MB |
 | `cosyvoice3-flow-q8_0.gguf` | Q8_0 (input_embd + spk_affine stay F16) | 361 MB |
 | `cosyvoice3-hift-f16.gguf` | F16 — too small to benefit from quant | 42 MB |
@@ -61,6 +63,33 @@ text (Qwen2 BPE) → CosyVoice3LM (Qwen2-0.5B + speech-token AR head)
 | `cosyvoice3-s3tok-f16.gguf` | F16 speech_tokenizer_v3 — **byte-exact vs ONNX** | 462 MB |
 | `cosyvoice3-s3tok-q4_k.gguf` | Q4_K s3tok (FSQ proj stays F16); ~0.6% token drift — optional smaller variant | 139 MB |
 | `cosyvoice3-campplus-f16.gguf` | F16 CAMPPlus 192-D speaker encoder | 13 MB |
+
+### Base vs RL talker
+
+Upstream ships two talker checkpoints in one repo: `llm.pt` (pre-trained) and
+`llm.rl.pt` (the same architecture after reinforcement learning, tuned by the
+authors for speech quality, pronunciation accuracy and generation stability).
+Only the talker differs — **flow, HiFT, CAMPPlus, the speech tokenizer and the
+voice bank are shared**, so switching is just pointing `-m` at the other LLM
+GGUF and leaving every companion file in place:
+
+```bash
+crispasr -m cosyvoice3-llm-rl-q4_k.gguf --backend cosyvoice3-tts \
+    --voice fleurs-en --i-have-rights \
+    --tts "The northern lights can be heard as well as seen." --tts-output out.wav
+```
+
+CrispASR also ships `--backend cosyvoice3-tts-rl` (aliases `cosyvoice3-rl`,
+`cv3-rl`): the same engine, wired so that `-m auto` fetches the RL talker and
+reuses the shared companions.
+
+```bash
+crispasr --backend cosyvoice3-tts-rl -m auto \
+    --voice fleurs-en --i-have-rights \
+    --tts "The northern lights can be heard as well as seen." --tts-output out.wav
+```
+
+Both talkers are published here; keep whichever you prefer and delete the other.
 
 Pick **one LLM + one flow + HiFT + voices**. The smallest viable
 combo is `llm-q4_k + flow-q8_0 + hift-f16 + voices` at **745 MB
@@ -140,13 +169,25 @@ the converter in the CrispASR tree:
 python models/convert-cosyvoice3-voices-to-gguf.py \
     --manifest my-voices.json \
     --upstream-base /path/to/CosyVoice-clone \
-    --output my-voices.gguf
+    --output my-voices.gguf \
+    --i-have-rights
 ```
 
 Each manifest entry is `{name, wav, prompt_text}`. The script needs
 `campplus.onnx` (CV2/CV3 speaker encoder) and
 `speech_tokenizer_v3.onnx` (CV3 token extractor); both auto-download
 from HF on first run.
+
+`--i-have-rights` is required: baking turns a real speaker's recording
+into a reusable voice clone, and by passing it you attest that you have
+that speaker's consent or that the voice is your own. The converter
+stamps each entry as recording-derived, which is what makes CrispASR
+demand `--i-have-rights` / `consent_attestation` at synthesis time and
+prepend the spoken AI disclosure to the output (EU AI Act Art. 50(4)).
+
+A bundle baked before that stamp existed still gates — every entry falls
+back to the producer architecture — but re-bake it for per-entry
+accuracy.
 
 ### Arbitrary-WAV cloning (native, no Python pre-bake)
 

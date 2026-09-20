@@ -60,6 +60,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -2136,8 +2137,8 @@ struct dots_tts_context* dots_tts_init_from_file(const char* path_model, struct 
     // ggml_gallocr (no ggml_backend_sched), so there are no cross-backend copy
     // hazards — GPU is just init_best() with all weights + KV caches resident on
     // it. Opt out with CRISPASR_DOTS_TTS_CPU=1.
-    ctx->backend_cpu = ggml_backend_cpu_init();
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads);
+    ctx->backend_cpu = core_cpu_backend::init();
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, params.n_threads);
 
     const char* cpu_env = std::getenv("CRISPASR_DOTS_TTS_CPU");
     const bool force_cpu = cpu_env && *cpu_env && *cpu_env != '0';
@@ -2850,12 +2851,12 @@ void dots_tts_free(struct dots_tts_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->buf_w)
-        ggml_backend_buffer_free(ctx->buf_w);
+        core_gguf::release_weight_buffer(ctx->buf_w);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
 
     if (ctx->voc.buf_w)
-        ggml_backend_buffer_free(ctx->voc.buf_w);
+        core_gguf::release_weight_buffer(ctx->voc.buf_w);
     if (ctx->voc.ctx_w)
         ggml_free(ctx->voc.ctx_w);
 
@@ -2872,7 +2873,7 @@ void dots_tts_free(struct dots_tts_context* ctx) {
 
 void dots_tts_set_n_threads(struct dots_tts_context* ctx, int n_threads) {
     if (ctx && ctx->backend_cpu)
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, n_threads);
 }
 
 void dots_tts_set_temperature(struct dots_tts_context* ctx, float temperature) {
@@ -3275,7 +3276,7 @@ extern "C" int dots_tts_dit_diff(const char* model_gguf, const char* ref_gguf, i
 // stage; the alias-free resblock path / final audio is reported but not gated.
 extern "C" int dots_tts_vocoder_diff(const char* voc_gguf, const char* ref_gguf, int verbosity) {
     auto* ctx = new dots_tts_context();
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     ctx->backend = dots_diff_use_gpu() ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (!ctx->backend)
         ctx->backend = ctx->backend_cpu;
@@ -3464,7 +3465,7 @@ extern "C" int dots_tts_vocoder_diff(const char* voc_gguf, const char* ref_gguf,
 // can run the full wav→x-vector→g_cond pipeline without the 4.6 GB core GGUF.
 extern "C" int dots_tts_spk_diff(const char* spk_gguf, const char* ref_gguf, int verbosity) {
     auto* ctx = new dots_tts_context();
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     ctx->backend = ctx->backend_cpu;
     ctx->params = dots_tts_context_default_params();
     ctx->params.verbosity = verbosity;
@@ -3544,7 +3545,7 @@ extern "C" int dots_tts_spk_diff(const char* spk_gguf, const char* ref_gguf, int
 // (C,) + act_up_filter/act_down_filter (K,). Validates dots_alias_free_act.
 extern "C" int dots_tts_act_diff(const char* ref_gguf, int verbosity) {
     auto* ctx = new dots_tts_context();
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     ctx->backend = ctx->backend_cpu;
     core_gguf::WeightLoad rw;
     if (!core_gguf::load_weights(ref_gguf, ctx->backend, "ref", rw)) {

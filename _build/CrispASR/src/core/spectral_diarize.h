@@ -161,13 +161,16 @@ CountMethod count_method_from_env();
 
 // Estimate the number of speakers in `x` (n, d) via the single-speaker
 // cosine veto, then a PCA + full-covariance GMM BIC sweep.
-SpeakerEstimate estimate_speakers(const float* x, int n, int d, int min_k, int max_k, unsigned seed = 42);
+SpeakerEstimate estimate_speakers(const float* x, int n, int d, int min_k, int max_k, unsigned seed = 42,
+                                  int n_threads = 0);
 
 // Cluster `x` into speakers. When `num_speakers > 0` that count is used
 // directly and no estimation runs; otherwise the count is estimated and then
 // refined by scoring a small neighbourhood of candidates on silhouette.
 // `out_estimate` may be null.
+// `n_threads` bounds the k-sweep fan-out; 0 means "ask the machine". Pass the
+// caller's thread budget so a `-t N` run does not oversubscribe a shared box.
 std::vector<int> cluster_speakers(const float* x, int n, int d, int min_speakers, int max_speakers, int num_speakers,
-                                  SpeakerEstimate* out_estimate, unsigned seed = 42);
+                                  SpeakerEstimate* out_estimate, unsigned seed = 42, int n_threads = 0);
 
 } // namespace core_spectral

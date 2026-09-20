@@ -8,9 +8,55 @@ of numerics.
 ## NOW — active work
 
 Embedder, clustering, smoothing, pipeline, DER harness, CLI wiring and
-word-aligned segment splitting all landed. **Automatic speaker counting is the open problem** (below). Not yet
-done: WeSpeaker GGUF upload + CC-BY attribution, THIRD_PARTY_NOTICES entry,
-docs/architecture.md section, session ABI, real-audio DER.
+word-aligned segment splitting all landed. **Automatic speaker counting is the
+open problem** (below).
+
+The old "not yet done" list here was stale — re-verified 2026-08-03, all five
+had in fact landed:
+
+| claimed missing | actual state |
+|---|---|
+| WeSpeaker GGUF upload + CC-BY attribution | uploaded; `api.model_info("cstr/wespeaker-resnet34-lm-GGUF").cardData["license"]` returns `cc-by-4.0` |
+| THIRD_PARTY_NOTICES entry | present (7 WeSpeaker mentions) |
+| docs/architecture.md section | present (6 foxnose mentions) |
+| session ABI | `foxnose_embedder_path` in `crispasr_c_api.cpp` (`crispasr_diarize_opts_abi`) |
+| registry auto-download | `{"wespeaker", "wespeaker-resnet34-lm.gguf", …}` in `crispasr_model_registry.cpp` |
+
+Only **real-audio DER** was genuinely open, and it is now the root `PLAN.md`
+NOW item (§1: route the pyannote+embedder path through the same
+`core_spectral::cluster_speakers` that gets foxnose to 7.32%).
+
+### Post-release server fixes (reporter follow-up on v0.8.25)
+
+The reporter hit two SERVER-only defects — neither reachable from the CLI,
+both instances of the multi-surface dispatch trap (the server re-implements
+the runner's diarize orchestration instead of calling it).
+
+1. **Transcript loss around every speaker change.** The CLI diarizes inside
+   its per-slice loop, handing the slice its own segment vector; the server
+   transcribes all slices first and then re-walks the merged list, giving each
+   slice a copied sub-range. `crispasr_apply_diarize` **grows** that sub-range
+   whenever it splits a segment at a speaker turn (pyannote, foxnose and
+   sherpa all do word-range splitting), and the copy-back wrote back only the
+   element count it started with — so every sub-segment past the first was
+   dropped. One segment split three ways lost two thirds of its text. With VAD
+   the slices are short and often hold a single segment, so the loss is
+   "large portions"; without VAD a 30 s chunk holds many segments and only the
+   ones straddling a turn are lost, which is why the reporter saw *"almost"
+   full transcription, some parts where there are overlapping speakers /
+   laughter didn't get transcribed* — those parts ARE the split ones.
+   Fixed by hoisting the re-walk into `crispasr_diarize_merged_by_slice`
+   (`crispasr_diarize_cli.{h,cpp}`), which rebuilds the list instead of
+   copying a fixed count back. Guarded by `tests/test-diarize-slice-rewalk.cpp`
+   (`[issue324]`), whose last case drives the REAL splitter via a hand-built
+   global-sherpa cache so the guard is anchored to production behaviour.
+2. **Foxnose ran per slice on the server.** `diarize_foxnose_global` was never
+   set there and `crispasr_apply_foxnose_global` was never called, so each VAD
+   slice clustered independently — numbering restarted at 0 every few seconds
+   and the WeSpeaker embedder was re-resolved per slice. The server now
+   mirrors `crispasr_apply_global_speaker_stages`: stand the per-slice path
+   down, run one global pass, and skip the TitaNet remap when it owns the
+   labels.
 
 ## What was reused vs. built
 
@@ -240,9 +286,52 @@ Where the time goes on a 215 s file (~45 s wall, ~4.8x realtime):
 | stage | share |
 |---|---|
 | WeSpeaker ResNet34 forward | ~70% (94% of the embedder) |
-| speaker-count estimation (GMM/BIC + silhouette) | ~12% (58 s -> 51 s when `--diarize-num-speakers` pins it) |
+| speaker-count estimation (GMM/BIC + silhouette) | ~12% (58 s -> 51 s when `--diarize-num-speakers` pins it), before the parallel sweep below |
 | Kaldi fbank | ~4% |
 | VAD, clustering, smoothing, I/O | remainder |
+
+**Speaker counting was single-threaded and recomputed its inputs (2026-08).**
+`cluster_speakers` rebuilt the same O(n^2 d) cosine affinity up to ~10 times
+per call — once inside the `run(k)` lambda and at three more sites — and then
+ran both k-sweeps serially: the GMM/BIC sweep (`n_init=5`, `max_iter=300` per
+k) and the spectral+silhouette sweep (a dense Laplacian, a subspace iteration
+and `10x300` k-means per k, for every k in `[2, max_speakers]`). Every k is
+independent — `gmm_bic` seeds its own RNG per init, and the spectral runs take
+the same `seed` per candidate — so the sweeps parallelise with the reductions
+left serial in ascending k, which is what keeps the tie-breaks (and therefore
+the chosen count) bit-identical.
+
+The fan-out is a file-local `parallel_tasks` in `spectral_diarize.cpp`, kept
+local to match every other parallelism helper in the tree
+(`firered_parallel_for`, `marblenet_parallel_for`, `ov_parallel_for`, and the
+inline loops in `core/mel.cpp` and `core/foxnose_pipeline.cpp` — none of them
+sit in a shared header). It differs from those four in handing out task
+INDICES from an atomic counter rather than splitting [0, n) into contiguous
+per-thread chunks: they parallelise uniform-cost items like audio frames,
+whereas a k=8 spectral run costs many times a k=2 one, so a static split
+leaves the thread holding the cheap candidates idle. Unifying all five behind
+one helper is a reasonable cleanup, but it has its own testing surface (two
+VAD models plus omnivoice) and does not belong in a diarization perf change.
+
+⚠ Note for anyone extending this: neither of the "just use the standard/
+platform" routes works here, and both were tested rather than assumed.
+`std::execution::par` is in-standard for core (C++17) but does not build on
+the Apple toolchain — libc++ gates `<execution>` behind
+`_LIBCPP_HAS_EXPERIMENTAL_PSTL`, and force-enabling it fails to LINK
+(`__pstl::__libdispatch::__dispatch_apply` is not in the shipped dylib);
+libstdc++ implements it over Intel TBB, which is nowhere in this tree. OpenMP
+is used heavily elsewhere (~28 pragma sites, including `schedule(dynamic)` at
+`mel_band_roformer.cpp:666`), but every site is `#ifdef _OPENMP`-guarded and
+OpenMP is NOT found on the stock macOS toolchain, so a pragma-based sweep
+would have delivered 0% of the speedup below on the machine it was measured
+on — the same trap the firered-asr note in `src/CMakeLists.txt` records.
+
+Measured on an M-series box, `-t 8`, esrit.wav (215 s), warm runs, arms
+interleaved base/PR: ASR-only 2.39 s; foxnose end-to-end **10.82 s -> 9.63 s**,
+i.e. **diarization delta 8.43 s -> 7.24 s (1.16x)**. Labels are bit-identical
+(259 spectral assertions unchanged, shard DER identical per file at 7.32%).
+The remaining estimation cost is real work, not redundancy: pinning the count
+with `--diarize-num-speakers` still saves ~1 s on top of this.
 
 ### Levers that were tried and LOST — do not re-litigate without new evidence
 
@@ -253,9 +342,15 @@ Where the time goes on a 215 s file (~45 s wall, ~4.8x realtime):
 | **Persistent graph + `gallocr`** (the `bananamind_tts` / `beat_this` trick) | **~0.1% available.** Instrumented build/alloc/compute per call: **0.050 ms build, 0.049 ms alloc, 103.430 ms compute.** There is no per-call overhead to remove. The graph is already rebuilt-and-thrown-away for free. |
 | **More threads** | wash. `-t 4` 44.72 / 44.58 s vs `-t 8` 45.05 / 44.60 s. The M1's 4 E-cores contribute nothing; the default `n_threads = 4` is already right. |
 
-BLAS is not a factor on this path: with `use_gpu = false` the embedder runs on
-a plain `ggml_backend_cpu_init()` backend and never schedules to the BLAS
-backend, even though the binary reports `backends: cpu,metal,blas`.
+BLAS *was* not a factor on this path, and the reason turned out to be fixable:
+the embedder ran on a plain `ggml_backend_cpu_init()` backend and never
+scheduled to the BLAS backend even though the binary reports
+`backends: cpu,metal,blas`. That was not a scheduler quirk — `ggml_conv_2d_direct`
+emits ONE `GGML_OP_CONV_2D` node that does its im2col + GEMM internally, so
+there is no `MUL_MAT` for the BLAS backend to claim (it supports `MUL_MAT` /
+`OUT_PROD` and nothing else). Lowering the convs to explicit IM2COL + MUL_MAT
+nodes and putting the BLAS backend in the scheduler is what the 2026-08 round
+below does, and it is the single biggest win recorded on this model.
 
 ### The lever that is actually left: stop embedding the same audio twice
 
@@ -281,3 +376,51 @@ above), not a cosine check. A cheaper variant with the same shape: batch N
 windows into one graph along `ne[3]` — the `parakeet` / `nemotron` batched
 decode trick — which changes no arithmetic at all, improves CPU GEMM shapes,
 and is the change most likely to make the GPU path win instead of lose.
+
+### 2026-08 round — reaching Accelerate (different machine: M-series, `-t 8`)
+
+Baselines on this box, esrit.wav (215 s) through the unified runner, warm
+runs only, arms always interleaved base/PR/base/PR. ASR-only **2.39 s**.
+
+⚠ This is a desktop, not a quiet bench, and the ratio moves with load — so
+both conditions are recorded rather than the flattering one. Interleaving is
+what makes them comparable at all; a non-interleaved arm on this machine is
+worthless.
+
+| condition | base delta | PR delta | speedup |
+|---|---|---|---|
+| loadavg ~1 (4 samples/arm) | 8.43 s | 5.96 s | **1.41x** |
+| loadavg ~7, desktop apps busy (3 samples/arm) | 9.13 s | 6.77 s | **1.35x** |
+
+Output JSON is byte-identical to base in every row below, and the 8-file
+VoxConverse shard scores identically per file (mean 7.32%).
+
+| lever | result |
+|---|---|
+| **im2col conv lowering + BLAS backend in the sched** (`CRISPASR_WESPEAKER_CONV`, now the DEFAULT) | **WON — 1.35-1.41x on the diarization delta** (see the table above), end-to-end 10.82 → 8.35 s quiet. See the corrected BLAS note above for why the direct-conv op could never reach Accelerate. Embeddings cosine 1.0 vs direct (`test_wespeaker_live.cpp` "im2col conv matches direct conv"), DER identical per file. |
+| **Batch N windows along `ne[3]`** (`wespeaker_embed_batch`, `CRISPASR_DIARIZE_BATCH_EMBED`) | **CPU: LOST** — 12.1 → 14.9 s wall at 8 workers, and cost-neutral single-threaded (43.0 s vs 44.0 s of embed compute). ggml's CPU conv loops `ne[3]`, so fusing changes no GEMM shape, and 352 windows → 11 chunks starves the worker pool. The prediction above that batching would "improve CPU GEMM shapes" was WRONG for ggml's CPU conv — it is right for the GPU. **GPU: the enabler**, see the next row. Arithmetic-identical either way (cosine 1.0, batch-vs-loop live test); defaults ON only under GPU. |
+| **Metal, revisited with im2col + batching** (`CRISPASR_WESPEAKER_GPU=1`) | **parity, not a win** — 8.5 s wall (batch 32, one GPU context) vs 8.4 s for the 8-worker CPU schedule. The 2.0x loss recorded above is GONE: im2col gets real `mul_mm` kernels instead of the naive scalar `kernel_conv_2d`, and batching cuts ~350 dispatches to ~11. Ships as an opt-in env; CPU stays the default. Mixed GPU-main + CPU-workers **aborts by construction** — workers borrow weights that now live in a Metal buffer — so `use_gpu` clamps the pool to one context. One-GPU-many-CPU would need dual-resident weights. |
+| **Kaldi fbank SIMD/Accelerate** | **skipped on measurement** — 697 ms out of 43 s of single-threaded embed compute (~1.6%) on this box, not the ~4% the M1 table above shows. Below the effort line; the `kaldi_fbank.cpp` scalar mel projection and per-call FFT scratch remain unoptimised. |
+
+**Which half does the work?** The lowering and the BLAS backend arrive
+together, so they were separated with a throwaway probe that skipped the
+`ggml_backend_init_by_name("BLAS")` call while keeping im2col. Interleaved,
+3 samples/arm, loadavg ~3, esrit.wav, ASR-only 2.22 s:
+
+| arm | end-to-end | diarization delta | vs direct |
+|---|---|---|---|
+| `direct` | 11.14 s | 8.92 s | — |
+| `im2col`, BLAS backend **withheld** | 11.22 s | 9.00 s | **1.00x — no gain** |
+| `im2col` + BLAS | 8.21 s | 5.99 s | **1.49x** |
+
+So the lowering on its own buys **nothing**: ggml's CPU `MUL_MAT` (llamafile
+tinyBLAS) is no faster here than the GEMM already inside `GGML_OP_CONV_2D`.
+The entire win is Accelerate, and the lowering is purely the mechanism that
+lets the scheduler hand it the GEMM. That also means the win is
+platform-conditional — on a build with no BLAS backend this change is
+performance-neutral, not a regression (outputs are byte-identical either way).
+
+⚠ The `~70% / ~12% / ~4%` split at the top of this section is the M1 measurement
+and is now stale for the embedder: with the conv lowering in, the ResNet
+forward no longer dominates by that margin. Re-measure before using those
+shares to pick the next lever.

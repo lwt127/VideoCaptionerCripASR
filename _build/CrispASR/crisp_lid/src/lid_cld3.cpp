@@ -7,7 +7,7 @@
 // the RAM hit is trivial).
 //
 // All algorithms below are byte-faithful ports of the upstream sources
-// at /Volumes/backups/ai/upstream/cld3/src/. Cross-validated against
+// of google/cld3 (src/). Cross-validated against
 // pycld3 + the Python reference dumper at
 // tools/reference_backends/lid_cld3.py.
 
@@ -78,7 +78,7 @@ constexpr FeatureKind kFeatureKinds[kNFeatures] = {
 };
 
 // ULScript values — verified against
-// /Volumes/backups/ai/upstream/cld3/src/script_span/generated_ulscript.h.
+// google/cld3 src/script_span/generated_ulscript.h.
 // Hiragana / Katakana / Hangul are NOT separate scripts; they all return
 // Hani. ScriptFeature::Compute then runs a secondary Hangul-vs-Hani
 // codepoint count and returns NUM_ULSCRIPTS (= kHangulSentinel) when
@@ -804,7 +804,7 @@ extern "C" void lid_cld3_free(lid_cld3_context* ctx) {
     if (!ctx)
         return;
     if (ctx->buf)
-        ggml_backend_buffer_free(ctx->buf);
+        core_gguf::release_weight_buffer(ctx->buf);
     if (ctx->gctx)
         ggml_free(ctx->gctx);
     delete ctx;

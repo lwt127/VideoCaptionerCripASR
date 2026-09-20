@@ -43,6 +43,7 @@
 #include "core/gpu_backend_pref.h"
 #include "core/ngram_loop_fix.h"
 #include "core/crispasr_env.h"
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1588,20 +1589,20 @@ extern "C" struct moss_diarize_context* moss_diarize_init_from_file(const char* 
     ctx->n_threads = params.n_threads;
     ctx->model_path = path_model;
 
-    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init();
     if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
-    ctx->backend_cpu = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (ctx->backend_cpu)
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
 
     {
         const char* force_cpu = std::getenv("CRISPASR_MOSS_DIARIZE_FORCE_CPU");
         if (force_cpu && force_cpu[0] == '1')
             ctx->backend = ctx->backend_cpu;
     }
-    if (ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
 
     // Encoder attention path — flash by default, manual on Vulkan
     {
@@ -1642,7 +1643,7 @@ extern "C" void moss_diarize_free(struct moss_diarize_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)

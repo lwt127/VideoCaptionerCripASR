@@ -6,6 +6,8 @@
 // Phase 4: Full forward + overlap-add chunking.
 
 #include "htdemucs.h"
+#include "htdemucs_gates.h"
+#include "htdemucs_ggml_util.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -30,6 +32,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -64,6 +67,8 @@ static bool htdemucs_profile() {
 static double htd_now_ms();
 static bool htdemucs_use_ggml();
 static bool htdemucs_use_fused();
+static void htdemucs_resolve_gates(bool caller_use_gpu, bool have_real_gpu);
+static htdemucs_gates::Resolved htdemucs_gates_resolved();
 static bool htdemucs_fused_ggml(struct htdemucs_context* ctx, std::vector<float>& x_buf, int& x_C, int& x_Fq, int x_T,
                                 std::vector<float>& xt_buf, int& xt_C, int xt_T,
                                 const std::vector<float>& freq_emb_bcast);
@@ -630,16 +635,42 @@ static htdemucs_context* htdemucs_init_impl(const char* model_path, htdemucs_par
     // weights would live on the GPU and every scalar/BLAS kernel would pay a
     // device->host read. CRISPASR_HTDEMUCS_GPU=1 requests it without having to
     // thread a flag through all three surfaces (CLI, session C-ABI, server).
-    const char* gpu_env = getenv("CRISPASR_HTDEMUCS_GPU");
-    const bool want_gpu = (params.use_gpu || (gpu_env && atoi(gpu_env) != 0));
-    if (want_gpu && htdemucs_use_ggml()) {
-        ctx->backend = crispasr_init_gpu_backend();
-        if (!ctx->backend)
-            ctx->backend = ggml_backend_cpu_init();
-    } else {
-        ctx->backend = ggml_backend_cpu_init();
+    // #413/#414: on a host with a real GPU backend the fused-graph GPU path
+    // is ~20x faster than CPU/BLAS (RTF 0.37 vs 7.4, RTX 3090 Ti), while
+    // per-layer graphs — GPU or CPU — measured SLOWER than BLAS. The AUTO
+    // defaults in htdemucs_gates::resolve() therefore pick graph+fused+GPU
+    // exactly when a real GPU is present, and the legacy BLAS path otherwise
+    // — a CPU-only host sees no behavior change. Probe the GPU backend first
+    // (the DL registry hands back CPU or null on GPU-less hosts) so AUTO
+    // resolves against reality, not against the build flags.
+    ggml_backend_t gpu_probe = nullptr;
+    {
+        // Skip the probe when GPU is explicitly forbidden — a CUDA context
+        // spin-up is not free and the answer would be discarded.
+        const char* e = getenv("CRISPASR_HTDEMUCS_GPU");
+        const bool may_gpu = (e && *e) ? atoi(e) != 0 : params.use_gpu;
+        if (may_gpu) {
+            gpu_probe = crispasr_init_gpu_backend();
+            if (gpu_probe && core_cpu_backend::is_cpu(gpu_probe)) {
+                ggml_backend_free(gpu_probe);
+                gpu_probe = nullptr;
+            }
+        }
     }
-    ctx->is_gpu = !ggml_backend_is_cpu(ctx->backend);
+    htdemucs_resolve_gates(params.use_gpu, gpu_probe != nullptr);
+    const htdemucs_gates::Resolved gates = htdemucs_gates_resolved();
+    if (gates.use_graph) {
+        ctx->backend = gates.gpu_backend ? gpu_probe : core_cpu_backend::init();
+        if (!ctx->backend)
+            ctx->backend = core_cpu_backend::init();
+    } else {
+        ctx->backend = core_cpu_backend::init();
+    }
+    if (gpu_probe && ctx->backend != gpu_probe)
+        ggml_backend_free(gpu_probe);
+    ctx->is_gpu = !core_cpu_backend::is_cpu(ctx->backend);
+    fprintf(stderr, "htdemucs: gates graph=%d fused=%d gpu=%d (real_gpu_present=%d)\n", (int)gates.use_graph,
+            (int)gates.use_fused, (int)gates.gpu_backend, (int)(gpu_probe != nullptr));
     fprintf(stderr, "htdemucs: backend = %s\n", ggml_backend_name(ctx->backend));
     core_gguf::WeightLoad wl;
     if (!core_gguf::load_weights(model_path, ctx->backend, "htdemucs", wl)) {
@@ -832,7 +863,7 @@ void htdemucs_free(htdemucs_context* ctx) {
     if (!ctx)
         return;
     if (ctx->buf_w)
-        ggml_backend_buffer_free(ctx->buf_w);
+        core_gguf::release_weight_buffer(ctx->buf_w);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
     if (ctx->backend)
@@ -953,13 +984,28 @@ static void htd_gemm(int M, int N, int K, const float* A, const float* B, float*
 // GGML graph port for the CrossTransformer (CRISPASR_HTDEMUCS_GGML).
 // Default OFF pending a full A/B: per the dev-guide inverse-default rule a
 // verified-but-not-yet-faster path stays opt-in and the old path stays default.
+// #414: the gates resolve ONCE at init (htdemucs_resolve_gates) so the AUTO
+// defaults can see whether a real GPU backend exists. Before init the helpers
+// fall back to the plain env reads (old semantics) — nothing on the compute
+// paths runs pre-init, this is belt-and-braces for stray early callers.
+static htdemucs_gates::Resolved g_htd_gates;
+static bool g_htd_gates_set = false;
+
+static void htdemucs_resolve_gates(bool caller_use_gpu, bool have_real_gpu) {
+    g_htd_gates = htdemucs_gates::resolve(getenv("CRISPASR_HTDEMUCS_GPU"), getenv("CRISPASR_HTDEMUCS_GGML"),
+                                          getenv("CRISPASR_HTDEMUCS_FUSED"), caller_use_gpu, have_real_gpu);
+    g_htd_gates_set = true;
+}
+
+static htdemucs_gates::Resolved htdemucs_gates_resolved() {
+    return g_htd_gates;
+}
+
 static bool htdemucs_use_ggml() {
-    static int v = -1;
-    if (v < 0) {
-        const char* e = getenv("CRISPASR_HTDEMUCS_GGML");
-        v = (e && atoi(e) != 0) ? 1 : 0; // default OFF
-    }
-    return v != 0;
+    if (g_htd_gates_set)
+        return g_htd_gates.use_graph;
+    const char* e = getenv("CRISPASR_HTDEMUCS_GGML");
+    return e && atoi(e) != 0;
 }
 
 // FUSED: run encoder + transformer + decoder as ONE graph so activations never
@@ -968,12 +1014,10 @@ static bool htdemucs_use_ggml() {
 // SLOWER than CPU+Accelerate for the encoder despite the transformer being
 // 3.3-6x faster.
 static bool htdemucs_use_fused() {
-    static int v = -1;
-    if (v < 0) {
-        const char* e = getenv("CRISPASR_HTDEMUCS_FUSED");
-        v = (e && atoi(e) != 0) ? 1 : 0; // default OFF
-    }
-    return v != 0;
+    if (g_htd_gates_set)
+        return g_htd_gates.use_fused;
+    const char* e = getenv("CRISPASR_HTDEMUCS_FUSED");
+    return e && atoi(e) != 0;
 }
 
 // FASTCONV: batched im2col + gemm for the CPU convs (default ON). Set
@@ -3818,10 +3862,12 @@ static ggml_tensor* g_dconv_groupnorm(ggml_context* g, ggml_tensor* x, ggml_tens
                                       float eps) {
     ggml_tensor* p = ggml_cont(g, ggml_permute(g, x, 0, 2, 1, 3)); // (T, C, Fq)
     p = ggml_group_norm(g, p, n_bands, eps);
+    // The affine weights here are the issue-#398 offenders: the F16 GGUF
+    // stores `*.dconv.layers.N.4.weight` as F16 (see htdemucs_ggml_util.h).
     if (w)
-        p = ggml_mul(g, p, ggml_reshape_3d(g, w, 1, (int)w->ne[0], 1));
+        p = ggml_mul(g, p, ggml_reshape_3d(g, htd_bcast_f32(g, w), 1, (int)w->ne[0], 1));
     if (b)
-        p = ggml_add(g, p, ggml_reshape_3d(g, b, 1, (int)b->ne[0], 1));
+        p = ggml_add(g, p, ggml_reshape_3d(g, htd_bcast_f32(g, b), 1, (int)b->ne[0], 1));
     return ggml_cont(g, ggml_permute(g, p, 0, 2, 1, 3)); // back to (T, Fq, C)
 }
 
@@ -3848,7 +3894,7 @@ static ggml_tensor* g_dconv(ggml_context* g, ggml_tensor* x, const htdemucs_dcon
         ggml_tensor* w1 = ggml_reshape_4d(g, sl.conv1_w, K, 1, C, hidden);
         ggml_tensor* h = ggml_conv_2d(g, w1, x, 1, 1, dilation * (K / 2), 0, dilation, 1);
         if (sl.conv1_b)
-            h = ggml_add(g, h, ggml_reshape_3d(g, sl.conv1_b, 1, 1, hidden));
+            h = ggml_add(g, h, ggml_reshape_3d(g, htd_bcast_f32(g, sl.conv1_b), 1, 1, hidden));
         if (sl.norm1_w)
             h = g_dconv_groupnorm(g, h, sl.norm1_w, sl.norm1_b, n_bands, 1e-5f);
         h = ggml_gelu(g, h);
@@ -3857,13 +3903,13 @@ static ggml_tensor* g_dconv(ggml_context* g, ggml_tensor* x, const htdemucs_dcon
         ggml_tensor* w2 = ggml_reshape_4d(g, sl.conv2_w, 1, 1, hidden, out2C);
         ggml_tensor* h2 = ggml_conv_2d(g, w2, h, 1, 1, 0, 0, 1, 1);
         if (sl.conv2_b)
-            h2 = ggml_add(g, h2, ggml_reshape_3d(g, sl.conv2_b, 1, 1, out2C));
+            h2 = ggml_add(g, h2, ggml_reshape_3d(g, htd_bcast_f32(g, sl.conv2_b), 1, 1, out2C));
         if (sl.norm2_w)
             h2 = g_dconv_groupnorm(g, h2, sl.norm2_w, sl.norm2_b, n_bands, 1e-5f);
 
         ggml_tensor* y = g_glu_c(g, h2);
         if (sl.scale)
-            y = ggml_mul(g, y, ggml_reshape_3d(g, sl.scale, 1, 1, (int)sl.scale->ne[0]));
+            y = ggml_mul(g, y, ggml_reshape_3d(g, htd_bcast_f32(g, sl.scale), 1, 1, (int)sl.scale->ne[0]));
         x = ggml_add(g, x, y);
     }
     return x;
@@ -3890,7 +3936,7 @@ static bool htdemucs_enc_freq_ggml(htdemucs_context* ctx, const htdemucs_enc_lay
     ggml_tensor* x = ggml_conv_2d(g, enc.conv_w, X, 1, stride, 0, pad, 1, 1);
     const int OC = (int)enc.conv_w->ne[3];
     if (enc.conv_b)
-        x = ggml_add(g, x, ggml_reshape_3d(g, enc.conv_b, 1, 1, OC));
+        x = ggml_add(g, x, ggml_reshape_3d(g, htd_bcast_f32(g, enc.conv_b), 1, 1, OC));
 
     ggml_tensor* INJ = nullptr;
     if (inject) {
@@ -3925,7 +3971,8 @@ static bool htdemucs_enc_freq_ggml(htdemucs_context* ctx, const htdemucs_enc_lay
         if (enc.rewrite_w) {
             ggml_tensor* rw = ggml_conv_2d(g, enc.rewrite_w, x, 1, 1, 0, 0, 1, 1);
             if (enc.rewrite_b)
-                rw = ggml_add(g, rw, ggml_reshape_3d(g, enc.rewrite_b, 1, 1, (int)enc.rewrite_w->ne[3]));
+                rw = ggml_add(g, rw,
+                              ggml_reshape_3d(g, htd_bcast_f32(g, enc.rewrite_b), 1, 1, (int)enc.rewrite_w->ne[3]));
             x = g_glu_c(g, rw);
         }
         if (cap0) {
@@ -4015,7 +4062,8 @@ static bool htdemucs_dec_freq_ggml(htdemucs_context* ctx, const htdemucs_dec_lay
             // 3x3 Conv2d with context padding on the freq axis.
             ggml_tensor* rw = ggml_conv_2d(g, dec.rewrite_w, y, 1, 1, 1, 1, 1, 1);
             if (dec.rewrite_b)
-                rw = ggml_add(g, rw, ggml_reshape_3d(g, dec.rewrite_b, 1, 1, (int)dec.rewrite_w->ne[3]));
+                rw = ggml_add(g, rw,
+                              ggml_reshape_3d(g, htd_bcast_f32(g, dec.rewrite_b), 1, 1, (int)dec.rewrite_w->ne[3]));
             y = g_glu_c(g, rw);
         }
         if (!dec.dconv.layers.empty())
@@ -4043,7 +4091,7 @@ static bool htdemucs_dec_freq_ggml(htdemucs_context* ctx, const htdemucs_dec_lay
                        (size_t)x_T * fq_raw * ct_OC * sizeof(float), (size_t)kh * x_T * sizeof(float));
     }
     if (dec.conv_tr_b)
-        acc = ggml_add(g, acc, ggml_reshape_3d(g, dec.conv_tr_b, 1, 1, ct_OC));
+        acc = ggml_add(g, acc, ggml_reshape_3d(g, htd_bcast_f32(g, dec.conv_tr_b), 1, 1, ct_OC));
 
     // Crop `pad` frequency rows from each side: z[..., pad:-pad, :].
     const int fq_out = fq_raw - 2 * pad;
@@ -4122,9 +4170,9 @@ static bool htdemucs_dec_freq_ggml(htdemucs_context* ctx, const htdemucs_dec_lay
 static ggml_tensor* g_layernorm(ggml_context* g, ggml_tensor* x, ggml_tensor* w, ggml_tensor* b, float eps) {
     ggml_tensor* y = ggml_norm(g, x, eps);
     if (w)
-        y = ggml_mul(g, y, ggml_reshape_2d(g, w, (int)w->ne[0], 1));
+        y = ggml_mul(g, y, ggml_reshape_2d(g, htd_bcast_f32(g, w), (int)w->ne[0], 1));
     if (b)
-        y = ggml_add(g, y, ggml_reshape_2d(g, b, (int)b->ne[0], 1));
+        y = ggml_add(g, y, ggml_reshape_2d(g, htd_bcast_f32(g, b), (int)b->ne[0], 1));
     return y;
 }
 
@@ -4138,9 +4186,9 @@ static ggml_tensor* g_groupnorm1(ggml_context* g, ggml_tensor* x, ggml_tensor* w
     flat = ggml_group_norm(g, flat, 1, eps);
     ggml_tensor* y = ggml_reshape_2d(g, flat, dim, seq);
     if (w)
-        y = ggml_mul(g, y, ggml_reshape_2d(g, w, dim, 1));
+        y = ggml_mul(g, y, ggml_reshape_2d(g, htd_bcast_f32(g, w), dim, 1));
     if (b)
-        y = ggml_add(g, y, ggml_reshape_2d(g, b, dim, 1));
+        y = ggml_add(g, y, ggml_reshape_2d(g, htd_bcast_f32(g, b), dim, 1));
     return y;
 }
 
@@ -4164,14 +4212,14 @@ static ggml_tensor* g_mha(ggml_context* g, ggml_tensor* Q, ggml_tensor* K, ggml_
 static ggml_tensor* g_linear(ggml_context* g, ggml_tensor* w, ggml_tensor* b, ggml_tensor* x) {
     ggml_tensor* y = ggml_mul_mat(g, w, x);
     if (b)
-        y = ggml_add(g, y, ggml_reshape_2d(g, b, (int)b->ne[0], 1));
+        y = ggml_add(g, y, ggml_reshape_2d(g, htd_bcast_f32(g, b), (int)b->ne[0], 1));
     return y;
 }
 
 // x = x + gamma * y   (LayerScale is per-channel)
 static ggml_tensor* g_layerscale_add(ggml_context* g, ggml_tensor* x, ggml_tensor* y, ggml_tensor* gamma, int dim) {
     if (gamma)
-        y = ggml_mul(g, y, ggml_reshape_2d(g, gamma, dim, 1));
+        y = ggml_mul(g, y, ggml_reshape_2d(g, htd_bcast_f32(g, gamma), dim, 1));
     return ggml_add(g, x, y);
 }
 
@@ -4218,9 +4266,13 @@ static ggml_tensor* g_cross_attn_layer(ggml_context* g, ggml_tensor* x, ggml_ten
     if (ca.cross_attn_in_proj_b) {
         ggml_tensor* b = ca.cross_attn_in_proj_b;
         const size_t es = ggml_element_size(b);
-        Q = ggml_add(g, Q, ggml_reshape_2d(g, ggml_cont(g, ggml_view_1d(g, b, dim, 0)), dim, 1));
-        K = ggml_add(g, K, ggml_reshape_2d(g, ggml_cont(g, ggml_view_1d(g, b, dim, (size_t)dim * es)), dim, 1));
-        V = ggml_add(g, V, ggml_reshape_2d(g, ggml_cont(g, ggml_view_1d(g, b, dim, (size_t)2 * dim * es)), dim, 1));
+        Q = ggml_add(g, Q, ggml_reshape_2d(g, htd_bcast_f32(g, ggml_cont(g, ggml_view_1d(g, b, dim, 0))), dim, 1));
+        K = ggml_add(
+            g, K,
+            ggml_reshape_2d(g, htd_bcast_f32(g, ggml_cont(g, ggml_view_1d(g, b, dim, (size_t)dim * es))), dim, 1));
+        V = ggml_add(
+            g, V,
+            ggml_reshape_2d(g, htd_bcast_f32(g, ggml_cont(g, ggml_view_1d(g, b, dim, (size_t)2 * dim * es))), dim, 1));
     }
 
     ggml_tensor* att = g_mha(g, Q, K, V, dim, n_heads, q_seq, k_seq);
@@ -4519,7 +4571,7 @@ static bool htdemucs_fused_ggml(htdemucs_context* ctx, std::vector<float>& x_buf
 
         x = ggml_conv_2d(g, enc.conv_w, x, 1, stri, 0, pad_val, 1, 1);
         if (enc.conv_b)
-            x = ggml_add(g, x, ggml_reshape_3d(g, enc.conv_b, 1, 1, (int)enc.conv_w->ne[3]));
+            x = ggml_add(g, x, ggml_reshape_3d(g, htd_bcast_f32(g, enc.conv_b), 1, 1, (int)enc.conv_w->ne[3]));
         const int nb = (int)x->ne[1];
         if (!enc.empty) {
             x = ggml_gelu(g, x);
@@ -4528,7 +4580,8 @@ static bool htdemucs_fused_ggml(htdemucs_context* ctx, std::vector<float>& x_buf
             if (enc.rewrite_w) {
                 ggml_tensor* rw = ggml_conv_2d(g, enc.rewrite_w, x, 1, 1, 0, 0, 1, 1);
                 if (enc.rewrite_b)
-                    rw = ggml_add(g, rw, ggml_reshape_3d(g, enc.rewrite_b, 1, 1, (int)enc.rewrite_w->ne[3]));
+                    rw = ggml_add(g, rw,
+                                  ggml_reshape_3d(g, htd_bcast_f32(g, enc.rewrite_b), 1, 1, (int)enc.rewrite_w->ne[3]));
                 x = g_glu_c(g, rw);
             }
         }
@@ -4618,7 +4671,8 @@ static bool htdemucs_fused_ggml(htdemucs_context* ctx, std::vector<float>& x_buf
             if (dec.rewrite_w) {
                 ggml_tensor* rw = ggml_conv_2d(g, dec.rewrite_w, y, 1, 1, hp.context, hp.context, 1, 1);
                 if (dec.rewrite_b)
-                    rw = ggml_add(g, rw, ggml_reshape_3d(g, dec.rewrite_b, 1, 1, (int)dec.rewrite_w->ne[3]));
+                    rw = ggml_add(g, rw,
+                                  ggml_reshape_3d(g, htd_bcast_f32(g, dec.rewrite_b), 1, 1, (int)dec.rewrite_w->ne[3]));
                 y = g_glu_c(g, rw);
             }
             if (!dec.dconv.layers.empty())
@@ -4643,7 +4697,7 @@ static bool htdemucs_fused_ggml(htdemucs_context* ctx, std::vector<float>& x_buf
                            (size_t)x_T * fq_raw * ct_OC * sizeof(float), (size_t)kh * x_T * sizeof(float));
         }
         if (dec.conv_tr_b)
-            acc = ggml_add(g, acc, ggml_reshape_3d(g, dec.conv_tr_b, 1, 1, ct_OC));
+            acc = ggml_add(g, acc, ggml_reshape_3d(g, htd_bcast_f32(g, dec.conv_tr_b), 1, 1, ct_OC));
         x = ggml_cont(g, ggml_view_3d(g, acc, x_T, fq_raw - 2 * pad, ct_OC, acc->nb[1], acc->nb[2],
                                       (size_t)pad * x_T * sizeof(float)));
         if (idx != hp.depth - 1)

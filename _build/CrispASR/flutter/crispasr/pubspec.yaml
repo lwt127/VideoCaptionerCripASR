@@ -1,6 +1,6 @@
 name: crispasr
 description: Lightweight on-device speech recognition via ggml. Supports Whisper, Qwen3-ASR, FastConformer, and more.
-version: 0.8.25
+version: 0.8.34
 homepage: https://github.com/CrispStrobe/CrispASR
 repository: https://github.com/CrispStrobe/CrispASR/tree/main/flutter/crispasr
 
@@ -12,10 +12,10 @@ topics:
   - ggml
 
 environment:
-  # 3.1.0+: chat.dart uses NativeCallable.listener and Array<Int8> inline
-  # struct fields, both of which were stabilised in Dart 3.1. The rest
-  # of the package compiles fine on 3.0; upgrading to 3.1 is the lowest
-  # bar that lets the chat ABI bind.
+  # 3.1.0+: chat.dart uses NativeCallable.isolateLocal (for the generate
+  # abort predicate) and Array<Int8> inline struct fields, both of which were
+  # stabilised in Dart 3.1. The rest of the package compiles fine on 3.0;
+  # upgrading to 3.1 is the lowest bar that lets the chat ABI bind.
   sdk: '>=3.1.0 <4.0.0'
 
 dependencies:

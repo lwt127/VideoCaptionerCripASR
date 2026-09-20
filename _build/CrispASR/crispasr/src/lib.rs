@@ -257,6 +257,14 @@ pub struct CtcLogits {
 }
 
 /// A loaded session over a CrispASR model of any backend.
+/// One stem from [`Session::separate`]: its name (`vocals`, `drums`, …) and
+/// its interleaved-stereo PCM at [`Session::separate_sample_rate`].
+#[derive(Debug, Clone)]
+pub struct Stem {
+    pub name: String,
+    pub pcm: Vec<f32>,
+}
+
 pub struct Session {
     handle: *mut crispasr_sys::CrispasrSession,
     n_threads: c_int,
@@ -330,6 +338,106 @@ impl Session {
             .filter(|s| !s.is_empty())
             .map(|s| s.trim().to_string())
             .collect()
+    }
+
+    /// What can this backend actually *do*? (#433)
+    ///
+    /// [`detect_backend`](Self::detect_backend) returns a name and nothing
+    /// else, but several backends serve more than one purpose — `lfm2-audio`
+    /// and `mini-omni2` are both `tts` **and** `s2s`, and `gemma4-e2b` does
+    /// recognition and translation. Pair the two calls to answer "what can I do
+    /// with this file?".
+    ///
+    /// Returns the capability names, e.g. `["auto-download", "tts", "s2s"]`.
+    /// An unknown backend is an error rather than an empty list, because a
+    /// backend that genuinely declares no capabilities is a different answer.
+    pub fn backend_caps(backend: &str) -> Result<Vec<String>, String> {
+        let name = CString::new(backend).map_err(|e| format!("invalid backend: {e}"))?;
+        let mut buf = [0i8; 1024];
+        let n = unsafe {
+            crispasr_sys::crispasr_backend_caps_abi(name.as_ptr(), buf.as_mut_ptr(), buf.len() as i32)
+        };
+        if n == -3 {
+            return Err(format!("unknown backend '{backend}'"));
+        }
+        if n < 0 {
+            return Err(format!("backend_caps failed (code {n})"));
+        }
+        let s = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned();
+        Ok(s.split(',').filter(|x| !x.is_empty()).map(|x| x.to_string()).collect())
+    }
+
+    /// Every backend paired with its verbs (#433).
+    ///
+    /// The "available backend list containing verb info" the issue asked for —
+    /// without shelling out to `crispasr --list-backends-json` and parsing
+    /// stdout, which was previously the only way to reach this data.
+    pub fn list_backends_with_caps() -> Result<Vec<(String, Vec<String>)>, String> {
+        // Ask once with an empty buffer: a negative return is the required size,
+        // so the buffer is never guessed and never silently truncated.
+        let need = unsafe { crispasr_sys::crispasr_backend_caps_list_abi(std::ptr::null_mut(), 0) };
+        let cap = if need < 0 { (-need) as usize } else { 65536 };
+        let mut buf = vec![0i8; cap.max(1024)];
+        let n = unsafe {
+            crispasr_sys::crispasr_backend_caps_list_abi(buf.as_mut_ptr(), buf.len() as i32)
+        };
+        if n < 0 {
+            return Err(format!("list_backends_with_caps failed (code {n})"));
+        }
+        let s = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned();
+        Ok(s.lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| {
+                let mut it = l.splitn(2, '\t');
+                let name = it.next().unwrap_or("").to_string();
+                let caps = it
+                    .next()
+                    .unwrap_or("")
+                    .split(',')
+                    .filter(|x| !x.is_empty())
+                    .map(|x| x.to_string())
+                    .collect();
+                (name, caps)
+            })
+            .collect())
+    }
+
+    /// Every backend that can open this GGUF, primary first (#433).
+    ///
+    /// [`detect_backend`](Self::detect_backend) is 1:1 — one architecture
+    /// string, one backend — and that is not always the whole truth. A voxcpm2
+    /// GGUF opens both as `voxcpm2-tts` (the full TTS pipeline) and as
+    /// `voxcpm2-vae` (the standalone causal VAE upscaler): the VAE entry point
+    /// calls the same loader with `vae_only`, and there is no separate VAE
+    /// model to download. Before this, a caller had no way to discover the
+    /// second name.
+    ///
+    /// The relation is DECLARED, not inferred: nothing in a GGUF says "another
+    /// backend can also read this", so it is a recorded fact about the runtimes
+    /// (`core_arch::alternates`).
+    ///
+    /// An unknown architecture is an `Err`, matching `detect_backend` — an
+    /// empty list would not distinguish "not recognised" from "recognised, no
+    /// alternates".
+    pub fn detect_backends(model_path: &str) -> Result<Vec<String>, String> {
+        let path = CString::new(model_path).map_err(|e| format!("invalid path: {e}"))?;
+        // Sized for the longest plausible list; the ABI returns -5 rather than
+        // truncating, so a too-small buffer can never under-report.
+        let mut buf = [0i8; 512];
+        let n = unsafe {
+            crispasr_sys::crispasr_detect_backends_from_gguf(
+                path.as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len() as i32,
+            )
+        };
+        if n <= 0 {
+            return Err(format!("backend detection failed (code {n})"));
+        }
+        let s = unsafe { CStr::from_ptr(buf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        Ok(s.lines().filter(|l| !l.is_empty()).map(|l| l.to_string()).collect())
     }
 
     /// Detect the backend from a GGUF file without opening it.
@@ -849,6 +957,53 @@ impl Session {
         Ok(())
     }
 
+    /// Set the reference voice from samples you already hold (#432).
+    ///
+    /// [`set_voice`](Self::set_voice) takes a path, which forces a temp file
+    /// whenever the reference is a *segment* of a WAV you have already decoded.
+    /// This takes the buffer directly.
+    ///
+    /// `pcm` is mono float32 at `sample_rate`. `ref_text` follows the same rule
+    /// as `set_voice`: backends that clone from raw audio need the reference
+    /// transcript.
+    ///
+    /// The library still serialises to a temp WAV internally and routes through
+    /// the same code path as `set_voice`, so consent handling and AI-Act
+    /// marking are identical for both — a clone does not get a different audit
+    /// trail for arriving as a buffer. That write is an implementation detail
+    /// and can be removed per-backend later without changing this signature.
+    pub fn set_voice_samples(
+        &self,
+        pcm: &[f32],
+        sample_rate: i32,
+        ref_text: Option<&str>,
+    ) -> Result<(), String> {
+        if pcm.is_empty() {
+            return Err("set_voice_samples: empty sample buffer".to_string());
+        }
+        if sample_rate <= 0 {
+            return Err(format!("set_voice_samples: invalid sample_rate {sample_rate}"));
+        }
+        let crt = match ref_text {
+            Some(t) => Some(CString::new(t).map_err(|e| e.to_string())?),
+            None => None,
+        };
+        let rt_ptr = crt.as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null());
+        let rc = unsafe {
+            crispasr_sys::crispasr_session_set_voice_samples(
+                self.handle,
+                pcm.as_ptr(),
+                pcm.len() as i32,
+                sample_rate,
+                rt_ptr,
+            )
+        };
+        if rc != 0 {
+            return Err(format!("set_voice_samples failed (rc={rc})"));
+        }
+        Ok(())
+    }
+
     /// Select a fixed/preset speaker by NAME for backends that bake names
     /// into the GGUF (orpheus). Names are e.g. `"tara"`/`"leo"` for
     /// canopylabs English; `"Anton"`/`"Sophie"` for Kartoffel_Orpheus DE.
@@ -933,7 +1088,9 @@ impl Session {
                 unsafe { crispasr_sys::crispasr_session_translate_text_free(text_ptr) };
             }
             return Err(format!(
-                "speech_to_speech returned no audio for backend {:?} (S2S may be unsupported)",
+                "speech_to_speech returned no audio for backend {:?} (S2S may be unsupported). \
+                 Separation models (htdemucs, mel-band-roformer) are not S2S — use \
+                 Session::separate() instead (#359).",
                 self.backend()
             ));
         }
@@ -951,12 +1108,100 @@ impl Session {
         Ok((out, transcript))
     }
 
+    /// Source separation: split stereo audio into its stems (#359).
+    ///
+    /// This is the verb for `htdemucs` and `mel-band-roformer`. They are NOT
+    /// speech-to-speech models, so [`Session::speech_to_speech`] returns no
+    /// audio for them — the C ABI has always had a separate five-function
+    /// surface for this, and it simply was not bound here.
+    ///
+    /// `pcm_stereo` is INTERLEAVED stereo at the model's own rate, which is
+    /// not 16 kHz: call [`Session::separate_sample_rate`] after loading (44100
+    /// for the shipped separation models). Each returned stem is interleaved
+    /// stereo of the same length.
+    ///
+    /// The C side owns the stem buffers only until the next call, so this
+    /// copies them out before returning.
+    pub fn separate(&self, pcm_stereo: &[f32]) -> Result<Vec<Stem>, String> {
+        // The C API counts PER-CHANNEL frames, not floats.
+        let n_frames = (pcm_stereo.len() / 2) as c_int;
+        if n_frames == 0 {
+            return Err("separate needs interleaved stereo PCM".to_string());
+        }
+        let n_stems = unsafe {
+            crispasr_sys::crispasr_session_separate(self.handle, pcm_stereo.as_ptr(), n_frames)
+        };
+        if n_stems <= 0 {
+            return Err(format!(
+                "separate returned no stems for backend {:?} (is it a separation model?)",
+                self.backend()
+            ));
+        }
+        let mut stems = Vec::with_capacity(n_stems as usize);
+        for i in 0..n_stems {
+            let name_ptr =
+                unsafe { crispasr_sys::crispasr_session_separate_stem_name(self.handle, i) };
+            let name = if name_ptr.is_null() {
+                format!("stem{}", i)
+            } else {
+                unsafe { CStr::from_ptr(name_ptr) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let mut n_out: c_int = 0;
+            let ptr = unsafe {
+                crispasr_sys::crispasr_session_separate_stem(
+                    self.handle,
+                    i,
+                    &mut n_out as *mut c_int,
+                )
+            };
+            if ptr.is_null() || n_out <= 0 {
+                return Err(format!("stem {} ({}) came back empty", i, name));
+            }
+            // n_out is per-channel; the buffer is interleaved stereo.
+            let pcm =
+                unsafe { std::slice::from_raw_parts(ptr, (n_out as usize) * 2).to_vec() };
+            stems.push(Stem { name, pcm });
+        }
+        Ok(stems)
+    }
+
+    /// Sample rate (Hz) of the stems from [`Session::separate`], and the rate
+    /// its input must be at. `0` before a separation backend is loaded — which
+    /// is what a caller sees if they reach for the ASR-side rate accessors on
+    /// a separation model.
+    pub fn separate_sample_rate(&self) -> i32 {
+        unsafe { crispasr_sys::crispasr_session_separate_sample_rate(self.handle) as i32 }
+    }
+
     /// The sample rate (Hz) the backend expects for input PCM — `16000` for
     /// Whisper-family backends, the model's native rate otherwise, `0` on
     /// error. Feed [`Session::speech_to_speech`] (and TTS voice-clone input)
     /// at this rate rather than resampling twice.
     pub fn input_sample_rate(&self) -> i32 {
         unsafe { crispasr_sys::crispasr_session_input_sample_rate(self.handle) as i32 }
+    }
+
+    /// The sample rate (Hz) of the PCM that [`Session::synthesize`] /
+    /// [`Session::speech_to_speech`] produce for this backend — the
+    /// "backend-native rate" their docs refer to. `0` when the backend
+    /// produces no audio output (ASR-only). (#332)
+    pub fn output_sample_rate(&self) -> i32 {
+        unsafe { crispasr_sys::crispasr_session_output_sample_rate(self.handle) as i32 }
+    }
+
+    /// Channel count for audio input (transcribe / s2s / voice references):
+    /// `1` (mono) for every current backend. Source separation is the stereo
+    /// exception and has its own surface. `0` on error. (#332)
+    pub fn input_channels(&self) -> i32 {
+        unsafe { crispasr_sys::crispasr_session_input_channels(self.handle) as i32 }
+    }
+
+    /// Channel count for synthesized / s2s output audio: `1` (mono) for every
+    /// current backend, `0` when the backend produces no audio output. (#332)
+    pub fn output_channels(&self) -> i32 {
+        unsafe { crispasr_sys::crispasr_session_output_channels(self.handle) as i32 }
     }
 
     /// Attest that the integrator accepts AI-content marking/disclosure
@@ -974,10 +1219,72 @@ impl Session {
         Ok(())
     }
 
+    /// Declare whose voice a PRESET voice is: `"real_person"`,
+    /// `"synthetic"` or `"unknown"`.
+    ///
+    /// Cloning is not the only way to produce a deep fake: a preset voice
+    /// shipped inside a model can be an identifiable individual — a named
+    /// donor, or a corpus speaker such as VCTK's `p225` — and EU AI Act
+    /// Art. 3(60) attaches to the audio resembling that person, not to which
+    /// pipeline produced it. Setting `real_person` makes the Art. 50(4)
+    /// reminder fire for a non-cloned voice.
+    ///
+    /// It does **not** require a consent attestation: whether that donor
+    /// agreed to the model being trained is a licensing matter settled
+    /// upstream, which you cannot attest to.
+    ///
+    /// Returns `Err` on an unrecognised value rather than silently
+    /// downgrading it to `unknown`.
+    pub fn set_speaker_identity(&self, identity: &str) -> Result<(), String> {
+        let c = CString::new(identity).map_err(|e| e.to_string())?;
+        let rc =
+            unsafe { crispasr_sys::crispasr_session_set_speaker_identity(self.handle, c.as_ptr()) };
+        match rc {
+            0 => Ok(()),
+            -2 => Err(format!(
+                "unrecognised speaker_identity {identity:?} (expected real_person, synthetic or unknown)"
+            )),
+            _ => Err(format!("set_speaker_identity failed (rc={rc})")),
+        }
+    }
+
+    /// Embed the AI-content watermark into f32 mono PCM, in place.
+    ///
+    /// The other half of [`Session::synthesize_raw`]: opting out of automatic
+    /// marking makes marking the result *your* duty (EU AI Act Art. 50(2)), and
+    /// this is what discharges it. Do the post-processing you opted out for —
+    /// resample, mix, concatenate — then call this on the finished buffer.
+    ///
+    /// Uses the robust, reliably detectable default strength; AudioSeal instead
+    /// if a model was loaded. Associated function, not a method: marking is a
+    /// property of the samples, not of the session that produced them.
+    pub fn watermark_embed(pcm: &mut [f32]) {
+        if pcm.is_empty() {
+            return;
+        }
+        unsafe {
+            crispasr_sys::crispasr_watermark_embed(pcm.as_mut_ptr(), pcm.len() as c_int, -1.0)
+        };
+    }
+
+    /// Confidence in `[0, 1]` that `pcm` carries the watermark.
+    ///
+    /// A weak diagnostic, not proof: the spread-spectrum detector's null mean is
+    /// 0.5, not 0, and a negative result on a short clip is mostly evidence that
+    /// the clip was short. See `docs/eu-ai-act.md` §6.7 before reading anything
+    /// into a number from here.
+    pub fn watermark_detect(pcm: &[f32]) -> f32 {
+        if pcm.is_empty() {
+            return 0.0;
+        }
+        unsafe { crispasr_sys::crispasr_watermark_detect(pcm.as_ptr(), pcm.len() as c_int) }
+    }
+
     /// UNMARKED synthesis (no watermark / disclosure), for callers that embed
     /// the mark themselves after post-processing. Hard-refused (returns `Err`)
     /// unless [`Session::accept_marking_responsibility`] was called first.
     /// Prefer [`Session::synthesize`] for the default watermarked output.
+    /// Mark the result with [`Session::watermark_embed`].
     pub fn synthesize_raw(&self, text: &str) -> Result<Vec<f32>, String> {
         let ctext = CString::new(text).map_err(|e| e.to_string())?;
         let mut n: c_int = 0;
@@ -1036,6 +1343,29 @@ impl Session {
             unsafe { crispasr_sys::crispasr_session_set_target_language(self.handle, c.as_ptr()) };
         if rc != 0 {
             return Err(format!("set_target_language failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Language a voice-cloning reference clip is spoken in (issue #329).
+    ///
+    /// Cross-lingual TTS backends (cosyvoice3) compare it to the requested
+    /// output language — [`set_target_language`](Session::set_target_language),
+    /// falling back to [`set_source_language`](Session::set_source_language) —
+    /// and drop the reference transcript when they differ, so the clone speaks
+    /// the target language instead of carrying the reference's accent.
+    ///
+    /// Optional: the backend otherwise infers the reference language from the
+    /// voice-bank entry or the reference transcript. That inference cannot
+    /// answer for a short transcript, and when it cannot, the requested target
+    /// language has no effect — set this to make it explicit.
+    pub fn set_tts_reference_language(&self, lang: &str) -> Result<(), String> {
+        let c = CString::new(lang).map_err(|e| e.to_string())?;
+        let rc = unsafe {
+            crispasr_sys::crispasr_session_set_tts_reference_language(self.handle, c.as_ptr())
+        };
+        if rc != 0 {
+            return Err(format!("set_tts_reference_language failed (rc={})", rc));
         }
         Ok(())
     }
@@ -1339,6 +1669,15 @@ impl Session {
         Ok(())
     }
 
+    /// Set the floor on generated audio length (MOSS TTS). Units are codec frames at 12.5 Hz (80 ms each), so n=25 floors at ~2 s; other backends no-op (rc=-2).
+    pub fn set_min_speech_tokens(&self, n: i32) -> Result<(), String> {
+        let rc = unsafe { crispasr_sys::crispasr_session_set_min_speech_tokens(self.handle, n) };
+        if rc != 0 && rc != -2 {
+            return Err(format!("set_min_speech_tokens failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
     /// Set the per-phoneme length-scale / speaking-rate scalar. Honoured by
     /// kokoro today; other backends silently no-op. 1.0 = upstream default.
     pub fn set_length_scale(&self, scale: f32) -> Result<(), String> {
@@ -1491,6 +1830,12 @@ impl Session {
         Ok(())
     }
 
+    /// Pad N ms of silence at the beginning of TTS output. Useful to bypass VLC playback bugs
+    /// where it drops the first ~1.5s of audio while parsing a large C2PA chunk.
+    pub fn set_tts_pad_silence_ms(&self, ms: i32) {
+        unsafe { crispasr_sys::crispasr_session_set_tts_pad_silence_ms(self.handle, ms as std::os::raw::c_int) };
+    }
+
     /// Select + load a punctuation-restoration model (`auto`/`firered`/`fullstop`/
     /// `punctuate-all`/`pcs`/path; `"none"`/`""` unloads). Auto-downloads on first use.
     pub fn set_punc_model(&self, punc_model: &str) -> Result<(), String> {
@@ -1510,6 +1855,30 @@ impl Session {
             unsafe { crispasr_sys::crispasr_session_set_hotwords(self.handle, c.as_ptr(), boost) };
         if rc != 0 {
             return Err(format!("set_hotwords failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    /// Apply a named bundle of the four decoder fallback thresholds:
+    /// `"conservative"`, `"balanced"` (the shipped defaults, a no-op) or
+    /// `"aggressive"`. `"strict"`/`"default"`/`"loose"` are aliases. Mirrors the
+    /// CLI's `--sensitivity`.
+    ///
+    /// The four thresholds interact — a decode is only retried when the logprob
+    /// *and* no-speech bars are both crossed — so they move as a set. A later
+    /// [`Session::set_fallback_thresholds`] overrides this. An unrecognised
+    /// preset is rejected rather than silently treated as `"balanced"`.
+    pub fn set_sensitivity(&self, preset: &str) -> Result<(), String> {
+        let c = CString::new(preset).map_err(|e| e.to_string())?;
+        let rc = unsafe { crispasr_sys::crispasr_session_set_sensitivity(self.handle, c.as_ptr()) };
+        if rc == -2 {
+            return Err(format!(
+                "unknown sensitivity preset {:?} (expected: conservative, balanced, aggressive)",
+                preset
+            ));
+        }
+        if rc != 0 {
+            return Err(format!("set_sensitivity failed (rc={})", rc));
         }
         Ok(())
     }
@@ -1908,7 +2277,11 @@ pub struct RegistryEntry {
 }
 
 /// Role of one artifact in a canonical model download bundle.
+///
+/// Mirrors the append-only `crispasr_registry_artifact_kind` C enum, so
+/// new kinds may appear in minor releases — match with a `_` arm (#332).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RegistryArtifactKind {
     Primary,
     Companion,
@@ -2230,8 +2603,11 @@ pub fn align_words(
 // Language identification (shared C-ABI, 0.4.6+)
 // =========================================================================
 
+/// Mirrors the append-only C LID-method enum, so new methods may appear
+/// in minor releases — match with a `_` arm (#332).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
+#[non_exhaustive]
 pub enum LidMethod {
     /// Whisper encoder + language head. Needs a multilingual ggml-*.bin model.
     Whisper = 0,
@@ -2423,8 +2799,11 @@ impl DiarizeSegment {
     }
 }
 
+/// Mirrors the append-only `CrispasrDiarizeMethod` C enum, so new methods
+/// may appear in minor releases — match with a `_` arm (#332).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
+#[non_exhaustive]
 pub enum DiarizeMethod {
     /// Stereo only. |L| vs |R| energy per segment, 1.1× margin.
     Energy = 0,
@@ -2435,9 +2814,18 @@ pub enum DiarizeMethod {
     /// Mono-friendly, ML-based. Runs the GGUF pyannote segmentation net;
     /// requires a model path.
     Pyannote = 3,
+    /// Mono-friendly, ML-based (#324): WeSpeaker embeddings + spectral
+    /// clustering (the FoxNose recipe). Requires
+    /// [`DiarizeOptions::foxnose_embedder_path`]. Unlike the other methods
+    /// it derives speaker turns from the audio and attributes each caller
+    /// segment to the turn it overlaps most.
+    FoxNose = 4,
 }
 
+/// Construct via [`Default`] and set fields as needed — the struct grows
+/// alongside the append-only C ABI (#332).
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct DiarizeOptions {
     pub method: DiarizeMethod,
     /// GGUF path. Required for `Pyannote`, ignored otherwise.
@@ -2448,6 +2836,15 @@ pub struct DiarizeOptions {
     /// audio, so the diarizer can map absolute segment timestamps back
     /// to sample indices.
     pub slice_t0: f64,
+    /// GGUF path for the speaker-embedding model (WeSpeaker ResNet34-LM).
+    /// Required for `FoxNose`, ignored otherwise.
+    pub foxnose_embedder_path: Option<String>,
+    /// FoxNose speaker-count lower bound for automatic estimation (0 -> 1).
+    pub min_speakers: i32,
+    /// FoxNose speaker-count upper bound for automatic estimation (0 -> 8).
+    pub max_speakers: i32,
+    /// FoxNose: > 0 pins the speaker count and skips estimation entirely.
+    pub num_speakers: i32,
 }
 
 impl Default for DiarizeOptions {
@@ -2457,20 +2854,46 @@ impl Default for DiarizeOptions {
             pyannote_model_path: None,
             n_threads: 4,
             slice_t0: 0.0,
+            foxnose_embedder_path: None,
+            min_speakers: 0,
+            max_speakers: 0,
+            num_speakers: 0,
         }
     }
+}
+
+/// A speaker turn the diarizer derived from the AUDIO, independent of the
+/// caller's segment grid (#395).
+///
+/// Only [`DiarizeMethod::FoxNose`] produces these; the other methods label
+/// the caller's segments directly and yield none. `t0` / `t1` are seconds on
+/// the same absolute timeline as [`DiarizeSegment`] (i.e.
+/// [`DiarizeOptions::slice_t0`] is already accounted for), so a turn and a
+/// segment compare directly. `speaker` is dense and zero-based — a turn is
+/// always labelled, unlike a segment.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DiarizeTurn {
+    pub t0: f64,
+    pub t1: f64,
+    pub speaker: i32,
 }
 
 /// Assign a speaker index to each of `segs`, mutating each
 /// [`DiarizeSegment::speaker`] in place.
 ///
-/// Four methods — see [`DiarizeMethod`]. `left` is mono PCM for
+/// Five methods — see [`DiarizeMethod`]. `left` is mono PCM for
 /// mono-only methods, otherwise the left channel of a stereo pair.
 /// When `is_stereo` is true, `right` must be `Some`. All PCM is 16 kHz
 /// float32.
 ///
-/// Returns `Ok(())` on success. Only [`DiarizeMethod::Pyannote`] can
-/// fail (model load failure).
+/// Returns `Ok(())` on success. Only the model-backed methods
+/// ([`DiarizeMethod::Pyannote`], [`DiarizeMethod::FoxNose`]) can fail
+/// (model load failure).
+///
+/// Labelling alone can never resolve finer than the grid you pass in: a
+/// segment that straddles a speaker change is silently awarded to whoever
+/// holds the majority of it. Use [`diarize_segments_with_turns`] when you
+/// have word timings and want to split such a segment.
 pub fn diarize_segments(
     segs: &mut [DiarizeSegment],
     left: &[f32],
@@ -2478,14 +2901,53 @@ pub fn diarize_segments(
     is_stereo: bool,
     opts: &DiarizeOptions,
 ) -> Result<(), String> {
+    diarize_inner(segs, left, right, is_stereo, opts, false).map(|_| ())
+}
+
+/// Same as [`diarize_segments`], and additionally returns the speaker turns
+/// the method derived from the audio (#395).
+///
+/// The turns are what let a caller resolve a speaker change INSIDE one of its
+/// own segments — split a merged run wherever the turn id changes, instead of
+/// accepting the majority label for the whole span. Only
+/// [`DiarizeMethod::FoxNose`] derives turns; every other method returns an
+/// empty `Vec`, which is not an error.
+///
+/// The segments are labelled exactly as [`diarize_segments`] would label
+/// them; asking for turns changes nothing about the labels.
+pub fn diarize_segments_with_turns(
+    segs: &mut [DiarizeSegment],
+    left: &[f32],
+    right: Option<&[f32]>,
+    is_stereo: bool,
+    opts: &DiarizeOptions,
+) -> Result<Vec<DiarizeTurn>, String> {
+    diarize_inner(segs, left, right, is_stereo, opts, true)
+}
+
+fn diarize_inner(
+    segs: &mut [DiarizeSegment],
+    left: &[f32],
+    right: Option<&[f32]>,
+    is_stereo: bool,
+    opts: &DiarizeOptions,
+    want_turns: bool,
+) -> Result<Vec<DiarizeTurn>, String> {
     if segs.is_empty() || left.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let path_c = match (&opts.pyannote_model_path, opts.method) {
         (Some(p), DiarizeMethod::Pyannote) => Some(
             CString::new(p.as_str())
                 .map_err(|e| format!("pyannote_model_path contains NUL: {e}"))?,
+        ),
+        _ => None,
+    };
+    let foxnose_c = match (&opts.foxnose_embedder_path, opts.method) {
+        (Some(p), DiarizeMethod::FoxNose) => Some(
+            CString::new(p.as_str())
+                .map_err(|e| format!("foxnose_embedder_path contains NUL: {e}"))?,
         ),
         _ => None,
     };
@@ -2498,6 +2960,14 @@ pub fn diarize_segments(
             .as_ref()
             .map(|c| c.as_ptr())
             .unwrap_or(std::ptr::null()),
+        foxnose_embedder_path: foxnose_c
+            .as_ref()
+            .map(|c| c.as_ptr())
+            .unwrap_or(std::ptr::null()),
+        min_speakers: opts.min_speakers,
+        max_speakers: opts.max_speakers,
+        num_speakers: opts.num_speakers,
+        _pad2: 0,
     };
 
     let mut abi_segs: Vec<crispasr_sys::CrispasrDiarizeSegAbi> = segs
@@ -2515,26 +2985,95 @@ pub fn diarize_segments(
         _ => left.as_ptr(),
     };
 
-    let rc = unsafe {
-        crispasr_sys::crispasr_diarize_segments_abi(
-            left.as_ptr(),
-            right_ptr,
-            left.len() as i32,
-            if is_stereo { 1 } else { 0 },
-            abi_segs.as_mut_ptr(),
-            abi_segs.len() as i32,
-            &abi_opts,
-        )
-    };
+    if !want_turns {
+        let rc = unsafe {
+            crispasr_sys::crispasr_diarize_segments_abi(
+                left.as_ptr(),
+                right_ptr,
+                left.len() as i32,
+                if is_stereo { 1 } else { 0 },
+                abi_segs.as_mut_ptr(),
+                abi_segs.len() as i32,
+                &abi_opts,
+            )
+        };
+        return finish(rc, segs, &abi_segs, &[], 0).map(|_| Vec::new());
+    }
+
+    // The ABI keeps no state between calls, so a buffer that turns out to be
+    // too small costs a SECOND full diarization pass. Size the first attempt
+    // so that can't happen: turns are merged embedding windows, the hop is
+    // 0.6 s, and no turn is shorter than one hop — so one slot per 0.5 s of
+    // audio (plus one per segment, plus slack) is comfortably above the
+    // ceiling. The retry below is the belt to that pair of braces.
+    let mut cap = (left.len() as f64 / 16_000.0 / 0.5).ceil() as usize + segs.len() + 16;
+    let mut turns: Vec<crispasr_sys::CrispasrDiarizeTurnAbi> = Vec::new();
+    for attempt in 0..2 {
+        turns.clear();
+        turns.resize(
+            cap,
+            crispasr_sys::CrispasrDiarizeTurnAbi {
+                t0_cs: 0,
+                t1_cs: 0,
+                speaker: -1,
+                _pad: 0,
+            },
+        );
+        let mut n_turns: i32 = 0;
+        let rc = unsafe {
+            crispasr_sys::crispasr_diarize_segments_turns_abi(
+                left.as_ptr(),
+                right_ptr,
+                left.len() as i32,
+                if is_stereo { 1 } else { 0 },
+                abi_segs.as_mut_ptr(),
+                abi_segs.len() as i32,
+                &abi_opts,
+                turns.as_mut_ptr(),
+                cap as i32,
+                &mut n_turns,
+            )
+        };
+        // rc 2 = the buffer was short; n_turns is the required capacity.
+        if rc == 2 && attempt == 0 {
+            cap = n_turns.max(1) as usize;
+            continue;
+        }
+        return finish(rc, segs, &abi_segs, &turns, n_turns);
+    }
+    unreachable!("the retry loop returns on its second pass")
+}
+
+/// Shared tail of both diarize entry points: map the ABI return code, copy the
+/// labels back, and convert the turns out of centiseconds.
+fn finish(
+    rc: i32,
+    segs: &mut [DiarizeSegment],
+    abi_segs: &[crispasr_sys::CrispasrDiarizeSegAbi],
+    abi_turns: &[crispasr_sys::CrispasrDiarizeTurnAbi],
+    n_turns: i32,
+) -> Result<Vec<DiarizeTurn>, String> {
     match rc {
         0 => {
             for (i, s) in segs.iter_mut().enumerate() {
                 s.speaker = abi_segs[i].speaker;
             }
-            Ok(())
+            let n = (n_turns.max(0) as usize).min(abi_turns.len());
+            Ok(abi_turns[..n]
+                .iter()
+                .map(|t| DiarizeTurn {
+                    t0: t.t0_cs as f64 / 100.0,
+                    t1: t.t1_cs as f64 / 100.0,
+                    speaker: t.speaker,
+                })
+                .collect())
         }
-        1 => Err("pyannote model load failed".to_string()),
+        1 => Err("diarize model load failed (pyannote / foxnose embedder)".to_string()),
         -1 => Err("invalid arguments to crispasr_diarize_segments_abi".to_string()),
+        2 => Err(format!(
+            "diarize turn buffer too small — {n_turns} turns needed; this is a \
+             crispasr bug, please report it with the audio length and segment count"
+        )),
         other => Err(format!("crispasr_diarize_segments_abi returned {other}")),
     }
 }
@@ -3017,7 +3556,13 @@ pub fn vad_slices(
         )
     };
     if n < 0 {
-        return Err(format!("crispasr_vad_slices failed (rc={n})"));
+        let why = match n {
+            -1 => " (bad arguments)",
+            -2 => " (allocation failed)",
+            -3 => " (the VAD model could not be loaded)",
+            _ => "",
+        };
+        return Err(format!("crispasr_vad_slices failed (rc={n}){why}"));
     }
     let mut spans = Vec::with_capacity(n as usize);
     for i in 0..n as isize {
@@ -3137,4 +3682,971 @@ pub fn kokoro_lang_is_german(lang: &str) -> bool {
 pub fn kokoro_lang_has_native_voice(lang: &str) -> bool {
     let c = CString::new(lang).unwrap_or_default();
     unsafe { crispasr_sys::crispasr_kokoro_lang_has_native_voice_abi(c.as_ptr()) }
+}
+
+// =========================================================================
+// Chat / LLM — safe wrapper over include/crispasr_chat.h
+// =========================================================================
+//
+// EU AI Act note: this surface generates synthetic TEXT, which the runtime
+// does NOT mark for you (unlike every audio path, which watermarks). See
+// [`ChatSession::ai_disclosure_text`] and docs/eu-ai-act.md §6.6 before
+// shipping a product on top of it.
+
+use std::cell::Cell;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+
+/// Why a chat call failed.
+///
+/// The chat ABI promises exactly one error code as a contract —
+/// `CRISPASR_CHAT_ERR_ABORTED` — because a caller running its own
+/// cancellation has to tell a cancel apart from a decode fault. That
+/// distinction is the whole reason this is an enum and not a `String`:
+/// [`ChatError::Aborted`] means "you cancelled it", everything else is
+/// [`ChatError::Failed`] carrying the C diagnostic verbatim. Do not switch
+/// on numbers — no other code is stable.
+///
+/// `From<ChatError> for String` is implemented, so `?` still works inside
+/// the `Result<_, String>` functions that make up the rest of this crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatError {
+    /// A registered abort callback stopped the generation (see
+    /// [`ChatSession::with_abort_callback`]). Whatever text was already
+    /// delivered through the token callback is valid, and the session has
+    /// been flushed back to its just-opened state — reuse it directly, no
+    /// [`ChatSession::reset`] needed.
+    Aborted(String),
+    /// Any other failure. The string is the C side's diagnostic.
+    Failed(String),
+}
+
+impl ChatError {
+    /// True when a registered abort callback stopped the generation, as
+    /// opposed to anything going wrong.
+    pub fn is_aborted(&self) -> bool {
+        matches!(self, ChatError::Aborted(_))
+    }
+
+    /// The underlying diagnostic, without the variant.
+    pub fn message(&self) -> &str {
+        match self {
+            ChatError::Aborted(m) | ChatError::Failed(m) => m,
+        }
+    }
+
+    fn from_raw(err: &crispasr_sys::CrispasrChatError, code_hint: i32, fallback: &str) -> Self {
+        // The one-shot path signals failure by returning null, so `err` is
+        // the only carrier there; the streaming path also returns the code.
+        let code = if err.code != 0 { err.code } else { code_hint };
+        let bytes: Vec<u8> = err
+            .message
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        let mut msg = String::from_utf8_lossy(&bytes).into_owned();
+        if msg.is_empty() {
+            msg = fallback.to_string();
+        }
+        if code == crispasr_sys::CRISPASR_CHAT_ERR_ABORTED {
+            ChatError::Aborted(msg)
+        } else {
+            ChatError::Failed(msg)
+        }
+    }
+}
+
+impl std::fmt::Display for ChatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChatError::Aborted(m) => write!(f, "aborted: {m}"),
+            ChatError::Failed(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+impl std::error::Error for ChatError {}
+
+impl From<ChatError> for String {
+    fn from(e: ChatError) -> String {
+        e.to_string()
+    }
+}
+
+/// One turn in a conversation.
+///
+/// `role` is one of `"system"`, `"user"`, `"assistant"`, `"tool"` — the
+/// OpenAI chat schema; the model's chat template maps those onto whatever
+/// it actually expects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
+impl ChatMessage {
+    /// A message with an arbitrary role.
+    pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+        }
+    }
+
+    /// A `"system"` message.
+    pub fn system(content: impl Into<String>) -> Self {
+        Self::new("system", content)
+    }
+
+    /// A `"user"` message.
+    pub fn user(content: impl Into<String>) -> Self {
+        Self::new("user", content)
+    }
+
+    /// An `"assistant"` message.
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self::new("assistant", content)
+    }
+}
+
+/// Per-session open options for [`ChatSession::open_with_options`].
+///
+/// Every field is `None` by default, meaning "keep the ABI's own default"
+/// (read from `crispasr_chat_open_params_default`, so it cannot drift from
+/// the C side). Set only what you need:
+///
+/// * `n_ctx` — context window in tokens; `None` uses the model's own.
+///   Size it against [`ChatSession::count_tokens`] plus the tokens you
+///   expect back.
+/// * `n_batch` / `n_ubatch` — logical and physical prompt-batch sizes
+///   (ABI default 512 each). A long prompt is prefilled in `n_batch`-sized
+///   pieces, and the abort hook is checked between them, so `n_batch` also
+///   sets the coarse bound on cancel latency.
+/// * `n_gpu_layers` — `-1` offloads every layer (the ABI default), `0` is
+///   CPU only, a positive value is a partial offload.
+#[derive(Debug, Clone, Default)]
+pub struct ChatOptions {
+    pub n_threads: Option<i32>,
+    pub n_threads_batch: Option<i32>,
+    pub n_ctx: Option<i32>,
+    pub n_batch: Option<i32>,
+    pub n_ubatch: Option<i32>,
+    pub n_gpu_layers: Option<i32>,
+    pub use_mmap: Option<bool>,
+    pub use_mlock: Option<bool>,
+    /// Overrides the chat template baked into the GGUF. `None` reads
+    /// `tokenizer.chat_template` from the model, falling back to "chatml".
+    pub chat_template: Option<String>,
+}
+
+/// Keeps the C strings a [`crispasr_sys::CrispasrChatOpenParams`] points at
+/// alive for as long as the params are in use.
+struct RawOpenParams {
+    _template: Option<CString>,
+    params: crispasr_sys::CrispasrChatOpenParams,
+}
+
+impl ChatOptions {
+    fn to_raw(&self) -> Result<RawOpenParams, ChatError> {
+        let mut params = crispasr_sys::CrispasrChatOpenParams::default();
+        // Start from the ABI's defaults rather than our own copy of them.
+        unsafe { crispasr_sys::crispasr_chat_open_params_default(&mut params) };
+        if let Some(v) = self.n_threads {
+            params.n_threads = v;
+        }
+        if let Some(v) = self.n_threads_batch {
+            params.n_threads_batch = v;
+        }
+        if let Some(v) = self.n_ctx {
+            params.n_ctx = v;
+        }
+        if let Some(v) = self.n_batch {
+            params.n_batch = v;
+        }
+        if let Some(v) = self.n_ubatch {
+            params.n_ubatch = v;
+        }
+        if let Some(v) = self.n_gpu_layers {
+            params.n_gpu_layers = v;
+        }
+        if let Some(v) = self.use_mmap {
+            params.use_mmap = v;
+        }
+        if let Some(v) = self.use_mlock {
+            params.use_mlock = v;
+        }
+        let template = match &self.chat_template {
+            Some(t) => {
+                let c = CString::new(t.as_str())
+                    .map_err(|e| ChatError::Failed(format!("chat_template NUL: {e}")))?;
+                params.chat_template = c.as_ptr();
+                Some(c)
+            }
+            None => None,
+        };
+        Ok(RawOpenParams {
+            _template: template,
+            params,
+        })
+    }
+}
+
+/// Per-call sampler options for the `*_with_options` generate entry points.
+///
+/// As with [`ChatOptions`], `None` keeps the ABI default. Note that
+/// `temperature: Some(0.0)` selects greedy decoding, which short-circuits
+/// the rest of the sampler chain — `top_k`, `top_p`, `min_p` and `seed`
+/// have no effect there — and `repeat_penalty: Some(1.0)` drops the
+/// penalties sampler, which makes `repeat_last_n` inert too.
+#[derive(Debug, Clone, Default)]
+pub struct ChatGenerateOptions {
+    /// Hard cap on generated tokens. `Some(0)` does NOT mean "generate
+    /// nothing": the ABI reads any non-positive value as "unset" and applies
+    /// its own default of 256. Use `prefill_only` to suppress generation.
+    pub max_tokens: Option<i32>,
+    pub temperature: Option<f32>,
+    pub top_k: Option<i32>,
+    pub top_p: Option<f32>,
+    pub min_p: Option<f32>,
+    pub repeat_penalty: Option<f32>,
+    pub repeat_last_n: Option<i32>,
+    pub seed: Option<u32>,
+    /// Generation halts the first time any of these appears in the decoded
+    /// output; the output is truncated before the match.
+    pub stop: Vec<String>,
+    /// Prefill the prompt but suppress assistant generation — for
+    /// measuring prompt cost.
+    pub prefill_only: bool,
+}
+
+/// Keeps the stop-string array a
+/// [`crispasr_sys::CrispasrChatGenerateParams`] points at alive.
+struct RawGenerateParams {
+    _stop_owned: Vec<CString>,
+    _stop_ptrs: Vec<*const c_char>,
+    params: crispasr_sys::CrispasrChatGenerateParams,
+}
+
+impl ChatGenerateOptions {
+    fn to_raw(&self) -> Result<RawGenerateParams, ChatError> {
+        let mut params = crispasr_sys::CrispasrChatGenerateParams::default();
+        unsafe { crispasr_sys::crispasr_chat_generate_params_default(&mut params) };
+        if let Some(v) = self.max_tokens {
+            params.max_tokens = v;
+        }
+        if let Some(v) = self.temperature {
+            params.temperature = v;
+        }
+        if let Some(v) = self.top_k {
+            params.top_k = v;
+        }
+        if let Some(v) = self.top_p {
+            params.top_p = v;
+        }
+        if let Some(v) = self.min_p {
+            params.min_p = v;
+        }
+        if let Some(v) = self.repeat_penalty {
+            params.repeat_penalty = v;
+        }
+        if let Some(v) = self.repeat_last_n {
+            params.repeat_last_n = v;
+        }
+        if let Some(v) = self.seed {
+            params.seed = v;
+        }
+        params.prefill_only = self.prefill_only;
+
+        let mut stop_owned = Vec::with_capacity(self.stop.len());
+        for s in &self.stop {
+            stop_owned.push(
+                CString::new(s.as_str())
+                    .map_err(|e| ChatError::Failed(format!("stop sequence NUL: {e}")))?,
+            );
+        }
+        let stop_ptrs: Vec<*const c_char> = stop_owned.iter().map(|s| s.as_ptr()).collect();
+        if stop_ptrs.is_empty() {
+            params.stop = std::ptr::null();
+            params.n_stop = 0;
+        } else {
+            params.stop = stop_ptrs.as_ptr();
+            params.n_stop = stop_ptrs.len();
+        }
+        Ok(RawGenerateParams {
+            _stop_owned: stop_owned,
+            _stop_ptrs: stop_ptrs,
+            params,
+        })
+    }
+}
+
+/// Keeps the C strings a message array points at alive for the call.
+struct RawMessages {
+    _owned: Vec<(CString, CString)>,
+    raw: Vec<crispasr_sys::CrispasrChatMessage>,
+}
+
+fn raw_messages(messages: &[ChatMessage]) -> Result<RawMessages, ChatError> {
+    let mut owned = Vec::with_capacity(messages.len());
+    for m in messages {
+        let role = CString::new(m.role.as_str())
+            .map_err(|e| ChatError::Failed(format!("role NUL: {e}")))?;
+        let content = CString::new(m.content.as_str())
+            .map_err(|e| ChatError::Failed(format!("content NUL: {e}")))?;
+        owned.push((role, content));
+    }
+    // CString owns a heap buffer, so these pointers survive `owned` moving.
+    let raw = owned
+        .iter()
+        .map(|(r, c)| crispasr_sys::CrispasrChatMessage {
+            role: r.as_ptr(),
+            content: c.as_ptr(),
+        })
+        .collect();
+    Ok(RawMessages { _owned: owned, raw })
+}
+
+/// What the token trampoline needs: the caller's closure, plus a slot for
+/// a panic it raised. A panic must not unwind through C, so it is caught
+/// here and resumed once the native call has returned.
+///
+/// `failed` is the session's shared flag, which the abort trampoline reads:
+/// nobody is left reading the output once the token closure has panicked, so
+/// a registered abort hook answers "stop" from then on.
+///
+/// `pending` holds the tail of a character the C side delivered in pieces. A
+/// model that falls back to byte tokens emits one chunk per BYTE, so a chunk
+/// can end part-way through a character; decoding each chunk on its own would
+/// turn every such character into replacement characters for good.
+struct TokenState<'a> {
+    on_token: &'a mut dyn FnMut(&str),
+    failed: &'a Cell<bool>,
+    panic: Option<Box<dyn std::any::Any + Send>>,
+    pending: Vec<u8>,
+}
+
+impl TokenState<'_> {
+    /// Hand `text` to the caller's closure, catching a panic rather than
+    /// letting it unwind through C. Empty text is not delivered.
+    fn deliver(&mut self, text: &str) {
+        if self.panic.is_some() || text.is_empty() {
+            return;
+        }
+        let on_token = &mut *self.on_token;
+        let outcome = catch_unwind(AssertUnwindSafe(|| on_token(text)));
+        if let Err(p) = outcome {
+            self.panic = Some(p);
+            self.failed.set(true);
+        }
+    }
+
+    /// Deliver everything in `bytes` that completes a character, keeping any
+    /// trailing incomplete sequence for the next chunk.
+    fn deliver_utf8(&mut self, bytes: &[u8]) {
+        let text = take_complete_utf8(&mut self.pending, bytes);
+        self.deliver(&text);
+    }
+
+    /// Deliver whatever is still buffered when the generation ends. Those
+    /// bytes are a character the generation stopped in the middle of, so they
+    /// are malformed on their own — hand them over with replacement rather
+    /// than drop output silently.
+    fn flush(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let tail = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        self.deliver(&tail);
+    }
+}
+
+/// Append `bytes` to `pending` and split off the longest prefix that is
+/// valid UTF-8, leaving a trailing incomplete sequence in `pending`.
+///
+/// A sequence that is merely unfinished (`Utf8Error::error_len() == None`) is
+/// held back — its remaining bytes arrive in a later chunk. One that is
+/// genuinely invalid (`Some(n)`) never becomes valid however much follows, so
+/// it becomes one replacement character and decoding continues after it.
+fn take_complete_utf8(pending: &mut Vec<u8>, bytes: &[u8]) -> String {
+    pending.extend_from_slice(bytes);
+    let mut out = String::new();
+    let mut consumed = 0;
+    loop {
+        match std::str::from_utf8(&pending[consumed..]) {
+            Ok(rest) => {
+                out.push_str(rest);
+                consumed = pending.len();
+                break;
+            }
+            Err(e) => {
+                let good = e.valid_up_to();
+                out.push_str(&String::from_utf8_lossy(
+                    &pending[consumed..consumed + good],
+                ));
+                match e.error_len() {
+                    Some(bad) => {
+                        out.push('\u{fffd}');
+                        consumed += good + bad;
+                    }
+                    None => {
+                        consumed += good;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    pending.drain(..consumed);
+    out
+}
+
+extern "C" fn token_trampoline(chunk: *const c_char, user: *mut c_void) {
+    if user.is_null() || chunk.is_null() {
+        return;
+    }
+    // SAFETY: `user` is the `&mut TokenState` registered for this one call.
+    // The C side only invokes this synchronously from inside that call, on
+    // the same thread, so the reference is live and unaliased here.
+    let st = unsafe { &mut *(user as *mut TokenState) };
+    if st.panic.is_some() {
+        // Already unwound once — don't call the closure again.
+        return;
+    }
+    // SAFETY: valid for the duration of the callback, per the ABI.
+    let bytes = unsafe { CStr::from_ptr(chunk) }.to_bytes();
+    st.deliver_utf8(bytes);
+}
+
+/// The abort hook's counterpart to [`TokenState`].
+struct AbortState<'a> {
+    should_continue: &'a mut dyn FnMut() -> bool,
+    token_failed: &'a Cell<bool>,
+    panic: Option<Box<dyn std::any::Any + Send>>,
+}
+
+extern "C" fn abort_trampoline(user: *mut c_void) -> bool {
+    if user.is_null() {
+        return true; // nothing registered — let the generation continue
+    }
+    // SAFETY: `user` is the `&mut AbortState` registered by
+    // `with_abort_callback`, which restores the previous registration before
+    // the state goes out of scope (on the unwind path too).
+    let st = unsafe { &mut *(user as *mut AbortState) };
+    if st.panic.is_some() {
+        return false; // already unwound once — stop the generation
+    }
+    if st.token_failed.get() {
+        // The token closure panicked: nothing is reading the output any
+        // more, so stop without asking the caller's predicate again.
+        return false;
+    }
+    let outcome = catch_unwind(AssertUnwindSafe(|| (st.should_continue)()));
+    match outcome {
+        // Same question, same polarity as the C ABI: `true` continues.
+        Ok(keep_going) => keep_going,
+        Err(p) => {
+            // A hook that panicked cannot be trusted to answer again, and
+            // finishing the generation would waste the work anyway.
+            st.panic = Some(p);
+            false
+        }
+    }
+}
+
+/// A chat / LLM session over a GGUF model.
+///
+/// One call at a time per session — the C side serialises its context with
+/// a mutex, so a second concurrent call blocks rather than racing. The KV
+/// cache persists across [`ChatSession::generate`] calls, and reuse depends
+/// on passing the WHOLE conversation every time: the session compares the
+/// templated prompt against the tokens it already holds and decodes only
+/// what is new. Passing just the latest turn is not wrong, it simply
+/// shares no prefix.
+///
+/// ```no_run
+/// use crispasr::{ChatMessage, ChatOptions, ChatSession};
+///
+/// let msgs = vec![ChatMessage::user("Say hello.")];
+/// let opts = ChatOptions {
+///     n_ctx: Some(4096),
+///     ..Default::default()
+/// };
+/// let chat = ChatSession::open_with_options("gemma-3-1b-it-Q4_K_M.gguf", &opts).unwrap();
+/// assert!(chat.count_tokens(&msgs).unwrap() < chat.n_ctx());
+/// println!("{}", chat.generate(&msgs).unwrap());
+/// ```
+pub struct ChatSession {
+    handle: *mut crispasr_sys::CrispasrChatSession,
+    /// Set by the token trampoline when the caller's closure panicked, read
+    /// by the abort trampoline so a registered hook answers "stop".
+    token_failed: Cell<bool>,
+    /// The `AbortState` currently registered with the C session, or null.
+    /// [`ChatSession::with_abort_callback`] puts back what it found here so a
+    /// nested scope does not disarm the enclosing one.
+    abort_user: Cell<*mut c_void>,
+}
+
+// Not `Sync` — one call at a time, and the abort registration is
+// session-global state.
+unsafe impl Send for ChatSession {}
+
+impl ChatSession {
+    /// Open a GGUF chat model with the ABI's default parameters.
+    pub fn open(model_path: &str) -> Result<Self, ChatError> {
+        Self::open_with_options(model_path, &ChatOptions::default())
+    }
+
+    /// Open a GGUF chat model, overriding the parameters named in
+    /// `options` (context window, batch sizes, GPU offload, threads,
+    /// chat template).
+    pub fn open_with_options(model_path: &str, options: &ChatOptions) -> Result<Self, ChatError> {
+        let path = CString::new(model_path)
+            .map_err(|e| ChatError::Failed(format!("invalid path: {e}")))?;
+        let raw = options.to_raw()?;
+        let mut err = crispasr_sys::CrispasrChatError::default();
+        let handle =
+            unsafe { crispasr_sys::crispasr_chat_open(path.as_ptr(), &raw.params, &mut err) };
+        if handle.is_null() {
+            return Err(ChatError::from_raw(
+                &err,
+                0,
+                &format!("failed to open chat model {model_path:?}"),
+            ));
+        }
+        Ok(Self {
+            handle,
+            token_failed: Cell::new(false),
+            abort_user: Cell::new(std::ptr::null_mut()),
+        })
+    }
+
+    /// Conservative working set in bytes (weights + KV cache + activations)
+    /// for a model on disk, reading its metadata but never its tensor data —
+    /// a pre-flight guard for low-memory devices. `options` matters mostly
+    /// for `n_ctx`, which sizes the KV term linearly; leave it unset and the
+    /// model's own trained context is used.
+    ///
+    /// The number is deliberately high, not approximate. The KV term bills
+    /// both the K and the V cache at the full attention width `n_embd`, but
+    /// a grouped-query model gives each layer a K/V width that is a fraction
+    /// of that: on Gemma 3 1B the KV term comes out 4.50× llama.cpp's real
+    /// cache (117.00 MiB against 26.00 MiB at `n_ctx` 1024), which is 1.33×
+    /// on the whole estimate at `n_ctx` 4096. Over-reporting is the safe
+    /// direction for a "will this fit?" guard: it can turn away a model that
+    /// would just have fitted, and never admits one that would not.
+    pub fn memory_estimate(model_path: &str, options: &ChatOptions) -> Result<usize, ChatError> {
+        let path = CString::new(model_path)
+            .map_err(|e| ChatError::Failed(format!("invalid path: {e}")))?;
+        let raw = options.to_raw()?;
+        let mut err = crispasr_sys::CrispasrChatError::default();
+        let bytes = unsafe {
+            crispasr_sys::crispasr_chat_memory_estimate(path.as_ptr(), &raw.params, &mut err)
+        };
+        if bytes == 0 {
+            return Err(ChatError::from_raw(
+                &err,
+                0,
+                "could not estimate chat model memory",
+            ));
+        }
+        Ok(bytes)
+    }
+
+    /// The canonical "you are talking to an AI" wording (EU AI Act
+    /// Art. 50(1)). Show it at or before the first turn of any
+    /// conversational product, and show it visibly — Art. 50(5) requires
+    /// disclosures to meet accessibility requirements. Nothing in this
+    /// crate marks generated text for you.
+    pub fn ai_disclosure_text() -> &'static str {
+        let p = unsafe { crispasr_sys::crispasr_chat_ai_disclosure_text() };
+        if p.is_null() {
+            return "";
+        }
+        // SAFETY: a static string owned by the library; never freed.
+        unsafe { CStr::from_ptr(p) }.to_str().unwrap_or("")
+    }
+
+    /// The context window in tokens. Compare against
+    /// [`Self::count_tokens`] when sizing a prompt.
+    pub fn n_ctx(&self) -> i32 {
+        unsafe { crispasr_sys::crispasr_chat_n_ctx(self.handle) }
+    }
+
+    /// The chat template the session resolved against — e.g. "chatml",
+    /// "llama3", "gemma". Empty only if the handle has none.
+    pub fn template_name(&self) -> String {
+        let p = unsafe { crispasr_sys::crispasr_chat_template_name(self.handle) };
+        if p.is_null() {
+            return String::new();
+        }
+        // SAFETY: owned by the session, valid until it is dropped.
+        unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+    }
+
+    /// Clear the KV cache and history so the next generate re-prefills from
+    /// scratch. Call it when starting a new conversation in a reused
+    /// session — not after an abort, which already resets the session.
+    pub fn reset(&self) -> Result<(), ChatError> {
+        let mut err = crispasr_sys::CrispasrChatError::default();
+        let rc = unsafe { crispasr_sys::crispasr_chat_reset(self.handle, &mut err) };
+        if rc != 0 {
+            return Err(ChatError::from_raw(&err, rc, "crispasr_chat_reset failed"));
+        }
+        Ok(())
+    }
+
+    /// Tokens the model's own tokenizer produces for `messages` once the
+    /// chat template has been applied — the prompt a FRESH session
+    /// prefills, so it can be compared straight against [`Self::n_ctx`].
+    /// It covers the template's control tokens, the leading BOS, and the
+    /// trailing generation prompt.
+    ///
+    /// An empty `messages` counts the template's own opening, which is
+    /// whatever that template emits for no messages — template-dependent,
+    /// and possibly nothing at all: several chat templates write only from
+    /// inside their loop over the messages, and those return `0`. Do not
+    /// read a positive overhead into it.
+    ///
+    /// A pure query: it touches neither the KV cache nor the history, so
+    /// it can be called freely between generations. For a session part-way
+    /// through a conversation the number is an upper bound, since the
+    /// history already holds part of the prompt.
+    pub fn count_tokens(&self, messages: &[ChatMessage]) -> Result<i32, ChatError> {
+        let msgs = raw_messages(messages)?;
+        let mut err = crispasr_sys::CrispasrChatError::default();
+        let n = unsafe {
+            crispasr_sys::crispasr_chat_count_tokens(
+                self.handle,
+                msgs.raw.as_ptr(),
+                msgs.raw.len(),
+                &mut err,
+            )
+        };
+        if n < 0 {
+            return Err(ChatError::from_raw(
+                &err,
+                0,
+                "crispasr_chat_count_tokens failed",
+            ));
+        }
+        Ok(n)
+    }
+
+    /// Generate a reply with the ABI's default sampler settings.
+    pub fn generate(&self, messages: &[ChatMessage]) -> Result<String, ChatError> {
+        self.generate_with_options(messages, &ChatGenerateOptions::default())
+    }
+
+    /// Generate a reply, overriding the sampler settings named in `params`.
+    pub fn generate_with_options(
+        &self,
+        messages: &[ChatMessage],
+        params: &ChatGenerateOptions,
+    ) -> Result<String, ChatError> {
+        let msgs = raw_messages(messages)?;
+        let gp = params.to_raw()?;
+        // The flag describes the generation about to run, not the last one.
+        self.token_failed.set(false);
+        let mut err = crispasr_sys::CrispasrChatError::default();
+        let out = unsafe {
+            crispasr_sys::crispasr_chat_generate(
+                self.handle,
+                msgs.raw.as_ptr(),
+                msgs.raw.len(),
+                &gp.params,
+                &mut err,
+            )
+        };
+        if out.is_null() {
+            return Err(ChatError::from_raw(
+                &err,
+                0,
+                "crispasr_chat_generate failed",
+            ));
+        }
+        // SAFETY: a malloc'd NUL-terminated buffer we now own.
+        let text = unsafe { CStr::from_ptr(out) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { crispasr_sys::crispasr_chat_string_free(out) };
+        Ok(text)
+    }
+
+    /// Stream a reply with the ABI's default sampler settings, calling
+    /// `on_token` once per detokenised chunk (usually one per token — see
+    /// [`Self::generate_stream_with_options`] for when it is fewer).
+    pub fn generate_stream<F: FnMut(&str)>(
+        &self,
+        messages: &[ChatMessage],
+        on_token: F,
+    ) -> Result<(), ChatError> {
+        self.generate_stream_with_options(messages, &ChatGenerateOptions::default(), on_token)
+    }
+
+    /// Stream a reply, overriding the sampler settings named in `params`.
+    ///
+    /// `on_token` fires on the calling thread for the duration of this call
+    /// only, so it need not be `Send` or `'static`. Concatenating the
+    /// chunks yields exactly what [`Self::generate_with_options`] would
+    /// return for the same messages and params — except when a stop sequence
+    /// ends the generation. The C side hands each piece to the callback
+    /// before it scans for a match, so the chunk the match lands in has
+    /// already been delivered, while the one-shot return value is truncated
+    /// before the match. With `stop` set, the streamed text is therefore the
+    /// one-shot text plus that last chunk, and a caller who wants the
+    /// truncated form has to cut it back themselves.
+    ///
+    /// Every chunk is whole characters. A model that spells a character the
+    /// tokeniser does not hold emits it one byte per token, so those bytes
+    /// are buffered here and delivered when the character is complete: such a
+    /// run of tokens produces ONE call rather than one call per token, and
+    /// the number of calls is therefore at most the number of tokens, not
+    /// equal to it. If the generation stops part-way through a character the
+    /// leftover bytes are delivered as replacement characters once the call
+    /// finishes, rather than dropped.
+    ///
+    /// `on_token` runs with the session mutex held, so it must not call back
+    /// into this session — re-entering deadlocks, the same way it does from
+    /// the abort hook.
+    ///
+    /// If `on_token` panics the panic is caught at the FFI boundary,
+    /// further chunks are dropped, and the panic is resumed once the native
+    /// call has returned — it never unwinds through C. An abort callback
+    /// registered with [`Self::with_abort_callback`] then answers "stop"
+    /// from the next check onwards, without consulting your predicate again,
+    /// so the generation is cancelled rather than decoding output nobody
+    /// reads. With no abort callback registered there is no way to ask the
+    /// ABI to stop, so the generation runs to completion first.
+    pub fn generate_stream_with_options<F: FnMut(&str)>(
+        &self,
+        messages: &[ChatMessage],
+        params: &ChatGenerateOptions,
+        mut on_token: F,
+    ) -> Result<(), ChatError> {
+        let msgs = raw_messages(messages)?;
+        let gp = params.to_raw()?;
+        self.token_failed.set(false);
+        let mut state = TokenState {
+            on_token: &mut on_token,
+            failed: &self.token_failed,
+            panic: None,
+            pending: Vec::new(),
+        };
+        let mut err = crispasr_sys::CrispasrChatError::default();
+        let rc = unsafe {
+            crispasr_sys::crispasr_chat_generate_stream(
+                self.handle,
+                msgs.raw.as_ptr(),
+                msgs.raw.len(),
+                &gp.params,
+                Some(token_trampoline),
+                &mut state as *mut TokenState as *mut c_void,
+                &mut err,
+            )
+        };
+        // Whatever is still buffered belongs to the caller, aborted run or
+        // not; `flush` is a no-op once the closure has panicked.
+        state.flush();
+        // A panic the callback raised outranks whatever the call returned.
+        if let Some(p) = state.panic.take() {
+            resume_unwind(p);
+        }
+        if rc != 0 {
+            return Err(ChatError::from_raw(
+                &err,
+                rc,
+                "crispasr_chat_generate_stream failed",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Run `body` with `should_continue` registered as this session's abort
+    /// hook, then clear it.
+    ///
+    /// **Polarity: `should_continue` returns `true` to LET THE GENERATION
+    /// CONTINUE** and `false` to abort it — a "may I keep going?" predicate.
+    /// That is the polarity of `crispasr_chat_abort_callback` in
+    /// `crispasr_chat.h`, which in turn matches the encoder-begin callback on
+    /// the ASR surface; this crate forwards your answer to C unchanged.
+    ///
+    /// The hook is called on the generating thread before each prompt batch
+    /// during prefill and before each sampled token, and additionally from
+    /// inside a running compute graph on the CPU backend — so it must be
+    /// cheap and non-blocking, and it must not call back into this session
+    /// (the session mutex is held for the whole generation; re-entering
+    /// deadlocks). Cancel latency is therefore one prompt batch or one
+    /// token on Metal / CUDA, and finer on CPU.
+    ///
+    /// On abort the generate call fails with [`ChatError::Aborted`], having
+    /// already delivered its partial text through the token callback, and
+    /// the session is flushed back to its just-opened state — reuse it
+    /// without a [`Self::reset`].
+    ///
+    /// A panic inside `should_continue` is caught at the FFI boundary, aborts
+    /// the generation, and is resumed after `body` returns. A panic inside the
+    /// token callback of [`Self::generate_stream_with_options`] also aborts
+    /// the generation, through this hook: from the next check onwards it
+    /// answers "stop" without consulting `should_continue` again.
+    ///
+    /// The registration is scoped to this call because the hook is a
+    /// pointer to a closure on your stack: it is taken back before
+    /// `should_continue` can go out of scope, including on the unwind path.
+    /// Nesting works — `body` is handed the session, so it may open a scope
+    /// of its own, and the inner scope puts the outer hook back when it ends
+    /// rather than leaving the session with none.
+    ///
+    /// ```no_run
+    /// use std::cell::Cell;
+    /// use crispasr::{ChatMessage, ChatSession};
+    ///
+    /// let chat = ChatSession::open("model.gguf").unwrap();
+    /// let msgs = vec![ChatMessage::user("Write an essay.")];
+    /// let seen = Cell::new(0usize);
+    /// let res = chat.with_abort_callback(
+    ///     || seen.get() < 20,
+    ///     |c| {
+    ///         c.generate_stream(&msgs, |chunk| {
+    ///             seen.set(seen.get() + 1);
+    ///             print!("{chunk}");
+    ///         })
+    ///     },
+    /// );
+    /// assert!(res.is_err_and(|e| e.is_aborted()));
+    /// ```
+    pub fn with_abort_callback<A, B, R>(&self, mut should_continue: A, body: B) -> R
+    where
+        A: FnMut() -> bool,
+        B: FnOnce(&ChatSession) -> R,
+    {
+        let mut state = AbortState {
+            should_continue: &mut should_continue,
+            token_failed: &self.token_failed,
+            panic: None,
+        };
+
+        /// Puts back whatever was registered before, on every exit path,
+        /// unwinding included — the session must not hold a pointer to
+        /// `state` past this frame, and an enclosing scope's hook must
+        /// survive this one ending.
+        struct Restore<'s> {
+            session: &'s ChatSession,
+            previous: *mut c_void,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                unsafe {
+                    if self.previous.is_null() {
+                        crispasr_sys::crispasr_chat_set_abort_callback(
+                            self.session.handle,
+                            None,
+                            std::ptr::null_mut(),
+                        );
+                    } else {
+                        // SAFETY: the enclosing scope's `AbortState` is still
+                        // on the stack — this frame is nested inside its body.
+                        crispasr_sys::crispasr_chat_set_abort_callback(
+                            self.session.handle,
+                            Some(abort_trampoline),
+                            self.previous,
+                        );
+                    }
+                }
+                self.session.abort_user.set(self.previous);
+            }
+        }
+
+        let previous = self.abort_user.get();
+        let user = &mut state as *mut AbortState as *mut c_void;
+        unsafe {
+            crispasr_sys::crispasr_chat_set_abort_callback(
+                self.handle,
+                Some(abort_trampoline),
+                user,
+            )
+        };
+        self.abort_user.set(user);
+        let guard = Restore {
+            session: self,
+            previous,
+        };
+        let out = body(self);
+        drop(guard);
+
+        if let Some(p) = state.panic.take() {
+            resume_unwind(p);
+        }
+        out
+    }
+}
+
+impl Drop for ChatSession {
+    fn drop(&mut self) {
+        unsafe { crispasr_sys::crispasr_chat_close(self.handle) }
+    }
+}
+
+#[cfg(test)]
+mod chat_stream_tests {
+    use super::take_complete_utf8;
+
+    /// One byte at a time is what a byte-fallback token stream looks like.
+    #[test]
+    fn a_character_split_over_several_chunks_is_delivered_once() {
+        let mut pending = Vec::new();
+        let mut out = String::new();
+        for b in "🪿".as_bytes() {
+            out.push_str(&take_complete_utf8(&mut pending, &[*b]));
+        }
+        assert_eq!(out, "🪿");
+        assert!(pending.is_empty(), "nothing left over: {pending:?}");
+    }
+
+    #[test]
+    fn a_complete_chunk_passes_straight_through() {
+        let mut pending = Vec::new();
+        assert_eq!(take_complete_utf8(&mut pending, b"hello"), "hello");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn a_partial_tail_is_held_back_and_nothing_before_it_is_lost() {
+        let mut pending = Vec::new();
+        // "ab" plus the first two bytes of a three-byte character.
+        assert_eq!(take_complete_utf8(&mut pending, b"ab\xe2\x82"), "ab");
+        assert_eq!(pending, b"\xe2\x82");
+        assert_eq!(take_complete_utf8(&mut pending, b"\xacc"), "€c");
+        assert!(pending.is_empty());
+    }
+
+    /// `error_len() == Some(n)`: no continuation byte can rescue these, so
+    /// they become one replacement character and decoding carries on.
+    #[test]
+    fn a_genuinely_invalid_sequence_is_replaced_not_buffered() {
+        let mut pending = Vec::new();
+        assert_eq!(take_complete_utf8(&mut pending, b"a\xffb"), "a\u{fffd}b");
+        assert!(
+            pending.is_empty(),
+            "invalid bytes must not be held: {pending:?}"
+        );
+    }
+
+    /// A truncated sequence followed by an unrelated character is invalid
+    /// once the next byte arrives, not merely unfinished.
+    #[test]
+    fn a_truncated_sequence_is_replaced_once_the_next_character_arrives() {
+        let mut pending = Vec::new();
+        assert_eq!(take_complete_utf8(&mut pending, b"\xe2\x82"), "");
+        assert_eq!(take_complete_utf8(&mut pending, b"x"), "\u{fffd}x");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn an_empty_chunk_delivers_nothing_and_keeps_the_buffer() {
+        let mut pending = Vec::new();
+        assert_eq!(take_complete_utf8(&mut pending, b"\xf0\x9f"), "");
+        assert_eq!(take_complete_utf8(&mut pending, b""), "");
+        assert_eq!(pending, b"\xf0\x9f");
+    }
 }

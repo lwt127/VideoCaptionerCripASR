@@ -81,6 +81,62 @@ else
     bad "did not refuse (silent fallback makes an A/B unreadable)"
 fi
 
+# ── 4. round 2: the contextual rules must actually reach the model ───────────
+#
+# Round 1 of #316 shipped core/g2p_ctxwords.h behind a flag nothing set, so
+# 0.8.24 and 0.8.25 read "the" as ði everywhere and the article "a" as the
+# LETTER, ˈA. The unit tests could not see it — they call the helper, not
+# text_to_ipa. This reads the phoneme string the model is actually handed.
+echo "=== #316 round 2: the rules reach the phoneme string ==="
+REPORTED='It'"'"'s described as "dramatic" because of the high-contrast, cinematic lighting and moody atmosphere I built into the prompt.'
+PH=$("$CRISPASR" --tts "$REPORTED" --backend kokoro -m "$KOKORO" --voice "$VOICE" \
+        --tts-output "$TMP/r2.wav" -v 2>&1 | sed -n "s/^kokoro: phonemes: '\(.*\)'$/\1/p" | tr '\n' ' ')
+echo "    phonemes: ${PH:0:120}..."
+if [ -z "$PH" ]; then
+    bad "no phoneme string printed — cannot check anything below"
+else
+    # "the prompt" -> ðə, never the citation form ði before a consonant.
+    echo "$PH" | grep -q 'ðə' && ok "the/to reduce (ðə present)" \
+                              || bad "no ðə anywhere — context_words is off again (THE #316 round-2 bug)"
+    # The pronoun takes SECONDARY stress. ˈI is the letter/emphatic reading.
+    echo "$PH" | grep -q 'ˌI ' && ok "the pronoun I is ˌI, not ˈI" \
+                               || bad "pronoun I is not secondary-stressed"
+    # Kokoro's vocabulary has , and . — dropping them delivers a paragraph in
+    # one breath, which is what "doesn't sound natural" was.
+    echo "$PH" | grep -q ',' && ok "punctuation survives into the phonemes" \
+                             || bad "no comma in the phoneme string — every pause is gone"
+    # A quoted word must reach the lexicon without its quotes: misaki says
+    # dɹəmˈæTɪk (second syllable). The LTS fallback said dɹˈæmætɪk.
+    echo "$PH" | grep -q 'dɹəmˈæTɪk' && ok "\"dramatic\" is stressed on the second syllable" \
+                                     || bad "dramatic mis-stressed — the quotes reached the lexicon"
+fi
+
+# ── 5. …and the round-trip hears the difference ──────────────────────────────
+#
+# The discriminator found while fixing this: with ˈI the pronoun is a NOUN to
+# an ASR. Reproduced on ggml-tiny and ggml-base, both arms.
+echo "=== #316 round 2: ASR round-trip ==="
+if [ -s "$TMP/r2.wav" ]; then
+    TXT=$("$CRISPASR" -m "$ASR" -f "$TMP/r2.wav" -l en --no-prints 2>/dev/null \
+            | sed 's/\x1b\[[0-9;]*m//g' | tr '\n' ' ')
+    echo "    ASR: $TXT"
+    if echo "$TXT" | grep -qi "eye built"; then
+        bad "ASR heard the NOUN \"eye\" — the pronoun carries primary stress (this IS the report)"
+    else
+        ok "the pronoun is not heard as \"eye\""
+    fi
+    # Whisper punctuates from prosody. With no marks in the phoneme string it
+    # finds no clause boundary at all.
+    NC=$(echo "$TXT" | tr -cd ',' | wc -c | tr -d ' ')
+    if [ "$NC" -ge 1 ]; then
+        ok "the transcript has $NC comma(s) — the pauses are audible"
+    else
+        bad "not one comma — the delivery has no clause boundaries"
+    fi
+else
+    echo "  - skipped (no audio from step 4)"
+fi
+
 echo
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -5,7 +5,8 @@ CrispASR has two tiers of tests: **unit tests** (no models, fast) and
 
 ## Unit tests
 
-679 unit tests run unconditionally in ~20 seconds with no model files:
+1736 unit tests run unconditionally with no model files (~80 s at `-j2`,
+~2.5 min serial):
 
 ```bash
 ctest --test-dir build -L unit --timeout 30
@@ -15,13 +16,14 @@ These cover: audio chunking, mel preprocessing, CTC/beam decode,
 sentence splitting, WAV metadata, stream finalization, registry lookup,
 watermark embed/detect, cache helpers, GPT-2 BPE tokenizer,
 BERT WordPiece tokenizer, bench env-var gating, per-backend param
-defaults and null-guard coverage (43 backends), and more.
+defaults and null-guard coverage (60 backends), and more.
 
 ## Integration tests
 
-~25 integration tests need real GGUF models. They are gated by env vars
-and **SKIP cleanly** when the vars are unset (Catch2 `SKIP()` → exit
-code 4, mapped to ctest "Skipped" via `SKIP_RETURN_CODE 4`).
+133 integration tests (ctest label `live`) need real GGUF models. They
+are gated by env vars and **SKIP cleanly** when the vars are unset
+(Catch2 `SKIP()` → exit code 4, mapped to ctest "Skipped" via
+`SKIP_RETURN_CODE 4`).
 
 ### Quick start
 
@@ -53,9 +55,9 @@ other vars derive from it unless individually overridden.
 | `CRISPASR_MODEL_QWEN3_ASR` | Beam search (Qwen3-ASR) | Large model, may timeout on CPU |
 | `CRISPASR_MODEL_CANARY` | Beam search (Canary) | Large model, may timeout on CPU |
 | `CRISPASR_MODEL_COHERE` | Beam search (Cohere) | Large model, may timeout on CPU |
-| `PARAFORMER_MODEL` | Paraformer live tests | F16 GGUF |
-| `PARAFORMER_MODEL_Q4K` | Paraformer Q4_K parity | Q4_K GGUF |
-| `PARAFORMER_AUDIO_ZH` | Paraformer Chinese test | 16kHz mono WAV |
+| `CRISPASR_PARAFORMER_MODEL` | Paraformer live tests | F16 GGUF. Bare `PARAFORMER_MODEL` still works as a deprecated legacy alias. |
+| `CRISPASR_PARAFORMER_MODEL_Q4K` | Paraformer Q4_K parity | Q4_K GGUF |
+| `CRISPASR_PARAFORMER_AUDIO_ZH` | Paraformer Chinese test | 16kHz mono WAV |
 | `CRISPASR_TEST_DIARIZE_MODEL` | Diarization (pyannote) | pyannote-seg-3.0 GGUF |
 | `CRISPASR_TEST_TITANET_MODEL` | Diarization (embedder) | titanet-large GGUF |
 | `CRISPASR_TEST_DIARIZE_WAV` | Diarization | Multi-speaker 16kHz mono WAV |
@@ -70,20 +72,23 @@ other vars derive from it unless individually overridden.
 
 ### Test groups
 
+Test *numbers* shift whenever a test is added — they are the numbering of
+the current build. Prefer `ctest -R <name>` over `ctest -I <n>`.
+
 | Tests | Group | Model | Timeout |
 |---|---|---|---|
-| #100-103 | Paraformer | paraformer-zh-f16.gguf (~422 MB) | 30s |
-| #110-112 | Nemotron | nemotron Q4_K + F16 (~1.7 GB total) | 300s |
-| #218-220 | Beam: whisper | ggml-tiny.bin (~75 MB) | 120s |
-| #221-228 | Beam: other backends | 2-5 GB models | 300s+ (CPU) |
-| #77-78 | Diarize (pyannote + TitaNet) | ~50 MB total | 120s |
-| #409 | Chat (LLM) | Any chat GGUF | 120s |
-| #456-458 | CLI integration | Auto-download (whisper base) | 300s |
-| #460-461 | VAD (full + thresholds) | ggml-tiny.bin + silero | 120s |
-| #462 | Backend regression | Auto-download (many backends) | 600s |
-| #463 | Benchmark-quick | parakeet-tdt-0.6b-v3 | 300s |
-| #464 | Progress output | Auto-download (whisper + parakeet) | 300s |
-| — | BTC chords (`test-btc-chords`, tag `[btc-chords]`) | btc-chords-large-f32.gguf (~11.7 MB) | — |
+| #278-281 | Paraformer | paraformer-zh-f16.gguf (~422 MB) | 30s |
+| #286-289 | Nemotron | nemotron Q4_K + F16 (~1.7 GB total) | 300s |
+| #1037-1039 | Beam: whisper | ggml-tiny.bin (~75 MB) | 120s |
+| #1040-1047 | Beam: other backends | 2-5 GB models | 300s+ (CPU) |
+| #169-170 | Diarize (pyannote + TitaNet) | ~50 MB total | 120s |
+| #1624-1643 | Chat (LLM) | Any chat GGUF | 120s |
+| #1849-1860 | CLI integration | Auto-download (whisper base) | 300s |
+| #1862-1863 | VAD (full + thresholds) | ggml-tiny.bin + silero | 120s |
+| #1874 | Backend regression (`test-backends`, label `integration`) | Auto-download (many backends) | 600s |
+| #1875 | Benchmark-quick (label `benchmark`) | parakeet-tdt-0.6b-v3 | 600s |
+| #1877 | Progress output | Auto-download (whisper + parakeet) | 300s |
+| #1840-1842 | BTC chords (`test-btc-chords`, tag `[btc-chords]`) | btc-chords-large-f32.gguf (~11.7 MB) | — |
 
 > **BTC chord weights are non-commercial.** `test-btc-chords` (3 test cases /
 > 41 assertions, ctest label `live`, drives the session C-ABI) needs a BTC GGUF
@@ -100,13 +105,17 @@ progress) resolve models via the registry (`crispasr_model_registry.cpp`)
 and the cache system (`crispasr_cache.cpp`). The cache probes these
 locations in order:
 
-1. `--cache-dir` CLI override (or `cache_dir_override` in C API)
+1. The dispatcher's chosen cache dir — `--cache-dir` CLI override (or
+   `cache_dir_override` in the C API), else `$CRISPASR_CACHE_DIR`, else
+   `$CRISPASR_MODELS_DIR`, else the platform default
 2. `$CRISPASR_MODELS_DIR` env var
-3. `/mnt/storage/gguf-models` (dev machine convention)
-4. `/Volumes/backups/ai/crispasr-models` (macOS dev convention)
-5. `~/.cache/crispasr` (platform default)
-6. `~/.cache/crispasr-models` (legacy)
-7. `~/.cache/huggingface/hub` (HF download cache)
+3. `~/.cache/crispasr` (platform default)
+4. `~/.cache/crispasr-models` (legacy alt cache)
+5. `~/.cache/huggingface/hub` (HF download cache)
+
+There are deliberately **no** absolute machine-specific defaults in this
+list (`/mnt/storage/gguf-models`, `/Volumes/backups/...` and friends were
+removed): point `$CRISPASR_MODELS_DIR` at a dedicated model volume instead.
 
 If none of the probed paths has the file, it downloads from HuggingFace.
 

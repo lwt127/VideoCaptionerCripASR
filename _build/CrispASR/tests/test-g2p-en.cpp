@@ -491,3 +491,94 @@ TEST_CASE("Technical token normalization", "[g2p][normalize]") {
         CHECK(r.empty());
     }
 }
+
+// ── #435: language dispatch + the TTS convention ─────────────────────
+//
+// These two properties are what zonos (and any future non-kokoro consumer)
+// depends on, and both are the kind a refactor breaks without failing anything
+// else: the dispatch is a string comparison, and the punctuation flag is a bool
+// that defaults to the wrong value for this consumer.
+
+TEST_CASE("builtin_g2p_language matches the PRIMARY SUBTAG, not a substring", "[unit][g2p][phonemizer]") {
+    using crispasr::builtin_g2p_language;
+
+    SECTION("the four covered languages, bare and with a region") {
+        CHECK(std::string(builtin_g2p_language("en")) == "en");
+        CHECK(std::string(builtin_g2p_language("en-us")) == "en");
+        CHECK(std::string(builtin_g2p_language("en-gb")) == "en");
+        CHECK(std::string(builtin_g2p_language("de")) == "de");
+        CHECK(std::string(builtin_g2p_language("de-at")) == "de");
+        CHECK(std::string(builtin_g2p_language("fr")) == "fr");
+        CHECK(std::string(builtin_g2p_language("fr-fr")) == "fr");
+        CHECK(std::string(builtin_g2p_language("es")) == "es");
+        CHECK(std::string(builtin_g2p_language("es-419")) == "es");
+        CHECK(std::string(builtin_g2p_language("ES-419")) == "es"); // case-insensitive
+        CHECK(std::string(builtin_g2p_language("en_US")) == "en");  // underscore form
+    }
+
+    SECTION("Russian is covered now") {
+        // This section used to assert `builtin_g2p_language("ru") == nullptr`.
+        // That was true when written and is not any more: a built-in Russian
+        // G2P ships (812,953-entry CC-BY-4.0 dictionary + LTS fallback), so the
+        // dispatcher must route ru rather than fall through to espeak.
+        //
+        // Note this says nothing about zonos's DEFAULT, which still prefers
+        // espeak for ru — zonos-v0.1 does not list Russian, so its roundtrip
+        // could not certify the swap in either direction. Coverage and default
+        // are separate questions and this test only answers the first.
+        CHECK(std::string(builtin_g2p_language("ru")) == "ru");
+        CHECK(std::string(builtin_g2p_language("RU")) == "ru");
+    }
+
+    SECTION("uncovered languages return nullptr, so the caller falls through") {
+        CHECK(builtin_g2p_language("ja") == nullptr);
+        CHECK(builtin_g2p_language("cmn") == nullptr);
+        CHECK(builtin_g2p_language("") == nullptr);
+    }
+
+    SECTION("the substring trap the per-language functions still have") {
+        // phonemize_builtin_en tests `lang.find("en") != npos`, so a code that
+        // merely CONTAINS the digraph is claimed by the wrong G2P. Assert both
+        // halves: that the raw function really does claim it (otherwise this
+        // test is guarding a hazard that no longer exists and would keep
+        // passing after the dispatch regressed), and that the dispatch does not.
+        std::string out;
+        const bool raw_claims_it = crispasr::phonemize_builtin_en("ben", "hello", out);
+        CHECK(raw_claims_it); // the hazard is real
+        CHECK(builtin_g2p_language("ben") == nullptr);
+        CHECK(builtin_g2p_language("hi-en") == nullptr); // primary subtag is "hi"
+        CHECK(builtin_g2p_language("nl") == nullptr);
+    }
+}
+
+TEST_CASE("phonemize_builtin_tts carries punctuation through", "[unit][g2p][phonemizer]") {
+    // Zonos's Python reference phonemizes with preserve_punctuation=True and its
+    // symbol table contains `;:,.!?`, which is how the model pauses. The
+    // built-in G2P defaults that flag OFF (piper's inventory never saw
+    // punctuation), so this entry point has to turn it on — and if it ever
+    // stops, the failure is a paragraph delivered in one breath, which no
+    // roundtrip metric would call a failure.
+    std::string out;
+    REQUIRE(crispasr::phonemize_builtin_tts("en-us", "Hello, world. Is it?", out));
+    CHECK(out.find(',') != std::string::npos);
+    CHECK(out.find('.') != std::string::npos);
+    CHECK(out.find('?') != std::string::npos);
+
+    SECTION("and the default English entry point still does NOT — piper's contract") {
+        // The positive control for the check above: if emit_punctuation were
+        // globally on, both assertions would pass and neither would mean
+        // anything.
+        std::string plain;
+        REQUIRE(crispasr::phonemize_builtin_en("en-us", "Hello, world. Is it?", plain));
+        CHECK(plain.find(',') == std::string::npos);
+        CHECK(plain.find('?') == std::string::npos);
+    }
+
+    SECTION("an uncovered language is refused, not silently mis-phonemised") {
+        // ru is no longer the example — it is covered. Japanese still is not,
+        // and refusing is the point: a silent mis-phonemisation is what made
+        // zonos emit confident noise for Cyrillic in #435.
+        std::string ja;
+        CHECK_FALSE(crispasr::phonemize_builtin_tts("ja", "\xe3\x81\x93\xe3\x82\x93", ja));
+    }
+}

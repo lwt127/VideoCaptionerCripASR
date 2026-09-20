@@ -17,6 +17,9 @@ so each can import this right after the clone:
         kh.sh_with_progress(f"stdbuf -oL -eL cmake --build {BUILD} "
                             f"--target {target} -j{kh.safe_build_jobs(gpu=True)}")
     token = kh.resolve_hf_token()            # env → Secret(retry) → dataset
+    # Uploading kernels: kh.resolve_hf_token(require=True) FIRST, before any
+    # build/compute — a missing token then aborts in seconds instead of the
+    # finished run losing every artifact to upload 401s.
 
 Design rules (so a kernel never dies *because of* the harness):
   * pure stdlib at import time — huggingface_hub / kaggle_secrets are
@@ -103,6 +106,37 @@ def _push_progress_to_hf(force: bool = False) -> None:
         _HF_LAST_PUSH = now
     except Exception:
         pass
+
+
+def provenance(script_version: str, clone_dir: "str | os.PathLike | None" = None) -> dict:
+    """Log BOTH halves of what a run actually exercised, because they drift
+    apart silently.
+
+    Kernels `git clone` CrispASR at runtime, so the C++ UNDER TEST is always
+    fresh from main — but the HARNESS (arms, env gating, capture, pass/fail
+    predicate) freezes at the last `kaggle kernels push`. `git push` does NOT
+    update a Kaggle kernel. So a run can build and exercise the newest code
+    while scoring it with an outdated verdict, and nothing in the log looks
+    wrong (2026-09-03: a verdict fix sat correct in main while the kernel kept
+    running the old script). Print the clone's SHA and the script's own version
+    constant so the two halves are visible and comparable in the log.
+
+    `script_version` should be a literal in the kernel script — bump it when
+    you change the arms, the capture, or the predicate.
+    """
+    sha = "unknown"
+    root = str(clone_dir) if clone_dir else os.environ.get("CRISPASR_CLONE", "")
+    if root:
+        try:
+            r = subprocess.run(["git", "-C", root, "rev-parse", "--short", "HEAD"],
+                               capture_output=True, text=True, timeout=60)
+            if r.returncode == 0:
+                sha = (r.stdout or "").strip() or "unknown"
+        except Exception:
+            pass
+    info = {"script_version": script_version, "clone_sha": sha}
+    step("provenance", **info)
+    return info
 
 
 def step(name: str, **extra) -> None:
@@ -375,6 +409,16 @@ def install_build_toolchain() -> dict:
         ccache_dir.mkdir(parents=True, exist_ok=True)
         os.environ["CCACHE_DIR"] = str(ccache_dir)
         os.environ["CCACHE_MAXSIZE"] = "5G"
+        # Make the cache RELOCATABLE. ccache hashes the working directory by
+        # default, so a build tree at a different path misses every object even
+        # with a perfectly good cache — moving the sweep's build from
+        # /kaggle/working to /kaggle/temp turned a ~3 min warm build into a full
+        # 734-object cold one. NOHASHDIR drops the cwd from the hash; BASEDIR
+        # rewrites absolute paths beneath it to relative, so -I flags baked into
+        # the command line do not bust the hash either. Same pairing that makes
+        # the cache shared across local git worktrees.
+        os.environ["CCACHE_NOHASHDIR"] = "1"
+        os.environ["CCACHE_BASEDIR"] = str(_scratch)
         # Warm ccache from attached dataset (chr1s4/crispasr-ccache or
         # chr1str/crispasr-ccache). Shaves ~15 min off incremental builds.
         _warm_ccache_from_dataset(ccache_dir)
@@ -530,6 +574,14 @@ def kaggle_secret(name: str, retries: int = 3, backoff_s: float = 5.0) -> str | 
     return None
 
 
+def _kaggle_input_root() -> Path:
+    """Root of Kaggle dataset mounts. Overridable via KAGGLE_INPUT_ROOT so the
+    token-resolution logic is unit-testable off-Kaggle against a fake tree
+    (tests/test_kaggle_harness_token.py). On a real worker this is always
+    /kaggle/input."""
+    return Path(os.environ.get("KAGGLE_INPUT_ROOT", "/kaggle/input"))
+
+
 def kaggle_token_from_dataset(filename: str = "hf_token.txt") -> str | None:
     """Read an HF token from a private Kaggle Dataset mounted via
     kernel-metadata.json `dataset_sources` (e.g. chr1str/crispasr-hf-token
@@ -538,39 +590,56 @@ def kaggle_token_from_dataset(filename: str = "hf_token.txt") -> str | None:
 
     Kaggle mounts datasets at several locations depending on the
     environment version:
-      /kaggle/input/<slug>/           — classic path
-      /kaggle/input/datasets/<owner>/<slug>/  — newer environments
-    We scan both roots."""
+      /kaggle/input/<slug>/           — classic ("short") path
+      /kaggle/input/datasets/<owner>/<slug>/  — newer ("long") environments
+    We scan BOTH depths, short first, each sorted. Some workers mount
+    attached datasets ONLY under the long path: CrispEmbed's T19-E3 run 1
+    (2026-08) completed a full 21-minute pipeline on such a worker
+    ("/kaggle/input contains 1 entries: ['datasets']") and then lost every
+    artifact to upload 401s, because its (stale, vendored) copy of this
+    resolver never descended into datasets/<owner>/<slug>. Keep both depths
+    covered here, and keep this file the single source of truth.
+
+    kaggle_usage.md gotcha #26 also applies to how kernels REACH this code:
+    a Kaggle *script* kernel ships ONLY its `code_file` — sibling files
+    (this harness, corpora, reference audio) are NOT present at runtime.
+    Kernels must `git clone` the repo in-kernel and import the harness FROM
+    THE CLONE; never read data via Path(__file__).parent, and never rely on
+    a bundled copy (bundled = local-dev fallback only)."""
+    root = _kaggle_input_root()
     candidates: list[Path] = [
-        Path("/kaggle/input/crispasr-hf-token") / filename,
+        root / "crispasr-hf-token" / filename,
     ]
     # Owner-agnostic scan: probe <filename> in EVERY mounted dataset dir, at
-    # both the classic depth (/kaggle/input/<slug>/) and the newer nested depth
-    # (/kaggle/input/datasets/<owner>/<slug>/). The old code only matched owner
+    # both the classic depth (<root>/<slug>/) and the newer nested depth
+    # (<root>/datasets/<owner>/<slug>/). The old code only matched owner
     # names containing "hf-token" and hard-coded chr1str, so a chr1s4 kernel on
     # the newer mount path (/kaggle/input/datasets/chr1s4/crispasr-hf-token/)
     # never had its token file scanned → token silently unresolved (the
     # 2026-06-20 v2/v3 full-sweep runs). Don't filter by dir name — probe the file.
-    dataset_dirs: list[Path] = []
-    inp = Path("/kaggle/input")
-    if inp.exists():
-        for sub in inp.iterdir():
+    # Deterministic precedence (matches the t19 driver's sorted short-then-long
+    # glob order): classic dirs first, then nested dirs, each depth sorted.
+    classic_dirs: list[Path] = []
+    nested_dirs: list[Path] = []
+    if root.exists():
+        for sub in sorted(root.iterdir()):
             if not sub.is_dir():
                 continue
             if sub.name == "datasets":
-                for owner in sub.iterdir():  # nested <owner>/<slug>
+                for owner in sorted(sub.iterdir()):  # nested <owner>/<slug>
                     if owner.is_dir():
-                        dataset_dirs.extend(s for s in owner.iterdir() if s.is_dir())
+                        nested_dirs.extend(
+                            s for s in sorted(owner.iterdir()) if s.is_dir())
             else:
-                dataset_dirs.append(sub)  # classic /kaggle/input/<slug>
-    for d in dataset_dirs:
+                classic_dirs.append(sub)  # classic <root>/<slug>
+    for d in classic_dirs + nested_dirs:
         for fn in (filename, "hf_token.txt", "token", "access_token"):
             p = d / fn
             if p not in candidates:
                 candidates.append(p)
     # Also try the flat file variants
-    candidates.append(Path("/kaggle/input/crispasr-hf-token") / "token")
-    candidates.append(Path("/kaggle/input/crispasr-hf-token") / "access_token")
+    candidates.append(root / "crispasr-hf-token" / "token")
+    candidates.append(root / "crispasr-hf-token" / "access_token")
 
     # Debug: list what we're scanning
     for p in candidates:
@@ -588,11 +657,10 @@ def kaggle_token_from_dataset(filename: str = "hf_token.txt") -> str | None:
         except Exception as e:
             print(f"HF auth: {p} error: {e}", flush=True)
 
-    # Last resort: dump what's actually under /kaggle/input for debugging
-    root = Path("/kaggle/input")
+    # Last resort: dump what's actually under the input root for debugging
     if root.exists():
         dirs = sorted(root.iterdir())
-        print(f"HF auth: /kaggle/input contains {len(dirs)} entries: "
+        print(f"HF auth: {root} contains {len(dirs)} entries: "
               f"{[d.name for d in dirs[:10]]}", flush=True)
         # Also check one level deeper
         for d in dirs:
@@ -607,17 +675,93 @@ def kaggle_token_from_dataset(filename: str = "hf_token.txt") -> str | None:
     return None
 
 
-def resolve_hf_token(secret_name: str = "HF_TOKEN") -> str | None:
+def hf_token_rejected(tok: str, url: str = "https://huggingface.co/api/whoami-v2") -> bool:
+    """True only when HF EXPLICITLY rejects the token (401/403).
+
+    An EXPIRED token is worse than no token: every huggingface_hub call sends
+    it, and HF answers 401 even for a PUBLIC repo, so downloads that would
+    have worked anonymously fail with "Repository Not Found ... make sure you
+    are authenticated". Observed 2026-09-15: the supertonic-vs-audio.cpp bench
+    died on `Supertone/supertonic-3` — a repo that is public and ungated —
+    with "User Access Token 'collabmerge' is expired", after a 45-minute build.
+
+    FAILS OPEN on network trouble. A timeout or DNS failure is not evidence
+    that the token is bad, and discarding a good token because the validator
+    could not reach HF would break authenticated uploads for an unrelated
+    reason. Only an explicit 401/403 counts.
+    """
+    import urllib.error
+    import urllib.request
+    # `url` is injectable ONLY so the caller can prove this function is able to
+    # return False. Without that control, a validator that rejected everything
+    # would look identical to one that works — and it would silently strip a
+    # perfectly good token from every kernel.
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {tok}"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status in (401, 403)
+    except urllib.error.HTTPError as e:
+        return e.code in (401, 403)
+    except Exception:
+        return False  # fail open: cannot tell, keep the token
+
+
+def resolve_hf_token(secret_name: str = "HF_TOKEN",
+                     require: bool = False) -> str | None:
     """3-tier HF auth: env HF_TOKEN → Kaggle Secret (with retry) → mounted
     Kaggle Dataset file. Exports HF_TOKEN + HUGGING_FACE_HUB_TOKEN +
-    HF_HUB_ENABLE_HF_TRANSFER on success and returns the token (or None)."""
+    HF_HUB_ENABLE_HF_TRANSFER on success and returns the token (or None).
+
+    Any kernel that UPLOADS must call this with require=True at the very
+    top, BEFORE building or computing anything: with require=True a missing
+    token raises SystemExit immediately, instead of the run completing and
+    then losing every artifact to 401s at upload time (CrispEmbed T19-E3
+    run 1 burned a full 21-minute pipeline exactly this way — the token
+    dataset was mounted only under the long path and the resolver missed
+    it; `hf_token_ok: False` was in the log all along). Download-only
+    kernels can keep the default require=False: public cstr/* repos work
+    unauthenticated."""
     tok = (os.environ.get("HF_TOKEN")
            or kaggle_secret(secret_name)
            or kaggle_token_from_dataset())
+    # A token HF rejects must be DROPPED, not passed on. Keeping it turns every
+    # public download into a 401 (see hf_token_rejected). Anonymous access is
+    # strictly better than bad credentials for the public cstr/* repos this
+    # docstring promises work unauthenticated.
+    if tok and hf_token_rejected(tok):
+        print("HF auth: the resolved token is REJECTED by HF (expired or "
+              "revoked). Dropping it and continuing ANONYMOUSLY — public repos "
+              "still work; anything private or gated will fail from here.",
+              flush=True)
+        os.environ.pop("HF_TOKEN", None)
+        os.environ.pop("HUGGING_FACE_HUB_TOKEN", None)
+        if require:
+            raise SystemExit(
+                "FATAL: the HF token is expired/revoked and this kernel "
+                "UPLOADS — refresh the hf-token dataset before rerunning, "
+                "rather than losing the artifacts to 401s at the end.")
+        tok = None
     if tok:
         os.environ["HF_TOKEN"] = tok
         os.environ["HUGGING_FACE_HUB_TOKEN"] = tok
-        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+        # Only opt into the fast downloader if it is actually importable.
+        # huggingface_hub raises outright ("enabled but not available") rather
+        # than falling back, so setting this unconditionally turned every
+        # kernel that resolves a token WITHOUT pip-installing hf_transfer into
+        # a hard download failure — it killed the breeze-refdump run at its
+        # first hf_hub_download, minutes into a GPU session (2026-09-03).
+        try:
+            import hf_transfer  # noqa: F401
+
+            os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+        except ImportError:
+            os.environ.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
+    elif require:
+        raise SystemExit(
+            "FATAL: no HF token from env/secret/dataset — uploads would 401 "
+            "after the compute finishes; aborting up front. Attach the "
+            "hf-token dataset (kernel-metadata.json dataset_sources) or the "
+            "HF_TOKEN secret.")
     else:
         print("HF auth: no token from env/secret/dataset — public-only "
               "downloads (fine for cstr/* public repos).", flush=True)

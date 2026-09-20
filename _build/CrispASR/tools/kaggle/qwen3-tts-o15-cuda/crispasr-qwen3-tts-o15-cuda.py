@@ -32,7 +32,10 @@ BUILD = WORK / "build"
 RESULTS = WORK / "results"
 RESULTS.mkdir(parents=True, exist_ok=True)
 
-CRISPASR_REF = os.environ.get("CRISPASR_REF", "main")
+CRISPASR_REF = os.environ.get("CRISPASR_REF", "fix/337-qwen3-tts-hip")
+CRISPASR_COMMIT = os.environ.get(
+    "CRISPASR_COMMIT", "e6a179b6958cccc0f3f22a9be7e577d12c1d9218"
+)
 CRISPASR_REPO = os.environ.get(
     "CRISPASR_REPO", "https://github.com/CrispStrobe/CrispASR.git"
 )
@@ -64,6 +67,9 @@ run(
         CRISPASR_REPO, str(REPO),
     ]
 )
+run(["git", "-C", str(REPO), "fetch", "--depth", "1", "origin", CRISPASR_COMMIT])
+run(["git", "-C", str(REPO), "checkout", "--detach", CRISPASR_COMMIT])
+run(["git", "-C", str(REPO), "submodule", "update", "--init", "--recursive"])
 
 sys.path.insert(0, os.path.join(str(REPO), "tools", "kaggle"))
 try:
@@ -93,7 +99,7 @@ kh.step("cuda_arch", arch=arch)
 BUILD.mkdir(parents=True, exist_ok=True)
 cmake_args = (
     [
-        "cmake", "-S", str(REPO), "-B", str(BUILD),
+        "cmake", "-G", "Ninja", "-S", str(REPO), "-B", str(BUILD),
         "-DCMAKE_BUILD_TYPE=Release", "-DBUILD_SHARED_LIBS=ON",
         "-DCRISPASR_BUILD_TESTS=OFF",
     ]
@@ -155,7 +161,7 @@ kh.step("models_downloaded")
 
 
 # ── Run TTS with O15=OFF and O15=ON ────────────────────────────────
-def run_tts(label, o15_value, extra_env=None, timeout=300):
+def run_tts(label, o15_value, extra_env=None, gpu_backend=None, replay_codes=None, timeout=300):
     """Run qwen3-tts synthesis and return dict with results."""
     kh.step(f"{label}.start")
     out_wav = WORK / f"tts-{label}.wav"
@@ -166,6 +172,15 @@ def run_tts(label, o15_value, extra_env=None, timeout=300):
         "QWEN3_TTS_O15": str(o15_value),
         "QWEN3_TTS_BENCH": "1",
     }
+    dump_dir = RESULTS / f"{label}_dump"
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    env.update({
+        "CRISPASR_QWEN3_TTS_GREEDY": "1",
+        "CRISPASR_QWEN3_TTS_DUMP_DIR": str(dump_dir),
+        "CRISPASR_QWEN3_TTS_DUMP_LOGITS": str(dump_dir),
+    })
+    if replay_codes:
+        env["CRISPASR_QWEN3_TTS_REPLAY_CODES"] = str(replay_codes)
     if extra_env:
         env.update(extra_env)
 
@@ -203,6 +218,8 @@ def run_tts(label, o15_value, extra_env=None, timeout=300):
         "--seed", "42",
         "-v",
     ]
+    if gpu_backend:
+        cmd += ["--gpu-backend", gpu_backend]
     t0 = time.time()
     try:
         r = subprocess.run(
@@ -287,6 +304,52 @@ off = run_tts("o15_off", 0)
 # Run O15=ON — the one that previously crashed on CUDA
 on = run_tts("o15_on", 1)
 
+# ── #337 HIP prefill parity: full-frame teacher forcing ───────────
+# Capture one deterministic CPU trajectory, then replay all 16 codebooks on
+# HIP.  This keeps both runs on identical history; free-running token/output
+# differences are not a valid GPU arithmetic test for an autoregressive LM.
+def make_replay_codes(dump_dir):
+    import numpy as np
+    src = dump_dir / "generated_codes_s00.bin"
+    if not src.exists():
+        raise RuntimeError(f"missing CPU code dump: {src}")
+    codes = np.fromfile(src, dtype="<i4")
+    if codes.size == 0 or codes.size % 16:
+        raise RuntimeError(f"invalid code dump size: {codes.size}")
+    out = dump_dir / "codes16.txt"
+    np.savetxt(out, codes.reshape(-1, 16), fmt="%d")
+    return out, codes.size // 16
+
+replay_cpu = run_tts("replay_cpu", 0, {"CRISPASR_QWEN3_TTS_TALKER_SCHED": "1"}, "cpu")
+replay_codes, replay_frames = make_replay_codes(RESULTS / "replay_cpu_dump")
+replay_gpu = run_tts("replay_gpu", 0, {}, "auto", replay_codes)
+
+def compare_replay(cpu_dir, gpu_dir):
+    import glob
+    import numpy as np
+    cpu_files = sorted(glob.glob(str(cpu_dir / "talker_s00_*.f32")))
+    gpu_files = sorted(glob.glob(str(gpu_dir / "talker_s00_*.f32")))
+    n = min(len(cpu_files), len(gpu_files))
+    rows = []
+    for i in range(n):
+        a = np.fromfile(cpu_files[i], dtype="<f4")
+        b = np.fromfile(gpu_files[i], dtype="<f4")
+        cos = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
+        rows.append((i, cos, float(np.max(np.abs(a - b))), int(np.argmax(a) != np.argmax(b))))
+    worst = min((r[1] for r in rows), default=0.0)
+    disagreements = sum(r[3] for r in rows)
+    print(f"#337 replay: frames={n}/{replay_frames} worst_cos={worst:.6f} "
+          f"argmax_disagreements={disagreements}/{n}", flush=True)
+    (RESULTS / "issue337_replay.txt").write_text(
+        f"frames={n}/{replay_frames}\nworst_cos={worst:.6f}\n"
+        f"argmax_disagreements={disagreements}/{n}\n" +
+        "\n".join(f"frame={i} cos={c:.6f} max_abs={m:.6f} argmax_diff={d}" for i, c, m, d in rows) + "\n"
+    )
+    return n > 0 and n == replay_frames and worst >= 0.999
+
+replay_ok = compare_replay(RESULTS / "replay_cpu_dump", RESULTS / "replay_gpu_dump")
+kh.step("issue337.replay", ok=replay_ok)
+
 
 # ── ASR roundtrip: transcribe both WAVs with parakeet ──────────────
 def asr_roundtrip(label, wav_path, timeout=120):
@@ -329,6 +392,7 @@ print(f"  O15=ON:  rc={on['rc']}  wav={'OK' if on['wav_ok'] else 'FAIL'}  "
       f"{on['ms_per_frame'] or '?'} ms/frame  {on['elapsed']}s wall", flush=True)
 print(f"  ASR roundtrip OFF: {asr_off[:100]!r}", flush=True)
 print(f"  ASR roundtrip ON:  {asr_on[:100]!r}", flush=True)
+print(f"  #337 replay:       {'PASS' if replay_ok else 'FAIL'}", flush=True)
 
 o15_works = on["rc"] == 0 and on["wav_ok"]
 o15_faster = (
@@ -354,7 +418,15 @@ kh.step(
     "summary",
     o15_works=o15_works, o15_faster=o15_faster,
     off_ms=off["ms_per_frame"], on_ms=on["ms_per_frame"],
-    sha=sha,
+    sha=sha, issue337_replay_ok=replay_ok,
+)
+# Keep the shared CUDA compiler cache current after a real build.  The harness
+# writes one archive so Kaggle's output file cap cannot truncate the cache.
+ccache_tar = kh.export_ccache_tar()
+kh.step(
+    "ccache_export",
+    ok=bool(ccache_tar and Path(ccache_tar).exists()),
+    path=ccache_tar,
 )
 kh._push_progress_to_hf(force=True)
 kh.step("script.end")

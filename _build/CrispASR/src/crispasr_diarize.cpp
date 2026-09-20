@@ -447,6 +447,14 @@ int foxnose_embed_cb(void* ud, int worker, const float* pcm, int n, float* out) 
     return wespeaker_embed(e->ctx[worker], pcm, n, out);
 }
 
+int foxnose_embed_batch_cb(void* ud, int worker, const float* pcm, int64_t n, const int64_t* offs, const int* lens,
+                           int n_win, float* out) {
+    auto* e = static_cast<FoxnoseEmbedder*>(ud);
+    if (worker < 0 || worker >= (int)e->ctx.size())
+        return -1;
+    return wespeaker_embed_batch(e->ctx[worker], pcm, n, offs, lens, n_win, out);
+}
+
 bool apply_foxnose(const float* left, int n_samples, const CrispasrDiarizeOptions& opts,
                    std::vector<CrispasrDiarizeSegment>& segs, std::vector<CrispasrDiarizeTurn>* out_turns) {
     if (opts.foxnose_embedder_path.empty()) {
@@ -463,6 +471,12 @@ bool apply_foxnose(const float* left, int n_samples, const CrispasrDiarizeOption
     // See core_foxnose::Params::n_workers.
     wespeaker_context_params cp = wespeaker_context_default_params();
     cp.n_threads = 1; // one thread per worker; parallelism comes from n_workers
+    // #324 B1: opt-in GPU embedder (htdemucs pattern). Workers stay CPU-pinned
+    // (wespeaker_init_worker), so pair this with CRISPASR_DIARIZE_EMBED_WORKERS=1
+    // unless a mixed GPU-main + CPU-workers schedule is being measured.
+    if (const char* e = std::getenv("CRISPASR_WESPEAKER_GPU"))
+        if (*e && *e != '0')
+            cp.use_gpu = true;
     // Same override the pluggable embedders honour, so the pre-#324-perf
     // behaviour (all of -t inside one graph, one window at a time) stays
     // reachable for an interleaved A/B.
@@ -487,6 +501,13 @@ bool apply_foxnose(const float* left, int n_samples, const CrispasrDiarizeOption
         if (v > 0)
             want_workers = v;
     }
+    // GPU embedder => single context. Workers borrow the main context's
+    // weights, and with use_gpu those live in a Metal buffer a CPU worker
+    // cannot touch (measured: ggml_abort from the first worker thread).
+    // One-GPU-many-CPU needs dual-resident weights; until someone builds
+    // that, the GPU path runs all windows through the one GPU context.
+    if (cp.use_gpu)
+        want_workers = 1;
     for (int i = 1; i < want_workers; i++) {
         wespeaker_context* c = wespeaker_init_worker(ctx);
         if (!c)
@@ -526,8 +547,24 @@ bool apply_foxnose(const float* left, int n_samples, const CrispasrDiarizeOption
     if (const char* e = std::getenv("CRISPASR_DIARIZE_SPAN_EMBED"))
         if (*e && *e != '0')
             span_fn = foxnose_embed_windows_cb;
+    // Batched independent-window embedding (#324 perf). Arithmetic-identical
+    // to the per-window path, but MEASURED SLOWER on CPU (esrit.wav, -t 8:
+    // 12.1 s -> 14.9 s wall) — ggml's CPU conv loops ne[3], so fusing buys no
+    // GEMM shape and the 32-window chunks starve the 8-worker schedule. On the
+    // GPU it collapses ~350 dispatches into ~11 and is the schedule that made
+    // Metal reach CPU parity, so it is the DEFAULT there (single context, no
+    // worker balance to lose). CRISPASR_DIARIZE_BATCH_EMBED=1/0 overrides
+    // either way; the span path above, an accuracy-trading opt-in, wins when
+    // both are set.
+    core_foxnose::EmbedBatchFn batch_fn = (span_fn || !cp.use_gpu) ? nullptr : foxnose_embed_batch_cb;
+    if (const char* e = std::getenv("CRISPASR_DIARIZE_BATCH_EMBED")) {
+        if (*e && *e == '0')
+            batch_fn = nullptr;
+        else if (*e && *e != '0' && !span_fn)
+            batch_fn = foxnose_embed_batch_cb;
+    }
     core_foxnose::Result res =
-        core_foxnose::diarize(left, n_samples, sr, speech, foxnose_embed_cb, &emb, dim, p, span_fn);
+        core_foxnose::diarize(left, n_samples, sr, speech, foxnose_embed_cb, &emb, dim, p, span_fn, batch_fn);
     if (std::getenv("CRISPASR_DIARIZE_DEBUG"))
         fprintf(stderr, "crispasr[diarize]: foxnose windows=%d skipped=%d -> %d speakers (%s), %zu turns\n",
                 res.n_windows, res.n_skipped, res.n_speakers, res.reason.c_str(), res.turns.size());

@@ -47,7 +47,7 @@ def _hook_factory(captured: Dict, name: str, *, first_call_only: bool = False) -
     when a module is invoked many times inside `generate()` — e.g. the
     Qwen3-TTS talker decoder fires once for the full prefill and then
     again for every AR step with shape (1, 1, *), and we want to keep
-    the prefill capture. This option does NOT replace `_iter_capture`,
+    the prefill capture. This option does NOT replace `capture_per_call()`,
     which collects ONE tensor PER call instead of skipping later calls.
     """
     def hook(_module, _inp, output):
@@ -97,6 +97,64 @@ def capture_modules(
             continue
         handles.append(module.register_forward_hook(
             _hook_factory(captured, name, first_call_only=first_call_only)))
+    return handles
+
+
+def capture_per_call(
+    captured: Dict,
+    stages: Iterable[Tuple[str, object]],
+    *,
+    max_calls: int = 64,
+    name_fmt: str = "{name}_step{idx}",
+) -> List:
+    """Register hooks that keep ONE capture PER CALL, not just the first.
+
+    `capture_modules(..., first_call_only=True)` keeps the prefill and
+    discards every autoregressive step. This is its complement: each call
+    lands under its own key, so a decode loop yields
+    `talker_logits_step0, talker_logits_step1, …`.
+
+    That is the only shape in which a per-step comparison against a C++
+    runtime means anything — and it is worth being precise about why. Two
+    implementations free-running from the same prompt diverge as soon as
+    one of them samples a different token, after which every later step is
+    conditioned on different history and the diff measures the divergence
+    rather than the arithmetic. So a per-step capture is half of a pair:
+    the other half is replaying THIS run's sampled ids through the runtime
+    (crispasr: `CRISPASR_QWEN3_TTS_REPLAY_CODES`). Capture the ids you
+    generate alongside the logits, or the dump is not usable as a
+    reference.
+
+    `max_calls` bounds the capture — a long generation would otherwise
+    hold every step's logits in memory and write a GGUF full of stages
+    nobody diffs. Calls past the bound are ignored, not an error.
+
+    Returns handles for `drop_hooks()`, like `capture_modules`.
+    """
+    counters: Dict[str, int] = {}
+
+    def factory(base: str) -> Callable:
+        def hook(_module, _inp, output):
+            import torch
+            idx = counters.get(base, 0)
+            counters[base] = idx + 1
+            if idx >= max_calls:
+                return
+            if hasattr(output, "last_hidden_state"):
+                t = output.last_hidden_state
+            elif isinstance(output, (tuple, list)):
+                t = output[0]
+            else:
+                t = output
+            if isinstance(t, torch.Tensor):
+                captured[name_fmt.format(name=base, idx=idx)] = t.detach().cpu().float()
+        return hook
+
+    handles = []
+    for name, module in stages:
+        if module is None:
+            continue
+        handles.append(module.register_forward_hook(factory(name)))
     return handles
 
 

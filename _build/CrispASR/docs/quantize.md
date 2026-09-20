@@ -14,6 +14,12 @@ Replaces the legacy per-model tools (`cohere-quantize`,
 references one of them, use `crispasr-quantize` instead with the same
 arguments.
 
+> **GGUF only.** `crispasr-quantize` opens its input with
+> `gguf_init_from_file`, so it reads GGUF and nothing else. The original
+> whisper.cpp `ggml-*.bin` files are the *pre-GGUF* format and are not
+> accepted; quantize those with the separate **`crispasr-legacy-quantize`**
+> tool (`examples/quantize/`), which is also built by default.
+
 ## Build
 
 `crispasr-quantize` is built automatically as part of the default
@@ -105,8 +111,9 @@ crispasr-quantize model-f16.gguf model.gguf q4_k \
 ### Examples
 
 ```bash
-# Whisper base.en F16 → Q4_K (small + fast)
-./build/bin/crispasr-quantize ggml-base.en.bin ggml-base.en-q4_k.bin q4_k
+# Whisper base.en F16 → Q4_K (small + fast).
+# NOTE: the classic whisper.cpp `ggml-*.bin` is pre-GGUF — use the legacy tool:
+./build/bin/crispasr-legacy-quantize ggml-base.en.bin ggml-base.en-q4_k.bin q4_k
 
 # Parakeet TDT 0.6B F16 → Q4_K
 ./build/bin/crispasr-quantize parakeet-tdt-0.6b-f16.gguf parakeet-tdt-0.6b-q4_k.gguf q4_k
@@ -131,10 +138,13 @@ K-quants (`q2_k` through `q6_k`) and `iq4_xs` require tensor row sizes
 to be multiples of 256. If a tensor doesn't meet this requirement (e.g.
 the 896-wide tensors in some Qwen3-ASR layers), the tool transparently
 falls back to a compatible smaller-block quant for that tensor only
-(`q4_k`→`q4_0`, `q5_k`→`q5_0`, `q6_k`→`q8_0`, `iq4_xs`→`iq4_nl`→`q4_0`),
-and the rest of the model still gets the requested type. The output
-GGUF is always fully quantized — there is no half-quantized failure
-mode.
+(`q2_k`/`q3_k`/`q4_k`→`q4_0`, `q5_k`→`q5_0`, `q6_k`→`q8_0`,
+`iq4_xs`→`iq4_nl`, `iq4_nl`→`q4_0`), and the rest of the model still gets
+the requested type. The fallback is a single step, not a chain: if the
+fallback type does not tile the row either (a width that is not a
+multiple of 32), that one tensor is left at its source precision and the
+run still succeeds — so a failed fit costs size, never a failed
+quantization.
 
 ### Generating an importance matrix (calibration)
 
@@ -185,11 +195,14 @@ Notes:
   (−0.04) even as **CER** — the real quality metric — improved sharply.
   Trust CER; the single-position cosine is only a proxy.
 - Implemented for the ASR backends whose large weights actually benefit
-  (whisper, parakeet, canary, cohere, qwen3-asr / mega-asr, higgs-stt,
-  ark-asr, moss-transcribe, moss-diarize, granite, glm-asr, mimo-asr, voxtral). The
-  collector is installed on the decode scheduler
-  (`crispasr_imatrix_install`); adding it to another backend is a
-  one-line call after its `ggml_backend_sched_new`.
+  (whisper, parakeet, canary, canary-qwen, cohere, qwen3-asr / mega-asr,
+  higgs-stt, ark-asr, moss-transcribe, granite-speech, granite-nle,
+  glm-asr, mimo-asr, voxtral, voxtral4b). The collector is installed on
+  the decode scheduler (`crispasr_imatrix_install`); adding it to another
+  backend is a one-line call after its `ggml_backend_sched_new`.
+  **moss-diarize is not instrumented** — `src/moss_transcribe_diarize.cpp`
+  includes the header but never calls `crispasr_imatrix_install`, so a
+  calibration run against it collects nothing.
 
 ## Recommended quants per backend
 
@@ -220,6 +233,7 @@ ASR backends.
 | kokoro (TTS)        | ✓     | ✓     | —     | —     | Q5_K and below break the German backbone — ship F16 + Q8_0 only.         |
 | qwen3-tts           | ✓     | ✓     | ✓     | ✓     |                                                                          |
 | vibevoice (TTS)     | ✓     | ✓     | ✓     | ✓     | F16 + Q4_K shipped.                                                      |
+| vibevoice-streaming (ASR) | ✓ | ✓ | ✓ | ✓ | Q4_K is validated against the persistent-stream F16 path; set `CRISPASR_VIBEVOICE_ASR_FRONTEND_F16=1` while quantizing to keep the encoder frontend in F16 for an A/B arm. |
 | chatterbox (TTS)    | ✓     | ✓     | ✓     | ✓     | Vocoder/F0/embeddings auto-skipped. F16 + Q8_0 + Q4_K shipped. On **Metal** a quantized S3Gen CFM has its `s3.fd.*` weights dequantised to F16 at load and kept GPU-resident (Metal's q8 mat-vec kernel requantises activations to q8 and corrupts the CFM — NaN/garbage; F16 weights take the correct `mul_mm_f16_f32_hp` path at full GPU speed). F16 S3Gen and all CUDA are unaffected. `CRISPASR_S3GEN_UNET_CPU=1` forces the slower all-CPU route. |
 
 > The cells marked `—` are not just "untested" — they have a known

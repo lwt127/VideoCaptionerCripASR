@@ -2,10 +2,15 @@
 
 #include "crispasr_cpu_isa.h"
 
-// ggml_cpu_has_*(): build-time constants compiled into libggml-cpu, i.e. the ISA
-// ggml's own kernels actually emit — which is what SIGILLs in #261, and which our
-// own TU macros cannot see. Safe to call before ggml_cpu_init().
-#include "ggml-cpu.h"
+// core_cpu_backend::has_feature(): the ISA libggml-cpu was BUILT with, i.e. what
+// ggml's own kernels actually emit — which is what SIGILLs in #261, and which
+// our own TU macros cannot see. Safe to call before ggml_cpu_init().
+//
+// Routed through the shim rather than calling ggml_cpu_has_*() directly: those
+// are symbols in libggml-cpu, and under GGML_BACKEND_DL the CPU backend is a
+// dlopen'd module, so a direct call does not LINK. That broke every CUDA
+// package in the v0.8.30 release run.
+#include "core/ggml_cpu_backend.h"
 
 #include <cstdint>
 #include <vector>
@@ -161,12 +166,12 @@ IsaCheck check() {
 #endif
 
     const std::vector<Feature> feats = {
-        {"AVX512F", own_avx512f || ggml_cpu_has_avx512() != 0, h.avx512f},
-        {"AVX2", own_avx2 || ggml_cpu_has_avx2() != 0, h.avx2},
-        {"FMA", own_fma || ggml_cpu_has_fma() != 0, h.fma},
-        {"F16C", own_f16c || ggml_cpu_has_f16c() != 0, h.f16c},
-        {"BMI2", own_bmi2 || ggml_cpu_has_bmi2() != 0, h.bmi2},
-        {"AVX", own_avx || ggml_cpu_has_avx() != 0, h.avx},
+        {"AVX512F", own_avx512f || core_cpu_backend::has_feature("AVX512"), h.avx512f},
+        {"AVX2", own_avx2 || core_cpu_backend::has_feature("AVX2"), h.avx2},
+        {"FMA", own_fma || core_cpu_backend::has_feature("FMA"), h.fma},
+        {"F16C", own_f16c || core_cpu_backend::has_feature("F16C"), h.f16c},
+        {"BMI2", own_bmi2 || core_cpu_backend::has_feature("BMI2"), h.bmi2},
+        {"AVX", own_avx || core_cpu_backend::has_feature("AVX"), h.avx},
     };
 
     for (const auto& f : feats) {

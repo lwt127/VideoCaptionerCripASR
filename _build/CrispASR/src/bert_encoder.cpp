@@ -23,6 +23,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `BERT_ENCODER_BENCH=1` for per-stage timings.
@@ -313,8 +314,8 @@ extern "C" struct bert_encoder_context* bert_encoder_init(const char* gguf_path,
     ctx->n_threads = n_threads;
 
     // Backend
-    ctx->backend_cpu = ggml_backend_cpu_init();
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, n_threads);
+    ctx->backend_cpu = core_cpu_backend::init();
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, n_threads);
     ctx->backend = ctx->backend_cpu;
 
     // Metadata
@@ -449,7 +450,7 @@ extern "C" void bert_encoder_free(struct bert_encoder_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->w_buf)
-        ggml_backend_buffer_free(ctx->w_buf);
+        core_gguf::release_weight_buffer(ctx->w_buf);
     if (ctx->w_ctx)
         ggml_free(ctx->w_ctx);
     if (ctx->backend_cpu)

@@ -29,8 +29,22 @@ struct RunResult {
     bool spawn_failed = false;
 };
 
-#ifdef _WIN32
-inline std::string quote_arg(const std::string& arg) {
+// Both quoters are compiled on every platform, and quote_arg() picks one. They
+// used to sit in the two arms of an #ifdef, which meant the Windows rules were
+// never compiled — let alone tested — anywhere else, and #328 is what that
+// costs: sherpa was spawned with POSIX single quotes that cmd.exe does not
+// interpret, so it received literal quote characters inside its model paths and
+// wedged. Neither a Linux build nor a macOS build could have caught it, and the
+// only machines that could were the ones already broken.
+//
+// Defined unconditionally, they are pure string functions that
+// test-subprocess-quoting.cpp round-trips against reference parsers on any host.
+
+// MSVC / CommandLineToArgvW rules: backslashes are literal unless they precede
+// a quote, where they double and the quote is escaped. A run of backslashes at
+// the very end of a quoted argument doubles too, so the closing quote is not
+// swallowed by the last one.
+inline std::string quote_arg_windows(const std::string& arg) {
     if (arg.empty())
         return "\"\"";
     if (arg.find_first_of(" \t\n\v\"") == std::string::npos)
@@ -55,8 +69,10 @@ inline std::string quote_arg(const std::string& arg) {
     out.push_back('"');
     return out;
 }
-#else
-inline std::string quote_arg(const std::string& arg) {
+
+// POSIX sh: single quotes take everything literally, so only the single quote
+// itself needs handling — close, emit an escaped one, reopen.
+inline std::string quote_arg_posix(const std::string& arg) {
     std::string out = "'";
     for (char c : arg) {
         if (c == '\'')
@@ -67,7 +83,14 @@ inline std::string quote_arg(const std::string& arg) {
     out.push_back('\'');
     return out;
 }
+
+inline std::string quote_arg(const std::string& arg) {
+#ifdef _WIN32
+    return quote_arg_windows(arg);
+#else
+    return quote_arg_posix(arg);
 #endif
+}
 
 inline std::string join_cmdline(const std::vector<std::string>& args) {
     std::string cmd;

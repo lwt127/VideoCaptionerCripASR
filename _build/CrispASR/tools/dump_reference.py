@@ -102,7 +102,14 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # under a delay pattern + 1.6B transformer codec. The greedy code grid
     # ("codes") is the Phase-3 byte-parity target; "waveform" (needs the codec)
     # is the Phase-4 decoded reference. Text from $MOSS_TTS_TEXT; --audio ignored.
+    # MADLAD-400 (google/madlad400-3b-mt) T5 1.1 encoder-decoder translation
+    # (#333). Text model — the shared --audio arg is ignored; source text comes
+    # from $MADLAD_TEXT and the target tag from $MADLAD_TL. Loads the 11.76 GB
+    # fp32 checkpoint ONE TENSOR AT A TIME, so it fits a ~13 GB box.
+    "madlad":     "reference_backends.madlad",
     "miotts":     "reference_backends.miotts",
+    "breeze-tts-2": "reference_backends.breeze_tts_2",
+    "bt2-tts":    "reference_backends.breeze_tts_2",
     "moss-tts":   "reference_backends.moss_tts",
     "qwen3":      "reference_backends.qwen3",
     "higgs-stt":  "reference_backends.higgs_stt",
@@ -125,6 +132,10 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # audio arg is a real multi-speaker clip.
     "tiron":      "reference_backends.tiron",
     "parakeet":   "reference_backends.parakeet",
+    # Supertonic-3 (#434): ONNX-only distribution — the reference IS the
+    # onnxruntime pipeline (standalone script; run it directly, not via this
+    # dispatcher). Kept here for discoverability.
+    "supertonic-tts": "reference_backends.supertonic_tts",
     # WeSpeaker ResNet34-LM speaker embedder (#324). model_dir is a snapshot of
     # Wespeaker/wespeaker-voxceleb-resnet34-LM (containing `avg_model`), or the
     # checkpoint path itself. Needs the upstream package importable — either
@@ -268,6 +279,10 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # model_dir = FunAudioLLM/Fun-CosyVoice3-0.5B-2512 HF snapshot.
     # Audio arg is unused (the per-block test vector is seeded random).
     "cosyvoice3-tts": "reference_backends.cosyvoice3_tts",
+    # FireRedTTS3 (#377): Qwen3-1.7B LLM + PatchEncoder + DiT flow head
+    # over continuous RedAE latents. Runs the full upstream pipeline on
+    # CPU (Kaggle-only: ~13 GB of fp32 weights).
+    "fireredtts3": "reference_backends.fireredtts3_tts",
     # F5-TTS v1 Base: DiT-based flow-matching TTS with Vocos vocoder.
     # model_dir = /mnt/storage/f5-tts (containing F5TTS_v1_Base/ + vocos/).
     # Audio arg is a reference voice WAV for cloning (16 kHz); synth text
@@ -368,6 +383,17 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # waveform, not from replayed features, or the front end is never tested
     # (the BTC/piano blind spot).
     "tabcnn": "reference_backends.tabcnn",
+    # Basic Pitch (Spotify, ICASSP 2022, Apache-2.0, §250): polyphonic,
+    # instrument-agnostic audio → note events. `model_dir` is the ONNX FILE
+    # (nmp.onnx), which ships inside the basic-pitch package/repo at
+    # basic_pitch/saved_models/icassp_2022/. Runs on onnxruntime — do NOT
+    # install tensorflow for this. Audio arg = any file librosa can read; it is
+    # loaded at 22050 Hz mono.
+    # ⚠️ The CQT lives INSIDE the ONNX, so this dumper exposes the graph's own
+    # intermediate tensors (cqt_magnitude, normalized_log, harmonic_stack) as
+    # extra outputs and emits `audio_window0` too. Diff from the waveform, not
+    # from replayed features — the front end is most of this model.
+    "basic_pitch": "reference_backends.basic_pitch",
 }
 
 DEFAULT_STAGES_BY_BACKEND: Dict[str, List[str]] = {}  # populated at import
@@ -579,6 +605,11 @@ def main() -> None:
     # harnesses on the C++ side can replay the exact synthesis context.
     for env_key in ("QWEN3_TTS_SYN_TEXT", "QWEN3_TTS_REF_TEXT", "QWEN3_TTS_LANG", "QWEN3_TTS_VOICE",
                     "KOKORO_PHONEMES", "KOKORO_VOICE", "KOKORO_SEED", "CHATTERBOX_SYN_TEXT",
+                    "CHATTERBOX_LANG",
+                    "CHATTERBOX_SEED",
+                    "FIREREDTTS3_SYN_TEXT", "FIREREDTTS3_PROMPT_TEXT", "FIREREDTTS3_LANG",
+                    "FIREREDTTS3_SEED",
+                    "CHATTERBOX_DEVICE",
                     "VOXCPM2_SYN_TEXT", "VOXCPM2_USE_REF",
                     "F5_TTS_SYN_TEXT", "F5_TTS_REF_TEXT", "F5_TTS_SEED",
                     "F5_TTS_STEPS", "F5_TTS_CFG", "F5_TTS_SWAY",

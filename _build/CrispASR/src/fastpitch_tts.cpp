@@ -28,6 +28,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `FASTPITCH_BENCH=1` for per-stage timings.
@@ -331,15 +332,23 @@ static fastpitch_tts_context* load_model(const char* path, fastpitch_tts_params 
 
     // ── Init backends ──
 
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (!ctx->backend_cpu) {
         fprintf(stderr, "fastpitch: failed to init CPU backend\n");
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, params.n_threads);
 
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
+    // On a CPU-only build crispasr_init_gpu_backend() falls through to
+    // ggml_backend_init_best() and hands back a SECOND, DISTINCT CPU backend;
+    // keeping it silently dropped params.n_threads (set_n_threads was applied
+    // to backend_cpu only). Collapse back — same guard as bananamind_tts.
+    if (ctx->backend && ctx->backend != ctx->backend_cpu && core_cpu_backend::is_cpu(ctx->backend)) {
+        ggml_backend_free(ctx->backend);
+        ctx->backend = ctx->backend_cpu;
+    }
     if (!ctx->backend)
         ctx->backend = ctx->backend_cpu;
 
@@ -1202,7 +1211,7 @@ void fastpitch_tts_free(struct fastpitch_tts_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->buf_w)
-        ggml_backend_buffer_free(ctx->buf_w);
+        core_gguf::release_weight_buffer(ctx->buf_w);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)

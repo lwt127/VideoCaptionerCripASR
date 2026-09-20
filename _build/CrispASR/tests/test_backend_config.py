@@ -50,15 +50,54 @@ class TestBackendConfig(unittest.TestCase):
         self.assertIn("const int T_pack = T_proj * 4;", impl)
 
     def test_cli_only_loads_all_backends_when_gpu_is_enabled(self) -> None:
+        """`ggml_backend_load_all()` must stay behind BOTH gates.
+
+        Asserted on structure rather than on one exact source line: this test
+        used to pin the literal `if (params.use_gpu && params.gpu_backend !=
+        "cpu") {` and went red the moment fd3c0e5e split it into a nested pair
+        — same behaviour, different formatting, red nightly. What matters is
+        that the call is reached only when the GPU is on AND the chosen backend
+        is not "cpu"; how the two conditions are spelled is not the contract.
+        """
         text = read("examples/cli/cli.cpp")
-        self.assertIn('if (params.use_gpu && params.gpu_backend != "cpu") {', text)
-        self.assertIn("ggml_backend_load_all();", text)
+        start = text.find("if (params.use_gpu)")
+        if start < 0:
+            start = text.find("if (params.use_gpu &&")
+        self.assertGreater(start, 0, "no `if (params.use_gpu)` guard in cli.cpp")
+        window = text[start:start + 400]
+        self.assertIn('params.gpu_backend != "cpu"', window)
+        self.assertIn("ggml_backend_load_all();", window)
+        # ...and nowhere else: an unguarded call would defeat the whole point.
+        self.assertEqual(text.count("ggml_backend_load_all();"), 1)
 
     def test_omniasr_keeps_explicit_cpu_fallback_backend(self) -> None:
+        """omniasr keeps a CPU backend distinct from the main one, and schedules it.
+
+        Asserted on structure, not on the literal init call — the same lesson the
+        sibling test above records. This one pinned
+        `ctx->backend_cpu = ggml_backend_cpu_init();` and went red the moment
+        f7464aeb (#355) routed every CPU-backend acquisition through
+        `core_cpu_backend::init()` so GGML_BACKEND_DL builds can dlopen it. The
+        behaviour was unchanged; the nightly was red for five nights over a
+        rename.
+
+        The contract is: a CPU fallback exists, it is only used/freed when it is
+        genuinely a different object from the main backend, and it is handed to
+        the scheduler. How the CPU backend is spelled, and what graph size the
+        sched gets, are not the contract.
+        """
         text = read("src/omniasr.cpp")
-        self.assertIn("ctx->backend_cpu = ggml_backend_cpu_init();", text)
+        self.assertRegex(
+            text,
+            r"ctx->backend_cpu\s*=\s*(?:core_cpu_backend::init|ggml_backend_cpu_init)\s*\(",
+            "omniasr must initialise an explicit CPU fallback backend",
+        )
         self.assertIn("if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)", text)
-        self.assertIn("ggml_backend_sched_new(backends, nullptr, n_backends, 65536, false, false);", text)
+        self.assertRegex(
+            text,
+            r"ggml_backend_sched_new\(\s*backends\s*,\s*nullptr\s*,\s*n_backends\s*,",
+            "the CPU fallback must be handed to ggml_backend_sched_new",
+        )
 
     def test_backend_default_params_enable_gpu(self) -> None:
         expected = {

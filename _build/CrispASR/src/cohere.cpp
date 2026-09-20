@@ -10,6 +10,8 @@
 #include "cohere.h"
 #include "core/crispasr_env.h"
 #include "cohere-arch.h"
+#include "cohere_lang.h"
+#include "core/lid_probe.h"
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "ggml-alloc.h"
@@ -374,6 +376,14 @@ struct cohere_hparams {
     int n_freqs() const { return n_fft / 2 + 1; } // 257
     int pre_conv_ch = 256;
     int pre_sub_fac = 8; // 3 × stride-2 → ×8 downsampling
+    // Longest window the model was trained on (config.json max_audio_clip_s).
+    // 35 s for every release so far; the chunker keeps a margin below it.
+    int max_audio_clip_s = 35;
+
+    // From config.json `supported_languages`. EMPTY means the GGUF predates the
+    // metadata key — "unknown", not "none": callers must not treat it as a
+    // restriction. See cohere_lang.h.
+    std::vector<std::string> supported_languages;
 };
 
 // ---------------------------------------------------------------------------
@@ -528,6 +538,18 @@ struct cohere_context {
 
     // Cached T_enc from last encode call, needed by decode graph builder.
     int cached_T_enc = 0;
+
+    // Probe-LID encoder reuse. The encoder output and the cross-attention KV
+    // depend only on the AUDIO; the language enters solely through the decoder
+    // prompt. So probing N languages over one clip can encode once and decode
+    // N times — and encode is 87% of a pass (881 ms vs 113 ms decode, M1
+    // q4_k-imatrix on 11 s), so it is nearly the whole cost.
+    //
+    // INVARIANT: reuse_encoder may only be set while calling transcribe_ex
+    // repeatedly over the SAME samples. cohere_detect_language is the only
+    // place that sets it, and it clears it again in the same function.
+    bool reuse_encoder = false;
+    int reused_T_enc = 0;
 
     // Mel spectrogram buffer
     std::vector<float> mel_buf;
@@ -1143,6 +1165,39 @@ static bool cohere_load_model(cohere_model& model, cohere_vocab& vocab, const ch
     hp.n_fft = (int)core_gguf::kv_u32(gguf_ctx, CT_KEY_AUDIO_N_FFT, 0);
     hp.hop_length = (int)core_gguf::kv_u32(gguf_ctx, CT_KEY_AUDIO_HOP, 0);
     hp.win_length = (int)core_gguf::kv_u32(gguf_ctx, CT_KEY_AUDIO_WIN, 0);
+    hp.max_audio_clip_s = (int)core_gguf::kv_u32(gguf_ctx, CT_KEY_MAX_AUDIO_CLIP_S, 35);
+
+    // The model's own language list. Absent in GGUFs converted before the key
+    // existed — an empty vector then means "unknown", and cohere_lang::resolve
+    // passes the request through untouched.
+    hp.supported_languages = core_gguf::kv_str_array(gguf_ctx, CT_KEY_SUPPORTED_LANGS);
+
+    // Escape hatch for the GGUFs already in circulation, which were converted
+    // before that key existed: declare the model's language set without
+    // reconverting 1.5 GB. Overrides the GGUF when both are present.
+    //   CRISPASR_COHERE_LANGS=en,ar
+    if (const char* env = crispasr_env::get("CRISPASR_COHERE_LANGS")) {
+        std::vector<std::string> from_env;
+        std::string cur;
+        for (const char* p = env;; p++) {
+            if (*p == ',' || *p == '\0') {
+                if (!cur.empty())
+                    from_env.push_back(cur);
+                cur.clear();
+                if (*p == '\0')
+                    break;
+            } else {
+                cur += *p;
+            }
+        }
+        if (!from_env.empty()) {
+            hp.supported_languages = std::move(from_env);
+            fprintf(stderr, "cohere: supported languages overridden by CRISPASR_COHERE_LANGS=%s\n", env);
+        }
+    }
+
+    for (auto& code : hp.supported_languages)
+        code = cohere_lang::normalize(code);
 
     // Load vocabulary
     {
@@ -1460,6 +1515,7 @@ static void cohere_fft_r2c(const float* in, int N, float* out) {
 
 #include "core/mel.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1940,7 +1996,7 @@ struct cohere_context* cohere_init_from_file(const char* path_model, struct cohe
             }
         }
         if (!ctx->ggml_backend) {
-            ctx->ggml_backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
+            ctx->ggml_backend = params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init();
         }
         if (!ctx->ggml_backend) {
             fprintf(stderr, "cohere: failed to initialize any ggml backend\n");
@@ -1950,17 +2006,17 @@ struct cohere_context* cohere_init_from_file(const char* path_model, struct cohe
     }
 
     // Always have a CPU backend available as scheduler fallback for unsupported ops
-    ctx->ggml_backend_cpu = ggml_backend_cpu_init();
-    bool using_gpu = !ggml_backend_is_cpu(ctx->ggml_backend);
+    ctx->ggml_backend_cpu = core_cpu_backend::init();
+    bool using_gpu = !core_cpu_backend::is_cpu(ctx->ggml_backend);
     const int vb = params.verbosity;
     COHERE_VLOG(vb, "cohere: backend: %s%s\n", ggml_backend_name(ctx->ggml_backend), using_gpu ? "" : " (CPU-only)");
 
     // Apply thread count only when explicitly requested via env var
     if (crispasr_env::get("CRISPASR_COHERE_THREADS")) {
         COHERE_VLOG(vb, "cohere: applying n_threads=%d to CPU backend [COHERE_THREADS override]\n", params.n_threads);
-        ggml_backend_cpu_set_n_threads(ctx->ggml_backend_cpu, params.n_threads);
+        core_cpu_backend::set_n_threads(ctx->ggml_backend_cpu, params.n_threads);
         if (!using_gpu) {
-            ggml_backend_cpu_set_n_threads(ctx->ggml_backend, params.n_threads);
+            core_cpu_backend::set_n_threads(ctx->ggml_backend, params.n_threads);
         }
     } else {
         COHERE_VLOG(vb, "cohere: n_threads param=%d (use COHERE_THREADS=N to override)\n", params.n_threads);
@@ -1995,11 +2051,17 @@ struct cohere_context* cohere_init_from_file(const char* path_model, struct cohe
                                        hp.dec_n_layers);
         // PLAN #69b: optional KV-on-CPU spill for VRAM-tight users.
         ggml_backend_t kv_backend = core_attn::kv_backend_from_env(ctx->ggml_backend, ctx->ggml_backend_cpu, "cohere");
-        ctx->kv_buf = ggml_backend_alloc_buffer(kv_backend, ggml_nbytes(ctx->kv_k) + ggml_nbytes(ctx->kv_v));
+        // #367: size and place via ggml, not ggml_nbytes() arithmetic. CUDA's
+        // get_alloc_size() pads a quantized row up to MATRIX_ROW_PADDING (512),
+        // and these KV rows are dec_head_dim wide, so a q8_0 tensor needs more
+        // than nbytes — the hand-sized buffer came up short and
+        // ggml_backend_tensor_alloc aborted. Only reachable with
+        // CRISPASR_KV_QUANT set, and only on CUDA.
+        //
+        // (The cross-attention KV below is hardcoded F16, which is never
+        // padded, so its arithmetic is safe and is left alone.)
+        ctx->kv_buf = ggml_backend_alloc_ctx_tensors(ctx->kv_ctx, kv_backend);
         ggml_backend_buffer_t kv_buf = ctx->kv_buf;
-        char* base = (char*)ggml_backend_buffer_get_base(kv_buf);
-        ggml_backend_tensor_alloc(kv_buf, ctx->kv_k, (void*)(base));
-        ggml_backend_tensor_alloc(kv_buf, ctx->kv_v, (void*)(base + ggml_nbytes(ctx->kv_k)));
 
         COHERE_VLOG(vb, "cohere: kv cache     = %.1f MiB  (dec_head_dim=%d max_ctx=%d n_heads=%d n_layers=%d)\n",
                     ggml_backend_buffer_get_size(kv_buf) / 1048576.0, hp.dec_head_dim, hp.dec_max_ctx, hp.dec_n_heads,
@@ -2048,7 +2110,7 @@ void cohere_free(struct cohere_context* ctx) {
     if (ctx->kv_buf)
         ggml_backend_buffer_free(ctx->kv_buf);
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->ggml_backend)
         ggml_backend_free(ctx->ggml_backend);
     if (ctx->ggml_backend_cpu && ctx->ggml_backend_cpu != ctx->ggml_backend)
@@ -2066,6 +2128,19 @@ void cohere_free(struct cohere_context* ctx) {
 
 int cohere_n_vocab(struct cohere_context* ctx) {
     return ctx->vocab.n_vocab();
+}
+
+int cohere_n_supported_languages(struct cohere_context* ctx) {
+    return ctx ? (int)ctx->model.hparams.supported_languages.size() : 0;
+}
+
+const char* cohere_supported_language(struct cohere_context* ctx, int i) {
+    if (!ctx)
+        return nullptr;
+    const auto& langs = ctx->model.hparams.supported_languages;
+    if (i < 0 || i >= (int)langs.size())
+        return nullptr;
+    return langs[i].c_str();
 }
 
 const char* cohere_token_to_str(struct cohere_context* ctx, int id) {
@@ -2167,6 +2242,61 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
     COHERE_VLOG2(vb, "cohere: transcribe started   n_samples=%d  audio=%.2fs\n", n_samples,
                  (double)n_samples / hp.sample_rate);
 
+    // --- Resolve the language BEFORE anything else ---
+    //
+    // Cohere Transcribe never fails on a wrong language — it transcribes
+    // fluently in whichever one the prompt names — and an unsupported code has
+    // no `<|xx|>` token at all, so the prompt builder below used to drop both
+    // language slots and decode with none. Callers reach here with codes the
+    // model may not know: `-l auto` is the CLI default and external LID knows
+    // 99 languages against this model's 14 (or the Arabic finetune's two).
+    // Substitute a supported code loudly instead. Resolving here — before the
+    // chunk loop — also means the recursive per-chunk calls see an already-
+    // resolved code and stay quiet.
+    const std::string lang_resolved = [&]() -> std::string {
+        auto r = cohere_lang::resolve(hp.supported_languages, lang ? lang : "");
+        // Unconditional, not gated on verbosity: this SWITCHES THE OUTPUT
+        // LANGUAGE. A substitution the user cannot see is the defect being
+        // fixed, so --no-prints must not be able to hide it. Only fires on a
+        // genuine mismatch, so it is not chatter.
+        if (r.substituted)
+            fprintf(stderr, "cohere: %s\n", r.reason.c_str());
+        return r.lang;
+    }();
+    lang = lang_resolved.empty() ? nullptr : lang_resolved.c_str();
+
+    // --- Digital-silence gate ---
+    //
+    // Handed a span with no signal at all, this model does not return nothing —
+    // it INVENTS speech. 10 s of zeros decodes to "And I'm going to go ahead and
+    // do that.", and because the chunk loop below re-enters this function per
+    // chunk, a long file whose trailing 30 s window is silent gets that sentence
+    // appended to an otherwise perfect transcript. (VAD suppresses it, but VAD
+    // only auto-arms above 30 s, and requires a model download.)
+    //
+    // Gate exactly that: no signal in, empty transcript out. The threshold sits
+    // below one int16 LSB so a single non-zero sample disables it — see
+    // audio_chunking::is_digitally_silent for the measured headroom against real
+    // quiet speech. CRISPASR_COHERE_SILENCE_GATE=0 restores the old behaviour.
+    {
+        const char* gate_env = crispasr_env::get("CRISPASR_COHERE_SILENCE_GATE");
+        const bool gate_on =
+            !(gate_env && (gate_env[0] == '0' || gate_env[0] == 'n' || gate_env[0] == 'N' || gate_env[0] == 'f'));
+        if (gate_on && audio_chunking::is_digitally_silent(samples, (size_t)n_samples)) {
+            COHERE_VLOG(vb, "cohere: %.2fs of digital silence — returning an empty transcript\n",
+                        (double)n_samples / hp.sample_rate);
+            cohere_result* empty = (cohere_result*)calloc(1, sizeof(cohere_result));
+            if (!empty)
+                return nullptr;
+            empty->text = (char*)calloc(1, 1); // "" — NOT nullptr; callers read it
+            if (!empty->text) {
+                free(empty);
+                return nullptr;
+            }
+            return empty;
+        }
+    }
+
     // --- Long-audio chunking: encode AND decode each <=30s window independently ---
     //
     // The previous approach assembled a single giant cross-KV for all chunks and ran
@@ -2180,7 +2310,11 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
     // 30 s window so cuts land at quiet points instead of slicing
     // mid-word (PLAN #80b, ported from nano-cohere-transcribe).
     {
-        const int CHUNK_S = 30 * hp.sample_rate;
+        // 30 s, but never within 5 s of the model's own training window
+        // (config.json max_audio_clip_s = 35 for every release so far, so this
+        // is a no-op today and a guard for a future model with a shorter one).
+        const int chunk_seconds = std::min(30, std::max(5, hp.max_audio_clip_s - 5));
+        const int CHUNK_S = chunk_seconds * hp.sample_rate;
         if (n_samples > CHUNK_S) {
             const size_t search_window_samples = (size_t)5 * (size_t)hp.sample_rate;
             const size_t energy_win_samples = 1600; // 100 ms at 16 kHz
@@ -2264,7 +2398,16 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
     const int CHUNK_SAMPLES = 30 * hp.sample_rate;
     const bool do_chunked = (n_samples > CHUNK_SAMPLES);
 
-    int T_enc_total = 0;
+    // Skip the encoder + cross-KV entirely when the caller guarantees the same
+    // audio as the previous call (probe LID — see cohere_context::reuse_encoder).
+    // Both blocks below are gated on this; the cross-KV buffer is freed and
+    // reallocated INSIDE the second one, so skipping it keeps the previous
+    // allocation live, which is exactly what we want to reuse.
+    const bool reuse_enc = ctx->reuse_encoder && ctx->reused_T_enc > 0 && ctx->cross_kv_buf != nullptr;
+
+    int T_enc_total = reuse_enc ? ctx->reused_T_enc : 0;
+    if (reuse_enc)
+        COHERE_VLOG2(vb, "cohere: reusing encoder output  T_enc=%d\n", T_enc_total);
 
     // Per-chunk K/V CPU storage: partial_k[il][chunk] and partial_v[il][chunk]
     // K chunk: [head_dim, T_c, n_heads] layout (F32; converted to F16 on upload)
@@ -2281,7 +2424,7 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
     cohere_prof_state prof_state;
     bool do_prof = !do_chunked && (crispasr_env::get("CRISPASR_COHERE_PROF") != nullptr);
 
-    {
+    if (!reuse_enc) {
         cohere_bench_stage _b_enc("encoder (all chunks)");
         int n_chunks = 0;
         for (int sample_offset = 0; sample_offset < n_samples; sample_offset += CHUNK_SAMPLES) {
@@ -2519,7 +2662,7 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
     }
 
     // Assemble cross-KV from per-chunk CPU data and upload to backend buffer.
-    {
+    if (!reuse_enc) {
         cohere_bench_stage _b_ckv("cross-kv assembly");
         t0 = ggml_time_us();
 
@@ -2614,6 +2757,7 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
     }
 
     const int T_enc = T_enc_total;
+    ctx->reused_T_enc = T_enc_total; // so the next call may reuse this encode
 
     // --- Decoder prompt ---
     cohere_bench_stage _b_dec("decoder (total)");
@@ -2621,6 +2765,26 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
     const char* lang_tok = lang ? lang : "en";
     char lang_tok_str[32];
     snprintf(lang_tok_str, sizeof(lang_tok_str), "<|%s|>", lang_tok);
+
+    // The remove_if below strips any token this vocab lacks. Harmless for the
+    // optional slots, but for the two source/target-language slots it meant an
+    // unrecognised code decoded with NO language at all.
+    //
+    // Note this catches LESS than it looks: the vocab carries all 183 ISO
+    // 639-1 `<|xx|>` tokens regardless of what the model supports, so every
+    // real language code passes here and only non-ISO input (`<|auto|>`) is
+    // caught. cohere_lang::resolve() above is what actually constrains the
+    // code to the model's own list. Keep both: this is the backstop for a
+    // GGUF carrying no list at all.
+    if (tid(lang_tok_str) == -1) {
+        fprintf(stderr, "cohere: no '%s' token in this model's vocab — falling back to '<|en|>'\n", lang_tok_str);
+        snprintf(lang_tok_str, sizeof(lang_tok_str), "<|en|>");
+        if (tid(lang_tok_str) == -1) {
+            fprintf(stderr, "cohere: error: this model's vocab has no language tokens at all "
+                            "(not even '<|en|>') — refusing to decode without a language slot\n");
+            return nullptr;
+        }
+    }
 
     const char* pnc_tok = ctx->params.no_punctuation ? "<|nopnc|>" : "<|pnc|>";
     std::vector<int> prompt = {
@@ -3220,6 +3384,119 @@ char* cohere_transcribe(struct cohere_context* ctx, const float* samples, int n_
     r->text = nullptr;
     cohere_result_free(r);
     return text;
+}
+
+// ---- Probe-based language identification ----
+
+struct cohere_lid_params cohere_lid_default_params(void) {
+    struct cohere_lid_params p;
+    p.probe_seconds = 20.0f;
+    p.max_new_tokens = 48;
+    p.text_lid = nullptr;
+    p.text_lid_user = nullptr;
+    p.verbosity = 0;
+    return p;
+}
+
+bool cohere_detect_language(struct cohere_context* ctx, const float* samples, int n_samples,
+                            struct cohere_lid_params params, char* out_lang, int out_lang_size, float* out_confidence) {
+    if (!ctx || !samples || n_samples <= 0 || !out_lang || out_lang_size < 3)
+        return false;
+
+    const auto& langs = ctx->model.hparams.supported_languages;
+    if (langs.empty()) {
+        // No candidate set to probe over. Guessing one would re-create exactly
+        // the bug this work exists to fix, so say so and let the caller use an
+        // external detector.
+        if (params.verbosity > 0)
+            fprintf(stderr, "cohere[lid]: this GGUF carries no supported-language list — "
+                            "cannot probe; reconvert it or use an external LID\n");
+        return false;
+    }
+
+    const auto& hp = ctx->model.hparams;
+    if (params.probe_seconds <= 0.0f)
+        params.probe_seconds = 20.0f;
+    if (params.max_new_tokens <= 0)
+        params.max_new_tokens = 48;
+
+    // Probe a leading clip short enough to stay in one window (no chunking).
+    const int max_probe = (int)(params.probe_seconds * (float)hp.sample_rate);
+    const int probe_n = n_samples < max_probe ? n_samples : max_probe;
+
+    // A probe must be deterministic and cheap regardless of what the caller
+    // configured for real transcription: sampling would make the comparison
+    // between candidates noise, and a beam would multiply the cost by its width.
+    const int saved_max_new = ctx->max_new_tokens;
+    const float saved_temp = ctx->decode_temperature;
+    const float saved_freq = ctx->frequency_penalty;
+    const int saved_beam = ctx->beam_size;
+    const int saved_verbosity = ctx->params.verbosity;
+    ctx->max_new_tokens = params.max_new_tokens;
+    ctx->decode_temperature = 0.0f;
+    ctx->frequency_penalty = 0.0f;
+    ctx->beam_size = 1;
+    ctx->params.verbosity = 0;
+
+    std::string best_lang;
+    double best_score = 0.0;
+    double total_score = 0.0;
+
+    // Encode once, decode per candidate. The encoder output and cross-KV are
+    // language-independent, and encode is ~87% of a pass, so this is worth
+    // roughly (N+7)/(8N) of the naive cost. CRISPASR_COHERE_PROBE_REUSE_ENC=0
+    // restores one full encode per candidate.
+    const char* reuse_env = crispasr_env::get("CRISPASR_COHERE_PROBE_REUSE_ENC");
+    const bool want_reuse =
+        !(reuse_env && (reuse_env[0] == '0' || reuse_env[0] == 'n' || reuse_env[0] == 'N' || reuse_env[0] == 'f'));
+    const bool saved_reuse = ctx->reuse_encoder;
+    const int saved_reused_T = ctx->reused_T_enc;
+    ctx->reuse_encoder = false; // first candidate always encodes
+    ctx->reused_T_enc = 0;
+
+    for (const auto& lang : langs) {
+        struct cohere_result* r = cohere_transcribe_ex(ctx, samples, probe_n, lang.c_str(), 0);
+        // Every candidate after the first reuses the first one's encode.
+        ctx->reuse_encoder = want_reuse;
+        const std::string text = (r && r->text) ? std::string(r->text) : std::string();
+        if (r)
+            cohere_result_free(r);
+
+        double agree = 0.0;
+        if (params.text_lid && !text.empty())
+            agree = (double)params.text_lid(text.c_str(), lang.c_str(), params.text_lid_user);
+
+        const double s = core_lid_probe::score(text, lang, agree);
+        total_score += s;
+        if (s > best_score) {
+            best_score = s;
+            best_lang = lang;
+        }
+        if (params.verbosity > 0) {
+            // utf8_prefix, NOT "%.60s": a byte-truncated multi-byte character
+            // puts invalid UTF-8 on stderr and breaks any consumer decoding it.
+            const std::string shown = core_lid_probe::utf8_prefix(text, 60);
+            fprintf(stderr, "cohere[lid]: %-3s len=%-4zu agree=%.2f div=%.2f score=%-8.0f :: %s\n", lang.c_str(),
+                    core_lid_probe::utf8_length(text), agree, core_lid_probe::diversity(text, lang), s, shown.c_str());
+        }
+    }
+
+    ctx->max_new_tokens = saved_max_new;
+    ctx->decode_temperature = saved_temp;
+    ctx->frequency_penalty = saved_freq;
+    ctx->beam_size = saved_beam;
+    ctx->params.verbosity = saved_verbosity;
+    // Clear the reuse invariant: the next transcribe() is real audio, not a probe.
+    ctx->reuse_encoder = saved_reuse;
+    ctx->reused_T_enc = saved_reused_T;
+
+    if (best_lang.empty() || best_score <= 0.0)
+        return false;
+
+    snprintf(out_lang, (size_t)out_lang_size, "%s", best_lang.c_str());
+    if (out_confidence)
+        *out_confidence = total_score > 0.0 ? (float)(best_score / total_score) : 0.0f;
+    return true;
 }
 
 // ---- Stage-level entry points for crispasr-diff ----

@@ -84,6 +84,24 @@ std::vector<crispasr_audio_slice> crispasr_compute_audio_slices(const float* sam
         *out_vad_load_failed = false;
     const std::string vad_path = crispasr_resolve_vad_model(params);
 
+    // #311 follow-up: crispasr_resolve_vad_model() returns "" for TWO different
+    // situations — "no VAD was requested" and "one was requested and the
+    // download/resolve failed". Below, an empty path skips the VAD block
+    // entirely, so the second case used to leave `out_vad_load_failed` false
+    // and looked identical to the first. The strict guard in crispasr_run.cpp
+    // keys off exactly that flag, so `--strict-pipeline` / `--require-vad`
+    // could not fire on a failed download: the run exited 0 having quietly not
+    // run VAD at all. Observed with a dangling cache dir — "download failed"
+    // on stderr, rc=0, and a full-file chunk export as if VAD had run.
+    //
+    // Distinguish them here: the user asked for a VAD iff --vad was passed or
+    // --vad-model names one.
+    const bool vad_requested = params.vad || !params.vad_model.empty();
+    if (vad_path.empty() && vad_requested) {
+        if (out_vad_load_failed)
+            *out_vad_load_failed = true;
+    }
+
     if (!vad_path.empty()) {
         crispasr_vad_options opts;
         opts.threshold = params.vad_threshold;

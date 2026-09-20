@@ -17,6 +17,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "portable_env.h"
 
 static std::string get_env(const char* name, const char* fallback = "") {
     const char* v = std::getenv(name);
@@ -212,4 +213,71 @@ TEST_CASE("wespeaker: same speaker is closer than a different speaker", "[wespea
     // threshold. A margin this wide still catches a scrambled embedding.
     CHECK(same > 0.3);
     wespeaker_free(ctx);
+}
+
+// #324 perf: wespeaker_embed_batch must reproduce the per-window path — that
+// is its entire contract. Mixed window lengths exercise the exact-T bucketing
+// (three 1.2 s windows batch together, the 0.9 s tail becomes a singleton and
+// takes the per-window graph). A tiny batch cap forces the chunking code too.
+TEST_CASE("wespeaker: batched embedding matches per-window", "[wespeaker][.live]") {
+    if (get_env("CRISPASR_MODEL_WESPEAKER").empty())
+        SKIP("CRISPASR_MODEL_WESPEAKER not set");
+    auto pcm = load_wav_16k_mono("samples/jfk.wav");
+    REQUIRE(pcm.size() > 16000 * 8);
+    wespeaker_context* ctx = open_model();
+    REQUIRE(ctx != nullptr);
+
+    const int sr = wespeaker_sample_rate(ctx);
+    const int dim = wespeaker_embed_dim(ctx);
+    const int64_t offsets[] = {(int64_t)(0.5 * sr), (int64_t)(1.1 * sr), (int64_t)(3.0 * sr), (int64_t)(5.2 * sr),
+                               (int64_t)(6.8 * sr)};
+    const int lengths[] = {(int)(1.2 * sr), (int)(1.2 * sr), (int)(1.2 * sr), (int)(1.2 * sr), (int)(0.9 * sr)};
+    const int n_win = 5;
+
+    std::vector<float> batched((size_t)n_win * dim);
+    setenv("CRISPASR_WESPEAKER_BATCH", "2", 1); // force >1 chunk per T group
+    const int rc = wespeaker_embed_batch(ctx, pcm.data(), (int64_t)pcm.size(), offsets, lengths, n_win, batched.data());
+    unsetenv("CRISPASR_WESPEAKER_BATCH");
+    REQUIRE(rc == 0);
+
+    for (int i = 0; i < n_win; i++) {
+        std::vector<float> ref((size_t)dim);
+        REQUIRE(wespeaker_embed(ctx, pcm.data() + offsets[i], lengths[i], ref.data()) == 0);
+        std::vector<float> got(batched.begin() + (size_t)i * dim, batched.begin() + (size_t)(i + 1) * dim);
+        const double cos = cosine(ref, got);
+        INFO("window " << i << " cos(batched, per-window) = " << cos);
+        CHECK(cos > 0.999999);
+    }
+    wespeaker_free(ctx);
+}
+
+// #324 perf: the im2col conv lowering must be numerically interchangeable with
+// the direct conv it replaces — same convolution, different summation order.
+// The bar is the same one the port itself was held to against the Python
+// oracle (cosine ~0.999997), an order of magnitude above what a wrong stride,
+// pad, or kernel layout would score.
+TEST_CASE("wespeaker: im2col conv matches direct conv", "[wespeaker][.live]") {
+    if (get_env("CRISPASR_MODEL_WESPEAKER").empty())
+        SKIP("CRISPASR_MODEL_WESPEAKER not set");
+    auto pcm = load_wav_16k_mono("samples/jfk.wav");
+    REQUIRE(pcm.size() > 16000 * 6);
+
+    setenv("CRISPASR_WESPEAKER_CONV", "direct", 1);
+    wespeaker_context* ctx_d = open_model();
+    REQUIRE(ctx_d != nullptr);
+    auto a = embed_window(ctx_d, pcm, 0.5, 2.5);
+    wespeaker_free(ctx_d);
+
+    setenv("CRISPASR_WESPEAKER_CONV", "im2col", 1);
+    wespeaker_context* ctx_i = open_model();
+    REQUIRE(ctx_i != nullptr);
+    auto b = embed_window(ctx_i, pcm, 0.5, 2.5);
+    wespeaker_free(ctx_i);
+    unsetenv("CRISPASR_WESPEAKER_CONV");
+
+    REQUIRE(a.size() == 256);
+    REQUIRE(b.size() == 256);
+    const double cos = cosine(a, b);
+    INFO("cos(direct, im2col) = " << cos);
+    CHECK(cos > 0.99999);
 }

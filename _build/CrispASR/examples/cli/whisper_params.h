@@ -369,6 +369,16 @@ struct whisper_params {
     // decodes. 0 = decode partials every --stream-step, preserving the
     // previous behavior. VAD timing/finalization still runs every step.
     int32_t stream_partial_decode_ms = 0;
+    // JSON streaming + VAD only (#404): bound the audio each live partial
+    // decode covers to the last N seconds of the open utterance. Text already
+    // decoded ahead of the moving anchor is kept as a committed prefix, so
+    // partial.text still covers the whole utterance; `final.text` is
+    // unaffected (redecode mode re-decodes the full utterance regardless).
+    // Cuts land on the quietest 100 ms (energy-min, same policy as the
+    // long-audio chunker). 0 = off (decode the full open slice, previous
+    // behavior). Minimum useful value ~4 s: values below the 2 s encoder
+    // floor + slack behave like 4.
+    int32_t stream_partial_tail_sec = 0;
     // JSON streaming + VAD only: control FireRedPunc placement when
     // --punc-model is loaded. "final" avoids the high-frequency partial
     // punc path; "partial" preserves the older partial+final behavior.
@@ -439,6 +449,7 @@ struct whisper_params {
     // CLI: --tts-phonemes "<IPA>"
     std::string tts_phonemes;
     bool tts_trim_silence = false;
+    int tts_pad_silence_ms = 0;
 
     // --make-ref: create a TADA voice reference GGUF from --voice <audio.wav>
     // + --ref-text "transcript". Requires tada-encoder.gguf + tada-aligner-*.gguf.
@@ -474,6 +485,12 @@ struct whisper_params {
     // the result, and exits. Exposes the detection API for end users.
     std::string detect_watermark_file;
 
+    // --print-speaker-identity PATH: standalone verb. Resolves whose voice a
+    // model or voice pack produces and prints it, then exits. One source of
+    // truth for the answer — a script that restated the verdicts would be a
+    // third copy to drift from the C++ table.
+    std::string print_speaker_identity_file;
+
     // C2PA (Content Credentials) signing — compile-time gated on
     // CRISPASR_HAVE_C2PA. Paths to self-signed or CA-issued X.509 cert
     // and key. Generate with: scripts/generate-c2pa-cert.sh
@@ -487,6 +504,39 @@ struct whisper_params {
     // `consent_attestation` string when voice ends in .wav.
     bool tts_voice_clone_consent = false;
     std::string tts_consent_attestation;
+
+    // --consent-log <path> / CRISPASR_CONSENT_LOG. When set, every [CONSENT]
+    // record is ALSO appended as one JSON object per line. Default off: turning
+    // on a persistent record of who attested what is the operator's decision,
+    // and it is their artefact to retain and erase, not ours. Tamper-resistance
+    // comes from where they put the file (append-only perms, WORM, a SIEM) —
+    // see crispasr_consent_record.h.
+    std::string consent_log;
+
+    // Set when THIS run baked `tts_voice` from a user-supplied recording (the
+    // TADA inline-clone path bakes a .wav into a temp .gguf and rewrites
+    // tts_voice to point at it). Without this the rewrite erased the only
+    // evidence the voice was a clone, and the consent + spoken-disclosure gates
+    // — which classified by filename suffix — both scored the most explicit
+    // cloning command in the CLI as "not a clone".
+    // See crispasr_voice_clone_policy.h.
+    bool tts_voice_baked_from_wav = false;
+    // The RECORDING that bake started from, before tts_voice was rewritten to
+    // point at the baked pack. Consent was given for this file, so this is what
+    // the audit record must hash — the pack is a derived artefact, and hashing
+    // it would bind the record to something the speaker never saw.
+    std::string tts_voice_source_recording;
+
+    // Operator override for whose voice a PRESET voice is: "real_person",
+    // "synthetic" or "unknown"/empty. Outranks the pack's declaration and the
+    // backend's default (crispasr_speaker_identity.h).
+    //
+    // real_person turns on the Art. 50(4) spoken disclosure for a non-cloned
+    // voice, and deliberately does NOT turn on the --i-have-rights gate: the
+    // donor's consent to the model being trained is a licensing matter settled
+    // upstream that this operator cannot attest to.
+    // CLI: --speaker-identity   Server: "speaker_identity"
+    std::string tts_speaker_identity;
 
     // Skip the spoken AI-disclosure prefix on voice-cloned output.
     // Machine-readable provenance (watermark + C2PA) is always retained.
@@ -557,6 +607,7 @@ struct whisper_params {
     float tts_exaggeration = -1.0f; // chatterbox expressiveness
     int tts_speaker_id = -1;        // piper multi-speaker model
     int tts_max_speech_tokens = -1; // chatterbox max AR tokens
+    int tts_min_speech_tokens = -1; // moss-tts min AR audio frames (exact-window fill)
 
     // CLI: --tts-play plays synthesised output on the local default speaker.
     // --tts-play-device N selects a non-default device by index (-1 = default).
@@ -601,7 +652,13 @@ struct whisper_params {
     //     / `-trtl` flags only matter when the primary backend's
     //     `-sl`/`-tl` mean something else (e.g., 2-stage piping).
     std::string text_input;
-    int translate_max_tokens = 256;
+    // 0 = let the backend apply its own documented default (#439). Both
+    // translate runtimes already default to 200 when passed <= 0, matching
+    // m2m100/wmt21's config.json max_length; madlad declares none and 200 is
+    // the runtime's own figure. This was 256 — a number from nowhere that
+    // SILENTLY OVERRODE both, because `translate_max_tokens > 0` is true for
+    // the default, so every "fall back to the backend" branch was dead code.
+    int translate_max_tokens = 0;
     std::string translate_source_lang; // overrides source_lang for the translator stage
     std::string translate_target_lang; // overrides target_lang for the translator stage
 
@@ -613,4 +670,10 @@ struct whisper_params {
     std::string chat_model; // path to a GGUF chat model
     int32_t chat_n_ctx = 4096;
     int32_t chat_n_gpu_layers = -1;
+
+    // Source separation (server-mode POST /v1/audio/separation). Independent
+    // from the primary ASR backend — a secondary GGUF loaded at startup.
+    // GGUF arch auto-detected (htdemucs / mel-band-roformer). When empty,
+    // /v1/audio/separation returns 503 with `separation_disabled`.
+    std::string separate_model;
 };

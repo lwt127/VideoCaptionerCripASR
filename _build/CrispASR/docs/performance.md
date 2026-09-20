@@ -6,19 +6,23 @@ Comprehensive survey of caching strategies across all CrispASR and CrispEmbed ba
 
 ### CrispASR — Autoregressive ASR/LLM Decoders
 
-All autoregressive decoders use `core_attn::kv_self_attn` with persistent F16 KV tensors
-allocated via `ggml_backend_alloc_ctx_tensors`. The cache is a 4D tensor
-`(head_dim, max_ctx, n_kv_heads, n_layers)` for both K and V.
+Most autoregressive decoders use the shared `core_attn::kv_self_attn` helper; a few
+(canary, cohere, granite_speech, kugelaudio, pocket_tts) hand-roll an equivalent
+cache instead. Either way the KV tensors are persistent, allocated via
+`ggml_backend_alloc_ctx_tensors`, and shaped as a 4D tensor
+`(head_dim, max_ctx, n_kv_heads, n_layers)` for both K and V. The element type is
+F16 by default and overridable per-half with `CRISPASR_KV_QUANT` /
+`CRISPASR_KV_QUANT_K` / `CRISPASR_KV_QUANT_V` (`src/core/attention.h`).
 
 | Backend | KV Cache | Conv/Other State | Allocation | Notes |
 |---------|----------|-----------------|------------|-------|
 | voxtral | `core_attn::kv_self_attn` | — | `ggml_backend_sched` | Mistral-based GQA 32/8 |
 | voxtral4b | `core_attn::kv_self_attn` | — | `ggml_backend_sched` | Fused QKV |
 | qwen3_asr | `core_attn::kv_self_attn` | — | `ggml_backend_sched` | GQA expansion, RoPE NEOX |
-| granite_speech | `core_attn::kv_self_attn` | — | `ggml_backend_sched` | µP residual_multiplier |
-| granite_nle | `core_attn::kv_self_attn` | Conv1d cache | `ggml_backend_sched` | NAR with conv streaming |
-| cohere | `core_attn::kv_self_attn` | — | `ggml_backend_sched` | Encoder-decoder cross-attn KV |
-| canary | `core_attn::kv_self_attn` | — | `ggml_backend_sched` | FastConformer enc + Transformer dec |
+| granite_speech | Own 4D K/V (`core_attn::kv_dtype_pair_from_env`) | — | `ggml_backend_sched` | µP residual_multiplier |
+| granite_nle | None (NAR, `kv_k`/`kv_v` = `nullptr`) | Conv1d cache | `ggml_backend_sched` | NAR with conv streaming |
+| cohere | Own 4D K/V + per-layer `cross_kv_k`/`cross_kv_v` | — | `ggml_backend_sched` | Encoder-decoder cross-attn KV |
+| canary | Own 4D K/V (`core_attn::kv_cache_write`) | — | `ggml_backend_sched` | FastConformer enc + Transformer dec |
 | glm_asr | `core_attn::kv_self_attn` | — | `ggml_backend_sched` | GLM decoder |
 | mimo_asr | `core_attn::kv_self_attn` | — | `ggml_backend_sched` | MIMO encoder-decoder |
 | gemma4_e2b | Dual cache (sliding+full) | — | `ggml_backend_sched` | Separate K/V for each attention type |
@@ -33,11 +37,11 @@ allocated via `ggml_backend_alloc_ctx_tensors`. The cache is a 4D tensor
 | csm_tts | Dual (backbone+depth) | — | `ggml_backend_sched` | 2 separate KV caches |
 | qwen3_tts | `core_attn::kv_self_attn` | — | `ggml_backend_sched` | Post-proj Q/K norm |
 | cosyvoice3_tts | `core_attn::kv_self_attn` | — | `ggml_backend_sched` | AR speech-token LM |
-| pocket_tts | `core_attn::kv_self_attn` | — | `ggml_backend_sched` | Llama-1B backbone |
+| pocket_tts | Own `pocket_tts_kv_cache` (backbone + Mimi dec) | — | `ggml_backend_sched` | Llama-1B backbone |
 | tada_tts | `core_attn::kv_self_attn` | — | `ggml_backend_sched` | Per-token flow matching |
 | zonos_tts | `core_attn::kv_self_attn` | — | `ggml_backend_sched` | CFG-guided, 9-codebook DAC |
-| kugelaudio | `core_attn::kv_self_attn` | — | `ggml_gallocr` (direct, §209) + sched for VAE | 7B Qwen2.5 + DiT diffusion. LM/diffusion compute directly on ctx->backend (avoids the §206 weight-less-first-op cross-backend-copy bug); only the VAE decoder stays on the sched (its `ggml_pad` is Metal-unsupported → CPU fallback) |
-| voxcpm2_tts | `core_attn::kv_self_attn` | — | `ggml_backend_sched` | Flow-matching diffusion |
+| kugelaudio | Own 4D K/V (inline `ggml_view_4d` slices) | — | `ggml_gallocr` (direct, §209) + sched for VAE | 7B Qwen2.5 + DiT diffusion. LM/diffusion compute directly on ctx->backend (avoids the §206 weight-less-first-op cross-backend-copy bug); only the VAE decoder stays on the sched (its `ggml_pad` is Metal-unsupported → CPU fallback) |
+| voxcpm2_tts | `core_attn::kv_self_attn` | — | `ggml_gallocr` | Flow-matching diffusion |
 | vibevoice | `core_attn::kv_self_attn` | Conv cache | `ggml_backend_sched` | σ-VAE streaming |
 | **lfm2_audio** | `core_attn::kv_self_attn` | **Conv state cache** | `ggml_gallocr` (direct, §206) | **Hybrid conv+attn backbone; backbone computes directly on ctx->backend — not the sched — to avoid the weight-less-first-op cross-backend-copy bug** |
 | **nemotron** | cache_last_channel + cache_last_time | **Conv + attn cache** | `ggml_backend_sched` | **Cache-aware streaming FastConformer** |
@@ -85,15 +89,22 @@ The LFM2 backbone uses two distinct cache types:
 
 ### Depthformer Cache
 - 6-layer transformer generating 8 codebooks per audio frame
-- Currently: O(codebooks²) = 36 layer passes per frame (no cache)
-- Target: O(codebooks) = 8 passes with manual KV cache (in progress)
+- **Done** — manual CPU-side K/V cache, one step per codebook: O(codebooks) = 8
+  passes per frame (was O(codebooks²) = 36 before the cache landed)
+- Per layer `[max_codebooks][kv_dim] = [8][256]`; total 6 × 2 × 8 × 256 × 4 = **96 KB**
+- Cached positions `0..c-1` are concatenated with the freshly computed K/V at
+  position `c` (`lfm2_depthformer_sample_frame`, `src/lfm2_audio.cpp`)
 
 ## Allocation Strategies
 
 | Strategy | Used by | Pros | Cons |
 |----------|---------|------|------|
-| `ggml_backend_sched` | 73 backends | GPU offload, automatic tensor placement | More complex setup |
-| `ggml_gallocr` | 11 backends | Simple, exact allocation | CPU-only, manual tensor_set/get |
+| `ggml_backend_sched` | 61 runtime files exclusively (+17 mixed) | GPU offload, automatic tensor placement | More complex setup |
+| `ggml_gallocr` | 16 runtime files exclusively (+17 mixed) | Simple, exact allocation | CPU-only, manual tensor_set/get |
+
+Counts are per `src/*.cpp` runtime file (some runtimes use both — e.g. a
+sched'd main graph plus a gallocr'd codec/vocoder subgraph). Re-derive with
+`grep -l ggml_backend_sched_new src/*.cpp` / `grep -l ggml_gallocr_new src/*.cpp`.
 | Fixed buffer (`no_alloc=false`) | Legacy / simple paths | Simplest code | Wasteful, page-fault overhead |
 
 ## Performance Benchmarks (LFM2-Audio, 4-core CPU)

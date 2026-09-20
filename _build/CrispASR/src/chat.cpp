@@ -10,6 +10,15 @@
 //   on the same handle serialise. Multiple sessions in the same process
 //   run independently.
 //
+//   That mutex cannot also govern teardown. `crispasr_chat_close` frees
+//   the context, the model and the session itself, and a generation holds
+//   the mutex for as long as it decodes — seconds — so a close that merely
+//   took the mutex would still free the session under a second call that
+//   was already blocked behind that generation. Teardown therefore runs on
+//   its own short-lived lock and a count of the calls currently inside the
+//   session: `close` retires the handle so no further call enters, waits
+//   for the count to fall to zero, and only then frees.
+//
 // KV cache
 //   Persisted across `crispasr_chat_generate` calls inside one session
 //   so a multi-turn chat doesn't re-prefill the history. `_reset` calls
@@ -21,14 +30,17 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -113,13 +125,11 @@ size_t find_first_stop(const std::string& acc, const char* const* stop, size_t n
 
 // Build the prompt string by applying the model's chat template via
 // llama.cpp's pre-defined list (chatml / llama3 / gemma / qwen / …).
-// Returns false on failure.
+// With n == 0 the result is the template's own opening — for add_ass that
+// is the bare assistant prefix, which is what a token count of an empty
+// conversation should report. Returns false on failure.
 bool apply_chat_template(const char* tmpl, const crispasr_chat_message* msgs, size_t n, bool add_ass,
                          std::string& out) {
-    if (n == 0) {
-        out.clear();
-        return true;
-    }
     // llama.cpp's signature expects llama_chat_message (same shape as ours).
     std::vector<llama_chat_message> chat;
     chat.reserve(n);
@@ -174,13 +184,94 @@ struct crispasr_chat_session {
     int32_t n_threads_batch = 1;
 
     // History of tokens already in the KV cache for this conversation.
-    // We tokenise + decode only the NEW prefix on each _generate call;
-    // a divergent history triggers a full reset.
+    // We tokenise + decode only the NEW suffix on each _generate call;
+    // a divergent history is truncated back to the shared prefix.
     std::vector<llama_token> history;
+
+    // Caller's cancellation hook, consulted between prompt batches and
+    // before each sampled token. Also handed to llama_set_abort_callback,
+    // which reaches the CPU backend's in-graph check.
+    crispasr_chat_abort_callback abort_cb = nullptr;
+    void* abort_user = nullptr;
 
     // Mutex serialising one-call-at-a-time per session.
     std::mutex mu;
+
+    // Teardown accounting, held only long enough to read `retiring` and move
+    // `in_use` — never across a native call, so counting a call in does not
+    // serialise it against anything.
+    std::mutex life;
+    std::condition_variable idle;
+    int32_t in_use = 0;
+    bool retiring = false;
 };
+
+namespace {
+
+// Holds the session open for the span of one call. Every entry point that
+// dereferences a session takes one; `crispasr_chat_close` waits for the
+// count to reach zero before it frees anything.
+//
+// A hold taken on a session already retired is refused rather than granted,
+// so a call that reaches the session during a close is declined instead of
+// running against memory about to be freed. That is a diagnostic for a caller
+// that has already broken the header's ordering rule, not a guarantee: this
+// check lives in the memory being freed, so a call descheduled just before it
+// locks `s_->life` can have the session freed underneath it and then lock a
+// destroyed mutex. Closing that window needs storage that outlives the
+// session, which is the caller's own lock — see crispasr_chat_close.
+class session_hold {
+public:
+    explicit session_hold(crispasr_chat_session* s) : s_(s) {
+        if (!s_) {
+            return;
+        }
+        std::lock_guard<std::mutex> g(s_->life);
+        if (s_->retiring) {
+            s_ = nullptr;
+            return;
+        }
+        s_->in_use += 1;
+    }
+
+    ~session_hold() {
+        if (!s_) {
+            return;
+        }
+        std::lock_guard<std::mutex> g(s_->life);
+        s_->in_use -= 1;
+        if (s_->in_use == 0) {
+            s_->idle.notify_all();
+        }
+    }
+
+    session_hold(const session_hold&) = delete;
+    session_hold& operator=(const session_hold&) = delete;
+
+    // False when the session is retiring, i.e. a close is already waiting to
+    // free it and this call must not proceed.
+    bool held() const { return s_ != nullptr; }
+
+private:
+    crispasr_chat_session* s_;
+};
+
+// The public callback returns false to abort; every call site asks the
+// opposite question, so invert once here.
+bool abort_requested(crispasr_chat_session* s) {
+    return s->abort_cb && !s->abort_cb(s->abort_user);
+}
+
+// Adapter for llama_set_abort_callback, whose callback returns true to
+// abort. A static trampoline rather than a cast of the caller's function
+// pointer: the two types differ in meaning, and casting them would be
+// undefined behaviour the moment ggml called through it.
+bool abort_trampoline(void* data) {
+    auto* s = static_cast<crispasr_chat_session*>(data);
+    return s && abort_requested(s);
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Default params
@@ -287,6 +378,22 @@ extern "C" void crispasr_chat_close(crispasr_chat_session_t s) {
     if (!s) {
         return;
     }
+    {
+        std::unique_lock<std::mutex> lk(s->life);
+        if (s->retiring) {
+            // A second close that got this far while the first is still
+            // waiting. Returning is better than freeing twice, but it is a
+            // partial mitigation for a caller that has already broken the
+            // rule, not support for closing twice: a second close blocked on
+            // `life` can be beaten to the delete by the first and wake on a
+            // destroyed mutex. Close exactly once.
+            return;
+        }
+        // Retire first, so a call arriving from here on is declined rather
+        // than counted in and waited for, and the wait below terminates.
+        s->retiring = true;
+        s->idle.wait(lk, [s] { return s->in_use == 0; });
+    }
     if (s->ctx) {
         llama_free(s->ctx);
     }
@@ -301,6 +408,11 @@ extern "C" int32_t crispasr_chat_reset(crispasr_chat_session_t s, crispasr_chat_
         set_err(err, 1, "session is null");
         return 1;
     }
+    session_hold hold(s);
+    if (!hold.held()) {
+        set_err(err, 5, "session is closing");
+        return 5;
+    }
     std::lock_guard<std::mutex> guard(s->mu);
     llama_memory_clear(llama_get_memory(s->ctx), /*data=*/true);
     s->history.clear();
@@ -308,11 +420,76 @@ extern "C" int32_t crispasr_chat_reset(crispasr_chat_session_t s, crispasr_chat_
 }
 
 extern "C" const char* crispasr_chat_template_name(crispasr_chat_session_t s) {
-    return s ? s->tmpl.c_str() : nullptr;
+    // The hold covers the read, not the pointer: what comes back points into
+    // the session's own string and dies with the session, exactly as before.
+    // Copy it before the next close, as the header says.
+    session_hold hold(s);
+    return hold.held() ? s->tmpl.c_str() : nullptr;
 }
 
 extern "C" int32_t crispasr_chat_n_ctx(crispasr_chat_session_t s) {
-    return s ? s->n_ctx : 0;
+    session_hold hold(s);
+    return hold.held() ? s->n_ctx : 0;
+}
+
+extern "C" int32_t crispasr_chat_count_tokens(crispasr_chat_session_t s, const crispasr_chat_message* messages,
+                                              size_t n_messages, crispasr_chat_error* err) {
+    if (!s) {
+        set_err(err, 1, "session is null");
+        return -1;
+    }
+    if (n_messages > 0 && !messages) {
+        set_err(err, 1, "messages is null but n_messages > 0");
+        return -1;
+    }
+    session_hold hold(s);
+    if (!hold.held()) {
+        set_err(err, 5, "session is closing");
+        return -1;
+    }
+    std::lock_guard<std::mutex> guard(s->mu);
+
+    // Same rendering and same tokenizer flags prepare_prompt uses on a
+    // fresh session, so the number is the prompt that session prefills.
+    std::string formatted;
+    if (!apply_chat_template(s->tmpl.c_str(), messages, n_messages, /*add_ass=*/true, formatted)) {
+        set_err(err, 20, "llama_chat_apply_template failed for template '%s'", s->tmpl.c_str());
+        return -1;
+    }
+    if (formatted.empty()) {
+        // The template rendered to nothing, which several of the vendored ones
+        // do for an empty message array: they emit only from inside their loop
+        // over the messages and have no `add_ass` opening of their own. A fresh
+        // session would prefill nothing here, so nothing is what this reports.
+        // Failing instead would make a legitimate query model-dependent, and
+        // inventing a token would count one the model never sees.
+        return 0;
+    }
+    const std::vector<llama_token> tokens = tokenize(s->vocab, formatted, /*add_special=*/true, /*parse_special=*/true);
+    if (tokens.empty()) {
+        set_err(err, 21, "tokenize produced no tokens for a non-empty prompt");
+        return -1;
+    }
+    return (int32_t)tokens.size();
+}
+
+extern "C" void crispasr_chat_set_abort_callback(crispasr_chat_session_t s, crispasr_chat_abort_callback cb,
+                                                 void* user) {
+    if (!s) {
+        return;
+    }
+    session_hold hold(s);
+    if (!hold.held()) {
+        return;
+    }
+    std::lock_guard<std::mutex> guard(s->mu);
+    s->abort_cb = cb;
+    s->abort_user = user;
+    // Registering after open still reaches every backend that supports an
+    // in-graph abort — llama_context::set_abort_callback re-registers on
+    // each of them. Only the CPU backend implements it today, so the
+    // checks in generate_loop are what cover the accelerated tiers.
+    llama_set_abort_callback(s->ctx, cb ? &abort_trampoline : nullptr, cb ? s : nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -362,12 +539,41 @@ int32_t generate_loop(crispasr_chat_session* s, const std::vector<llama_token>& 
                       std::string& out, crispasr_chat_error* err) {
     // -- Prefill the prompt prefix in one (or several) batches. --
     if (!prompt_new.empty()) {
+        // llama_decode asserts rather than erroring when a batch holds more
+        // than n_batch tokens, so walk the prompt in n_batch-sized pieces.
+        // Pieces decoded in order into the same sequence continue the KV
+        // cache, so positions need no bookkeeping here.
         // Mutable copy because llama_batch_get_one takes a non-const ptr.
         std::vector<llama_token> tokens = prompt_new;
-        llama_batch batch = llama_batch_get_one(tokens.data(), (int32_t)tokens.size());
-        if (llama_decode(s->ctx, batch) != 0) {
-            set_err(err, 10, "llama_decode failed during prefill");
-            return 10;
+        const int32_t n_total = (int32_t)tokens.size();
+        const int32_t n_piece_max = std::max<int32_t>(1, (int32_t)llama_n_batch(s->ctx));
+        for (int32_t off = 0; off < n_total; off += n_piece_max) {
+            // Checked between pieces so a cancel during a long prefill costs
+            // one prompt batch rather than the whole prompt.
+            if (abort_requested(s)) {
+                llama_memory_clear(llama_get_memory(s->ctx), /*data=*/true);
+                s->history.clear();
+                set_err(err, CRISPASR_CHAT_ERR_ABORTED, "generation aborted by callback during prefill");
+                return CRISPASR_CHAT_ERR_ABORTED;
+            }
+            const int32_t n_piece = std::min(n_piece_max, n_total - off);
+            llama_batch batch = llama_batch_get_one(tokens.data() + off, n_piece);
+            if (llama_decode(s->ctx, batch) != 0) {
+                // On the CPU backend the abort lands inside the graph, so a
+                // decode that failed under an abort request is a cancel
+                // rather than a fault.
+                const bool cancelled = abort_requested(s);
+                // Drop the partial prefill rather than leaving the session
+                // holding a prompt prefix its history does not describe.
+                llama_memory_clear(llama_get_memory(s->ctx), /*data=*/true);
+                s->history.clear();
+                if (cancelled) {
+                    set_err(err, CRISPASR_CHAT_ERR_ABORTED, "generation aborted by callback during prefill");
+                    return CRISPASR_CHAT_ERR_ABORTED;
+                }
+                set_err(err, 10, "llama_decode failed during prefill");
+                return 10;
+            }
         }
         s->history.insert(s->history.end(), prompt_new.begin(), prompt_new.end());
     }
@@ -387,6 +593,19 @@ int32_t generate_loop(crispasr_chat_session* s, const std::vector<llama_token>& 
     const int32_t max_tokens = gp.max_tokens > 0 ? gp.max_tokens : 256;
     llama_token new_token = 0;
     for (int32_t i = 0; i < max_tokens; ++i) {
+        // Before sampling, and outside the piece branch below: on Metal and
+        // CUDA a running batch cannot be interrupted, so this is the only
+        // place a cancel is honoured on those backends.
+        if (abort_requested(s)) {
+            // The cache holds half an assistant turn that no later prompt
+            // can reuse, so flush it rather than hand the next call a
+            // prefix it would have to diverge from anyway.
+            llama_memory_clear(llama_get_memory(s->ctx), /*data=*/true);
+            s->history.clear();
+            set_err(err, CRISPASR_CHAT_ERR_ABORTED, "generation aborted by callback");
+            return CRISPASR_CHAT_ERR_ABORTED;
+        }
+
         new_token = llama_sampler_sample(smpl.get(), s->ctx, -1);
 
         if (llama_vocab_is_eog(s->vocab, new_token)) {
@@ -417,6 +636,17 @@ int32_t generate_loop(crispasr_chat_session* s, const std::vector<llama_token>& 
         // Decode the just-sampled token to advance the KV cache.
         llama_batch batch = llama_batch_get_one(&new_token, 1);
         if (llama_decode(s->ctx, batch) != 0) {
+            // As in prefill: an in-graph abort on the CPU backend surfaces
+            // here as a failed decode, and is a cancel rather than a fault.
+            const bool cancelled = abort_requested(s);
+            // A failed decode drops this sequence's cache entries, so the
+            // history no longer describes what is in the cache — clear both.
+            llama_memory_clear(llama_get_memory(s->ctx), /*data=*/true);
+            s->history.clear();
+            if (cancelled) {
+                set_err(err, CRISPASR_CHAT_ERR_ABORTED, "generation aborted by callback");
+                return CRISPASR_CHAT_ERR_ABORTED;
+            }
             set_err(err, 12, "llama_decode failed during generation");
             return 12;
         }
@@ -425,25 +655,32 @@ int32_t generate_loop(crispasr_chat_session* s, const std::vector<llama_token>& 
 }
 
 // Prefill helper: build the chat-templated prompt, tokenize, and return
-// the NEW token suffix (the part not already in `s->history`). If the
-// new prompt diverges from history we wipe the KV cache and start over.
+// the NEW token suffix (the part not already in `s->history`). Where the
+// new prompt diverges from the history, the KV cache is truncated to
+// their common prefix so only the divergent tail is re-decoded.
 int32_t prepare_prompt(crispasr_chat_session* s, const crispasr_chat_message* messages, size_t n_messages,
                        std::vector<llama_token>& out_new, crispasr_chat_error* err) {
+    if (n_messages == 0) {
+        // Nothing to answer: the template would render a bare assistant
+        // prefix and the model would continue from nowhere.
+        set_err(err, 21, "no messages to prefill");
+        return 21;
+    }
     std::string formatted;
     if (!apply_chat_template(s->tmpl.c_str(), messages, n_messages, /*add_ass=*/true, formatted)) {
         set_err(err, 20, "llama_chat_apply_template failed for template '%s'", s->tmpl.c_str());
         return 20;
     }
-    // First message on a fresh session adds BOS; afterwards we want to
-    // continue mid-stream so add_special=false.
-    const bool fresh = s->history.empty();
-    std::vector<llama_token> full = tokenize(s->vocab, formatted, /*add_special=*/fresh, /*parse_special=*/true);
+    // `messages` is the whole conversation, so it is tokenized exactly as
+    // a just-opened session would tokenize it, leading BOS included. That
+    // is what makes it comparable to the history token for token below.
+    std::vector<llama_token> full = tokenize(s->vocab, formatted, /*add_special=*/true, /*parse_special=*/true);
     if (full.empty()) {
         set_err(err, 21, "tokenize produced no tokens");
         return 21;
     }
 
-    if (fresh) {
+    if (s->history.empty()) {
         out_new = std::move(full);
         return 0;
     }
@@ -457,10 +694,28 @@ int32_t prepare_prompt(crispasr_chat_session* s, const crispasr_chat_message* me
         }
     }
     if (common < s->history.size()) {
-        // History diverged — flush KV cache and re-prefill from scratch.
-        llama_memory_clear(llama_get_memory(s->ctx), /*data=*/true);
-        s->history.clear();
-        out_new = std::move(full);
+        // The history diverged, but everything before `common` is prompt
+        // the cache already holds and the new prompt still asks for — a
+        // fixed instruction block, in the usual case. Drop only the tail.
+        if (common == full.size()) {
+            // The new prompt is a strict prefix of the history: with no
+            // suffix left to decode, generation would sample from logits
+            // belonging to a token that is no longer the last one. Hold a
+            // token back so at least one is always decoded.
+            --common;
+        }
+        // A cache type that refuses a partial removal reports false and
+        // leaves its contents alone, so the full clear stays the fallback.
+        if (common > 0 && llama_memory_seq_rm(llama_get_memory(s->ctx), 0, (llama_pos)common, -1)) {
+            s->history.resize(common);
+        } else {
+            llama_memory_clear(llama_get_memory(s->ctx), /*data=*/true);
+            s->history.clear();
+            common = 0;
+        }
+        // The cache holds exactly the tokens the history now names, either
+        // way, so the suffix decodes onto a prefix that describes it.
+        out_new.assign(full.begin() + (ptrdiff_t)common, full.end());
         return 0;
     }
     // History is a clean prefix; only decode the new suffix.
@@ -478,6 +733,11 @@ extern "C" char* crispasr_chat_generate(crispasr_chat_session_t s, const crispas
                                         crispasr_chat_error* err) {
     if (!s) {
         set_err(err, 1, "session is null");
+        return nullptr;
+    }
+    session_hold hold(s);
+    if (!hold.held()) {
+        set_err(err, 5, "session is closing");
         return nullptr;
     }
     if (n_messages > 0 && !messages) {
@@ -518,6 +778,11 @@ extern "C" int32_t crispasr_chat_generate_stream(crispasr_chat_session_t s, cons
         set_err(err, 1, "session is null");
         return 1;
     }
+    session_hold hold(s);
+    if (!hold.held()) {
+        set_err(err, 5, "session is closing");
+        return 5;
+    }
     if (n_messages > 0 && !messages) {
         set_err(err, 1, "messages is null but n_messages > 0");
         return 1;
@@ -544,6 +809,15 @@ extern "C" void crispasr_chat_string_free(char* s) {
     }
 }
 
+// The canonical Art. 50(1) disclosure for conversational products built on this
+// ABI. Deliberately parallel to crispasr_session_disclaimer_text() on the audio
+// side — same job, different modality — and kept in ONE place so the CLI, the
+// server, the Flutter binding and downstream integrators cannot each invent
+// their own wording. tests/test-compliance-wiring.cpp pins it against drift.
+extern "C" const char* crispasr_chat_ai_disclosure_text(void) {
+    return "You are interacting with an AI system. Responses are generated by artificial intelligence.";
+}
+
 // ---------------------------------------------------------------------------
 // Memory estimate
 // ---------------------------------------------------------------------------
@@ -552,6 +826,19 @@ extern "C" void crispasr_chat_string_free(char* s) {
 // activations from there. Activations stay an approximation — getting
 // it exact would require building the graph, and the pre-flight guard
 // just wants "≤ available RAM / VRAM, with margin".
+//
+// `no_alloc` requires `use_mmap = false`. With mmap on, llama_model::load_tensors
+// takes the branch that wraps a backend buffer directly over the mapped file
+// region, and that branch opens with GGML_ASSERT(!ml.no_alloc) — the two are
+// mutually exclusive by construction. With mmap off it takes the branch
+// `no_alloc` was written for: a zero-byte dummy buffer that every weight tensor
+// points at, then an early return before any tensor data is read. llama.cpp's
+// own device-memory probe sets the same pair.
+//
+// `vocab_only` is NOT a substitute. load_hparams returns as soon as it sees that
+// flag, before it reads the context length, embedding length and block count —
+// precisely the three values the KV term below is built from — so the estimate
+// would silently collapse to file size + overhead while reporting success.
 extern "C" size_t crispasr_chat_memory_estimate(const char* model_path, const crispasr_chat_open_params* params,
                                                 crispasr_chat_error* err) {
     if (!model_path || !*model_path) {
@@ -561,9 +848,9 @@ extern "C" size_t crispasr_chat_memory_estimate(const char* model_path, const cr
     ensure_llama_backend_init();
 
     llama_model_params mparams = llama_model_default_params();
-    mparams.use_mmap = true;
+    mparams.use_mmap = false; // required by no_alloc — see above
     mparams.vocab_only = false;
-    mparams.no_alloc = true;  // metadata only — tensor data not faulted in
+    mparams.no_alloc = true;  // metadata only — tensor data not read
     mparams.n_gpu_layers = 0; // we don't want to provision a backend
     llama_model* model = llama_model_load_from_file(model_path, mparams);
     if (!model) {
@@ -572,23 +859,39 @@ extern "C" size_t crispasr_chat_memory_estimate(const char* model_path, const cr
     }
 
     // Approximation: weights size ≈ on-disk file size (mmap-friendly).
-    size_t weights = 0;
-    if (FILE* f = std::fopen(model_path, "rb")) {
-        std::fseek(f, 0, SEEK_END);
-        const long off = std::ftell(f);
-        if (off > 0) {
-            weights = (size_t)off;
-        }
-        std::fclose(f);
+    //
+    // std::filesystem::file_size, not fseek/ftell: ftell returns `long`, which
+    // is 32-bit on 64-bit Windows, so every GGUF over 2 GiB — which is most of
+    // the ones worth guarding against — would fail to be represented and leave
+    // the weights term at zero while the estimate still reported success. An
+    // estimate that omits the model it is deciding whether to load is worse
+    // than no estimate, so a size we cannot read is an error, not a zero.
+    std::error_code ec;
+    const std::uintmax_t file_bytes = std::filesystem::file_size(std::filesystem::path(model_path), ec);
+    if (ec || file_bytes > (std::uintmax_t)SIZE_MAX) {
+        llama_model_free(model);
+        set_err(err, 3, "could not read the model file's size");
+        return 0;
     }
+    const size_t weights = (size_t)file_bytes;
 
     // KV cache: n_ctx * n_layer * (n_embd_k + n_embd_v) * sizeof(fp16).
     // The exposed accessors give us what we need without llama-impl.
-    const int32_t n_ctx = params && params->n_ctx > 0 ? params->n_ctx : llama_model_n_ctx_train(model);
+    //
+    // Rounded up to a multiple of 256 the way llama_context's own constructor
+    // rounds it (GGML_PAD(cparams.n_ctx, 256)), so a request of, say, 1000
+    // tokens is sized as the 1024 the runtime will actually allocate.
+    const int32_t n_ctx_req = params && params->n_ctx > 0 ? params->n_ctx : llama_model_n_ctx_train(model);
+    // Widened before rounding: the padded value of a context near INT32_MAX
+    // does not fit back into an int32_t.
+    const uint64_t n_ctx = ((uint64_t)std::max(0, n_ctx_req) + 255u) & ~(uint64_t)255u;
     const int32_t n_layer = llama_model_n_layer(model);
-    const int32_t n_embd_k = llama_model_n_embd(model); // overestimate for non-GQA
-    const size_t kv_bytes = (size_t)std::max(0, n_ctx) * (size_t)std::max(0, n_layer) * (size_t)std::max(0, n_embd_k) *
-                            2 * 2; // 2 caches × fp16
+    // n_embd is the full attention width; on a grouped-query model the per-layer
+    // K/V width is a fraction of it, so this over-reports there. Over-reporting is
+    // the safe direction for a "will this fit?" guard.
+    const int32_t n_embd_k = llama_model_n_embd(model);
+    const size_t kv_bytes =
+        (size_t)n_ctx * (size_t)std::max(0, n_layer) * (size_t)std::max(0, n_embd_k) * 2 * 2; // 2 caches × fp16
 
     // Activations + overhead: rule-of-thumb 256 MB margin.
     constexpr size_t overhead = 256ull * 1024ull * 1024ull;

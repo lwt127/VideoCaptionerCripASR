@@ -5,7 +5,7 @@ package whisper
 // qwen3-tts, moss-tts, orpheus, chatterbox, csm, dia, zonos-tts, speecht5, fastpitch,
 // bananamind-tts, melotts, piper, parler-tts, outetts, indextts, voxcpm2-tts,
 // cosyvoice3-tts, pocket-tts, f5-tts, bark, kugelaudio, tada, lfm2-audio,
-// dots-tts, ...)
+// dots-tts, fireredtts3, ...)
 // and S2S-capable backends (lfm2-audio, mini-omni2), plus the kokoro
 // per-language model + voice resolver (PLAN #56 opt 2b).
 
@@ -28,9 +28,19 @@ void             crispasr_session_close(CrispasrSession* s);
 int              crispasr_session_set_codec_path(CrispasrSession* s, const char* path);
 int              crispasr_session_set_source_language(CrispasrSession* s, const char* lang);
 int              crispasr_session_set_target_language(CrispasrSession* s, const char* lang);
+int              crispasr_session_set_tts_reference_language(CrispasrSession* s, const char* lang);
 int              crispasr_session_set_punctuation(CrispasrSession* s, int enable);
 int              crispasr_session_set_punc_model(CrispasrSession* s, const char* punc_model);
 int              crispasr_session_set_hotwords(CrispasrSession* s, const char* hotwords, float boost);
+// Source separation (#359): stereo interleaved PCM in at the model's own rate.
+int              crispasr_session_separate(CrispasrSession* s, const float* pcm_stereo, int n_samples);
+int              crispasr_session_separate_n_stems(CrispasrSession* s);
+const char*      crispasr_session_separate_stem_name(CrispasrSession* s, int stem_idx);
+const float*     crispasr_session_separate_stem(CrispasrSession* s, int stem_idx, int* out_n_samples);
+int              crispasr_session_separate_sample_rate(CrispasrSession* s);
+int              crispasr_session_input_sample_rate(CrispasrSession* s);
+int              crispasr_session_output_sample_rate(CrispasrSession* s);
+int              crispasr_session_set_sensitivity(CrispasrSession* s, const char* preset);
 int              crispasr_session_set_translate(CrispasrSession* s, int enable);
 int              crispasr_session_set_temperature(CrispasrSession* s, float temperature, unsigned long long seed);
 int              crispasr_session_set_tts_seed(CrispasrSession* s, unsigned long long seed);
@@ -47,6 +57,7 @@ int              crispasr_session_set_cfg_weight(CrispasrSession* s, float cfg_w
 int              crispasr_session_set_tts_noise_temp(CrispasrSession* s, float noise_temp);
 int              crispasr_session_set_exaggeration(CrispasrSession* s, float exaggeration);
 int              crispasr_session_set_max_speech_tokens(CrispasrSession* s, int n);
+int              crispasr_session_set_min_speech_tokens(CrispasrSession* s, int n);
 int              crispasr_session_set_length_scale(CrispasrSession* s, float scale);
 int              crispasr_session_set_g2p_dict(CrispasrSession* s, const char* source);
 int              crispasr_session_set_best_of(CrispasrSession* s, int n);
@@ -72,11 +83,13 @@ int              crispasr_session_n_speakers(CrispasrSession* s);
 const char*      crispasr_session_get_speaker_name(CrispasrSession* s, int i);
 int              crispasr_session_set_instruct(CrispasrSession* s, const char* instruct);
 int              crispasr_session_set_tts_phonemes(CrispasrSession* s, const char* phonemes);
+void             crispasr_session_set_tts_pad_silence_ms(CrispasrSession* s, int ms);
 int              crispasr_session_is_custom_voice(CrispasrSession* s);
 int              crispasr_session_is_voice_design(CrispasrSession* s);
 float*           crispasr_session_synthesize(CrispasrSession* s, const char* text, int* out_n_samples);
 float*           crispasr_session_synthesize_raw(CrispasrSession* s, const char* text, int* out_n_samples);
 int              crispasr_session_accept_marking_responsibility(CrispasrSession* s, const char* attestation);
+int              crispasr_session_set_speaker_identity(CrispasrSession* s, const char* identity);
 float*           crispasr_session_speech_to_speech(CrispasrSession* s, const float* in_samples, int n_in_samples,
                                                     char** out_text, int* out_n_samples);
 void             crispasr_session_translate_text_free(char* text);
@@ -174,6 +187,21 @@ struct crispasr_diarize_opts_abi {
 int crispasr_diarize_segments_abi(const float* left_pcm, const float* right_pcm, int n_samples,
                                   int is_stereo, struct crispasr_diarize_seg_abi* segs, int n_segs,
                                   const struct crispasr_diarize_opts_abi* opts);
+// #395: a speaker turn the METHOD derived from the audio, independent of the
+// caller's segment grid. Same hand-maintained-layout warning as the opts
+// struct above: Go allocates these, so this must match
+// struct crispasr_diarize_turn_abi in src/crispasr_c_api.cpp exactly.
+struct crispasr_diarize_turn_abi {
+    long long t0_cs;
+    long long t1_cs;
+    int       speaker;
+    int       _pad;
+};
+int crispasr_diarize_segments_turns_abi(const float* left_pcm, const float* right_pcm, int n_samples,
+                                        int is_stereo, struct crispasr_diarize_seg_abi* segs, int n_segs,
+                                        const struct crispasr_diarize_opts_abi* opts,
+                                        struct crispasr_diarize_turn_abi* out_turns, int n_turns_cap,
+                                        int* out_n_turns);
 
 // --- Pluggable speaker embedder, clustering, pyannote cache (#107 P6) ---
 void*       crispasr_speaker_embedder_make_abi(const char* model_spec, int n_threads, const char* cache_dir);
@@ -349,6 +377,7 @@ import "C"
 import (
 	"errors"
 	"fmt"
+	"math"
 	"unsafe"
 )
 
@@ -418,6 +447,26 @@ func (s *CrispasrSession) SetTargetLanguage(lang string) error {
 	return nil
 }
 
+// SetTTSReferenceLanguage declares the language a voice-cloning REFERENCE clip
+// is spoken in (issue #329). Cross-lingual TTS backends (cosyvoice3) compare it
+// to the requested output language — SetTargetLanguage, falling back to
+// SetSourceLanguage — and drop the reference transcript when they differ, so the
+// clone speaks the target language instead of carrying the reference's accent.
+//
+// Optional: the backend otherwise infers it from the voice bank or the reference
+// transcript, and that inference declines rather than guesses on a short
+// transcript. When it declines, the requested target language has no effect —
+// set this to make it explicit. Empty string clears.
+func (s *CrispasrSession) SetTTSReferenceLanguage(lang string) error {
+	cl := C.CString(lang)
+	defer C.free(unsafe.Pointer(cl))
+	rc := C.crispasr_session_set_tts_reference_language(s.handle, cl)
+	if rc != 0 {
+		return errors.New("crispasr_session_set_tts_reference_language failed")
+	}
+	return nil
+}
+
 // SetPunctuation toggles punctuation + capitalisation in the output
 // (canary/cohere natively; LLM backends via post-process strip). Default true.
 func (s *CrispasrSession) SetPunctuation(enable bool) error {
@@ -456,6 +505,28 @@ func (s *CrispasrSession) SetHotwords(hotwords string, boost float32) error {
 	rc := C.crispasr_session_set_hotwords(s.handle, ch, C.float(boost))
 	if rc != 0 {
 		return errors.New("crispasr_session_set_hotwords failed")
+	}
+	return nil
+}
+
+// SetSensitivity applies a named bundle of the four decoder fallback
+// thresholds: "conservative", "balanced" (the shipped defaults, a no-op) or
+// "aggressive". "strict"/"default"/"loose" are aliases. Mirrors the CLI's
+// --sensitivity.
+//
+// The four thresholds interact — a decode is only retried when the logprob and
+// no-speech bars are both crossed — so they move as a set. A later
+// SetFallbackThresholds overrides this. An unrecognised name is rejected
+// rather than silently treated as "balanced".
+func (s *CrispasrSession) SetSensitivity(preset string) error {
+	cp := C.CString(preset)
+	defer C.free(unsafe.Pointer(cp))
+	rc := C.crispasr_session_set_sensitivity(s.handle, cp)
+	if rc == -2 {
+		return errors.New("unknown sensitivity preset (expected: conservative, balanced, aggressive)")
+	}
+	if rc != 0 {
+		return errors.New("crispasr_session_set_sensitivity failed")
 	}
 	return nil
 }
@@ -519,7 +590,7 @@ func (s *CrispasrSession) SetFrequencyPenalty(penalty float32) error {
 }
 
 // SetTTSSteps sets the diffusion / CFM / masked-iterative step count for
-// step-based TTS backends (chatterbox, vibevoice, kugelaudio, tada, irodori,
+// step-based TTS backends (chatterbox, vibevoice, kugelaudio, tada, irodori, supertonic,
 // omnivoice). Higher = better fidelity, slower. Other backends silently no-op.
 func (s *CrispasrSession) SetTTSSteps(steps int) error {
 	rc := C.crispasr_session_set_tts_steps(s.handle, C.int(steps))
@@ -626,6 +697,15 @@ func (s *CrispasrSession) SetMaxSpeechTokens(n int) error {
 	rc := C.crispasr_session_set_max_speech_tokens(s.handle, C.int(n))
 	if rc != 0 && rc != -2 {
 		return errors.New("crispasr_session_set_max_speech_tokens failed")
+	}
+	return nil
+}
+
+// SetMinSpeechTokens sets the floor on generated audio length (MOSS TTS). Units are codec frames at 12.5 Hz (80 ms each), so n=25 floors at ~2 s; other backends no-op (rc=-2).
+func (s *CrispasrSession) SetMinSpeechTokens(n int) error {
+	rc := C.crispasr_session_set_min_speech_tokens(s.handle, C.int(n))
+	if rc != 0 && rc != -2 {
+		return errors.New("crispasr_session_set_min_speech_tokens failed")
 	}
 	return nil
 }
@@ -993,6 +1073,13 @@ func (s *CrispasrSession) SetTTSPhonemes(phonemes string) error {
 	}
 }
 
+// SetTTSPadSilenceMs pads N ms of silence at the beginning of TTS output.
+// Useful to bypass VLC playback bugs where it drops the first ~1.5s of audio
+// while parsing a large C2PA chunk.
+func (s *CrispasrSession) SetTTSPadSilenceMs(ms int) {
+	C.crispasr_session_set_tts_pad_silence_ms(s.handle, C.int(ms))
+}
+
 // IsCustomVoice reports whether the loaded model is a qwen3-tts
 // CustomVoice variant (use SetSpeakerName for it).
 func (s *CrispasrSession) IsCustomVoice() bool {
@@ -1034,6 +1121,37 @@ func (s *CrispasrSession) Synthesize(text string) ([]float32, error) {
 	src := unsafe.Slice((*float32)(unsafe.Pointer(ptr)), int(n))
 	copy(samples, src)
 	return samples, nil
+}
+
+// SetSpeakerIdentity declares whose voice a PRESET voice is: "real_person",
+// "synthetic" or "unknown".
+//
+// Cloning is not the only way to produce a deep fake. A preset voice shipped
+// inside a model can be an identifiable individual — a named donor, a corpus
+// speaker — and EU AI Act Art. 3(60) attaches to the audio resembling that
+// person, not to which pipeline made it. Setting real_person makes the
+// Art. 50(4) reminder fire for a non-cloned voice.
+//
+// It does NOT require a consent attestation: whether that donor agreed to the
+// model being trained is a licensing matter settled upstream that you cannot
+// attest to.
+//
+// Returns an error on an unrecognised value rather than silently downgrading
+// it to "unknown".
+func (s *CrispasrSession) SetSpeakerIdentity(identity string) error {
+	if s == nil || s.handle == nil {
+		return errors.New("session is closed")
+	}
+	cid := C.CString(identity)
+	defer C.free(unsafe.Pointer(cid))
+	switch rc := C.crispasr_session_set_speaker_identity(s.handle, cid); rc {
+	case 0:
+		return nil
+	case -2:
+		return fmt.Errorf("unrecognised speaker_identity %q (expected real_person, synthetic or unknown)", identity)
+	default:
+		return fmt.Errorf("crispasr_session_set_speaker_identity failed (rc=%d)", int(rc))
+	}
 }
 
 // AcceptMarkingResponsibility attests that the caller accepts AI-content
@@ -1089,7 +1207,8 @@ func (s *CrispasrSession) SpeechToSpeech(samples []float32) (*SpeechToSpeechResu
 		C.int(len(samples)),
 		&textOut, &nOut)
 	if ptr == nil || nOut <= 0 {
-		return nil, errors.New("crispasr_session_speech_to_speech: no audio produced")
+		return nil, errors.New("crispasr_session_speech_to_speech: no audio produced " +
+			"(separation models like htdemucs / mel-band-roformer are not S2S — use Separate() instead, #359)")
 	}
 	defer C.crispasr_pcm_free(ptr)
 	out := make([]float32, int(nOut))
@@ -1101,6 +1220,79 @@ func (s *CrispasrSession) SpeechToSpeech(samples []float32) (*SpeechToSpeechResu
 		C.crispasr_session_translate_text_free(textOut)
 	}
 	return &SpeechToSpeechResult{PCM: out, Transcript: transcript}, nil
+}
+
+// InputSampleRate is the rate (Hz) this backend expects for input PCM.
+//
+// SpeechToSpeech and the other PCM entry points want audio at the backend's
+// native rate, and it varies by backend — so "resample to the native rate"
+// was not actionable from Go, C# or Ruby until this was bound (#321).
+func (s *CrispasrSession) InputSampleRate() int {
+	return int(C.crispasr_session_input_sample_rate(s.handle))
+}
+
+// OutputSampleRate is the rate (Hz) of PCM this backend returns — what
+// SpeechToSpeech and Synthesize hand back. 24 kHz for conversational S2S,
+// 48 kHz for Sidon and VoxCPM2 AudioVAE.
+func (s *CrispasrSession) OutputSampleRate() int {
+	return int(C.crispasr_session_output_sample_rate(s.handle))
+}
+
+// Stem is one separated source from Separate: its name ("vocals", "drums", …)
+// and interleaved-stereo PCM at SeparateSampleRate.
+type Stem struct {
+	Name string
+	PCM  []float32
+}
+
+// Separate splits stereo audio into its stems (#359).
+//
+// This is the verb for htdemucs and mel-band-roformer. They are not
+// speech-to-speech models, so SpeechToSpeech returns no audio for them — the C
+// ABI has always had a separate five-function surface, and it was not bound
+// here.
+//
+// pcmStereo is INTERLEAVED stereo at the model's own rate, which is not
+// 16 kHz: read SeparateSampleRate after loading (44100 for the shipped
+// separation models). Each stem comes back interleaved stereo. The C side owns
+// the stem buffers only until the next call, so they are copied out here.
+func (s *CrispasrSession) Separate(pcmStereo []float32) ([]Stem, error) {
+	if len(pcmStereo) < 2 {
+		return nil, errors.New("Separate: needs interleaved stereo PCM")
+	}
+	// The C API counts PER-CHANNEL frames, not floats.
+	nFrames := len(pcmStereo) / 2
+	nStems := C.crispasr_session_separate(
+		s.handle,
+		(*C.float)(unsafe.Pointer(&pcmStereo[0])),
+		C.int(nFrames))
+	if nStems <= 0 {
+		return nil, errors.New("crispasr_session_separate: no stems produced (is this a separation model?)")
+	}
+	stems := make([]Stem, 0, int(nStems))
+	for i := 0; i < int(nStems); i++ {
+		name := C.GoString(C.crispasr_session_separate_stem_name(s.handle, C.int(i)))
+		if name == "" {
+			name = fmt.Sprintf("stem%d", i)
+		}
+		var nOut C.int
+		ptr := C.crispasr_session_separate_stem(s.handle, C.int(i), &nOut)
+		if ptr == nil || nOut <= 0 {
+			return nil, fmt.Errorf("crispasr_session_separate: stem %d (%s) came back empty", i, name)
+		}
+		// nOut is per-channel; the buffer is interleaved stereo.
+		n := int(nOut) * 2
+		out := make([]float32, n)
+		copy(out, unsafe.Slice((*float32)(unsafe.Pointer(ptr)), n))
+		stems = append(stems, Stem{Name: name, PCM: out})
+	}
+	return stems, nil
+}
+
+// SeparateSampleRate is the rate (Hz) of the stems from Separate, and the rate
+// its input must be at. 0 before a separation backend is loaded.
+func (s *CrispasrSession) SeparateSampleRate() int {
+	return int(C.crispasr_session_separate_sample_rate(s.handle))
 }
 
 // KokoroResolved is the result of KokoroResolveForLang. Mirrors the
@@ -1472,17 +1664,45 @@ type FoxNoseOpts struct {
 // DiarizeSegmentsFoxNose adds the #324 options.
 func DiarizeSegments(leftPCM, rightPCM []float32, isStereo bool, segs []DiarizeSeg,
 	method DiarizeMethod, nThreads int, pyannoteModel string) error {
-	return diarizeSegments(leftPCM, rightPCM, isStereo, segs, method, nThreads, pyannoteModel, nil)
+	return diarizeSegments(leftPCM, rightPCM, isStereo, segs, method, nThreads, pyannoteModel, nil, nil)
 }
 
 // DiarizeSegmentsFoxNose runs the WeSpeaker + spectral-clustering diarizer.
 func DiarizeSegmentsFoxNose(leftPCM, rightPCM []float32, isStereo bool, segs []DiarizeSeg,
 	nThreads int, fox *FoxNoseOpts) error {
-	return diarizeSegments(leftPCM, rightPCM, isStereo, segs, DiarizeMethodFoxNose, nThreads, "", fox)
+	return diarizeSegments(leftPCM, rightPCM, isStereo, segs, DiarizeMethodFoxNose, nThreads, "", fox, nil)
+}
+
+// DiarizeTurn is one speaker turn the METHOD derived from the audio, on the
+// caller's absolute timeline (slice_t0_cs already added back), independent of
+// the segment grid that was passed in.
+type DiarizeTurn struct {
+	T0      int64 // centiseconds
+	T1      int64
+	Speaker int32 // dense, zero-based; never -1
+}
+
+// DiarizeSegmentsWithTurns labels segs AND returns the speaker turns the
+// method derived from the audio (#395).
+//
+// Labelling alone can never resolve finer than the segment grid the caller
+// sent in: apply_foxnose awards each segment to the turn it overlaps MOST, so
+// a segment straddling a speaker change goes wholly to the majority speaker.
+// The turns let a caller split such a segment itself. Sending a finer grid is
+// not an alternative — FoxNose skips spans under kMinSegmentSeconds (0.4 s).
+//
+// Only DiarizeMethodFoxNose derives turns; the others return an empty slice,
+// which is not an error.
+func DiarizeSegmentsWithTurns(leftPCM, rightPCM []float32, isStereo bool, segs []DiarizeSeg,
+	method DiarizeMethod, nThreads int, pyannoteModel string, fox *FoxNoseOpts) ([]DiarizeTurn, error) {
+	var turns []DiarizeTurn
+	err := diarizeSegments(leftPCM, rightPCM, isStereo, segs, method, nThreads, pyannoteModel, fox, &turns)
+	return turns, err
 }
 
 func diarizeSegments(leftPCM, rightPCM []float32, isStereo bool, segs []DiarizeSeg,
-	method DiarizeMethod, nThreads int, pyannoteModel string, fox *FoxNoseOpts) error {
+	method DiarizeMethod, nThreads int, pyannoteModel string, fox *FoxNoseOpts,
+	outTurns *[]DiarizeTurn) error {
 	if len(segs) == 0 {
 		return nil
 	}
@@ -1525,8 +1745,46 @@ func diarizeSegments(leftPCM, rightPCM []float32, isStereo bool, segs []DiarizeS
 	if isStereo {
 		stereo = 1
 	}
-	rc := C.crispasr_diarize_segments_abi(leftPtr, rightPtr, C.int(nSamples), stereo,
-		&cSegs[0], C.int(len(cSegs)), &opts)
+	var rc C.int
+	if outTurns == nil {
+		rc = C.crispasr_diarize_segments_abi(leftPtr, rightPtr, C.int(nSamples), stereo,
+			&cSegs[0], C.int(len(cSegs)), &opts)
+	} else {
+		// Size the turn buffer the way the Rust wrapper does: FoxNose's
+		// embedding hop is 0.6 s and no turn is shorter than one hop, so one
+		// slot per 0.5 s of audio is an over-estimate. That pair of braces is
+		// the belt; the single retry below is the suspenders — rc 2 means the
+		// buffer was short and n_turns holds the capacity actually needed.
+		turnCap := int(math.Ceil(float64(nSamples)/16000.0/0.5)) + len(segs) + 16
+		for attempt := 0; ; attempt++ {
+			if turnCap < 1 {
+				turnCap = 1
+			}
+			cTurns := make([]C.struct_crispasr_diarize_turn_abi, turnCap)
+			var nTurns C.int
+			rc = C.crispasr_diarize_segments_turns_abi(leftPtr, rightPtr, C.int(nSamples), stereo,
+				&cSegs[0], C.int(len(cSegs)), &opts, &cTurns[0], C.int(turnCap), &nTurns)
+			if rc == 2 && attempt == 0 {
+				turnCap = int(nTurns)
+				continue
+			}
+			if rc == 0 {
+				n := int(nTurns)
+				if n > turnCap {
+					n = turnCap
+				}
+				*outTurns = make([]DiarizeTurn, n)
+				for i := 0; i < n; i++ {
+					(*outTurns)[i] = DiarizeTurn{
+						T0:      int64(cTurns[i].t0_cs),
+						T1:      int64(cTurns[i].t1_cs),
+						Speaker: int32(cTurns[i].speaker),
+					}
+				}
+			}
+			break
+		}
+	}
 	if rc != 0 {
 		return fmt.Errorf("diarize failed (rc=%d)", int(rc))
 	}
@@ -2401,11 +2659,18 @@ func WatermarkLoadModel(ggufPath string) error {
 
 // WatermarkEmbed embeds an AI-generated watermark into PCM audio in-place.
 // Uses AudioSeal if a model was loaded, otherwise spread-spectrum.
+//
+// Passes alpha <= 0, which selects the band-limited default strength that makes
+// the mark reliably DETECTABLE — the property EU AI Act Art. 50(2) requires, and
+// the reason this is the call SynthesizeRaw users need to discharge marking
+// themselves. It used to hardcode 0.005, the strength the C ABI documents as
+// too faint to reliably detect on real speech: an explicit positive alpha is
+// used verbatim and bypasses the robust default.
 func WatermarkEmbed(pcm []float32) {
 	if len(pcm) == 0 {
 		return
 	}
-	C.crispasr_watermark_embed((*C.float)(unsafe.Pointer(&pcm[0])), C.int(len(pcm)), 0.005)
+	C.crispasr_watermark_embed((*C.float)(unsafe.Pointer(&pcm[0])), C.int(len(pcm)), -1.0)
 }
 
 // WatermarkDetect returns a confidence score [0, 1] indicating whether

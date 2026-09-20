@@ -63,8 +63,11 @@ for seg in s.transcribe_pcm(pcm_f32, sample_rate=16000):
 
 - `CrispASR` — Whisper-compatible high-level API
 - `Session` — unified API across all backends compiled into `libcrispasr`
+- `ChatSession` — text → text chat over a GGUF chat model: one-shot and streaming generation, prompt-token counting, and cancellation through an abort predicate
 - `align_words(...)` — word-level CTC alignment
-- `diarize_segments(...)` — speaker diarization (energy / xcorr / vad-turns / pyannote)
+- `diarize_segments(...)` — speaker diarization (energy / xcorr / vad-turns / pyannote / FoxNose)
+- `diarize_segments_with_turns(...)` — label segments and return FoxNose's
+  finer audio-derived speaker turns
 - `SpeakerEmbedder(spec)` — pluggable embedder ("auto"/"titanet", "indextts"/"ecapa", or a `.gguf` path)
 - `PyannoteCache(pcm, model)` — pre-computed pyannote-seg posteriors for cross-slice consistency
 - `agglomerative_cluster(embeddings, ...)` — single-linkage cosine clustering for globally stable speaker IDs

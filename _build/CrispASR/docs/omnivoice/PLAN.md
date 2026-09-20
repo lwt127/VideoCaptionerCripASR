@@ -3,6 +3,235 @@
 Branch: `fix/omnivoice-254-voiceclone-rtf` (rebased onto `main` on top of the
 stranded GPU commit `feat/omnivoice-gpu` = "run the LLM on GPU").
 
+## LANDED 2026-08-08 — encode diff wired to the harness front door, and the gate can finally go red
+
+`crispasr-diff omnivoice` was a stub (loaded the model, printed the ref token
+count, compared nothing, exited 0) while the REAL per-stage comparison —
+`omnivoice_encode_diff()`, #254 — hid behind `CRISPASR_OMNIVOICE_ENCODE_DIFF`
+in the CLI adapter. Worse, `run_encode_diff` returned 0 unconditionally: a run
+with the corrupt tokenizer printed `acoustic_enc … FAIL` and `FULL wav→codes
+15.0%` and still exited clean. Both fixed:
+
+- The diff-main branch now resolves the audio tokenizer
+  (`CRISPASR_OMNIVOICE_TOKENIZER_GGUF` env, else next-to-model candidates) and
+  runs the encode diff as a counted harness stage.
+- `run_encode_diff` counts main-chain failures and returns nonzero. New
+  explicit gates: RVQ ≥ 99.5% exact (measured 99.9%), FULL wav→codes ≥ 95%
+  (measured 99.0%; residual = our resampler vs torchaudio Hann sinc, the
+  documented optional item — corrupt-tokenizer failure mode sits at 15%).
+
+Current metrics (M1, q4_k LLM + f16 tokenizer `710ef610`, vs
+`omnivoice-encode-ref.gguf`): acoustic_enc / encoder_semantic / concat+fc all
+cos_min=1.000000, RVQ 2197/2200, FULL 2178/2200. Verified red-first: corrupt
+tokenizer → 2 stages FAILED, `crispasr-diff` rc=6, CLI env path rc=1.
+
+**⚠ Local-disk trap, defused:** `/Volumes/backups/ai/crispasr-gguf/` still had
+the CORRUPT Jul-11 `omnivoice-tokenizer-f16.gguf` under the canonical name the
+env-live-tests default and next-to-model discovery both resolve — the clean
+regen only existed as `-fixed`. HF has shipped the fixed bytes under the
+canonical name since Jul 14 (verified `710ef610` == HF LFS oid). Locally the
+corrupt file is renamed `*.CORRUPT-block4-zeroed` and the canonical name is now
+a hard link to the fixed file. Also stale in the #254 log below: "Ship the GGUF
+fix" HAS shipped (HF replaced); the registry carries URLs, not shas, so no
+registry bump was ever needed.
+
+## LANDED 2026-08-07 — `--instruct` had the SAME three defects, found by blueprint review
+
+Not from a report. After the language fix I went back and diffed our runtime
+against the blueprint properly, including the step I had skipped —
+**prompt-token parity** (dev-guide step 0). The language path came out clean
+(below); its sibling did not.
+
+**The language path, now actually proven.** Our style ids vs
+`AutoTokenizer.from_pretrained(<lm-src>)`: `de`/`en`/`arb`/`zh`, `None`, and the
+`<|denoise|>` clone variant are all byte-identical. Also confirmed: Qwen2's
+tokenizer has no BOS, so the blueprint's `add_special_tokens=True` on the style
+path (vs `False` on the text path) is a no-op, not a divergence; the uncond CFG
+arm is target-audio-only in both, so the tag lives only in the cond branch; and
+`normalize_text` is language-dependent but defaults off and the official CLI
+never passes it. One thing I had wrong: treating `"auto"` as cleared is not an
+addition on top of the blueprint — `demo.py:186` does exactly that.
+`CRISPASR_OMNIVOICE_DEBUG` now prints the style ids so this stays a one-command
+check.
+
+**`_resolve_instruct` sits ten lines below `_resolve_language`, and we mirrored
+neither.** The instruct is a CLOSED 48-item vocabulary (6 mutually-exclusive
+categories, each item with an EN/ZH counterpart). Upstream lowercases, repairs
+half/full-width separators, unifies to one language and **raises** on anything
+else. We stored the raw string and dropped it into `<|instruct_start|>`:
+
+    'Male, British Accent'  -> [151672, 36421, 11,  7855, 81809, 151673]
+    'male, british accent'  -> [151672, 36476, 11, 93927, 29100, 151673]
+
+Not one shared id, for what a user considers the same request. And it had the
+*same* per-call bug: `omnivoice_set_instruct` ran only in `init()`, so the
+server's per-request `"instructions"` field was dead after the first line —
+identical to the language defect, in the same function, missed the first time.
+
+**Fixed, mirroring upstream (rejection, not degradation).**
+`src/core/omnivoice_instruct.h` + a generated table from the vendored
+`voice_design.py`. Two-phase on purpose: `parse()` is text-independent
+(validation, conflict checks) and runs at set time; `render()` needs the text,
+because a dialect forces Chinese, an accent forces English, and otherwise it
+follows whether the *target text* is Chinese — so it runs per synthesis. Baking
+the rendered string at set time would freeze one line's EN/ZH choice onto every
+later line on a reused context.
+
+Verified against the blueprint resolver and the HF tokenizer:
+
+| input | resolved | our style ids |
+|---|---|---|
+| `Male, British Accent` (EN text) | `male, british accent` | match HF exactly |
+| `Male, Elderly` (**Chinese** text) | `男，老年` | match HF exactly |
+| `britsh accent` | rejected | CLI rc=13, server `400 invalid_instructions`, with did-you-mean |
+| `male, female` | rejected | conflict, 400 |
+| three different instructs, one server process | each applied | codes DIFFERENT per request |
+
+Suggestion text is the one deliberate non-parity: upstream uses difflib's
+Ratcliff/Obershelp, we use an LCS ratio at the same 0.6 cutoff. It changes no
+model input, only the error string — noted in the header.
+
+**Correction + closed (2026-08-07, follow-up):** I reported "there is no session
+instruct setter at all". Wrong — `crispasr_session_set_instruct` has existed all
+along, handling qwen3-tts and parler; **omnivoice fell through to `return -3`**,
+i.e. "this backend has no instruct contract". So it was the same wiring bug a
+third time, not a missing feature. Now dispatched, which makes voice design
+reachable from every binding (the Python `set_instruct` needed no change beyond
+its docstring). Guarded by a source test scoped to the function body.
+
+**Coverage after the audit.** Two things had been verified by hand only and are
+now gates:
+
+- `tests/test-omnivoice-style-tokens.sh` (live) — prompt-token parity against
+  the real vocabulary. The unit tests pin the style STRING; this pins what it
+  tokenizes to, which is what the model consumes and the one link no hermetic
+  test can see. 9 cases, ids from the reference Qwen2Tokenizer. Verified it goes
+  red (one wrong id → rc=1). Pin provenance recorded in the test header
+  (upstream rev `c5fdb5cc` + tokenizer.json sha256, re-derived byte-identical
+  2026-08-07) so a red run can tell whether our side or upstream moved without
+  vendoring the 7 MB tokenizer.json.
+- `tests/test-omnivoice-surface-parity.sh` (live) — CLI / server / session must
+  produce identical codes for the same request. Source guards catch a MISSING
+  call site; only this catches one that is present and wrong. Compares CODES,
+  never the watermarked WAV, and every comparison includes an arm whose expected
+  answer is IDENTICAL (an all-DIFFERENT suite is what a broken harness produces).
+
+Both SKIP cleanly without a model; env registered in `tests/env-live-tests.sh`.
+
+## LANDED 2026-08-07 — SubtitleEdit-13273: the language menu was decoration
+
+The reporter: "we have a menu where you can select the target language … nothing
+changes when you select it, and you can hear the strong accent of the original."
+Correct on the first half, and it was dead on **three** surfaces at once, each
+for its own reason — the classic multi-surface dispatch trap (dev guide point 6).
+
+**What was broken**
+
+1. `crispasr_backend_omnivoice.cpp::synthesize()` applied only `tts_num_steps`
+   per call; `omnivoice_set_language` ran ONLY in `init()`. The server owns one
+   backend instance for the whole session, so after the first line the menu
+   could never change anything — even though `crispasr_server.cpp` has parsed
+   `language`/`target_lang` into `rp.language` since #249/#304.
+2. `crispasr_c_api.cpp` — the session's omnivoice arm was a bare
+   `omnivoice_synthesize()`. `set_target_language` never reached it, so
+   bindings / Flutter / Android had no language knob by any route. This is
+   #329's cosyvoice3 bug, one backend over.
+3. `omnivoice.cpp` dropped the string VERBATIM into `<|lang_start|>…<|lang_end|>`.
+   The blueprint (`_resolve_language`, `omnivoice/models/omnivoice.py:1472`) is
+   ID-passthrough → lowercase-name lookup → **None**, and we did none of it, so
+   `de-DE` / `German` / a typo conditioned the model on tokens it never saw in
+   that slot while looking like it worked.
+
+**The fix.** `src/core/omnivoice_lang.h` mirrors `_resolve_language()` over a
+generated 646-ID table (`tools/gen-omnivoice-lang-map.py` ← upstream
+`lang_map.py`; regenerate rather than hand-edit). The runtime resolves centrally
+inside `omnivoice_set_language`, so no surface can forget to; unrecognized
+values warn with a did-you-mean and fall back to language-agnostic. Both the
+adapter and the session arm now apply it per call.
+
+**Verified at the CODE level, not the WAV level** — output is watermarked and
+carries a spoken disclaimer, so `cmp` on the audio measures the watermark. Use
+`CRISPASR_OMNIVOICE_DUMP_CODES` + `--no-spoken-disclaimer`. All three surfaces,
+English `jfk.wav` reference → German target:
+
+| comparison | result | what it proves |
+|---|---|---|
+| `-l de` vs none | DIFFERENT | the tag reaches the model |
+| `-l German` vs `-l de` | **IDENTICAL** | name→ID resolution is exact |
+| `-l de-DE` vs none | **IDENTICAL** | unrecognized really is agnostic, not a poisoned prompt |
+| session vs CLI, same lang | **IDENTICAL** | surface parity restored |
+| server vs CLI, same lang | **IDENTICAL** | three sequential requests on ONE process each honoured their own language |
+
+**⚠ NEGATIVE RESULT — the accent half of the report is NOT fixed, and probably
+cannot be here.** Two findings:
+
+- *No measurable accent change.* whisper-large-v3-turbo LID over 3 German
+  sentences: sentence 1 went 0.927 → 0.998 with the tag, but sentences 2 and 3
+  were already 0.9993 / 0.9996 untagged and the tag moved neither (0.9996 /
+  0.9995 — one slightly DOWN). The sentence-1 gap was one-clip noise, exactly
+  what the A/B rule warns about. Content round-trips clean on every arm, so the
+  tag is safe; it is just not demonstrably an accent lever. LID is also a poor
+  accent metric by construction — it is trained to be accent-robust. A real
+  verdict needs a listener, which the reporter now can be, because the knob
+  finally does something.
+- *#329's fix does not transfer, by design.* OmniVoice has no cross-lingual
+  drop-ref path: `create_voice_clone_prompt` either takes `ref_text` or
+  auto-transcribes it, and `_combine_text` lays `ref_text + " " + target` into
+  ONE stream whose tokens are positioned before the reference audio frames.
+  Dropping the transcript while keeping the audio desynchronizes the two — a
+  structural break, not a mode. Do not port the cosyvoice3 behaviour here
+  without new evidence; the language tag is the only lever the architecture
+  exposes.
+
+**Adjacent bug fixed in passing:** `/v1/audio/speech` advertises a per-request
+`seed` and the omnivoice adapter dropped it, so re-rendering one subtitle line
+could not be reproduced. Now applied when non-zero (0 = the runtime's own
+default 42, so nothing changes unless a caller asks). Verified: `--seed 999`
+differs from the default and is byte-identical across two runs.
+
+**SE-side gap, worked around (2026-08-07, follow-up):** `OmniVoiceCrispAsr.Speak()`
+accepts `TtsLanguage? language` and never sends it — the payload is
+`{input, response_format, speed}` — and the launch args carry no `-l`. Rather
+than leave the fix blocked on someone else's release, omnivoice now **guesses
+the language from the target text when nobody supplied one**
+(`CRISPASR_OMNIVOICE_AUTO_LANG`, default ON;
+`core_omnivoice_lang::auto_detect` = `core_tts_lang::detect` → `resolve`).
+
+*The measurement that justifies guessing, and would retract it.* Guessing is
+normally the wrong instinct; here it is defensible only because the **harm side
+was measured and is benign**. German text deliberately mis-tagged `-l en`:
+ASR round-trip word-perfect, whisper LID still `de` at 0.984 — the same band as
+the correct tag (0.947) and no tag (0.998), i.e. no ordering at all. So a bad
+guess costs nothing detectable, while the upside is what upstream documents
+("performance is slightly better if you specify the language"). **If a later
+measurement shows a wrong tag DOES degrade output, flip this back to opt-in** —
+the asymmetry is the entire argument, not the detection accuracy.
+
+Verified end to end (codes, `--no-spoken-disclaimer`):
+
+| arm | vs | result |
+|---|---|---|
+| no `-l` at all, fallback on | explicit `-l de` | **IDENTICAL** |
+| `CRISPASR_OMNIVOICE_AUTO_LANG=0` | old untagged behaviour | **IDENTICAL** (clean opt-out) |
+| explicit `-l en` on German text | the pre-existing `-l en` result | **IDENTICAL** (the guess never overrides) |
+| **SE-shaped POST** `{input, response_format}`, no language field | explicit `-l de` | **IDENTICAL** |
+
+Two implementation details that are load-bearing, both guarded in
+`tests/test-omnivoice-lang.cpp`:
+
+- **Detect over the TARGET text, not `combined_text`.** The combined stream has
+  the reference transcript glued to its front, so guessing from it would drag
+  every German subtitle toward an English reference clip's language — silently,
+  and only when cloning, which is exactly when it matters.
+- **Per call, into a local — never written back to `ctx->language`.** The server
+  reuses one context across requests; a sticky guess would leak line N's
+  detection onto line N+1, which is the per-call-vs-init bug this whole change
+  set exists to fix.
+
+Sending the field is still better than being guessed at (explicit wins, and it
+covers the languages the detector does not know), so the SE-side change is still
+worth having — it is just no longer a blocker. Reported on the issue.
+
 ## NOW — active work
 
 **Status (2026-07-16): OmniVoice RTF #4 — fused stage0 step graph, branch

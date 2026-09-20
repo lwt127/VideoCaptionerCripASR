@@ -32,6 +32,8 @@
 
 #pragma once
 
+#include "core/currency_symbols.h" // #316: the unit beside the number
+
 #include <cctype>
 #include <cstdint>
 #include <string>
@@ -155,6 +157,22 @@ inline std::string digits_each(const std::string& s) {
 
 } // namespace detail
 
+// Currency unit as it is SPOKEN, after the amount.
+inline std::string currency_word(core_currency::sym s, bool one) {
+    switch (s) {
+    case core_currency::sym::eur:
+        return one ? "euro" : "euros";
+    case core_currency::sym::usd:
+        return one ? "dollar" : "dollars";
+    case core_currency::sym::gbp:
+        return one ? "pound" : "pounds";
+    case core_currency::sym::jpy:
+        return "yen"; // invariable in English
+    default:
+        return std::string();
+    }
+}
+
 // Rewrite every numeric token in `text` as words, leaving the rest untouched.
 // Handles a leading -, thousands separators, decimals, ordinal suffixes, a
 // trailing %, and a leading $.
@@ -245,14 +263,24 @@ inline std::string expand(const std::string& text) {
             words += " percent";
             i++;
         }
-        // Leading currency symbol already emitted into `out` — drop it and put
-        // the unit after the number, the way it is spoken.
-        size_t back = out.size();
-        while (back > 0 && out[back - 1] == ' ')
-            back--;
-        if (back > 0 && out[back - 1] == '$') {
-            out.erase(back - 1);
-            words += (value == 1 && frac_part.empty()) ? " dollar" : " dollars";
+        // #316: the currency UNIT, which vanishes exactly like a digit does —
+        // it is in no dictionary and no letter-to-sound rule. This used to
+        // handle a leading `$` only, so "€50" and "£50" lost their unit and
+        // "50$" lost it in the postfix form every European locale writes.
+        {
+            const bool one = (value == 1 && frac_part.empty());
+            size_t sym_len = 0;
+            core_currency::sym cs = core_currency::at_postfix(text, i, sym_len);
+            if (cs == core_currency::sym::none && i + 1 < n && text[i] == ' ')
+                cs = core_currency::at_postfix(text, i + 1, sym_len);
+            if (cs != core_currency::sym::none) {
+                i += sym_len + (text[i] == ' ' ? 1 : 0);
+            } else {
+                cs = core_currency::take_prefix(out);
+            }
+            const std::string unit = currency_word(cs, one);
+            if (!unit.empty())
+                words += " " + unit;
         }
 
         detail::append_word(out, words);

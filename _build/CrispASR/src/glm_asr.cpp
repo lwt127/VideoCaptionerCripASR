@@ -40,6 +40,7 @@
 
 #include "core/bpe.h"
 #include "core/crispasr_env.h"
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `GLM_ASR_BENCH=1` for per-stage timings.
@@ -267,13 +268,13 @@ extern "C" struct glm_asr_context* glm_asr_init_from_file(const char* path_model
     ctx->params = params;
     ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
-    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init();
     if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
-    ctx->backend_cpu = ggml_backend_cpu_init();
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
-    if (ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+        ctx->backend = core_cpu_backend::init();
+    ctx->backend_cpu = core_cpu_backend::init();
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
 
     // Load GGUF
     auto& m = ctx->model;
@@ -284,7 +285,7 @@ extern "C" struct glm_asr_context* glm_asr_init_from_file(const char* path_model
         gguf_context* gctx = core_gguf::open_metadata(path_model);
         if (!gctx) {
             fprintf(stderr, "glm_asr: failed to open '%s'\n", path_model);
-            delete ctx;
+            glm_asr_free(ctx); // frees the backends this ctx already owns
             return nullptr;
         }
         hp.enc_hidden = core_gguf::kv_u32(gctx, "glmasr.audio.hidden_size", hp.enc_hidden);
@@ -357,7 +358,7 @@ extern "C" struct glm_asr_context* glm_asr_init_from_file(const char* path_model
         if (!core_gguf::load_weights_split(path_model, ctx->backend, ctx->backend_cpu,
                                            core_gguf::is_gpu_tensor_with_prefix, &cfg, "glm_asr", wl)) {
             fprintf(stderr, "glm_asr: split load failed from '%s'\n", path_model);
-            delete ctx;
+            glm_asr_free(ctx); // frees the backends this ctx already owns
             return nullptr;
         }
         fprintf(stderr, "glm_asr: layer offload: gpu=[0,%d), cpu=[%d,%d) (CRISPASR_N_GPU_LAYERS=%d)\n",
@@ -365,7 +366,7 @@ extern "C" struct glm_asr_context* glm_asr_init_from_file(const char* path_model
     } else {
         if (!core_gguf::load_weights(path_model, ctx->backend, "glm_asr", wl)) {
             fprintf(stderr, "glm_asr: failed to load weights from '%s'\n", path_model);
-            delete ctx;
+            glm_asr_free(ctx); // frees the backends this ctx already owns
             return nullptr;
         }
     }
@@ -503,9 +504,9 @@ extern "C" void glm_asr_free(struct glm_asr_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.buf_cpu)
-        ggml_backend_buffer_free(ctx->model.buf_cpu);
+        core_gguf::release_weight_buffer(ctx->model.buf_cpu);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
@@ -1259,15 +1260,18 @@ extern "C" bool glm_asr_kv_init(struct glm_asr_context* ctx, int max_ctx) {
     size_t kb = ggml_nbytes(ctx->kv_k), vb = ggml_nbytes(ctx->kv_v);
     // PLAN #69b: optional KV-on-CPU spill.
     ggml_backend_t kv_backend = core_attn::kv_backend_from_env(ctx->backend, ctx->backend_cpu, "glm_asr");
-    ctx->kv_buf = ggml_backend_alloc_buffer(kv_backend, kb + vb);
+    // #367: size and place via ggml, not ggml_nbytes() arithmetic. CUDA's
+    // get_alloc_size() pads a quantized row up to MATRIX_ROW_PADDING (512),
+    // and these KV rows are head_dim wide (128), so each q8_0 tensor needs
+    // 408 bytes more than nbytes — the hand-sized buffer came up short and
+    // ggml_backend_tensor_alloc aborted. f16 is not quantized, so this only
+    // ever fired with CRISPASR_KV_QUANT set, and only on CUDA.
+    ctx->kv_buf = ggml_backend_alloc_ctx_tensors(ctx->kv_ctx, kv_backend);
     if (!ctx->kv_buf) {
         ggml_free(ctx->kv_ctx);
         ctx->kv_ctx = nullptr;
         return false;
     }
-    char* base = (char*)ggml_backend_buffer_get_base(ctx->kv_buf);
-    ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_k, base);
-    ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_v, base + kb);
     glm_asr_kv_reset(ctx);
     if (ctx->params.verbosity >= 1) {
         fprintf(stderr, "glm_asr: kv cache %zu MiB\n", (kb + vb) >> 20);

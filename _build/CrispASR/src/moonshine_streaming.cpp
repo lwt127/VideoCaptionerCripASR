@@ -33,6 +33,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `MOONSHINE_STREAM_BENCH=1` for per-stage timings.
@@ -292,13 +293,13 @@ extern "C" struct moonshine_streaming_context* moonshine_streaming_init_from_fil
     }
 
     // ── Allocate weight buffer ─────────────────────────────────��────────
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (!ctx->backend_cpu) {
         fprintf(stderr, "moonshine_streaming: failed to init CPU backend\n");
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
 
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
     if (!ctx->backend)
@@ -842,7 +843,7 @@ static char* moonshine_streaming_transcribe_impl(struct moonshine_streaming_cont
         kv[i].cross_k = ggml_new_tensor_3d(kv_ctx, GGML_TYPE_F32, dec_head_dim, T_enc, dec_kv_heads);
         kv[i].cross_v = ggml_new_tensor_3d(kv_ctx, GGML_TYPE_F32, dec_head_dim, T_enc, dec_kv_heads);
     }
-    ggml_backend_buffer_t kv_buf = ggml_backend_alloc_ctx_tensors_from_buft(kv_ctx, ggml_backend_cpu_buffer_type());
+    ggml_backend_buffer_t kv_buf = ggml_backend_alloc_ctx_tensors_from_buft(kv_ctx, core_cpu_backend::buffer_type());
     if (!kv_buf) {
         ggml_free(kv_ctx);
         return nullptr;
@@ -1169,9 +1170,9 @@ extern "C" void moonshine_streaming_free(struct moonshine_streaming_context* ctx
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->model.buf_w)
-        ggml_backend_buffer_free(ctx->model.buf_w);
+        core_gguf::release_weight_buffer(ctx->model.buf_w);
     if (ctx->model.buf_w_cpu)
-        ggml_backend_buffer_free(ctx->model.buf_w_cpu);
+        core_gguf::release_weight_buffer(ctx->model.buf_w_cpu);
     if (ctx->model.ctx_w)
         ggml_free(ctx->model.ctx_w);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)
@@ -1185,7 +1186,7 @@ extern "C" void moonshine_streaming_set_n_threads(struct moonshine_streaming_con
     if (ctx && n_threads > 0) {
         ctx->n_threads = n_threads;
         if (ctx->backend_cpu)
-            ggml_backend_cpu_set_n_threads(ctx->backend_cpu, n_threads);
+            core_cpu_backend::set_n_threads(ctx->backend_cpu, n_threads);
     }
 }
 

@@ -26,6 +26,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -109,7 +110,7 @@ struct pyannote_seg_context {
 static bool pyannote_load(pyannote_model& m, const char* path) {
     // pyannote_seg_run() is a manual CPU F32 implementation that directly
     // dereferences tensor->data, so weights must live in host memory.
-    ggml_backend_t backend = ggml_backend_cpu_init();
+    ggml_backend_t backend = core_cpu_backend::init();
     core_gguf::WeightLoad wl;
     if (!core_gguf::load_weights(path, backend, "pyannote_seg", wl)) {
         ggml_backend_free(backend);
@@ -593,7 +594,7 @@ static float* pyannote_seg_run_ggml(pyannote_seg_context* ctx, const float* samp
             // Each worker needs its own backend: ggml_backend_graph_compute is
             // not re-entrant on one instance. The model weights are read-only
             // and shared, so only the scratch buffers are duplicated.
-            ggml_backend_t be = ggml_backend_cpu_init();
+            ggml_backend_t be = core_cpu_backend::init();
             if (!be) {
                 failed.store(true);
                 break;
@@ -607,7 +608,7 @@ static float* pyannote_seg_run_ggml(pyannote_seg_context* ctx, const float* samp
             // threads and the result does not depend on this number; the
             // byte-identity of the posteriors across -t is asserted below by
             // measurement, not assumed.
-            ggml_backend_cpu_set_n_threads(be, std::max(1, ctx->n_threads / ch.n_workers));
+            core_cpu_backend::set_n_threads(be, std::max(1, ctx->n_threads / ch.n_workers));
             backends.push_back(be);
         }
         if (!failed.load()) {
@@ -761,7 +762,7 @@ extern "C" struct pyannote_seg_context* pyannote_seg_init(const char* gguf_path,
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->model.backend, ctx->n_threads);
+    core_cpu_backend::set_n_threads(ctx->model.backend, ctx->n_threads);
     fprintf(stderr, "pyannote_seg: loaded (%d LSTM layers, hidden=%d)\n", 4, ctx->model.lstm[0].hidden_size);
     return ctx;
 }
@@ -770,7 +771,7 @@ extern "C" void pyannote_seg_free(struct pyannote_seg_context* ctx) {
     if (!ctx)
         return;
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->model.backend)

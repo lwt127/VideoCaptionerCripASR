@@ -69,4 +69,4 @@ and rewrites *only* the marker line below — the prose above is
 maintained here by hand and does not auto-update, so a codec added
 upstream will not be described until this file is edited.
 
-Synced at upstream commit: `5227708db602fb9dba723ae412d20f0f5d5765c3` (chore(dart_pure): glint_audio_pure 0.6.2 — description within pub.dev's limit).
+Synced at upstream commit: `77738f3ed9b15f627196cc5bbd7f6406814ba2fb` (fix(aac): decode KBD windows + short-window TNS — foreign streams 17 -> 60+ dB).

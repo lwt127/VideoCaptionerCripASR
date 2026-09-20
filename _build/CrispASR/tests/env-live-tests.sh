@@ -39,10 +39,28 @@ export CRISPASR_MODEL_CANARY="${CRISPASR_MODEL_CANARY:-$CRISPASR_MODELS_DIR/cana
 export CRISPASR_MODEL_CANARY_QWEN="${CRISPASR_MODEL_CANARY_QWEN:-$CRISPASR_MODELS_DIR/canary-qwen-2.5b-q8_0.gguf}"
 export CRISPASR_MODEL_LFM2_EN="${CRISPASR_MODEL_LFM2_EN:-$CRISPASR_MODELS_DIR/lfm2-audio-1.5b-q5_k.gguf}"
 export CRISPASR_MODEL_LFM2_JP="${CRISPASR_MODEL_LFM2_JP:-$CRISPASR_MODELS_DIR/lfm2-audio-1.5b-jp-q5_k.gguf}"
+# FireRedTTS3 (#377): mixed-Q4_K core (DiT/penc stay F16) + RedAE/CAM++ companion.
+export CRISPASR_MODEL_FIREREDTTS3="${CRISPASR_MODEL_FIREREDTTS3:-$CRISPASR_MODELS_DIR/fireredtts3-base-q4_k.gguf}"
+export CRISPASR_MODEL_FIREREDTTS3_REDAE="${CRISPASR_MODEL_FIREREDTTS3_REDAE:-$CRISPASR_MODELS_DIR/fireredtts3-redae-f16.gguf}"
+
 # dots.tts: F16 core (the CFG flow-match derails on full-q8) + vocoder companion.
 export CRISPASR_MODEL_DOTS_TTS="${CRISPASR_MODEL_DOTS_TTS:-$CRISPASR_MODELS_DIR/dots-tts-soar-f16.gguf}"
 export CRISPASR_MODEL_DOTS_TTS_VOCODER="${CRISPASR_MODEL_DOTS_TTS_VOCODER:-$CRISPASR_MODELS_DIR/dots-tts-soar-vocoder-f16.gguf}"
 export CRISPASR_MODEL_COHERE="${CRISPASR_MODEL_COHERE:-$CRISPASR_MODELS_DIR/cohere-transcribe.gguf}"
+
+# ── Kokoro TTS + its G2P live check (#316) ──
+# tests/test-kokoro-g2p-live.sh reads these three and silently skips without
+# them, so the G2P path — the one that used to drop numbers entirely — was
+# never exercised by a `source tests/env-live-tests.sh` run. The defaults match
+# the names the script already falls back to.
+export CRISPASR_KOKORO_MODEL="${CRISPASR_KOKORO_MODEL:-$CRISPASR_MODELS_DIR/kokoro-82m-q8_0.gguf}"
+export CRISPASR_KOKORO_VOICE="${CRISPASR_KOKORO_VOICE:-$CRISPASR_MODELS_DIR/kokoro-voice-af_heart.gguf}"
+
+# ── Parakeet non-JA long-form guards (issues #350 / #385) ──
+# test-parakeet-longform builds its fixture from samples/jfk.wav; it only needs
+# a NON-Japanese parakeet GGUF. Without this export both the #350 coverage case
+# and the #385 progress-contract case SKIP in a live run.
+export CRISPASR_MODEL_PARAKEET="${CRISPASR_MODEL_PARAKEET:-$CRISPASR_MODELS_DIR/parakeet-tdt-0.6b-v3-q4_k.gguf}"
 
 # ── Parakeet JA long-form regression guard (issue #89) ──
 # Fixture: hf download cstr/crispasr-regression-fixtures \
@@ -87,7 +105,10 @@ export CRISPASR_MODEL_MOSS_DIARIZE="${CRISPASR_MODEL_MOSS_DIARIZE:-$CRISPASR_MOD
 # codebooks + transformer codec companion (validated by ASR round-trip, #249).
 # MioTTS-0.6B (Qwen3 + MioCodec, Apache-2.0)
 export CRISPASR_MODEL_MIOTTS="${CRISPASR_MODEL_MIOTTS:-$CRISPASR_MODELS_DIR/miotts-0.6b-q8_0.gguf}"
+export CRISPASR_MODEL_CONFUCIUS4_T2S="${CRISPASR_MODEL_CONFUCIUS4_T2S:-$CRISPASR_MODELS_DIR/confucius4-tts-t2s-q4_k.gguf}"
 export CRISPASR_MODEL_PIANO_TRANSCRIPTION="${CRISPASR_MODEL_PIANO_TRANSCRIPTION:-$CRISPASR_MODELS_DIR/piano-transcription-f16.gguf}"
+export CRISPASR_MODEL_BASIC_PITCH="${CRISPASR_MODEL_BASIC_PITCH:-$CRISPASR_MODELS_DIR/basic-pitch-f32.gguf}"
+export CRISPASR_MODEL_MT3="${CRISPASR_MODEL_MT3:-$CRISPASR_MODELS_DIR/mt3-f16.gguf}"
 export CRISPASR_MODEL_MOSS_TTS="${CRISPASR_MODEL_MOSS_TTS:-$CRISPASR_MODELS_DIR/moss-tts-v1.5-q4_k.gguf}"
 export CRISPASR_MODEL_MOSS_TTS_CODEC="${CRISPASR_MODEL_MOSS_TTS_CODEC:-$CRISPASR_MODELS_DIR/moss-tts-v1.5-codec.gguf}"
 export CRISPASR_MODEL_MOSS_TTS_LOCAL="${CRISPASR_MODEL_MOSS_TTS_LOCAL:-$CRISPASR_MODELS_DIR/moss-tts-local-v1.5-q4_k.gguf}"
@@ -127,6 +148,7 @@ export CRISPASR_MODEL_TADA_CODEC="${CRISPASR_MODEL_TADA_CODEC:-$CRISPASR_MODELS_
 export CRISPASR_MODEL_KUGELAUDIO="${CRISPASR_MODEL_KUGELAUDIO:-$CRISPASR_MODELS_DIR/kugelaudio-0-open-f16.gguf}"
 
 # ── MeloTTS (VITS2) ──
+export CRISPASR_MODEL_SUPERTONIC="${CRISPASR_MODEL_SUPERTONIC:-$CRISPASR_MODELS_DIR/supertonic3-f16.gguf}"
 export CRISPASR_MODEL_MELOTTS="${CRISPASR_MODEL_MELOTTS:-$CRISPASR_MODELS_DIR/melotts-en-v2-f16.gguf}"
 
 # ── Dia TTS ──
@@ -138,6 +160,9 @@ export CRISPASR_MODEL_WAVTOK="${CRISPASR_MODEL_WAVTOK:-$CRISPASR_MODELS_DIR/wavt
 
 # ── Sidon speech restoration ──
 export CRISPASR_MODEL_SIDON="${CRISPASR_MODEL_SIDON:-$CRISPASR_MODELS_DIR/sidon-v0.1-f16.gguf}"
+# Issue #416: quantized Sidon builds must be exercised too — the f16 path
+# alone left every quant untested. Any q8_0/q6_k/q4_k Sidon GGUF works.
+export CRISPASR_MODEL_SIDON_QUANT="${CRISPASR_MODEL_SIDON_QUANT:-$CRISPASR_MODELS_DIR/sidon-v0.1-q8_0.gguf}"
 
 # ── VoxCPM2 AudioVAE speech upscaler ──
 export CRISPASR_MODEL_VOXCPM2_VAE="${CRISPASR_MODEL_VOXCPM2_VAE:-$CRISPASR_MODELS_DIR/voxcpm2-vae-f32.gguf}"
@@ -175,3 +200,11 @@ echo "Live test env configured (CRISPASR_MODELS_DIR=$CRISPASR_MODELS_DIR)"
 
 # qwen3-tts live tests
 export CRISPASR_MODEL_QWEN3_TTS="${CRISPASR_MODEL_QWEN3_TTS:-$CRISPASR_MODELS_DIR/qwen3-tts-0.6b-q4_k.gguf}"
+
+# omnivoice live tests (#13273): style-token parity + three-surface parity.
+# Both SKIP cleanly when these are unset, and the tokenizer must be the F16
+# build — the q8_0 one loads and synthesizes but cannot be read back as f32, so
+# a reference encode yields garbage codes (and poisons the content-addressed
+# voice cache for later F16 runs).
+export CRISPASR_TEST_OMNIVOICE_MODEL="${CRISPASR_TEST_OMNIVOICE_MODEL:-$CRISPASR_MODELS_DIR/omnivoice-q4_k.gguf}"
+export CRISPASR_TEST_OMNIVOICE_TOKENIZER="${CRISPASR_TEST_OMNIVOICE_TOKENIZER:-$CRISPASR_MODELS_DIR/omnivoice-tokenizer-f16.gguf}"

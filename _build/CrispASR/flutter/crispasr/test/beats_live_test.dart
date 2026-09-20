@@ -68,8 +68,8 @@ void main() {
       print('skip: set CRISPASR_LIB and CRISPASR_BEAT_MODEL to run');
       return;
     }
-    final s = CrispasrSession.open(modelPath,
-        libPath: libPath, backend: 'beat-this');
+    final s =
+        CrispasrSession.open(modelPath, libPath: libPath, backend: 'beat-this');
     try {
       expect(s.beatsSampleRate, _sr,
           reason: 'the binding must probe the rate, not hard-code it');

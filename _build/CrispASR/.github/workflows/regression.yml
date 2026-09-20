@@ -44,6 +44,8 @@ on:
   pull_request:
     paths:
       - 'tests/regression/**'
+      - 'tests/test_python_diarize_turns.py'
+      - 'python/crispasr/**'
       - '.github/workflows/regression.yml'
 
 permissions:
@@ -77,10 +79,31 @@ jobs:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
+      # tests/test_python_chat.py imports python/crispasr/_binding.py, which
+      # imports numpy at module scope — without it those cases ERROR rather than
+      # skip, and unittest's non-zero exit fails the step. The job never got
+      # this far before (the step above was red), so the gap was invisible. The
+      # perf job below already does exactly this on line ~275.
+      - name: Install no-model test deps
+        run: pip install -q numpy || true
       - name: Run no-model Python unit tests
         run: |
           python -m pytest tests/test_backend_config.py -v || \
           python -m unittest tests/test_backend_config.py -v
+      # Chat binding (#362). 891 lines of tests that nothing invoked: this file
+      # is not named by any workflow and regression.yml pytests two files by
+      # name rather than a directory, so it could only ever run by hand. With
+      # neither a library nor a model it still exercises the ctypes ABI struct
+      # definitions, the param defaults and the UTF-8 chunk assembly — 5 cases
+      # — and skips the rest, so it is safe in a job that builds nothing.
+      - name: Run no-model Python chat-binding tests
+        run: |
+          python -m pytest tests/test_python_chat.py -v || \
+          python -m unittest tests/test_python_chat.py -v
+      - name: Run Python diarization ABI tests
+        run: |
+          python -m pytest tests/test_python_diarize_turns.py -v || \
+          python tests/test_python_diarize_turns.py -v
       # Perf-regression compare logic (docs/perf-sweep/PLAN.md TODO-4). Model-free —
       # guards the hard/soft-gate logic used by the nightly perf snapshot step below.
       - name: Run perf-baseline compare unit tests
@@ -129,7 +152,7 @@ jobs:
   # "Adding a new backend"). Heavy backends (vibevoice 7 GB,
   # voxtral4b 4 GB) that don't fit reliably on the GitHub free-tier
   # 14 GB ubuntu-latest scratch should go through the weekly Kaggle
-  # full-sweep job (`tools/kaggle-regression.py`) instead.
+  # full-sweep job (`tools/test-all-backends.py` on a Kaggle kernel) instead.
   regression:
     if: github.event_name != 'pull_request'
     needs: preflight

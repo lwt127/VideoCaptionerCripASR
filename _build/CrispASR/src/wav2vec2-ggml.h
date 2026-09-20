@@ -15,6 +15,8 @@
 
 #pragma once
 
+#include "core/gguf_loader.h"
+
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "gguf.h"
@@ -116,9 +118,12 @@ struct wav2vec2_model {
     // Free in dependency order: buf (depends on backend) → ctx → backend.
     // Without this, on Metal the residency set survives past main() and
     // ggml_metal's static teardown trips ggml_metal_rsets_free's assert.
+    //
+    // `buf` came from core_gguf::load_weights, so on a zero-copy backend it
+    // carries a host mmap the backend does not own; release_weight_buffer
+    // frees the buffer and then unmaps that region.
     ~wav2vec2_model() noexcept {
-        if (buf)
-            ggml_backend_buffer_free(buf);
+        core_gguf::release_weight_buffer(buf);
         if (ctx)
             ggml_free(ctx);
         if (backend)

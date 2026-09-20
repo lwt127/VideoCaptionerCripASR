@@ -25,6 +25,7 @@
 #include <random>
 #include <set>
 #include <vector>
+#include "portable_env.h"
 
 using namespace core_spectral;
 
@@ -469,4 +470,29 @@ TEST_CASE("cluster_speakers: trivial sizes do not crash", "[unit][spectral]") {
     auto one = cluster_speakers(x.data(), 1, 2, 1, 5, 0, nullptr);
     REQUIRE(one.size() == 1);
     CHECK(one[0] == 0);
+}
+
+// #390 parallelised both k-sweeps (GMM/BIC and spectral+silhouette). Its whole
+// safety argument is that tasks write only their own slot and the reductions
+// stay SERIAL in ascending k, so tie-breaks land where the sequential loop put
+// them. That claim is only worth as much as a test that varies the fan-out:
+// the labels — and the estimated count — must not depend on how the work
+// happened to land across threads. n_threads=1 is the sequential baseline the
+// parallel arms have to reproduce exactly.
+TEST_CASE("cluster_speakers: labels are independent of the thread count", "[unit][spectral]") {
+    const int k = 4, per = 20, d = 24;
+    auto x = make_blobs(k, per, d, 1.0f, 4242);
+    const int n = k * per;
+
+    SpeakerEstimate est1;
+    const std::vector<int> serial = cluster_speakers(x.data(), n, d, 1, 10, 0, &est1, 42, /*n_threads=*/1);
+    REQUIRE(serial.size() == (size_t)n);
+
+    for (int nt : {2, 4, 8, 0}) { // 0 = "ask the machine"
+        SpeakerEstimate est;
+        const std::vector<int> got = cluster_speakers(x.data(), n, d, 1, 10, 0, &est, 42, nt);
+        INFO("n_threads = " << nt << " (0 means hardware_concurrency)");
+        CHECK(got == serial);
+        CHECK(est.best_k == est1.best_k);
+    }
 }

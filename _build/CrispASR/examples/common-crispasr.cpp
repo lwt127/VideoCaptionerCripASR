@@ -4,6 +4,8 @@
 
 #include "common-crispasr.h"
 
+#include "core/audio_resample.h"
+
 #include "common.h"
 
 #include "crispasr.h"
@@ -92,7 +94,31 @@ bool read_audio_data(const std::string& fname, std::vector<float>& pcmf32, std::
     ma_decoder_config decoder_config;
     ma_decoder decoder;
 
-    decoder_config = ma_decoder_config_init(ma_format_f32, stereo ? 2 : 1, effective_rate);
+    // Decode at the FILE's own rate (0 = native) and resample afterwards with
+    // core_audio::resample_polyphase, rather than letting miniaudio do it.
+    //
+    // miniaudio's decoder resamples with `ma_resample_algorithm_linear` — linear
+    // interpolation behind a 4th-order low-pass — and that is not good enough to
+    // put in front of a model. Measured (tests/test-audio-resample.cpp pins the
+    // resampler itself; these are end-to-end numbers on this path):
+    //
+    //   * a 10 kHz tone decoded to 16 kHz, where it is above Nyquist and must
+    //     vanish, survives at -10.3 dBFS relative to the source and folds down
+    //     to 6 kHz — inside the speech band. Polyphase: -89 dB. So every
+    //     44.1/48 kHz recording fed to a 16 kHz backend carried audible alias.
+    //   * upsampling 16 -> 24 kHz for vibevoice / kyutai, cos vs soxr_vhq was
+    //     0.944 (0.99997 with polyphase), with a 2-sample group delay and ~1e-5
+    //     of total energy above 8.2 kHz that a 16 kHz source cannot contain.
+    //     That was the whole of the "our sigma-VAE conditioning diverges from
+    //     upstream" gap chased in #369 — with identical 24 kHz input the encoder
+    //     matches upstream at cos 0.99993 per stage.
+    //
+    // Set CRISPASR_HQ_RESAMPLE=0 to restore miniaudio's resampler.
+    const bool hq_resample = [] {
+        const char* v = getenv("CRISPASR_HQ_RESAMPLE");
+        return !(v && v[0] == '0');
+    }();
+    decoder_config = ma_decoder_config_init(ma_format_f32, stereo ? 2 : 1, hq_resample ? 0 : effective_rate);
 
     if (fname == "-") {
 #ifdef _WIN32
@@ -197,6 +223,41 @@ bool read_audio_data(const std::string& fname, std::vector<float>& pcmf32, std::
         fprintf(stderr, "error: failed to read the frames of the audio data (%s)\n", ma_result_description(result));
 
         return false;
+    }
+
+    // Resample to the requested rate. Interleaved data is de-interleaved,
+    // resampled per channel and re-interleaved so the stereo split below is
+    // unchanged.
+    const int src_rate = (int)decoder.outputSampleRate;
+    if (hq_resample && src_rate > 0 && src_rate != effective_rate && frame_count > 0) {
+        const int ch = stereo ? 2 : 1;
+        std::vector<float> plane((size_t)frame_count);
+        std::vector<std::vector<float>> out_planes((size_t)ch);
+        for (int c = 0; c < ch; c++) {
+            for (uint64_t i = 0; i < frame_count; i++)
+                plane[(size_t)i] = pcmf32[(size_t)(i * ch + c)];
+            out_planes[(size_t)c] =
+                core_audio::resample_polyphase(plane.data(), (int)frame_count, src_rate, effective_rate);
+            // An empty result from a NON-EMPTY input is a refusal, not silence.
+            // resample_polyphase rejects an absurd expansion (a WAV declaring
+            // sampleRate = 1 asks for 16000x), and assigning that straight into
+            // pcmf32 made the CLI print "0 samples ... no speech detected" and
+            // exit 0 — a rejection rendered as a successful transcription of
+            // nothing, which is the one outcome a user cannot act on.
+            if (out_planes[(size_t)c].empty()) {
+                fprintf(stderr,
+                        "error: failed to resample '%s' from %d Hz to %d Hz (see the resampler diagnostic above)\n",
+                        fname.c_str(), src_rate, effective_rate);
+                ma_decoder_uninit(&decoder);
+                return false;
+            }
+        }
+        const size_t n_out = out_planes[0].size();
+        pcmf32.assign(n_out * (size_t)ch, 0.0f);
+        for (int c = 0; c < ch; c++)
+            for (size_t i = 0; i < n_out; i++)
+                pcmf32[i * (size_t)ch + (size_t)c] = out_planes[(size_t)c][i];
+        frame_count = (ma_uint64)n_out;
     }
 
     if (stereo) {

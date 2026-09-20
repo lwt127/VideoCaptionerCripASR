@@ -35,6 +35,7 @@
 #include <string>
 #include <unordered_set>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1173,7 +1174,7 @@ static float* build_step_embedding(tada_context* c, int32_t token_id, const floa
 // FP, still intelligible) and the win is marginal (CUDA A/B 1.02-1.06x), so their
 // default output is left byte-for-byte unchanged. CRISPASR_TADA_BUCKET_MIN overrides.
 static int tada_default_bucket_min(tada_context* c) {
-    if (!c->backend || ggml_backend_is_cpu(c->backend))
+    if (!c->backend || core_cpu_backend::is_cpu(c->backend))
         return 64;
     const char* name = ggml_backend_name(c->backend);
     if (name && (strstr(name, "CUDA") || strstr(name, "ROCm") || strstr(name, "Vulkan") || strstr(name, "WebGPU") ||
@@ -2127,13 +2128,13 @@ struct tada_context* tada_init_from_file(const char* path_model, struct tada_con
     }
 
     // ── Backend init ──
-    c->backend_cpu = ggml_backend_cpu_init();
+    c->backend_cpu = core_cpu_backend::init();
     if (!c->backend_cpu) {
         fprintf(stderr, "tada: failed to init CPU backend\n");
         delete c;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(c->backend_cpu, params.n_threads);
+    core_cpu_backend::set_n_threads(c->backend_cpu, params.n_threads);
     c->backend = params.use_gpu ? crispasr_init_gpu_backend() : c->backend_cpu;
     if (!c->backend)
         c->backend = c->backend_cpu;
@@ -2332,7 +2333,7 @@ int tada_load_prompt(struct tada_context* ctx, const char* path) {
 
     // Clean up
     if (wl.buf)
-        ggml_backend_buffer_free(wl.buf);
+        core_gguf::release_weight_buffer(wl.buf);
     if (wl.ctx)
         ggml_free(wl.ctx);
 
@@ -3583,7 +3584,7 @@ void tada_free(struct tada_context* ctx) {
     if (ctx->kv_ctx)
         ggml_free(ctx->kv_ctx);
     if (ctx->buf_w)
-        ggml_backend_buffer_free(ctx->buf_w);
+        core_gguf::release_weight_buffer(ctx->buf_w);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)

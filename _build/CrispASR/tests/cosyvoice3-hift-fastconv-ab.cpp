@@ -3,9 +3,10 @@
 // Drives the deterministic HiFT vocoder (`cosyvoice3_tts_run_hift_inference`)
 // with a FIXED mel + FIXED source-noise buffer, so its output depends only on
 // the weights and graph — no flow-matching / AR RNG. This isolates the
-// CRISPASR_COSYVOICE3_FASTCONV cast-kill: run once with the env var =1 and once
-// =0, compare the printed bit-exact hash. Equal hash ⇒ byte-identical output ⇒
-// the F32-kernel bake is numerically equivalent to the per-graph F16→F32 cast.
+// CRISPASR_COSYVOICE3_FASTCONV cast-kill and the opt-in SIMDCONV ResBlock
+// simdconv path. FASTCONV is expected to preserve the hash. SIMDCONV uses
+// a different reduction tree from ggml_conv_1d, so a hash change is allowed;
+// use the printed signal stats plus the normal HiFT diff harness for closeness.
 //
 // Usage:
 //   cosyvoice3-hift-fastconv-ab <llm.gguf> <hift.gguf> [T_mel=64]
@@ -13,8 +14,9 @@
 // The LLM GGUF is loaded only to construct a valid context (backend +
 // compute_meta); its weights are not exercised by the HiFT path.
 //
-// Set CRISPASR_COSYVOICE3_FASTCONV_DEBUG=1 to print the bake/swap count
-// (proves engagement: ON bakes 85/85, OFF bakes 0).
+// Set CRISPASR_COSYVOICE3_FASTCONV_DEBUG=1 and/or
+// CRISPASR_COSYVOICE3_SIMDCONV_DEBUG=1 to prove which path engaged. With
+// SIMDCONV on, FASTCONV intentionally skips the 72 packed ResBlock kernels.
 
 #include "cosyvoice3_tts.h"
 
@@ -104,8 +106,10 @@ int main(int argc, char** argv) {
             amax = std::fabs(v);
     }
     const char* env = getenv("CRISPASR_COSYVOICE3_FASTCONV");
-    printf("FASTCONV=%s  T_mel=%d  n=%zu  hash=%016llx  sum=%.6f  max|a|=%.6f  nan=%d\n", env ? env : "(default-on)",
-           T_mel, n, (unsigned long long)fnv1a(audio, n), sum, amax, nan_seen ? 1 : 0);
+    const char* env2 = getenv("CRISPASR_COSYVOICE3_SIMDCONV");
+    printf("FASTCONV=%s  SIMDCONV=%s  T_mel=%d  n=%zu  hash=%016llx  sum=%.6f  max|a|=%.6f  nan=%d\n",
+           env ? env : "(default-on)", env2 ? env2 : "(default-off)", T_mel, n,
+           (unsigned long long)fnv1a(audio, n), sum, amax, nan_seen ? 1 : 0);
 
     free(audio);
     cosyvoice3_tts_free(ctx);

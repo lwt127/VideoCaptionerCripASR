@@ -135,6 +135,18 @@ struct fastconv_cache {
         f32.clear();
         enabled = false;
     }
+
+    // RAII. bake() owns a ggml_context and a backend buffer, and free() was the
+    // only way to release them — so any caller that forgot leaked the pair
+    // (7680 bytes in 8 allocations from one test, caught by ASan once the
+    // sanitizer job stopped being a no-op). free() nulls what it releases, so
+    // it stays correct for the backends that already call it explicitly.
+    // Copying would hand two owners the same raw pointers; make that a compile
+    // error rather than a double free.
+    fastconv_cache() = default;
+    ~fastconv_cache() { free(); }
+    fastconv_cache(const fastconv_cache&) = delete;
+    fastconv_cache& operator=(const fastconv_cache&) = delete;
 };
 
 // Overlap-save codec decode — bounds peak decode memory for long outputs.

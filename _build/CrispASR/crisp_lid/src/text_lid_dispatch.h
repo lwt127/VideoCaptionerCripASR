@@ -48,7 +48,7 @@ struct text_lid_context* text_lid_init_from_file(const char* gguf_path, int n_th
 //   "auto"                       → cstr/cld3-GGUF (smallest, Apache-2.0)
 //   "auto:cld3"                  → same as "auto"
 //   "auto:glotlid"               → cstr/glotlid-GGUF (2102 ISO 639-3)
-//   "auto:lid-fasttext176"       → cstr/fasttext-lid176-GGUF (CC-BY-SA-3.0)
+//   "auto:lid-fasttext176"       → cstr/fasttext-lid176-GGUF (CC-BY-NC-4.0)
 //   "<filename>" or "<path>"     → if it exists, return as-is; else look up
 //                                  by basename in the registry and download.
 //

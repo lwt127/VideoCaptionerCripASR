@@ -94,6 +94,22 @@ struct parakeet_result* parakeet_transcribe_chunked(struct parakeet_context* ctx
 struct parakeet_result* parakeet_transcribe_streamed(struct parakeet_context* ctx, const float* samples, int n_samples,
                                                      int64_t t_offset_cs, int chunk_seconds, int overlap_seconds);
 
+// Issue #385: the streamed pipeline with a per-encoder-window progress hook.
+// `progress_cb` is invoked on the CALLING thread once per finished encoder
+// window with (input samples encoded so far, total samples) — monotonically
+// non-decreasing, and exactly (n_samples, n_samples) on the last window.
+//
+// NOTE the asymmetry with the LONGFORM route: here the single TDT decode runs
+// AFTER every window, so the last tick means "encoding done", not "transcript
+// done". A caller that wants 100 % to mean finished should suppress the
+// terminal tick and emit it itself once the decode returns — see the
+// CHUNK_SEGMENTED branch of parakeet_transcribe_segments().
+//
+// parakeet_transcribe_streamed() is exactly this with progress_cb == NULL.
+struct parakeet_result* parakeet_transcribe_streamed_progress(
+    struct parakeet_context* ctx, const float* samples, int n_samples, int64_t t_offset_cs, int chunk_seconds,
+    int overlap_seconds, void (*progress_cb)(int processed, int total, void* user_data), void* progress_ud);
+
 // Vocabulary helpers
 int parakeet_n_vocab(struct parakeet_context* ctx);
 // Issue #257: 1 iff the model's vocab is predominantly Japanese script (JA-only
@@ -144,6 +160,13 @@ float* parakeet_encode(struct parakeet_context* ctx, const float* samples, int n
                        int* out_d_model);
 struct parakeet_result* parakeet_decode_frames(struct parakeet_context* ctx, const float* enc_frames, int T_enc,
                                                int d_model, int64_t t_offset_cs);
+
+// 1 when parakeet_decode_frames() runs its predictor/joint as ggml graphs on
+// ctx->backend (CUDA/Vulkan default), 0 when it uses the cblas CPU path
+// (CPU + Metal default). Callers that want to overlap encode and decode on
+// separate threads MUST NOT do so when this returns 1 — both would drive the
+// same ggml backend and scheduler concurrently.
+int parakeet_decode_uses_backend(struct parakeet_context* ctx);
 
 // Hyper-parameters needed by callers (frame duration for stamping etc.)
 int parakeet_frame_dur_cs(struct parakeet_context* ctx); // centiseconds per encoder frame

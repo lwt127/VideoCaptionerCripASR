@@ -39,6 +39,7 @@
 #include <numeric>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ── Debug ───────────────────────────────────────────────────────────────────
 // Trace-level debug: set KUGELAUDIO_DEBUG=1 to see per-layer/per-step shapes.
@@ -435,14 +436,14 @@ extern "C" struct kugelaudio_context* kugelaudio_init_from_file(const char* path
     }
 
     // ── Backend init ────────────────────────────────────────────────────
-    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init();
     if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
-    ctx->backend_cpu = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (ctx->backend_cpu)
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, std::max(1, params.n_threads));
-    if (ctx->backend && ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, std::max(1, params.n_threads));
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, std::max(1, params.n_threads));
+    if (ctx->backend && core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, std::max(1, params.n_threads));
     if (!ctx->backend) {
         delete ctx;
         return nullptr;
@@ -535,9 +536,9 @@ extern "C" void kugelaudio_free(struct kugelaudio_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->buf)
-        ggml_backend_buffer_free(ctx->buf);
+        core_gguf::release_weight_buffer(ctx->buf);
     if (ctx->buf_cpu)
-        ggml_backend_buffer_free(ctx->buf_cpu);
+        core_gguf::release_weight_buffer(ctx->buf_cpu);
     if (ctx->weight_ctx)
         ggml_free(ctx->weight_ctx);
     if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)

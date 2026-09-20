@@ -5,6 +5,10 @@
 #include <catch2/catch_test_macros.hpp>
 #include "pocket_tts.h"
 
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+
 TEST_CASE("pocket_tts_params: default values are sensible", "[unit][pocket_tts]") {
     struct pocket_tts_context_params p = pocket_tts_context_default_params();
 
@@ -42,4 +46,32 @@ TEST_CASE("pocket_tts_init_from_file: empty path returns nullptr", "[unit][pocke
 TEST_CASE("pocket_tts_free: NULL context is a no-op", "[unit][pocket_tts]") {
     pocket_tts_free(nullptr);
     SUCCEED("pocket_tts_free tolerated a NULL ctx.");
+}
+
+TEST_CASE("pocket_tts: official prepared embedding synthesizes audio", "[live][pocket_tts]") {
+    const char* model = std::getenv("CRISPASR_POCKET_TEST_MODEL");
+    const char* voice = std::getenv("CRISPASR_POCKET_TEST_EMBEDDING");
+    if (!model || !voice)
+        SKIP("set CRISPASR_POCKET_TEST_MODEL and CRISPASR_POCKET_TEST_EMBEDDING");
+
+    pocket_tts_context_params p = pocket_tts_context_default_params();
+    p.use_gpu = false;
+    p.n_threads = 2;
+    p.seed = 1234;
+    p.max_audio_frames = 20;
+    pocket_tts_context* ctx = pocket_tts_init_from_file(model, p);
+    REQUIRE(ctx != nullptr);
+    REQUIRE(pocket_tts_load_voice_embedding(ctx, voice) == 0);
+    int n = 0;
+    float* pcm = pocket_tts_synthesize(ctx, "Hola mundo.", &n);
+    REQUIRE(pcm != nullptr);
+    REQUIRE(n > 2400);
+    double energy = 0.0;
+    for (int i = 0; i < n; ++i) {
+        REQUIRE(std::isfinite(pcm[i]));
+        energy += (double)pcm[i] * pcm[i];
+    }
+    REQUIRE(std::sqrt(energy / n) > 1e-4);
+    pocket_tts_pcm_free(pcm);
+    pocket_tts_free(ctx);
 }

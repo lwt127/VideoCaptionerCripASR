@@ -27,6 +27,7 @@
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "core/sentencepiece.h"
+#include "core/spm_bpe.h"
 #include "core/tts_ref_cache.h"
 
 #ifdef IRODORI_HAVE_SENTENCEPIECE
@@ -43,6 +44,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1016,106 +1018,6 @@ static ggml_tensor* build_dit_block_graph(ggml_context* ctx, const irodori_tts_c
 //
 // This matches CrispEmbed's BPETokenizer::bpe_merge() (spm_style path).
 
-// BPE merge: split text into UTF-8 chars, iteratively merge by rank.
-// Uses linked-list + priority queue for O(N log N) merging.
-static std::vector<int32_t> bpe_merge(const std::string& text,
-                                      const std::unordered_map<std::string, int32_t>& token_to_id,
-                                      const std::unordered_map<std::string, int32_t>& merge_rank) {
-    if (text.empty())
-        return {};
-
-    // Split into individual UTF-8 characters as initial symbols
-    struct Node {
-        std::string text;
-        int prev, next;
-    };
-    std::vector<Node> nodes;
-    {
-        size_t i = 0;
-        while (i < text.size()) {
-            size_t len = 1;
-            unsigned char c = (unsigned char)text[i];
-            if (c >= 0xC0) {
-                if (c < 0xE0)
-                    len = 2;
-                else if (c < 0xF0)
-                    len = 3;
-                else
-                    len = 4;
-            }
-            len = std::min(len, text.size() - i);
-            int idx = (int)nodes.size();
-            nodes.push_back({text.substr(i, len), idx - 1, -1});
-            if (idx > 0)
-                nodes[idx - 1].next = idx;
-            i += len;
-        }
-    }
-    if (nodes.empty())
-        return {};
-
-    // Priority-queue BPE: merge lowest-rank pairs first
-    using PQE = std::pair<int, int>; // (rank, left_index)
-    auto cmp = [](const PQE& a, const PQE& b) { return a.first > b.first; };
-    std::priority_queue<PQE, std::vector<PQE>, decltype(cmp)> pq(cmp);
-
-    auto try_add = [&](int i) {
-        int j = nodes[i].next;
-        if (j < 0)
-            return;
-        std::string pair = nodes[i].text + " " + nodes[j].text;
-        auto it = merge_rank.find(pair);
-        if (it != merge_rank.end())
-            pq.push({it->second, i});
-    };
-    for (int i = 0; i < (int)nodes.size(); i++)
-        try_add(i);
-
-    while (!pq.empty()) {
-        auto [rank, left] = pq.top();
-        pq.pop();
-        int right = nodes[left].next;
-        if (right < 0)
-            continue;
-        // Verify the pair hasn't been invalidated by a prior merge
-        std::string pair = nodes[left].text + " " + nodes[right].text;
-        auto it = merge_rank.find(pair);
-        if (it == merge_rank.end() || it->second != rank)
-            continue;
-        // Merge right into left
-        nodes[left].text += nodes[right].text;
-        nodes[left].next = nodes[right].next;
-        if (nodes[right].next >= 0)
-            nodes[nodes[right].next].prev = left;
-        nodes[right].next = -1;
-        nodes[right].prev = -1;
-        // Re-check neighbors for new merge opportunities
-        if (nodes[left].prev >= 0)
-            try_add(nodes[left].prev);
-        try_add(left);
-    }
-
-    // Collect symbols and convert to token IDs
-    std::vector<int32_t> ids;
-    for (int i = 0; i >= 0; i = nodes[i].next) {
-        auto it = token_to_id.find(nodes[i].text);
-        if (it != token_to_id.end()) {
-            ids.push_back(it->second);
-        } else {
-            // Byte fallback: encode each UTF-8 byte as <0xHH>
-            for (unsigned char byte : nodes[i].text) {
-                char hex[16];
-                std::snprintf(hex, sizeof(hex), "<0x%02X>", byte);
-                auto bit = token_to_id.find(hex);
-                if (bit != token_to_id.end()) {
-                    ids.push_back(bit->second);
-                }
-            }
-        }
-    }
-    return ids;
-}
-
 static std::vector<int32_t> tokenize_text(const irodori_tts_context* ctx, const char* text) {
     // Override token IDs from env var for parity testing:
     //   CRISPASR_IRODORI_TOKEN_IDS="1,19144,52839,302,275"
@@ -1155,7 +1057,7 @@ static std::vector<int32_t> tokenize_text(const irodori_tts_context* ctx, const 
                 else
                     processed += *p;
             }
-            auto bpe_ids = bpe_merge(processed, ctx->token_to_id, ctx->merge_rank);
+            auto bpe_ids = core_spm_bpe::bpe_merge(processed, ctx->token_to_id, ctx->merge_rank);
             tokens.insert(tokens.end(), bpe_ids.begin(), bpe_ids.end());
 #ifdef IRODORI_HAVE_SENTENCEPIECE
         } else if (ctx->sp_processor) {
@@ -1239,20 +1141,20 @@ struct irodori_tts_context* irodori_tts_init_from_file(const char* path_model, s
     // Initialize backends. use_gpu picks the best GPU (Metal/CUDA/Vulkan);
     // graphs are single-backend gallocr, so weights load onto the compute
     // backend directly. CRISPASR_IRODORI_CPU=1 forces CPU regardless.
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (!ctx->backend_cpu) {
         std::fprintf(stderr, "[irodori] failed to init CPU backend\n");
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
 
     const bool force_cpu = [] {
         const char* e = std::getenv("CRISPASR_IRODORI_CPU");
         return e && *e && *e != '0';
     }();
     ctx->backend = (params.use_gpu && !force_cpu) ? crispasr_init_gpu_backend() : nullptr;
-    if (ctx->backend && ggml_backend_is_cpu(ctx->backend)) {
+    if (ctx->backend && core_cpu_backend::is_cpu(ctx->backend)) {
         ggml_backend_free(ctx->backend); // CPU-only build: keep the threaded instance
         ctx->backend = nullptr;
     }
@@ -1479,11 +1381,11 @@ void irodori_tts_free(struct irodori_tts_context* ctx) {
         return;
     ctx->dac_fc.free(); // FASTCONV baked-kernel buffer (on codec_backend)
     if (ctx->codec_buf)
-        ggml_backend_buffer_free(ctx->codec_buf);
+        core_gguf::release_weight_buffer(ctx->codec_buf);
     if (ctx->codec_ctx)
         ggml_free(ctx->codec_ctx);
     if (ctx->buf_weights)
-        ggml_backend_buffer_free(ctx->buf_weights);
+        core_gguf::release_weight_buffer(ctx->buf_weights);
     if (ctx->w_ctx)
         ggml_free(ctx->w_ctx);
     if (ctx->dit_galloc) // §243 persistent DiT graph

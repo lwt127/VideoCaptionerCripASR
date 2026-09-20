@@ -81,6 +81,11 @@ def transcribe(audio_path: str, config: TranscribeConfig, callback=None) -> ASRD
                 "lid_method": lid_method,
                 "use_gpu": config.crisp_asr_use_gpu,
                 "use_vad": config.crisp_asr_use_vad,
+                "license_acceptances": config.crisp_asr_license_acceptances,
+                "engine_flavor": config.crisp_asr_engine_flavor,
+                "alignment_mode": config.crisp_asr_alignment_mode,
+                "aligner": config.crisp_asr_aligner,
+                "word_timestamps": config.crisp_asr_word_timestamps,
             }
         )
     elif config.transcribe_model == TranscribeModelEnum.WHISPER_API:
@@ -116,7 +121,11 @@ def transcribe(audio_path: str, config: TranscribeConfig, callback=None) -> ASRD
     asr_data = asr.run(callback=callback)
 
     # 优化字幕显示时间 #161
-    if not config.need_word_time_stamp:
+    preserve_word_timing = config.need_word_time_stamp or (
+        config.transcribe_model == TranscribeModelEnum.CRISP_ASR
+        and (config.crisp_asr_word_timestamps or config.crisp_asr_alignment_mode != "default")
+    )
+    if not preserve_word_timing:
         asr_data.optimize_timing()
 
     return asr_data

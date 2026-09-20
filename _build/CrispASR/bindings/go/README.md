@@ -46,6 +46,58 @@ func main() {
 }
 ```
 
+## Chat / LLM
+
+The same package also binds the `crispasr_chat_*` C ABI (text in, text out) as
+`whisper.ChatSession`: one-shot and streaming generation, prompt-token
+counting, and an abort predicate for cancellation.
+
+```go
+sess, err := whisper.ChatOpen("gemma-3-1b-it-Q4_K_M.gguf", nil)
+if err != nil {
+	panic(err)
+}
+defer sess.Close()
+
+params := whisper.DefaultChatGenerateParams()
+params.SetMaxTokens(128)
+messages := []whisper.ChatMessage{{Role: "user", Content: "Say hello."}}
+
+// Cancellation: the predicate returns true to CONTINUE and false to abort, the
+// same way round as the C callback and as EncoderBeginCallback on the ASR side.
+// The resulting error wraps whisper.ErrChatAborted, so a cancel is
+// distinguishable from a fault.
+sess.SetAbortCallback(func() bool { return !cancelled.Load() })
+
+err = sess.GenerateStream(messages, &params, func(chunk string) {
+	fmt.Print(chunk)
+})
+if errors.Is(err, whisper.ErrChatAborted) {
+	fmt.Println("\ncancelled")
+}
+```
+
+`ChatOpenParams` and `ChatGenerateParams` carry the C structs the ABI's own
+defaults functions fill and are read and written through accessors, the same
+way `Params` works on the ASR side. Setting one option therefore leaves every
+other one at the ABI default — `SetMaxTokens` alone does not turn the
+temperature into 0 and the decode greedy — and an untouched value is the
+defaults, not Go's zeroes.
+
+Pass the whole conversation on every call: the session compares the templated
+prompt against the tokens it already holds and decodes only what is new.
+`sess.CountTokens(messages)` reports how long that prompt is, to compare
+against `sess.NCtx()`.
+
+`whisper.ChatAIDisclosureText()` returns the canonical "you are talking to an
+AI" wording. Show it visibly at or before the first turn of anything
+conversational — see `include/crispasr_chat.h` for why that is a duty and not
+an option.
+
+The chat tests need a GGUF chat model and are gated on
+`CRISPASR_CHAT_TEST_MODEL`, the same env var the C++ chat suite uses; without
+it they skip.
+
 ## Building & Testing
 
 In order to build, you need to have the Go compiler installed. You can get it from [here](https://golang.org/dl/). Run the tests with:

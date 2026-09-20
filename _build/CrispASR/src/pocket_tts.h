@@ -61,6 +61,10 @@ void pocket_tts_pcm_free(float* pcm);
 // Returns 0 on success.
 int pocket_tts_set_voice(struct pocket_tts_context* ctx, const float* ref_pcm_24khz, int n_ref_samples);
 
+// Load an official Kyutai embeddings_v3/*.safetensors prepared transformer
+// state.  Unlike a WAV reference this does not require encoder weights.
+int pocket_tts_load_voice_embedding(struct pocket_tts_context* ctx, const char* path);
+
 // Clear voice conditioning (revert to unconditioned generation).
 void pocket_tts_clear_voice(struct pocket_tts_context* ctx);
 

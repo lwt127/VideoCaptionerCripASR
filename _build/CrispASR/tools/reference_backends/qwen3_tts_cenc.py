@@ -6,14 +6,25 @@ reference (the same diff-harness approach that took ECAPA from cos=0.74
 to 0.999999 and brought all 8 codec-decoder stages to PASS).
 
 Stages dumped (all stored in (T, C) time-first to match ggml flat layout):
-  cenc_input_audio   — fixed deterministic 24kHz PCM (3s of clone.wav)
+  cenc_input_audio   — the 24kHz PCM both sides encode (3s of clone.wav
+                       by default; see the override below)
   cenc_seanet_out    — output of self.encoder (SEANet) [T_enc, 512]
   cenc_xfmr_out      — output of self.encoder_transformer [T_enc, 512]
   cenc_ds_out        — after self.downsample [T_frames, 512]
   cenc_codes         — final RVQ codes [T_frames, 16] as float32
 
-The audio arg is unused — we use a fixed slice of clone.wav so both
-sides see identical inputs.
+The `audio` argument is unused on purpose: both sides must encode the
+SAME samples, so the input comes from a file rather than from whatever
+clip the diff run was invoked with. It is NOT hardcoded, and that matters
+for content-dependent divergences (#337: a GPU/HIP mismatch in this very
+encoder reproduced on one 20 s span of a clip and not another of equal
+length). Point it at the clip that triggers yours:
+
+  QWEN3_TTS_CENC_WAV=/path/to/trigger.wav   # 24 kHz mono WAV
+  QWEN3_TTS_CENC_FULL=1                     # keep the full duration
+
+which localises a divergence to SEANet vs encoder-transformer vs
+downsample vs RVQ in one run, upstream of the talker.
 """
 
 from __future__ import annotations

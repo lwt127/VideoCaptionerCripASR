@@ -8,7 +8,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #ifdef __APPLE__
@@ -75,8 +77,11 @@ static std::wstring to_wide(const std::string& s) {
     int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
     if (n <= 0)
         return {};
-    std::wstring w(static_cast<size_t>(n - 1), L'\0');
+    // MultiByteToWideChar writes the trailing NUL because cbMultiByte is -1.
+    // Keep room for it, then remove it from the returned C++ string.
+    std::wstring w(static_cast<size_t>(n), L'\0');
     MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], n);
+    w.pop_back();
     return w;
 }
 
@@ -86,8 +91,10 @@ static std::string to_utf8(const std::wstring& w) {
     int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
     if (n <= 0)
         return {};
-    std::string s(static_cast<size_t>(n - 1), '\0');
+    // WideCharToMultiByte likewise includes the trailing NUL for cchWideChar=-1.
+    std::string s(static_cast<size_t>(n), '\0');
     WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, &s[0], n, nullptr, nullptr);
+    s.pop_back();
     return s;
 }
 
@@ -207,7 +214,24 @@ static bool fetch_winhttp(const std::string& url, const std::string& dest, bool 
                                     WINHTTP_NO_HEADER_INDEX);
                 while (!loc.empty() && loc.back() == L'\0')
                     loc.pop_back();
-                current_url = to_utf8(loc);
+                // Hugging Face's first /resolve/ redirect is commonly a
+                // root-relative /api/resolve-cache/... URL. WinHttpCrackUrl
+                // requires an absolute URL, so retain the current origin.
+                if (loc.rfind(L"//", 0) == 0) {
+                    current_url = to_utf8(std::wstring(scheme) + L":" + loc);
+                } else if (!loc.empty() && loc.front() == L'/') {
+                    std::wstring absolute = std::wstring(scheme) + L"://" + host;
+                    const bool default_port = (is_https && port == INTERNET_DEFAULT_HTTPS_PORT) ||
+                                              (!is_https && port == INTERNET_DEFAULT_HTTP_PORT);
+                    if (!default_port)
+                        absolute += L":" + std::to_wstring(port);
+                    current_url = to_utf8(absolute + loc);
+                } else if (loc.find(L"://") != std::wstring::npos) {
+                    current_url = to_utf8(loc);
+                } else {
+                    const size_t slash = current_url.find_last_of('/');
+                    current_url = current_url.substr(0, slash == std::string::npos ? 0 : slash + 1) + to_utf8(loc);
+                }
             }
             WinHttpCloseHandle(hReq);
             WinHttpCloseHandle(hConn);
@@ -455,10 +479,23 @@ std::string dir(const std::string& cache_dir_override) {
 }
 
 bool file_present(const std::string& path) {
-    struct stat st;
-    if (stat(path.c_str(), &st) != 0)
+    // std::filesystem, not stat(): on MSVC `stat` resolves to `_stat64i32`,
+    // whose st_size is a 32-bit field, and the call FAILS outright for a file
+    // larger than 2 GiB. Every GGUF worth caching is bigger than that, so the
+    // probe reported "missing" for a model that was sitting right there and
+    // -m auto re-downloaded it (#393); the same helper validates a finished
+    // download, so a >2 GiB fetch could also be judged failed after it
+    // succeeded. Same reasoning as the file_size() note in chat.cpp.
+    // Plain path(std::string), not u8path(): these paths come from getenv /
+    // argv, i.e. the platform's narrow encoding, which is what path() assumes
+    // (u8path would misread a non-ASCII Windows profile dir, and is deprecated
+    // in C++20). Matches chat.cpp's construction.
+    std::error_code ec;
+    const std::filesystem::path fp(path);
+    if (!std::filesystem::is_regular_file(fp, ec) || ec)
         return false;
-    return st.st_size > 0;
+    const std::uintmax_t sz = std::filesystem::file_size(fp, ec);
+    return !ec && sz > 0;
 }
 
 // Worker: download `url` straight into `dest` (which the public fetch() sets to
@@ -497,13 +534,13 @@ static bool fetch_download(const std::string& url, const std::string& dest, bool
     {
         std::string curl_cmd = "curl -fL ";
         curl_cmd += quiet ? "-s " : "--progress-bar ";
-        curl_cmd += "-H 'Accept: application/octet-stream' ";
+        curl_cmd += "-H " + shell_quote("Accept: application/octet-stream") + " ";
         {
             const char* tok = getenv("HF_TOKEN");
             if (!tok)
                 tok = getenv("HUGGING_FACE_HUB_TOKEN");
             if (tok && tok[0])
-                curl_cmd += "-H 'Authorization: Bearer " + std::string(tok) + "' ";
+                curl_cmd += "-H " + shell_quote("Authorization: Bearer " + std::string(tok)) + " ";
         }
         curl_cmd += "-o " + shell_quote(dest) + " " + shell_quote(url);
 
@@ -513,13 +550,13 @@ static bool fetch_download(const std::string& url, const std::string& dest, bool
 
         std::string wget_cmd = "wget ";
         wget_cmd += quiet ? "-q " : "--show-progress ";
-        wget_cmd += "--header='Accept: application/octet-stream' ";
+        wget_cmd += "--header=" + shell_quote("Accept: application/octet-stream") + " ";
         {
             const char* tok = getenv("HF_TOKEN");
             if (!tok)
                 tok = getenv("HUGGING_FACE_HUB_TOKEN");
             if (tok && tok[0])
-                wget_cmd += "--header='Authorization: Bearer " + std::string(tok) + "' ";
+                wget_cmd += "--header=" + shell_quote("Authorization: Bearer " + std::string(tok)) + " ";
         }
         wget_cmd += "-O " + shell_quote(dest) + " " + shell_quote(url);
 
@@ -565,10 +602,15 @@ bool fetch(const std::string& url, const std::string& dest, bool quiet) {
 //
 //   1. The dispatcher's chosen cache dir.
 //   2. $CRISPASR_MODELS_DIR (set by users with a dedicated model SSD).
-//   3. /Volumes/backups/ai/crispasr-models  (macOS dev convention).
-//   4. ~/.cache/crispasr-models           (legacy alt cache).
-//   5. ~/.cache/huggingface/hub           (raw HF download cache —
+//   3. ~/.cache/crispasr-models           (legacy alt cache).
+//   4. ~/.cache/huggingface/hub           (raw HF download cache —
 //      filename match is rough, but worth a glance).
+//
+// Deliberately NO absolute machine-specific defaults: this list used to
+// carry two maintainer paths, which shipped one developer's directory
+// layout to every user, made a unit test depend on whether that volume
+// happened to be mounted, and probed directories no user has. Anyone with
+// a dedicated model volume points $CRISPASR_MODELS_DIR at it.
 //
 // The list is platform-agnostic; non-existent dirs are skipped silently.
 static std::vector<std::string> well_known_search_dirs(const std::string& cache_dir_override) {
@@ -578,8 +620,6 @@ static std::vector<std::string> well_known_search_dirs(const std::string& cache_
     if (const char* env = std::getenv("CRISPASR_MODELS_DIR"); env && *env) {
         append_unique(dirs, env);
     }
-    append_unique(dirs, "/mnt/storage/gguf-models");
-    append_unique(dirs, "/Volumes/backups/ai/crispasr-models");
     append_unique(dirs, platform_default_dir());
 
     const char* home = std::getenv("HOME");

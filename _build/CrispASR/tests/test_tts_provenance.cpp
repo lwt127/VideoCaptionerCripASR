@@ -318,7 +318,7 @@ TEST_CASE("Voice clone detection by .wav extension", "[unit][provenance][consent
 // Watermark spread-spectrum (additional edge cases)
 // ──────────────────────────────────────────────────────────────────────────
 
-#include "crispasr_watermark.h"
+#include "core/crispasr_watermark.h"
 
 TEST_CASE("Watermark embed is idempotent-ish (double embed doesn't crash)", "[unit][provenance][watermark]") {
     std::vector<float> pcm(4800, 0.3f);

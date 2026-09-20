@@ -62,6 +62,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 namespace {
 
@@ -350,13 +351,13 @@ extern "C" struct mimo_asr_context* mimo_asr_init_from_file(const char* path_mod
     }
 
     // Backends
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     if (!ctx->backend_cpu) {
         fprintf(stderr, "mimo_asr: failed to init CPU backend\n");
         delete ctx;
         return nullptr;
     }
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
     // PLAN #115: force the whole mimo-asr pipeline to CPU until option C
     // lands. Two failure modes regress on M1 Metal otherwise:
     //   - weights on GPU (PLAN #72 commit 89111260): prefill graph
@@ -1929,9 +1930,9 @@ extern "C" void mimo_asr_free(struct mimo_asr_context* ctx) {
     if (ctx->kv_ctx)
         ggml_free(ctx->kv_ctx);
     if (ctx->buf_w)
-        ggml_backend_buffer_free(ctx->buf_w);
+        core_gguf::release_weight_buffer(ctx->buf_w);
     if (ctx->buf_w_cpu)
-        ggml_backend_buffer_free(ctx->buf_w_cpu);
+        core_gguf::release_weight_buffer(ctx->buf_w_cpu);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)
@@ -1994,7 +1995,7 @@ extern "C" void mimo_asr_set_n_threads(struct mimo_asr_context* ctx, int n_threa
         return;
     ctx->n_threads = n_threads;
     if (ctx->backend_cpu)
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, n_threads);
 }
 
 extern "C" void mimo_asr_set_ask(struct mimo_asr_context* ctx, const char* prompt) {

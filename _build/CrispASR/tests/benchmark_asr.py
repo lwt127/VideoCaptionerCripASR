@@ -11,15 +11,16 @@ Usage::
     python tests/benchmark_asr.py --audio myfile.wav --backend parakeet
 
     # Full corpus matrix:
-    python tests/benchmark_asr.py --corpus /mnt/storage/test-audio/corpus.json
+    python tests/benchmark_asr.py --corpus <corpus.json>
 
     # Specific backend + settings:
     python tests/benchmark_asr.py --audio f.wav --backend parakeet --settings auto,chunk-30
 
     # Resume interrupted run:
-    python tests/benchmark_asr.py --corpus /mnt/storage/test-audio/corpus.json --resume
+    python tests/benchmark_asr.py --corpus <corpus.json> --resume
 
-Results are appended to /mnt/storage/benchmark-results/runs.jsonl and
+Results are appended to $CRISPASR_BENCH_RESULTS_DIR/runs.jsonl (default
+./benchmark-results) and
 a human-readable summary table is printed to stdout.
 """
 
@@ -44,7 +45,7 @@ from benchmark_metrics import metrics_from_json, CoverageMetrics
 # Constants
 # ---------------------------------------------------------------------------
 
-RESULTS_DIR = Path("/mnt/storage/benchmark-results")
+RESULTS_DIR = Path(os.environ.get("CRISPASR_BENCH_RESULTS_DIR", "benchmark-results"))
 RESULTS_FILE = RESULTS_DIR / "runs.jsonl"
 
 SETTINGS_MATRIX = [
@@ -105,7 +106,8 @@ BACKEND_MODELS = {
     },
 }
 
-MODELS_DIR = Path(os.environ.get("BENCHMARK_MODELS_DIR", "/mnt/storage"))
+MODELS_DIR = Path(os.environ.get("BENCHMARK_MODELS_DIR",
+                                 os.environ.get("CRISPASR_MODELS_DIR", "models")))
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +377,8 @@ def main():
                 backends.append((b, model))
 
     if not backends:
-        print("ERROR: no backends available. Set --model or check /mnt/storage/", file=sys.stderr)
+        print(f"ERROR: no backends available. Set --model or BENCHMARK_MODELS_DIR "
+              f"(currently {MODELS_DIR})", file=sys.stderr)
         sys.exit(1)
     print(f"Backends: {[b[0] for b in backends]}", file=sys.stderr)
 

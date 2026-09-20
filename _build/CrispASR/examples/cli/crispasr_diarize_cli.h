@@ -16,7 +16,9 @@
 
 #include "crispasr_diarize.h" // from src/ via whisper target's PUBLIC include dir
 #include "crispasr_backend.h"
+#include "crispasr_vad.h" // crispasr_audio_slice
 
+#include <functional>
 #include <vector>
 
 struct whisper_params;         // fwd decl
@@ -94,6 +96,27 @@ bool crispasr_apply_diarize(const std::vector<float>& left, const std::vector<fl
                             int64_t slice_t0_cs, std::vector<crispasr_segment>& segs, const whisper_params& params,
                             const CrispasrPyannoteCache* pyannote_cache = nullptr,
                             const CrispasrSherpaCache* sherpa_cache = nullptr);
+
+/// Apply a per-slice diarization pass to an ALREADY-MERGED segment list.
+///
+/// The unified CLI runner diarizes inside its per-slice loop and hands each
+/// slice its own segment vector, so it never needs this. The server
+/// transcribes every slice first and only then diarizes, so it has to re-walk
+/// the merged list and give each slice back its own sub-range.
+///
+/// That re-walk is the subtle part: `crispasr_apply_diarize` GROWS the vector
+/// whenever it splits a segment at a speaker-turn boundary (the pyannote,
+/// foxnose and sherpa paths all do word-range splitting), so the sub-range
+/// cannot be written back in place — see #324. This rebuilds the list instead,
+/// appending whatever each slice returns, so no sub-segment is ever dropped
+/// and a shrinking pass can never index past the end.
+///
+/// A segment belongs to slice `i` when its `t0` is below slice `i+1`'s
+/// `t0_cs`; the final slice takes the remainder. `diarize_slice` receives the
+/// slice and its segments, and may relabel, split or drop them.
+void crispasr_diarize_merged_by_slice(
+    std::vector<crispasr_segment>& segs, const std::vector<crispasr_audio_slice>& slices,
+    const std::function<void(const crispasr_audio_slice&, std::vector<crispasr_segment>&)>& diarize_slice);
 
 /// #324: run the FoxNose diarizer ONCE over the whole audio, using the final
 /// segment list as its speech regions, then relabel and split those segments.

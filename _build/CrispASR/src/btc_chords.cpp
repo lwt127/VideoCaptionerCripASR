@@ -37,6 +37,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ---------------------------------------------------------------------------
 // Chord vocabularies (utils/mir_eval_modules.py)
@@ -307,7 +308,7 @@ btc_chords_context* btc_chords_init_from_file(const char* model_path, btc_chords
 
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : nullptr;
     if (!ctx->backend)
-        ctx->backend = ggml_backend_cpu_init();
+        ctx->backend = core_cpu_backend::init();
 
     core_gguf::WeightLoad wl;
     if (!core_gguf::load_weights(model_path, ctx->backend, "btc", wl)) {
@@ -341,7 +342,7 @@ void btc_chords_free(btc_chords_context* ctx) {
     if (!ctx)
         return;
     if (ctx->buf_w)
-        ggml_backend_buffer_free(ctx->buf_w);
+        core_gguf::release_weight_buffer(ctx->buf_w);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
     if (ctx->backend)

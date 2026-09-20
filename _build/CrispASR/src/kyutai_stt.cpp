@@ -36,6 +36,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `KYUTAI_STT_BENCH=1` for per-stage timings.
@@ -127,6 +128,9 @@ struct kyutai_hparams {
     int existing_text_padding_id = 3;
     float audio_delay_seconds = 0.5f;
     float audio_silence_prefix_seconds = 0.0f; // prepended silence before Mimi encode (1.0s for 2.6B)
+    // Languages the checkpoint was trained on (#366). Empty for GGUFs converted
+    // before kyutai.languages was written; see the fallback in the loader.
+    std::vector<std::string> languages;
 
     // Mimi encoder
     int mimi_dim = 512;
@@ -241,6 +245,7 @@ struct kyutai_model {
 struct kyutai_stt_context {
     kyutai_stt_context_params params;
     kyutai_model model;
+    std::string languages_joined; // lazily built by kyutai_stt_languages()
 
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
@@ -341,13 +346,13 @@ extern "C" struct kyutai_stt_context* kyutai_stt_init_from_file(const char* path
     sctx->params = params;
     sctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
-    sctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ggml_backend_cpu_init();
+    sctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init();
     if (!sctx->backend)
-        sctx->backend = ggml_backend_cpu_init();
-    sctx->backend_cpu = ggml_backend_cpu_init();
-    ggml_backend_cpu_set_n_threads(sctx->backend_cpu, sctx->n_threads);
-    if (ggml_backend_is_cpu(sctx->backend))
-        ggml_backend_cpu_set_n_threads(sctx->backend, sctx->n_threads);
+        sctx->backend = core_cpu_backend::init();
+    sctx->backend_cpu = core_cpu_backend::init();
+    core_cpu_backend::set_n_threads(sctx->backend_cpu, sctx->n_threads);
+    if (core_cpu_backend::is_cpu(sctx->backend))
+        core_cpu_backend::set_n_threads(sctx->backend, sctx->n_threads);
 
     auto& m = sctx->model;
     auto& hp = m.hp;
@@ -357,7 +362,7 @@ extern "C" struct kyutai_stt_context* kyutai_stt_init_from_file(const char* path
         gguf_context* gctx = core_gguf::open_metadata(path_model);
         if (!gctx) {
             fprintf(stderr, "kyutai_stt: failed to open '%s'\n", path_model);
-            delete sctx;
+            kyutai_stt_free(sctx); // frees the backends this ctx already owns
             return nullptr;
         }
         // LM hparams
@@ -375,6 +380,18 @@ extern "C" struct kyutai_stt_context* kyutai_stt_init_from_file(const char* path
         hp.audio_delay_seconds = core_gguf::kv_f32(gctx, "kyutai.stt.audio_delay_seconds", hp.audio_delay_seconds);
         hp.audio_silence_prefix_seconds =
             core_gguf::kv_f32(gctx, "kyutai.stt.audio_silence_prefix_seconds", hp.audio_silence_prefix_seconds);
+
+        hp.languages = core_gguf::kv_str_array(gctx, "kyutai.languages");
+        if (hp.languages.empty()) {
+            // GGUFs converted before kyutai.languages existed — which is every
+            // one currently published. The two shipped checkpoints differ
+            // architecturally, so the layer count identifies them: stt-1b-en_fr
+            // is 16 layers and does support French, stt-2.6b-en is 48 and does
+            // not. Getting this wrong is what #366 reported: the warning fired
+            // for the DEFAULT model, which is the multilingual one.
+            hp.languages =
+                (hp.num_layers >= 48) ? std::vector<std::string>{"en"} : std::vector<std::string>{"en", "fr"};
+        }
 
         // Mimi hparams
         hp.mimi_dim = core_gguf::kv_u32(gctx, "kyutai.mimi.encoder_dim", hp.mimi_dim);
@@ -419,7 +436,7 @@ extern "C" struct kyutai_stt_context* kyutai_stt_init_from_file(const char* path
     core_gguf::WeightLoad wl;
     if (!core_gguf::load_weights(path_model, sctx->backend, "kyutai_stt", wl)) {
         fprintf(stderr, "kyutai_stt: failed to load weights from '%s'\n", path_model);
-        delete sctx;
+        kyutai_stt_free(sctx); // frees the backends this ctx already owns
         return nullptr;
     }
     m.ctx = wl.ctx;
@@ -576,7 +593,7 @@ extern "C" void kyutai_stt_free(struct kyutai_stt_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
@@ -1437,6 +1454,34 @@ extern "C" const char* kyutai_stt_token_text(struct kyutai_stt_context* ctx, int
     if (!ctx || id < 0 || id >= (int)ctx->model.vocab.size())
         return nullptr;
     return ctx->model.vocab[id].c_str();
+}
+
+// Does this checkpoint support `lang` (ISO-639-1, lowercase)? An empty or
+// "auto" language always matches. Used to decide whether the CLI should warn
+// that a requested language will be ignored (#366).
+extern "C" int kyutai_stt_supports_language(struct kyutai_stt_context* ctx, const char* lang) {
+    if (!ctx || !lang || !*lang)
+        return 1;
+    std::string want(lang);
+    for (auto& c : want)
+        c = (char)tolower((unsigned char)c);
+    if (want == "auto")
+        return 1;
+    for (const auto& l : ctx->model.hp.languages)
+        if (l == want)
+            return 1;
+    return 0;
+}
+
+// Comma-separated list of the languages this checkpoint supports, for
+// diagnostics. Owned by the context; valid until kyutai_stt_free.
+extern "C" const char* kyutai_stt_languages(struct kyutai_stt_context* ctx) {
+    if (!ctx)
+        return "";
+    if (ctx->languages_joined.empty())
+        for (const auto& l : ctx->model.hp.languages)
+            ctx->languages_joined += (ctx->languages_joined.empty() ? "" : ", ") + l;
+    return ctx->languages_joined.c_str();
 }
 
 extern "C" float kyutai_stt_total_lookahead_seconds(struct kyutai_stt_context* ctx) {

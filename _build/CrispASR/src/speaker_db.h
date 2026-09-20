@@ -67,6 +67,20 @@ const char* speaker_db_match(const struct speaker_db* db, const float* embedding
 // Returns true on success.
 bool speaker_db_enroll(const char* dir_path, const char* name, const float* embedding, int dim, bool consent_attested);
 
+// Enroll THROUGH an open handle: writes <dir>/<name>.spkr exactly like
+// speaker_db_enroll() AND updates the handle's in-memory profiles, so a
+// subsequent speaker_db_match() on the same handle can resolve the name —
+// previously the handle never learned of the new profile and callers had
+// to know an undocumented close-and-reopen contract.
+//
+// Closed-roster guarantee (#266) is preserved: when speaker_db_retain()
+// has been applied, a name OUTSIDE the retained roster is still written
+// to disk (available to future handles that claim it) but is NOT added
+// to this handle's matchable set; a note is printed to stderr.
+// Returns true when the on-disk write succeeded.
+bool speaker_db_enroll_into(struct speaker_db* db, const char* name, const float* embedding, int dim,
+                            bool consent_attested);
+
 #ifdef __cplusplus
 }
 #endif

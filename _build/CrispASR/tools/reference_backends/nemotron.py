@@ -23,77 +23,56 @@ DEFAULT_STAGES = [
 ]
 
 
-def dump(model_dir: str, audio_path: str, output_path: str, stages=None,
-         verbose: bool = False, **kwargs):
+def dump(model_dir: str, audio, stages=None, max_new_tokens: int = 0, verbose: bool = False, **kwargs):
     """Run NeMo nemotron inference and dump intermediate activations."""
     import torch
     import nemo.collections.asr as nemo_asr
-    import soundfile as sf
-
-    if stages is None:
-        stages = DEFAULT_STAGES
-
-    # Load audio
-    pcm, sr = sf.read(audio_path, dtype="float32")
-    if sr != 16000:
-        import torchaudio
-        pcm_t = torch.from_numpy(pcm).unsqueeze(0)
-        pcm_t = torchaudio.functional.resample(pcm_t, sr, 16000)
-        pcm = pcm_t.squeeze(0).numpy()
-        sr = 16000
-
-    # Load model
-    if model_dir.endswith(".nemo") or os.path.isfile(model_dir):
-        model = nemo_asr.models.ASRModel.restore_from(model_dir, map_location="cpu")
-    else:
-        model = nemo_asr.models.ASRModel.from_pretrained(model_dir, map_location="cpu")
-    model.eval()
 
     tensors = {}
-    lengths_tensor = torch.tensor([len(pcm)], dtype=torch.int64)
+    if stages is None:
+        stages = {"mel_spectrogram", "pre_encode_output", "encoder_output"}
 
-    # Mel spectrogram
-    if "mel_spectrogram" in stages:
-        with torch.no_grad():
-            processed, processed_len = model.preprocessor(
-                input_signal=torch.from_numpy(pcm).unsqueeze(0),
-                length=lengths_tensor,
-            )
-        mel = processed.squeeze(0).cpu().numpy()  # (n_mels, T_mel)
-        tensors["mel_spectrogram"] = mel
-        if verbose:
-            print(f"  mel_spectrogram: {mel.shape} min={mel.min():.4f} max={mel.max():.4f}")
+    # audio is passed as a numpy array, shape (T,)
+    # NeMo expects a torch tensor of shape (B, T)
+    audio_t = torch.from_numpy(audio).unsqueeze(0)
+    audio_len = torch.tensor([audio_t.shape[1]], dtype=torch.long)
 
-    # Encoder output (includes pre-encode internally)
-    if "encoder_output" in stages or "pre_encode_output" in stages:
-        with torch.no_grad():
-            # Run full encoder
-            encoded, encoded_len = model.encoder(
-                audio_signal=torch.from_numpy(pcm).unsqueeze(0),
-                length=lengths_tensor,
-            )
-        enc = encoded.squeeze(0).cpu().numpy()  # (T_enc, d_model)
-        # NeMo encoder output is (B, d, T) — transpose to (T, d)
-        if enc.shape[0] == model.encoder._feat_out:
-            enc = enc.T
-        tensors["encoder_output"] = enc
-        if verbose:
-            print(f"  encoder_output: {enc.shape} min={enc.min():.4f} max={enc.max():.4f}")
+    model_dir = str(model_dir)
+    print(f"Loading NeMo model from {model_dir} ...")
+    if os.path.exists(model_dir) and model_dir.endswith(".nemo"):
+        model = nemo_asr.models.EncDecRNNTModel.restore_from(model_dir, map_location="cpu")
+    else:
+        model = nemo_asr.models.EncDecRNNTModel.from_pretrained(model_dir, map_location="cpu")
+    model.eval()
 
-    # Write GGUF
-    from gguf import GGUFWriter
-    writer = GGUFWriter(output_path, arch="nemotron-ref")
-    writer.add_string("nemotron.audio_path", os.path.basename(audio_path))
-    writer.add_string("nemotron.model_dir", model_dir)
+    with torch.no_grad():
+        # 1. Mel spectrogram (frontend)
+        # processor returns (processed_signal, processed_length)
+        processed_signal, processed_length = model.preprocessor(
+            input_signal=audio_t, length=audio_len
+        )
+        if "mel_spectrogram" in stages:
+            # NeMo returns (B, n_mels, T)
+            tensors["mel_spectrogram"] = processed_signal[0].cpu().numpy()
+            if verbose:
+                print(f"  mel_spectrogram: {tensors['mel_spectrogram'].shape}")
 
-    for name, data in tensors.items():
-        arr = np.ascontiguousarray(data, dtype=np.float32)
-        writer.add_tensor(name, arr)
-        if verbose:
-            print(f"  wrote {name}: shape={arr.shape}")
+        # 2. Pre-encoder (causal subsampling)
+        if hasattr(model.encoder, "pre_encode"):
+            pre_enc, pre_len = model.encoder.pre_encode(processed_signal, processed_length)
+            if "pre_encode_output" in stages:
+                # Transpose to (T, d_model) to match C++ ggml expectation (T_enc, d_model)
+                tensors["pre_encode_output"] = pre_enc[0].transpose(0, 1).cpu().numpy()
+                if verbose:
+                    print(f"  pre_encode_output: {tensors['pre_encode_output'].shape}")
+        else:
+            pre_enc, pre_len = processed_signal, processed_length
 
-    writer.write_header_to_file()
-    writer.write_kv_data_to_file()
-    writer.write_tensors_to_file()
-    writer.close()
-    print(f"Wrote {output_path} ({len(tensors)} tensors)")
+        # 3. Encoder + Prompt MLP
+        enc, enc_len = model.encoder(audio_signal=processed_signal, length=processed_length)
+        if "encoder_output" in stages:
+            tensors["encoder_output"] = enc[0].transpose(0, 1).cpu().numpy()
+            if verbose:
+                print(f"  encoder_output: {tensors['encoder_output'].shape}")
+
+    return tensors

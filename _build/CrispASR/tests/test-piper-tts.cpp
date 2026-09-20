@@ -5,8 +5,8 @@
 //   build/bin/test-piper-tts <model.gguf> <ipa_string> <output.wav>
 //
 // Example:
-//   build/bin/test-piper-tts /mnt/storage/piper/piper-en_US-lessac-medium-f16.gguf \
-//       "həlˈoʊ wˈɜːld" /mnt/storage/piper/cpp_hello_world.wav
+//   build/bin/test-piper-tts <models>/piper-en_US-lessac-medium-f16.gguf \
+//       "həlˈoʊ wˈɜːld" <out>/cpp_hello_world.wav
 
 #include "piper_tts.h"
 
@@ -17,15 +17,18 @@
 #include <cmath>
 #include <vector>
 
-static bool write_wav(const char * path, const float * data, int n_samples, int sample_rate) {
-    FILE * f = fopen(path, "wb");
-    if (!f) return false;
+static bool write_wav(const char* path, const float* data, int n_samples, int sample_rate) {
+    FILE* f = fopen(path, "wb");
+    if (!f)
+        return false;
 
-    int16_t * pcm16 = (int16_t *)malloc(n_samples * sizeof(int16_t));
+    int16_t* pcm16 = (int16_t*)malloc(n_samples * sizeof(int16_t));
     for (int i = 0; i < n_samples; i++) {
         float v = data[i];
-        if (v > 1.0f) v = 1.0f;
-        if (v < -1.0f) v = -1.0f;
+        if (v > 1.0f)
+            v = 1.0f;
+        if (v < -1.0f)
+            v = -1.0f;
         pcm16[i] = (int16_t)(v * 32767.0f);
     }
 
@@ -59,20 +62,24 @@ static bool write_wav(const char * path, const float * data, int n_samples, int 
     return true;
 }
 
-int main(int argc, char ** argv) {
+int main(int argc, char** argv) {
     if (argc < 4) {
-        fprintf(stderr, "Usage: %s <model.gguf> <ipa_string> <output.wav> [noise_scale] [noise_w] [--dump <dir>]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <model.gguf> <ipa_string> <output.wav> [noise_scale] [noise_w] [--dump <dir>]\n",
+                argv[0]);
         return 1;
     }
 
-    const char * model_path = argv[1];
-    const char * ipa = argv[2];
-    const char * wav_path = argv[3];
+    const char* model_path = argv[1];
+    const char* ipa = argv[2];
+    const char* wav_path = argv[3];
     float noise_scale = (argc > 4) ? atof(argv[4]) : 0.0f;
     float noise_w = (argc > 5) ? atof(argv[5]) : 0.0f;
-    const char * dump_dir = nullptr;
+    const char* dump_dir = nullptr;
     for (int i = 4; i < argc - 1; i++) {
-        if (strcmp(argv[i], "--dump") == 0) { dump_dir = argv[i+1]; break; }
+        if (strcmp(argv[i], "--dump") == 0) {
+            dump_dir = argv[i + 1];
+            break;
+        }
     }
 
     struct piper_tts_params params = piper_tts_default_params();
@@ -81,7 +88,7 @@ int main(int argc, char ** argv) {
     params.noise_w = noise_w;
 
     fprintf(stderr, "Loading model: %s\n", model_path);
-    struct piper_tts_context * ctx = piper_tts_init_from_file(model_path, params);
+    struct piper_tts_context* ctx = piper_tts_init_from_file(model_path, params);
     if (!ctx) {
         fprintf(stderr, "Failed to load model\n");
         return 1;
@@ -92,7 +99,7 @@ int main(int argc, char ** argv) {
     }
 
     fprintf(stderr, "Synthesizing IPA: %s\n", ipa);
-    float * pcm = nullptr;
+    float* pcm = nullptr;
     int sr = 0;
     int n = piper_tts_synthesize_phonemes(ctx, ipa, &pcm, &sr);
     if (n <= 0 || !pcm) {
@@ -106,8 +113,10 @@ int main(int argc, char ** argv) {
     // Print audio stats
     float min_v = pcm[0], max_v = pcm[0], rms = 0;
     for (int i = 0; i < n; i++) {
-        if (pcm[i] < min_v) min_v = pcm[i];
-        if (pcm[i] > max_v) max_v = pcm[i];
+        if (pcm[i] < min_v)
+            min_v = pcm[i];
+        if (pcm[i] > max_v)
+            max_v = pcm[i];
         rms += pcm[i] * pcm[i];
     }
     rms = sqrtf(rms / n);

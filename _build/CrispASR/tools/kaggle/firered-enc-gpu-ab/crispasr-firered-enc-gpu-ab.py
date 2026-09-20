@@ -13,8 +13,11 @@
 # 1. Clone CrispASR @ env CRISPASR_REF (default: main).
 # 2. Build with -DGGML_CUDA=ON.
 # 3. Auto-download firered-asr2-aed-q4_k (~918 MB), transcribe samples/jfk.wav
-#    twice: (a) baseline (CPU-pinned encoder weights) and (b) with
-#    CRISPASR_FIRERED_ENC_GPU=1, both with FIRERED_BENCH=1.
+#    twice: (a) CPU-pinned encoder weights (CRISPASR_FIRERED_ENC_CPU=1 —
+#    the default DID flip after this A/B passed, so the GPU arm is now
+#    the no-env default and the old opt-in CRISPASR_FIRERED_ENC_GPU is
+#    no longer read) and (b) the GPU-encoder default, both with
+#    FIRERED_BENCH=1.
 # 4. PASS iff both transcripts are non-empty and identical, and the GPU
 #    encoder is at least as fast as baseline. Encoder timings reported.
 #
@@ -178,10 +181,10 @@ def firered_run(tag: str, extra_env: dict) -> dict:
     return res
 
 
-baseline = firered_run("cpu_pinned_enc", {})
-gpu_enc = firered_run("enc_gpu", {"CRISPASR_FIRERED_ENC_GPU": "1"})
+baseline = firered_run("cpu_pinned_enc", {"CRISPASR_FIRERED_ENC_CPU": "1"})
+gpu_enc = firered_run("enc_gpu", {})
 # Second GPU run: warm CUDA context / autotuned kernels.
-gpu_enc2 = firered_run("enc_gpu_warm", {"CRISPASR_FIRERED_ENC_GPU": "1"})
+gpu_enc2 = firered_run("enc_gpu_warm", {})
 
 # ─────────────────────────── cell 4 (code) — verdict ─────────────────────
 ok_text = (baseline["transcript"] and

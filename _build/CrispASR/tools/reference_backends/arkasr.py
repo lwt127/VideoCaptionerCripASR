@@ -19,12 +19,46 @@ from typing import Dict, Set
 
 import numpy as np
 
+# Upstream puts the user's text instruction BETWEEN <|end_of_audio|> and
+# <|assistant|>: both the model card's example and the real batch inference
+# script (AutoArk/open-audio-opd, scripts/infer/ark_asr_transformers.py) send
+#   content=[{"type":"audio",...},{"type":"text","text":"Please transcribe this audio."}]
+# and ArkAsrProcessor concatenates content parts in order.
+#
+# This dumper used to pass the audio part ALONE, so the reference archive
+# encoded a prompt the model was never trained on — and because ark_asr.cpp
+# omitted the instruction too, the diff compared two copies of the same wrong
+# assumption and reported first_logits cos=0.988. Fixing only the runtime made
+# that number DROP to 0.449, which looks like a regression and is the opposite:
+# the runtime moved to upstream's prompt while the reference stayed behind.
+# A reference that shares the runtime's assumption cannot falsify it.
+#
+# Verified against upstream's own apply_chat_template on a 17.9 s clip: 234
+# prompt tokens = <|user|> <|begin_of_audio|> 224x<|audio|> <|end_of_audio|>
+# Please| trans|cribe| this| audio|. <|assistant|>
+ASR_INSTRUCTION = "Please transcribe this audio."
+
 DEFAULT_STAGES = [
     "mel_spectrogram",
     "audio_embeds",
     "first_logits",
     "generated_text",
 ]
+
+
+def _cast_audios(batch, dtype):
+    """Match the model dtype for the audio tensor.
+
+    apply_chat_template returns `audios` as float32 while the model is loaded
+    bf16, and the encoder's conv1 then raises
+    "Input type (float) and bias type (c10::BFloat16) should be the same".
+    Upstream's own example does this cast explicitly:
+        if "audios" in inputs: inputs["audios"] = inputs["audios"].to(dtype=torch_dtype)
+    """
+    a = batch.get("audios")
+    if a is not None and hasattr(a, "to"):
+        batch["audios"] = a.to(dtype=dtype)
+    return batch
 
 
 def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str], max_new_tokens: int) -> Dict[str, np.ndarray]:
@@ -42,8 +76,24 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str], max_new_tokens
     needs_model = bool(stages & {"audio_embeds", "first_logits", "llm_input_ids", "generated_text"})
 
     # Default to bfloat16: a float32 3B forward needs ~12 GB RAM and OOM-crashes
-    # a 16 GB box. bf16 (~6 GB weights) keeps the cosine gate valid (>0.99 vs the
-    # F16 ggml port). Override with ARKASR_REF_DTYPE=float32 on a big machine.
+    # a 16 GB box. bf16 (~6 GB weights) is fine for a >0.99 gate.
+    #
+    # ⚠ bf16 CANNOT support the harness's 0.999 threshold on audio_embeds, and
+    # will manufacture a failure that looks like an encoder bug. Measured on
+    # fleurs_en, same runtime, only the reference dtype changed:
+    #
+    #     bf16 reference   audio_embeds cos_min 0.9679  rms 3.6e-2   [FAIL]
+    #     f32  reference   audio_embeds cos_min 0.9985  rms 5.6e-3   [~PASS]
+    #
+    # bf16 has ~8 mantissa bits vs F16's 10, so for |x|~40 activations the
+    # REFERENCE is the less precise side and 32 encoder layers accumulate it.
+    # The giveaway is that the worst frames MOVE between the two references
+    # (#127/#119/#2 vs #131/#117/#3) — a real port bug would hit the same frames
+    # regardless of reference precision. 0.9985 is the normal F16-vs-F32 band.
+    #
+    # So: use the bf16 default for prompt/logit work, but dump with
+    # ARKASR_REF_DTYPE=float32 on a big machine before believing any
+    # encoder-stage failure.
     dtype_name = os.environ.get("ARKASR_REF_DTYPE", "bfloat16")
     dtype = getattr(torch, dtype_name)
     processor = AutoProcessor.from_pretrained(str(model_dir), trust_remote_code=True)
@@ -78,9 +128,11 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str], max_new_tokens
     # ---- prompt build + first-token logits ----
     if {"first_logits", "llm_input_ids"} & stages:
         batch = processor.apply_chat_template(
-            [{"role": "user", "content": [{"type": "audio", "array": audio}]}],
+            [{"role": "user", "content": [{"type": "audio", "array": audio},
+                                          {"type": "text", "text": ASR_INSTRUCTION}]}],
             add_generation_prompt=True, tokenize=True, return_tensors="pt",
         )
+        batch = _cast_audios(batch, dtype)
         input_ids = batch["input_ids"]
         if "llm_input_ids" in stages:
             out["llm_input_ids"] = input_ids[0].detach().cpu().numpy().astype(np.float32)
@@ -98,9 +150,11 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str], max_new_tokens
     # ---- end-to-end greedy transcript ----
     if "generated_text" in stages:
         batch = processor.apply_chat_template(
-            [{"role": "user", "content": [{"type": "audio", "array": audio}]}],
+            [{"role": "user", "content": [{"type": "audio", "array": audio},
+                                          {"type": "text", "text": ASR_INSTRUCTION}]}],
             add_generation_prompt=True, tokenize=True, return_tensors="pt",
         )
+        batch = _cast_audios(batch, dtype)
         with torch.no_grad():
             gen = model.generate(
                 input_ids=batch["input_ids"],

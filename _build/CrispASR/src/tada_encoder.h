@@ -127,7 +127,17 @@ int tada_dp_align(const float* probs, int T, int V, const int32_t* tokens, int N
  * @param result     Encoder result with token_values and token_positions
  * @param transcript Text spoken in the reference audio
  * @param language   Language code (nullable, omit for English)
+ * @param cloned_from_recording  Stamp `crispasr.voice.cloned_from_recording`
+ *                   into the pack. Set when this reference was derived from a
+ *                   real person's recording, so the synthesis-time consent and
+ *                   Art. 50(4) disclosure gates can recognise the resulting
+ *                   .gguf as a clone — they classify by provenance, not by file
+ *                   suffix. See examples/cli/crispasr_voice_clone_policy.h.
+ * @param consent_attestation  Attestation recorded at bake time (nullable).
+ *                   Audit trail only; it does NOT satisfy the synthesis-time
+ *                   gate.
  * @return 0 on success
  */
 int tada_encoder_write_ref_gguf(const char* path, const tada_encoder_result& result, const char* transcript,
-                                const char* language);
+                                const char* language, bool cloned_from_recording = false,
+                                const char* consent_attestation = nullptr);

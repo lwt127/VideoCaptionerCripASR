@@ -92,3 +92,13 @@ python models/convert-csm-to-gguf.py \
 
 - [SesameAILabs/csm](https://github.com/SesameAILabs/csm) — original model and inference code
 - [Kyutai/mimi](https://huggingface.co/kyutai/mimi) — audio codec
+
+## Voice provenance (EU AI Act Art. 50(4))
+
+The upstream card states this is *"a base generation model ... capable of producing a variety of voices, but it has not been fine-tuned on any specific voice"*. There is no preset persona to disclose. CSM's cloning path takes a reference recording as `--voice`, and that is caught by the separate voice-clone gate, which does require `--i-have-rights`.
+
+CrispASR records this as `speaker_identity=synthetic`. No spoken AI disclosure is added, because no identifiable person's voice is being reproduced. Machine-readable marking (watermark + C2PA) still applies to every synthesis, as it does for all CrispASR TTS output.
+
+Override per run with `--speaker-identity`, or stamp a file permanently with
+`models/stamp-speaker-identity.py`. See
+[`docs/eu-ai-act.md` §6.2a](https://github.com/CrispStrobe/CrispASR/blob/main/docs/eu-ai-act.md).

@@ -252,7 +252,7 @@ jobs:
 
       - name: Build
         run: |
-          cmake . -DWHISPER_SDL2=ON -DCMAKE_BUILD_TYPE=${{ matrix.build }}
+          cmake . -DCRISPASR_SDL2=ON -DCMAKE_BUILD_TYPE=${{ matrix.build }}
           make
           # -L "gh|unit": this job already BUILDS all 192 test targets, so running the
           # unit tier costs seconds. CI used to execute 1 of 162 unit tests (found
@@ -282,7 +282,7 @@ jobs:
 
       - name: Build
         run: |
-          cmake . -DWHISPER_SDL2=ON -DCMAKE_BUILD_TYPE=${{ matrix.build }} -DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8-a
+          cmake . -DCRISPASR_SDL2=ON -DCMAKE_BUILD_TYPE=${{ matrix.build }} -DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8-a
           make
           # -L "gh|unit": this job already BUILDS all 192 test targets, so running the
           # unit tier costs seconds. CI used to execute 1 of 162 unit tests (found
@@ -327,7 +327,7 @@ jobs:
 
       - name: Build
         run: |
-          cmake . -DWHISPER_SDL2=ON -DCMAKE_BUILD_TYPE=${{ matrix.build }} -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang
+          cmake . -DCRISPASR_SDL2=ON -DCMAKE_BUILD_TYPE=${{ matrix.build }} -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang
           make
           # -L "gh|unit": this job already BUILDS all 192 test targets, so running the
           # unit tier costs seconds. CI used to execute 1 of 162 unit tests (found
@@ -370,7 +370,7 @@ jobs:
             # started running here.
             apt install -y build-essential cmake git curl python3
             cmake . -DCMAKE_BUILD_TYPE=Debug \
-              -DWHISPER_SANITIZE_${{ matrix.sanitizer }}=ON \
+              -DCRISPASR_SANITIZE_${{ matrix.sanitizer }}=ON \
               -DGGML_OPENMP=OFF
             make
             # -L "gh|unit": this job already BUILDS all 192 test targets, so running the
@@ -412,7 +412,7 @@ jobs:
       - name: Build using CMake
         shell: msys2 {0}
         run: |
-            cmake -B build -DWHISPER_SDL2=ON
+            cmake -B build -DCRISPASR_SDL2=ON
             cmake --build build --config ${{ matrix.build }} -j $(nproc)
 
       - name: Clean after building using CMake
@@ -469,7 +469,7 @@ jobs:
           -DCMAKE_BUILD_TYPE=${{ matrix.build }}
           -DBUILD_SHARED_LIBS=ON
           -DCRISPASR_BUILD_TESTS=OFF
-          -DWHISPER_SDL2=${{ matrix.sdl2 }}
+          -DCRISPASR_SDL2=${{ matrix.sdl2 }}
 
       - name: Build
         run: |
@@ -591,7 +591,7 @@ jobs:
           -DBLAS_LIBRARIES="$env:GITHUB_WORKSPACE/OpenBLAS-${{matrix.blasver}}/lib/libopenblas.lib"
           -DBLAS_INCLUDE_DIRS="$env:GITHUB_WORKSPACE/OpenBLAS-${{matrix.blasver}}/include"
           -DCRISPASR_BUILD_TESTS=OFF
-          -DWHISPER_SDL2=${{ matrix.sdl2 }}
+          -DCRISPASR_SDL2=${{ matrix.sdl2 }}
 
       - name: Build
         run: |
@@ -799,7 +799,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=${{ matrix.build }} ^
             -DGGML_CUDA=${{ matrix.cublas }} ^
             -DCRISPASR_BUILD_TESTS=OFF ^
-            -DWHISPER_SDL2=${{ matrix.sdl2 }} ^
+            -DCRISPASR_SDL2=${{ matrix.sdl2 }} ^
             -DSDL2_DIR="%SDL2_DIR%" ^
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ^
             -DCMAKE_CUDA_FLAGS="%CUDA_FLAGS%"

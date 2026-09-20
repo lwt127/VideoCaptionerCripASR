@@ -189,7 +189,15 @@ TEST_CASE("sidon speech restoration", "[integration][sidon]") {
     // the in-graph REPEAT of the gather index. Reordered float arithmetic means
     // these are close, not identical, and the DAC amplifies the difference — so
     // check the magnitudes too, since cosine alone is scale-blind.
-    for (const char* mode : {"expand", "bucket-direct"}) {
+    //
+    // NOTE: until the #416 follow-up this loop compared bucket-direct against
+    // itself. CRISPASR_SIDON_RPE was read once in sidon_init (parse_rpe_mode)
+    // and never again, so setting it here — on an already-loaded ctx — changed
+    // nothing and both iterations ran whatever init had chosen. The mode is now
+    // resolved per graph build (resolve_rpe_mode), so these env settings take
+    // effect and the comparison is real. `bucket` is included for the same
+    // reason: all three are claimed equivalent, so all three get checked.
+    for (const char* mode : {"expand", "bucket", "bucket-direct"}) {
         ScopedTestEnv rpe("CRISPASR_SIDON_RPE", mode);
         const auto alt = sidon_restore(ctx, input.data(), (int)input.size());
         REQUIRE(alt.size() == output.size());
@@ -218,6 +226,78 @@ TEST_CASE("sidon speech restoration", "[integration][sidon]") {
             too_long[i] = 0.1f;
         const auto capped = sidon_restore(ctx, too_long.data(), (int)too_long.size());
         CHECK(capped.empty());
+    }
+
+    sidon_free(ctx);
+}
+
+// Issue #416: a QUANTIZED Sidon GGUF produced a full-length file of pure
+// silence while the f16 model restored the same clip correctly. Nothing caught
+// it because every Sidon test above runs a single model, and
+// tests/env-live-tests.sh pointed CRISPASR_MODEL_SIDON at the f16 build only —
+// so no quantized Sidon was ever executed.
+//
+// The reported failure is silence, not drift, so this deliberately does NOT
+// assert a tolerance against the f16 output: q4_k genuinely differs, and a
+// cosine band wide enough to admit q4_k would still have to be narrower than
+// "all zeros" to catch anything. Assert the properties a silent/NaN decode
+// breaks instead — full length, all-finite, real energy, and energy that
+// actually tracks the input envelope rather than a constant hum.
+//
+// Point CRISPASR_MODEL_SIDON_QUANT at a q8_0/q6_k/q4_k Sidon GGUF; the case
+// skips when unset so CI without the artifact stays green.
+TEST_CASE("sidon quantized restoration is not silent", "[integration][sidon]") {
+    const char* model_path = std::getenv("CRISPASR_MODEL_SIDON_QUANT");
+    if (!model_path || !*model_path)
+        SKIP("CRISPASR_MODEL_SIDON_QUANT not set");
+
+    auto params = sidon_context_default_params();
+    params.verbosity = 0;
+    auto* ctx = sidon_init_from_file(model_path, params);
+    REQUIRE(ctx != nullptr);
+
+    const auto input = load_wav_16k("samples/jfk.wav");
+    REQUIRE(!input.empty());
+
+    const auto output = sidon_restore(ctx, input.data(), (int)input.size());
+    REQUIRE(output.size() == input.size() * 3);
+
+    // A NaN decode reaches the WAV writer as zeros, so the silence and the
+    // not-finite failures look identical downstream. Separate them here.
+    REQUIRE(std::all_of(output.begin(), output.end(), [](float s) { return std::isfinite(s); }));
+
+    double sum_sq = 0.0;
+    float peak = 0.0f;
+    for (float s : output) {
+        sum_sq += (double)s * s;
+        peak = std::max(peak, std::fabs(s));
+    }
+    const double rms = std::sqrt(sum_sq / (double)output.size());
+    INFO("quantized output rms=" << rms << " peak=" << peak);
+    // The f16 path measures rms ~0.128 / peak ~0.61 on this clip; every quant
+    // lands within a few percent. 0.01 is far below any real decode and far
+    // above the reported failure (identically zero).
+    CHECK(rms > 0.01);
+    CHECK(peak > 0.05f);
+
+    // Energy must FOLLOW the source. A constant tone or DC offset would clear
+    // the rms floor above while still being a broken decode, so require the
+    // loud half of the input to be louder than the quiet half on the output
+    // too. jfk.wav is speech into trailing silence, so this ordering is stable.
+    {
+        auto rms_of = [](const float* p, size_t n) {
+            double acc = 0.0;
+            for (size_t i = 0; i < n; ++i)
+                acc += (double)p[i] * p[i];
+            return std::sqrt(acc / (double)n);
+        };
+        const size_t half = output.size() / 2;
+        const double head = rms_of(output.data(), half);
+        const double tail = rms_of(output.data() + half, output.size() - half);
+        const double in_head = rms_of(input.data(), input.size() / 2);
+        const double in_tail = rms_of(input.data() + input.size() / 2, input.size() - input.size() / 2);
+        INFO("halves: out " << head << "/" << tail << "  in " << in_head << "/" << in_tail);
+        CHECK((head > tail) == (in_head > in_tail));
     }
 
     sidon_free(ctx);

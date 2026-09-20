@@ -20,7 +20,6 @@ tags:
 - sanm
 - multilingual
 - language-identification
-- emotion-recognition
 - audio-event-detection
 library_name: ggml
 base_model: FunAudioLLM/SenseVoiceSmall
@@ -30,7 +29,9 @@ base_model: FunAudioLLM/SenseVoiceSmall
 
 GGUF / ggml conversion of [`FunAudioLLM/SenseVoiceSmall`](https://huggingface.co/FunAudioLLM/SenseVoiceSmall) for use with the `sensevoice` backend in **[CrispStrobe/CrispASR](https://github.com/CrispStrobe/CrispASR)**.
 
-SenseVoiceSmall is Alibaba's **multi-task encoder-only ASR**: one forward pass through a 70-block SANM encoder emits the full transcript **plus** the spoken language ID, emotion, and audio-event tags through a single CTC head. Non-autoregressive design → **15× faster than Whisper-Large** (70 ms for 10 s of audio in upstream's measurements).
+SenseVoiceSmall is Alibaba's **multi-task encoder-only ASR**: one forward pass through a 70-block SANM encoder emits the full transcript **plus** the spoken language ID and audio-event tags through a single CTC head. Non-autoregressive design → **15× faster than Whisper-Large** (70 ms for 10 s of audio in upstream's measurements).
+
+> **Note on the emotion tag.** Upstream SenseVoice is also an emotion classifier — its CTC head emits an `<|HAPPY|>` / `<|ANGRY|>` / … marker in the annotation prefix. **CrispASR does not expose it.** Inferring emotions from voice makes a system an "emotion recognition system" under EU AI Act Art. 3(39), which is prohibited in workplace and education settings (Art. 5(1)(f)) and high-risk otherwise (Annex III(1)(c)). CrispASR parses the marker only to strip it out of the transcript, then discards the value. The weights are Alibaba's and unmodified — the classifier head is still in the GGUF; it is the *runtime* that does not surface it. See [docs/eu-ai-act.md](https://github.com/CrispStrobe/CrispASR/blob/main/docs/eu-ai-act.md).
 
 - **70-block SenseVoiceEncoderSmall** (1 entry block @ 560→512 + 49 main blocks + 20 tp blocks, all 512-dim, 4 heads, FSMN k=11 depthwise convolution branch — the same encoder body Fun-ASR-Nano-2512 ships, just here paired with a CTC head instead of an LLM decoder)
 - **4 query embeddings** (language / event / emotion / textnorm) prepended to the LFR fbank features so the encoder can emit rich annotations at those positions
@@ -54,21 +55,21 @@ explicit fields:
   "text":        "And so my fellow Americans...",
   "language":    "en",
   "audio_event": "Speech",
-  "emotion":     "ANGRY",
   "itn_flag":    "withitn"
 }
 ```
 
-The legacy `sensevoice_transcribe()` C ABI still returns the original
-prefixed string for callers that want it that way:
+`sensevoice_transcribe()` returns the transcript with the annotation
+prefix stripped. It used to return the raw prefixed string —
 
 ```text
 <|en|><|HAPPY|><|Speech|><|withitn|>And so my fellow Americans...
-<|zh|><|NEUTRAL|><|Speech|><|withitn|>开饭时间早上9点至下午5点。
 ```
 
-New callers should use `sensevoice_transcribe_structured()` which
-returns the same six fields as a `struct sensevoice_result`.
+— which reached every binding, since the session ABI routes SenseVoice
+through it. Both entry points now drop the prefix; use
+`sensevoice_transcribe_structured()` when you want language / audio-event /
+ITN back as `struct sensevoice_result` fields.
 
 Tag value sets:
 
@@ -82,7 +83,7 @@ Tag value sets:
 | File | Size | Notes |
 | --- | ---: | --- |
 | `sensevoice-small-q4_k.gguf` | 129 MB | **Recommended default.** 2× faster on M1 vs F16; byte-identical transcript on tested clips. Auto-download target for `--backend sensevoice -m auto`. |
-| `sensevoice-small-q8_0.gguf` | 240 MB | Larger but slightly closer to F16 numerically on borderline emotion-tag argmax cases. |
+| `sensevoice-small-q8_0.gguf` | 240 MB | Larger but slightly closer to F16 numerically on borderline annotation-tag argmax cases. |
 | `sensevoice-small-f16.gguf` | 448 MB | F16 reference weights. Use when you want bit-stability against the upstream PyTorch reference for diff testing. |
 
 ## Quick Start
@@ -109,7 +110,8 @@ on Alibaba's own example `zh.mp3`; 75/76 PASS on `samples/jfk.wav` with
 the single difference being the emotion-tag argmax flipping between
 `<|ANGRY|>` and `<|EMO_UNKNOWN|>` (F16/op-order pushes that one slot
 across a near-tied boundary; the transcript itself is byte-identical
-in both runs). On Apple M1 Metal the runtime hits **15-22× realtime**.
+in both runs). That slot is stripped and discarded by the runtime, so
+the flip is not observable in any CrispASR output. On Apple M1 Metal the runtime hits **15-22× realtime**.
 
 ## Licence + attribution
 

@@ -106,6 +106,15 @@ void kyutai_stt_result_ex_free(struct kyutai_stt_result_ex* r);
 // Returns the model's audio_delay_seconds + audio_silence_prefix_seconds.
 // The CLI wrapper uses this to size the silence tail it appends: the tail
 // must be at least as long as the lookahead so the LM can flush the final word.
+/// Does this checkpoint support `lang` (ISO-639-1, lowercase)? Empty or "auto"
+/// always returns 1. stt-1b-en_fr supports en+fr; stt-2.6b-en is English-only,
+/// and CrispASR used to warn "English-only model" for both (#366).
+int kyutai_stt_supports_language(struct kyutai_stt_context* ctx, const char* lang);
+
+/// Comma-separated languages this checkpoint supports, for diagnostics.
+/// Owned by the context; valid until kyutai_stt_free.
+const char* kyutai_stt_languages(struct kyutai_stt_context* ctx);
+
 float kyutai_stt_total_lookahead_seconds(struct kyutai_stt_context* ctx);
 
 // Like kyutai_stt_transcribe but returns per-token + word-level timing.

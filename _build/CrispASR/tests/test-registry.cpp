@@ -8,6 +8,8 @@
 #include "crispasr_model_registry.h"
 
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <string>
 
 TEST_CASE("registry: lookup known backend returns valid entry", "[unit][registry]") {
@@ -54,6 +56,74 @@ TEST_CASE("registry: default bundle preserves license metadata", "[unit][registr
     REQUIRE(crispasr_registry_default_bundle("voxtral-tts", bundle));
     REQUIRE_FALSE(bundle.license.empty());
     REQUIRE(bundle.requires_license_acceptance);
+}
+
+TEST_CASE("registry: non-permissive supported weights carry policy metadata", "[unit][registry][license]") {
+    struct Expected {
+        const char* backend;
+        const char* needle;
+        bool requires_acceptance;
+    } cases[] = {
+        {"parakeet", "CC-BY-4.0", false},
+        {"canary", "CC-BY-4.0", false},
+        {"fastconformer-ctc", "CC-BY-4.0", false},
+        {"fastpitch", "CC-BY-4.0", false},
+        {"outetts", "CC-BY-NC-SA-4.0", true},
+        {"wespeaker", "CC-BY-4.0", false},
+        {"lid-fasttext176", "CC-BY-NC-4.0", true},
+        {"lfm2-audio", "lfm1.0", true},
+        {"funasr", "funasr-v1.1", true},
+        {"sensevoice", "funasr-v1.1", true},
+        {"gemma4-e2b", "gemma-terms", true},
+        {"pocket-tts", "pocket-tts-terms", true},
+        {"tada", "llama3.2", true},
+        {"orpheus", "llama3.2", true},
+    };
+    for (const auto& c : cases) {
+        CrispasrRegistryEntry e;
+        REQUIRE(crispasr_registry_lookup(c.backend, e));
+        REQUIRE(std::string(e.license).find(c.needle) != std::string::npos);
+        REQUIRE(crispasr_license_requires_acceptance(e.license) == c.requires_acceptance);
+    }
+}
+
+TEST_CASE("registry: the Breeze TTS 2 non-commercial gate actually blocks", "[unit][registry][license]") {
+    // #412. The weights are non-commercial and this is the only thing standing
+    // between `-m auto` and downloading them without acceptance, so it gets its
+    // own test rather than a row in the table above.
+    CrispasrRegistryEntry e;
+    REQUIRE(crispasr_registry_lookup("bt2-tts", e));
+
+    // The prose a user is shown must actually say what the restriction is.
+    REQUIRE(std::string(e.license).find("NON-COMMERCIAL") != std::string::npos);
+    REQUIRE(std::string(e.license).find("BreezeBlue") != std::string::npos);
+
+    // The gate fires.
+    REQUIRE(crispasr_license_requires_acceptance(e.license));
+
+    // ...and the bundle -m auto consults agrees. A gate that is true in one
+    // accessor and false in the one the download path reads is not a gate.
+    CrispasrRegistryBundle bundle;
+    REQUIRE(crispasr_registry_default_bundle("bt2-tts", bundle));
+    REQUIRE(bundle.requires_license_acceptance);
+
+    // The codec companion must be listed, or a -m auto user gets a model that
+    // loads and cannot render audio.
+    REQUIRE(e.companion_filename == "qwen3-tts-tokenizer-12hz.gguf");
+
+    // CONTROL. Everything above would also pass if
+    // crispasr_license_requires_acceptance() simply returned true for every
+    // input — so prove it can say no. This is the pairing the "readout must be
+    // able to report failure" rule exists for.
+    REQUIRE_FALSE(crispasr_license_requires_acceptance("apache-2.0"));
+    REQUIRE_FALSE(crispasr_license_requires_acceptance("CC-BY-4.0 — attribution required"));
+
+    // SECOND CONTROL, on the tag parser rather than the predicate: the gate
+    // keys on the FIRST WORD of the licence string. If someone reworded the
+    // entry to lead with a permissive word and left "other" later in the
+    // sentence, the gate would silently stop firing while the prose still read
+    // as restrictive.
+    REQUIRE_FALSE(crispasr_license_requires_acceptance("apache-2.0 (not other, despite the word other here)"));
 }
 
 TEST_CASE("registry: default bundle rejects unknown backends", "[unit][registry]") {
@@ -147,6 +217,13 @@ TEST_CASE("registry: vibevoice has entry", "[unit][registry]") {
     REQUIRE(found);
 }
 
+TEST_CASE("registry: vibevoice streaming resolves the validated Q4", "[unit][registry]") {
+    CrispasrRegistryEntry e;
+    REQUIRE(crispasr_registry_lookup("vibevoice-streaming", e));
+    REQUIRE(e.filename == "vibevoice-asr-streaming-1.5b-q4_k.gguf");
+    REQUIRE(e.url.find("vibevoice-asr-streaming-1.5b-GGUF") != std::string::npos);
+}
+
 TEST_CASE("registry: wav2vec2 aligner aliases resolve", "[unit][registry]") {
     CrispasrRegistryEntry e;
     REQUIRE(crispasr_registry_lookup("wav2vec2-aligner", e));
@@ -181,14 +258,14 @@ TEST_CASE("registry: preferred quant rewrites primary filename", "[unit][registr
     CrispasrRegistryEntry e;
     bool found = crispasr_registry_lookup("chatterbox", e, "q4_k");
     REQUIRE(found);
-    REQUIRE(e.filename == "chatterbox-t3-q4_k.gguf");
+    REQUIRE(e.filename == "chatterbox-v3-t3-q4_k.gguf");
 }
 
 TEST_CASE("registry: companion quant can be resolved independently", "[unit][registry]") {
     CrispasrRegistryEntry e;
     bool found = crispasr_registry_lookup("chatterbox", e, "q4_k");
     REQUIRE(found);
-    REQUIRE(e.companion_filename == "chatterbox-s3gen-q4_k.gguf");
+    REQUIRE(e.companion_filename == "chatterbox-v3-s3gen-q4_k.gguf");
 }
 
 TEST_CASE("registry: non-quantized companion remains unchanged", "[unit][registry]") {
@@ -252,12 +329,17 @@ TEST_CASE("registry: chatterbox family keeps multilingual and finetunes separate
     CrispasrRegistryEntry e;
 
     REQUIRE(crispasr_registry_lookup("chatterbox", e));
-    REQUIRE(e.filename == "chatterbox-t3-q8_0.gguf");
-    REQUIRE(e.companion_filename == "chatterbox-s3gen-q8_0.gguf");
+    REQUIRE(e.filename == "chatterbox-v3-t3-q8_0.gguf");
+    REQUIRE(e.companion_filename == "chatterbox-v3-s3gen-q8_0.gguf");
 
     REQUIRE(crispasr_registry_lookup("kartoffelbox-turbo", e));
     REQUIRE(e.filename.find("kartoffelbox-turbo-t3") != std::string::npos);
     REQUIRE(e.companion_filename == "chatterbox-turbo-s3gen-f16.gguf");
+
+    REQUIRE(crispasr_registry_lookup("chatterbox-finnish-nano", e));
+    REQUIRE(e.filename == "chatterbox-finnish-nano-v0.1.3-t3-q8_0.gguf");
+    REQUIRE(e.url.find("JJarvinen/chatterbox-finnish-nano-GGUF") != std::string::npos);
+    REQUIRE(e.companion_filename == "chatterbox-turbo-s3gen-q8_0.gguf");
 
     REQUIRE(crispasr_registry_lookup("lahgtna-chatterbox", e));
     REQUIRE(e.filename == "chatterbox-t3-f16.gguf");
@@ -367,6 +449,24 @@ TEST_CASE("registry: cosyvoice3 short alias resolves via -tts fallback", "[unit]
     REQUIRE(e.filename == "cosyvoice3-llm-q4_k.gguf");
 }
 
+// #334: upstream ships a second talker (llm.rl.pt, RL-tuned). It is the same
+// engine with a different LLM GGUF, so the alias must resolve to the RL file
+// while pulling the SAME flow/HiFT/CAMPPlus/s3tok/voices companions — a copy
+// of the base row that forgot to swap `filename` would silently hand the user
+// the base talker under the RL name.
+TEST_CASE("registry: cosyvoice3-tts-rl swaps only the talker", "[unit][registry]") {
+    CrispasrRegistryEntry base;
+    CrispasrRegistryEntry rl;
+    REQUIRE(crispasr_registry_lookup("cosyvoice3-tts", base));
+    REQUIRE(crispasr_registry_lookup("cosyvoice3-tts-rl", rl));
+    REQUIRE(rl.filename == "cosyvoice3-llm-rl-q4_k.gguf");
+    REQUIRE(rl.filename != base.filename);
+    REQUIRE(rl.url != base.url);
+    // Companion (flow) is shared, not a second copy under a new name.
+    REQUIRE(rl.companion_filename == base.companion_filename);
+    REQUIRE(rl.companion_url == base.companion_url);
+}
+
 TEST_CASE("registry: dia has entry", "[unit][registry]") {
     CrispasrRegistryEntry e;
     REQUIRE(crispasr_registry_lookup("dia", e));
@@ -387,6 +487,24 @@ TEST_CASE("registry: piper has entry", "[unit][registry]") {
     REQUIRE(crispasr_registry_lookup("piper", e));
 }
 
+TEST_CASE("resolver: exact unregistered Piper voice wins over backend default (#397)", "[unit][registry]") {
+    const std::filesystem::path cache = "test-registry-piper-cache";
+    const std::string filename = "piper-en_GB-cori-medium-f16.gguf";
+    std::filesystem::create_directories(cache);
+    {
+        std::ofstream fixture(cache / filename, std::ios::binary);
+        fixture << "fixture";
+    }
+
+    const std::string resolved = crispasr_resolve_model(filename, "piper", /*quiet=*/true, cache.string(),
+                                                        /*allow_download=*/false);
+    CHECK(resolved == (cache / filename).string());
+    CHECK(resolved.find("lessac") == std::string::npos);
+
+    std::filesystem::remove(cache / filename);
+    std::filesystem::remove(cache);
+}
+
 TEST_CASE("registry: csm (sesame) has entry", "[unit][registry]") {
     CrispasrRegistryEntry e;
     REQUIRE(crispasr_registry_lookup("csm", e));
@@ -395,6 +513,21 @@ TEST_CASE("registry: csm (sesame) has entry", "[unit][registry]") {
 TEST_CASE("registry: pocket-tts has entry", "[unit][registry]") {
     CrispasrRegistryEntry e;
     REQUIRE(crispasr_registry_lookup("pocket-tts", e));
+}
+
+TEST_CASE("registry: Pocket-TTS language checkpoints are wired", "[unit][registry]") {
+    const std::pair<const char*, const char*> variants[] = {
+        {"pocket-tts-de", "pocket-tts-german-q8_0.gguf"},     {"pocket-tts-es", "pocket-tts-spanish-q8_0.gguf"},
+        {"pocket-tts-it", "pocket-tts-italian-q8_0.gguf"},    {"pocket-tts-pt", "pocket-tts-portuguese-q8_0.gguf"},
+        {"pocket-tts-fr", "pocket-tts-french_24l-q8_0.gguf"},
+    };
+    for (const auto& [backend, filename] : variants) {
+        CAPTURE(backend);
+        CrispasrRegistryEntry e;
+        REQUIRE(crispasr_registry_lookup(backend, e));
+        REQUIRE(e.filename == filename);
+        REQUIRE(e.url.find("cstr/pocket-tts-GGUF") != std::string::npos);
+    }
 }
 
 TEST_CASE("registry: speecht5 has entry", "[unit][registry]") {

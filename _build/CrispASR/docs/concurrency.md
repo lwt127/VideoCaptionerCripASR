@@ -40,7 +40,9 @@ invocation transcribing one file uses several CPU cores for the matmuls/convs.
 
 - CLI: `--threads N` (default `min(4, hardware_concurrency())`).
 - C-ABI / bindings: `crispasr_params_set_n_threads()` (default 4).
-- Server: the per-request `n_threads` field (form field / default).
+- Server: process-wide, from the same `--threads N` startup flag. There is
+  **no** per-request thread-count field — every request inherits the server's
+  setting.
 
 This is *within* a single stream — it does not let two files transcribe at once.
 On a GPU backend the heavy math runs on the device and thread count matters less.
@@ -170,8 +172,10 @@ named `crispasr`. Scale it and put a proxy in front:
 docker compose up --build --scale crispasr=4
 ```
 
-> **Port gotcha.** The shipped compose **publishes a fixed host port**
-> (`8080:8080`). Scaling as-is makes the replicas collide on that host port
+> **Port gotcha.** The shipped compose **publishes one host port for the whole
+> service** (`"${CRISPASR_HOST_PORT:-${CRISPASR_PORT:-8080}}:${CRISPASR_PORT:-8080}"`
+> — `8080:8080` unless you override it, and the same value for every replica).
+> Scaling as-is makes the replicas collide on that host port
 > ("port is already allocated"). The fix is to **not** publish the backend port
 > on the host and instead let the load balancer reach the replicas over the
 > compose network (as below) — remove the `ports:` mapping from the `crispasr`

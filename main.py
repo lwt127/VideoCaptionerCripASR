@@ -23,6 +23,7 @@ def _install_translators(app: "QApplication") -> None:
       - AUTO → 跟随系统区域
     """
     from app.common.config import Language, cfg
+    from app.common.i18n import SupplementalTranslator, locale_key
     from app.config import RESOURCE_PATH
 
     # 解析目标 locale
@@ -30,9 +31,11 @@ def _install_translators(app: "QApplication") -> None:
     if lang == Language.AUTO:
         locale = QLocale.system()
     else:
-        locale = lang.value  # QLocale 实例
+        locale = QLocale(lang.value)
 
-    locale_name = locale.name()  # zh_CN / zh_TW / en_US ...
+    # Use script, not country substrings (Hong Kong/Macau both use Hant).
+    locale = QLocale(locale_key(locale))
+    locale_name = locale.name()
 
     # 1) qfluentwidgets 自带控件的翻译
     try:
@@ -62,6 +65,13 @@ def _install_translators(app: "QApplication") -> None:
             app.installTranslator(translator)
             app._app_translator = translator  # 持有引用
             break
+
+    # Installed last so reviewed dynamic translations supplement/override QM.
+    supplemental = SupplementalTranslator(
+        locale, RESOURCE_PATH / "translations" / "supplemental_ui.json", app
+    )
+    app.installTranslator(supplemental)
+    app._supplemental_translator = supplemental
 
 
 def main() -> int:

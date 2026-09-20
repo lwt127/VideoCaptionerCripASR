@@ -321,6 +321,7 @@ static void cc_fft_r2c(const float* in, int N, float* out) {
 
 #include "core/mel.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -723,7 +724,7 @@ static bool cc_load_model(cc_model& model, canary_ctc_vocab& vocab, const char* 
 
 static ggml_backend_t cc_pick_backend() {
     ggml_backend_t b = crispasr_init_gpu_backend();
-    return b ? b : ggml_backend_cpu_init();
+    return b ? b : core_cpu_backend::init();
 }
 
 // ===========================================================================
@@ -745,12 +746,12 @@ extern "C" struct canary_ctc_context* canary_ctc_init_from_file(const char* path
 
     ctx->backend = cc_pick_backend();
     // Always have a CPU fallback backend for ops the primary doesn't support.
-    if (ggml_backend_is_cpu(ctx->backend)) {
+    if (core_cpu_backend::is_cpu(ctx->backend)) {
         ctx->backend_cpu = ctx->backend;
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
     } else {
-        ctx->backend_cpu = ggml_backend_cpu_init();
-        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+        ctx->backend_cpu = core_cpu_backend::init();
+        core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
     }
 
     if (!cc_load_model(ctx->model, ctx->vocab, path_model, ctx->backend)) {
@@ -789,7 +790,7 @@ extern "C" void canary_ctc_free(struct canary_ctc_context* ctx) {
     if (ctx->model.ctx_f32)
         ggml_free(ctx->model.ctx_f32);
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)

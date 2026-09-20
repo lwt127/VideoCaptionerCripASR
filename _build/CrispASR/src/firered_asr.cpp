@@ -39,6 +39,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Bench instrumentation — `FIRERED_BENCH=1` for per-stage timings.
@@ -362,16 +363,24 @@ extern "C" struct firered_asr_context* firered_asr_init_from_file(const char* pa
     // Load weights to CPU so the decoder can use native Q4_K SIMD kernels
     // (70ms/step vs 587ms with F32 dequant or 2600ms with per-call CUDA graphs).
     // The encoder uses ggml_backend_sched which auto-copies CPU weights to GPU.
-    ctx->backend_cpu = ggml_backend_cpu_init();
-    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
-    if (!ctx->backend || ggml_backend_is_cpu(ctx->backend))
-        ctx->backend = ctx->backend_cpu;
+    ctx->backend_cpu = core_cpu_backend::init();
+    // crispasr_init_gpu_backend() falls back to ggml_backend_init_best(), which
+    // on a GPU-less host hands back a CPU backend — a SEPARATE instance from
+    // backend_cpu above. Overwriting the pointer without freeing it leaked one
+    // ggml backend per init (152 bytes; ASan caught it once the sanitizer job
+    // stopped being a no-op). Free it before choosing, so nothing dangles.
+    ggml_backend_t gpu = params.use_gpu ? crispasr_init_gpu_backend() : nullptr;
+    if (gpu && core_cpu_backend::is_cpu(gpu)) {
+        ggml_backend_free(gpu);
+        gpu = nullptr;
+    }
+    ctx->backend = gpu ? gpu : ctx->backend_cpu;
     if (params.verbosity >= 1)
         fprintf(stderr, "firered_asr: backend ready (compute=%s, weights=CPU)\n",
-                ggml_backend_is_cpu(ctx->backend) ? "CPU" : "GPU");
-    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
-    if (ggml_backend_is_cpu(ctx->backend))
-        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+                core_cpu_backend::is_cpu(ctx->backend) ? "CPU" : "GPU");
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    if (core_cpu_backend::is_cpu(ctx->backend))
+        core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
 
     // §176k: persistent decoder matvec graph cache (default ON; opt out with
     // CRISPASR_FIRERED_MATVEC_CACHE=0). Bit-identical to the per-call sched path,
@@ -392,7 +401,7 @@ extern "C" struct firered_asr_context* firered_asr_init_from_file(const char* pa
         gguf_context* gctx = core_gguf::open_metadata(path_model);
         if (!gctx) {
             fprintf(stderr, "firered_asr: failed to open '%s'\n", path_model);
-            delete ctx;
+            firered_asr_free(ctx); // frees the backends this ctx already owns
             return nullptr;
         }
         hp.d_model = core_gguf::kv_u32(gctx, "firered.d_model", hp.d_model);
@@ -456,7 +465,7 @@ extern "C" struct firered_asr_context* firered_asr_init_from_file(const char* pa
                 : core_gguf::load_weights(path_model, ctx->backend_cpu, "firered_asr", wl);
     if (!loaded) {
         fprintf(stderr, "firered_asr: failed to load weights from '%s'\n", path_model);
-        delete ctx;
+        firered_asr_free(ctx); // frees the backends this ctx already owns
         return nullptr;
     }
     m.ctx = wl.ctx;
@@ -640,9 +649,9 @@ extern "C" void firered_asr_free(struct firered_asr_context* ctx) {
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.buf_cpu)
-        ggml_backend_buffer_free(ctx->model.buf_cpu);
+        core_gguf::release_weight_buffer(ctx->model.buf_cpu);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
@@ -2066,7 +2075,7 @@ static char* firered_asr_transcribe_impl(struct firered_asr_context* ctx, const 
         int beam_size_effective = is_lid ? 1 : std::max(1, ctx->params.beam_size);
         int d = hp.d_model;
         int odim = hp.odim;
-        const bool use_gpu_decoder_proj = !ggml_backend_is_cpu(ctx->backend);
+        const bool use_gpu_decoder_proj = !core_cpu_backend::is_cpu(ctx->backend);
         // Debug: set FIRERED_DEBUG_DECODER_STEP=N FIRERED_DEBUG_DECODER_LAYER=M
         // to dump intermediate values at decode step N, layer M (beam path only).
 
@@ -2111,7 +2120,7 @@ static char* firered_asr_transcribe_impl(struct firered_asr_context* ctx, const 
             V_enc[li].resize(T_sub * d);
             bool kv_done = false;
 
-            if (!ggml_backend_is_cpu(ctx->backend)) {
+            if (!core_cpu_backend::is_cpu(ctx->backend)) {
                 size_t mem = ggml_tensor_overhead() * 32 + ggml_graph_overhead_custom(256, false);
                 struct ggml_init_params gp = {mem, nullptr, true};
                 ggml_context* ctx0 = ggml_init(gp);

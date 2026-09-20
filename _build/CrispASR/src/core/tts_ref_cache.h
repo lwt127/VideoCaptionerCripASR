@@ -43,6 +43,19 @@
 namespace crispasr_ref_cache {
 
 inline const char kMagic[4] = {'C', 'R', 'C', '1'};
+
+// Suffix + tag for a CosyVoice3 reference transcript (#334).
+//
+// This blob is written by one layer and read by another that never compiles
+// with it: the CLI transcribes the reference clip and saves it
+// (examples/cli/crispasr_tts_ref_text.h), and the session C ABI reads it back
+// (src/crispasr_c_api.cpp) because it cannot run ASR itself. Nothing links the
+// two, so a literal on each side would be free to drift — and the failure is
+// silent: the session simply stops finding transcripts that are sitting right
+// next to the clip, and reports "needs a transcript" as if none existed.
+//
+// Naming it here once removes the possibility rather than testing for it.
+inline constexpr const char* kCv3RefTextSuffix = ".cv3reftext";
 inline constexpr uint32_t kVersion = 1;
 
 // Globally disable via CRISPASR_TTS_REF_CACHE=0.

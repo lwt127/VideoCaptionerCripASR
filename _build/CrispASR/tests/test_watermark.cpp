@@ -3,13 +3,15 @@
 // Verifies embed + detect round-trip, detection threshold semantics,
 // and robustness against simple transformations (volume scaling).
 
-#include "crispasr_watermark.h"
+#include "core/crispasr_watermark.h"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
+#include "portable_env.h"
 
 namespace {
 
@@ -221,4 +223,63 @@ TEST_CASE("Post-embed verification threshold: watermarked > 0.6, clean < 0.6", "
     REQUIRE(score_wm >= 0.6f);
     // Clean audio must NOT trigger a false positive at that threshold
     REQUIRE(score_clean < 0.6f);
+}
+
+// ---------------------------------------------------------------------------
+// Per-frame detector (the default since 2026-08-03). The sign test above stays
+// guarded because CRISPASR_WATERMARK_DETECT=sign still reaches it.
+//
+// Note the round-trip below uses a SINE, and a stationary tone is the one input
+// where consistency alone lies: every decoy pattern scores just as extremely on
+// it, which is exactly why the statistic requires specificity as well. Passing
+// here therefore says something the old test could not — that the specificity
+// term is wired in, not just the t.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("Per-frame watermark embed + detect round-trip", "[unit][watermark]") {
+    auto pcm = make_sine(48000);
+    auto original = pcm;
+
+    crispasr_watermark_embed_impl(pcm.data(), (int)pcm.size());
+
+    const float score = crispasr_watermark_detect_frames_impl(pcm.data(), (int)pcm.size());
+    REQUIRE(score > 0.65f);
+
+    const float score_orig = crispasr_watermark_detect_frames_impl(original.data(), (int)original.size());
+    REQUIRE(score_orig < 0.65f);
+}
+
+TEST_CASE("Per-frame detector needs enough frames before it answers", "[unit][watermark]") {
+    // Below kDetectMinFrames it returns 0 rather than guess from a handful of
+    // frames — the t would be computed over a sample too small to mean anything.
+    std::vector<float> tiny(1024 * 4, 0.5f);
+    REQUIRE(crispasr_watermark_detect_frames_impl(tiny.data(), (int)tiny.size()) == 0.0f);
+    std::vector<float> shorter(512, 0.5f);
+    REQUIRE(crispasr_watermark_detect_frames_impl(shorter.data(), (int)shorter.size()) == 0.0f);
+}
+
+TEST_CASE("Per-frame detector does not fire on silence", "[unit][watermark]") {
+    std::vector<float> silence(48000, 0.0f);
+    REQUIRE(crispasr_watermark_detect_frames_impl(silence.data(), (int)silence.size()) < 0.65f);
+}
+
+TEST_CASE("The detector selector honours CRISPASR_WATERMARK_DETECT", "[unit][watermark]") {
+    // Both surfaces (CLI dispatch, session C-ABI) route through the selector,
+    // so this is the single place the choice is made.
+    auto pcm = make_sine(48000);
+    crispasr_watermark_embed_impl(pcm.data(), (int)pcm.size());
+
+    setenv("CRISPASR_WATERMARK_DETECT", "sign", 1);
+    REQUIRE_FALSE(crispasr_watermark_detect_uses_frames());
+    REQUIRE(crispasr_watermark_detect_select(pcm.data(), (int)pcm.size()) ==
+            crispasr_watermark_detect_impl(pcm.data(), (int)pcm.size()));
+
+    setenv("CRISPASR_WATERMARK_DETECT", "frames", 1);
+    REQUIRE(crispasr_watermark_detect_uses_frames());
+    REQUIRE(crispasr_watermark_detect_select(pcm.data(), (int)pcm.size()) ==
+            crispasr_watermark_detect_frames_impl(pcm.data(), (int)pcm.size()));
+
+    // Unset => the compiled-in default, which is the per-frame statistic.
+    unsetenv("CRISPASR_WATERMARK_DETECT");
+    REQUIRE(crispasr_watermark_detect_uses_frames());
 }

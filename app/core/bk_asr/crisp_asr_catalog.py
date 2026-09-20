@@ -8,12 +8,21 @@
   下载到 ~/.cache/crispasr）；
 - VAD 方法使用 `--vad -vm <keyword>` 选择。
 
-包含全部 ASR 后端（不含纯 TTS / 对齐器 / LID / VAD 辅助行），
+精选已核对注册表及语言范围的 ASR 后端（不含纯 TTS / 辅助行），
 另含 m2m100 / madlad 等文本翻译后端。
 """
 
 CRISP_ASR_PROJECT_URL = "https://github.com/CrispStrobe/CrispASR"
 CRISP_ASR_REPO = "CrispStrobe/CrispASR"
+
+
+# Explicit downloads preserve the selected Whisper variant rather than falling
+# back to the registry's default (ggml-base.bin).
+CRISP_ASR_WHISPER_HF_REPOS = {
+    **{f"ggml-{size}.bin": "ggerganov/whisper.cpp"
+       for size in ("tiny", "base", "small", "medium", "large-v3")},
+    "kotoba-whisper-v2.2-ggml-q8_0.bin": "kenrouse/kotoba-whisper-v2.2-ggml",
+}
 
 
 # VAD 方法关键字（传给 -vm/--vad-model）
@@ -103,7 +112,7 @@ CRISP_ASR_BACKENDS = [
             {
                 # kotoba-whisper v2.2（日语微调）的 ggml 量化版，可在 whisper 后端运行。
                 # 该模型不在 CrispASR 内置注册表中，需通过 --hf-repo 从自定义仓库下载，
-                # 由 crisp_asr.py 的 CRISP_ASR_WHISPER_HF_REPOS 映射处理。
+                # 由本模块 CRISP_ASR_WHISPER_HF_REPOS 映射处理。
                 "label": "kotoba-whisper-v2.2 ✨ (日语, ggml q8_0)",
                 "value": "kotoba-whisper-v2.2-ggml-q8_0.bin",
                 "backend": "whisper",
@@ -112,10 +121,9 @@ CRISP_ASR_BACKENDS = [
         ],
     },
     {
-        # 注意：Parakeet 的所有变体都使用同一个 --backend "parakeet"，
-        # 具体变体通过 -m <registry-key> 选择（如 -m parakeet-ja）。
-        # CrispASR 不接受 --backend parakeet-ja（会报 "unknown backend"），
-        # 因此这些变体的 backend 必须保持 "parakeet"，变体名放在 -m 值里。
+        # TDT/RNNT/混合变体使用 parakeet；独立 CTC 模型使用 fastconformer-ctc。
+        # 具体变体通过 -m <registry-key> 选择（如 -m parakeet-ja），
+        # 不要将仅用于模型注册表的 key 当作 --backend。
         "label": "Parakeet (NeMo, 快, 多语言, 词级时间戳)",
         "backend": "parakeet",
         "languages": _MULTI_50,
@@ -128,8 +136,10 @@ CRISP_ASR_BACKENDS = [
             _auto("TDT-CTC 1.1B (含标点, 多语言)", "parakeet", "parakeet-tdt_ctc-1.1b", _MULTI_50),
             _auto("RNNT 0.6B (英语)", "parakeet", "parakeet-rnnt-0.6b", ["en"]),
             _auto("RNNT 1.1B (英语)", "parakeet", "parakeet-rnnt-1.1b", ["en"]),
-            _auto("CTC 0.6B (英语)", "parakeet", "parakeet-ctc-0.6b", ["en"]),
-            _auto("CTC 1.1B (英语)", "parakeet", "parakeet-ctc-1.1b", ["en"]),
+            _auto("CTC 0.6B (英语)", "fastconformer-ctc", "parakeet-ctc-0.6b", ["en"]),
+            _auto("CTC 1.1B (英语)", "fastconformer-ctc", "parakeet-ctc-1.1b", ["en"]),
+            _auto("CTC 1.1B 日语 GAL (Q8, ~1.2GB)", "fastconformer-ctc", "parakeet-ctc-1.1b-ja", ["ja"]),
+            _auto("ReazonSpeech NeMo v2 (日语, RNNT, Q8, ~704MB)", "parakeet", "reazonspeech", ["ja"]),
         ],
     },
     {
@@ -152,7 +162,11 @@ CRISP_ASR_BACKENDS = [
         "label": "Voxtral Mini 3B (Mistral, 8 语言)",
         "backend": "voxtral",
         "languages": ["en", "fr", "de", "es", "it", "pt", "nl", "hi"],
-        "models": [_auto("Voxtral Mini 3B (自动下载)", "voxtral")],
+        "models": [
+            _auto("Voxtral Mini 3B (自动下载)", "voxtral"),
+            _auto("Voxtral Mini 3B Q8 (~4.6GB)", "voxtral", "voxtral-mini-3b-2507-q8_0.gguf"),
+            _auto("Voxtral Mini 3B F16 (~8.7GB)", "voxtral", "voxtral-mini-3b-2507-f16.gguf"),
+        ],
     },
     {
         "label": "Voxtral 4B Realtime (13 语言, 流式)",
@@ -160,7 +174,11 @@ CRISP_ASR_BACKENDS = [
         "languages": [
             "en", "fr", "de", "es", "it", "pt", "nl", "hi", "ar", "zh", "ja", "ko", "ru",
         ],
-        "models": [_auto("Voxtral Mini 4B Realtime (自动下载)", "voxtral4b")],
+        "models": [
+            _auto("Voxtral Mini 4B Realtime (自动下载)", "voxtral4b"),
+            _auto("Voxtral 4B Realtime Q8 (~4.4GB)", "voxtral4b", "voxtral-mini-4b-realtime-q8_0.gguf"),
+            _auto("Voxtral 4B Realtime F16 (~8.3GB)", "voxtral4b", "voxtral-mini-4b-realtime-f16.gguf"),
+        ],
     },
     {
         "label": "Granite Speech (IBM)",
@@ -180,6 +198,7 @@ CRISP_ASR_BACKENDS = [
         "models": [
             _auto("Qwen3-ASR 0.6B (自动下载)", "qwen3"),
             _auto("Qwen3-ASR 1.7B", "qwen3-1.7b"),
+            _auto("Qwen3 1.7B 日语动漫 (Q4, ~1.3GB)", "qwen3", "qwen3-ja-anime", ["ja"]),
         ],
     },
     {
@@ -194,7 +213,11 @@ CRISP_ASR_BACKENDS = [
         "languages": ["zh", "yue", "en", "ja", "ko"],
         "models": [
             _auto("Fun-ASR Nano (自动下载)", "funasr"),
-            _auto("Fun-ASR MLT Nano (31 语言)", "fun-asr-mlt-nano", languages=_MULTI_50),
+            _auto("Fun-ASR MLT Nano (31 语言)", "fun-asr-mlt-nano", languages=[
+                "zh", "yue", "en", "ja", "ko", "vi", "id", "th", "ms", "tl", "ar", "hi",
+                "bg", "de", "fr", "es", "it", "pt", "nl", "pl", "cs", "ro", "el", "fi",
+                "sv", "tr", "fa", "da", "hu", "mk", "ru",
+            ]),
         ],
     },
     {
@@ -205,6 +228,7 @@ CRISP_ASR_BACKENDS = [
         ],
         "models": [
             _auto("Cohere Transcribe (自动下载)", "cohere"),
+            _auto("Cohere Arabic (阿拉伯语, Q4 imatrix, ~1.5GB)", "cohere", "cohere-ar", ["ar"]),
             {
                 "label": "Cohere ASR 日语",
                 "value": "cohere-asr-ja-q4_k.gguf",
@@ -219,7 +243,7 @@ CRISP_ASR_BACKENDS = [
         "languages": ["en"],
         "models": [
             _auto("wav2vec2 XLSR (英语, 自动下载)", "wav2vec2"),
-            _auto("wav2vec2 XLSR-53 (德语)", "wav2vec2-de", languages=["de"]),
+            _auto("wav2vec2 XLSR-53 (德语)", "wav2vec2", "wav2vec2-de", languages=["de"]),
             _auto("HuBERT Large (英语)", "hubert"),
             _auto("data2vec Audio (英语)", "data2vec"),
         ],
@@ -254,7 +278,10 @@ CRISP_ASR_BACKENDS = [
         "label": "Kyutai STT (英/法)",
         "backend": "kyutai-stt",
         "languages": ["en", "fr"],
-        "models": [_auto("Kyutai STT 1B (自动下载)", "kyutai-stt")],
+        "models": [
+            _auto("Kyutai STT 1B (自动下载)", "kyutai-stt"),
+            _auto("Kyutai STT 2.6B (英语, ~1.5GB)", "kyutai-stt", "kyutai-stt-2.6b", ["en"]),
+        ],
     },
     {
         "label": "Gemma4-E2B (140+ 语言, 需 HF 令牌)",
@@ -281,10 +308,22 @@ CRISP_ASR_BACKENDS = [
         "models": [_auto("VibeVoice ASR (自动下载, ~4.5GB)", "vibevoice")],
     },
     {
-        "label": "KugelAudio (多语言, ~14GB)",
-        "backend": "kugelaudio",
-        "languages": _MULTI_50,
-        "models": [_auto("KugelAudio 0 Open F16 (自动下载)", "kugelaudio")],
+        "label": "GigaAM v3 (俄语, MIT)", "backend": "gigaam", "languages": ["ru"],
+        "models": [_auto("GigaAM v3 e2e RNNT (Q8, ~249MB)", "gigaam")],
+    },
+    {
+        "label": "Canary-Qwen 2.5B (英语, CC-BY-4.0)",
+        "backend": "canary-qwen", "languages": ["en"],
+        "models": [_auto("Canary-Qwen 2.5B (Q8, ~4.1GB, 须署名)", "canary-qwen")],
+    },
+    {
+        "label": "Higgs-STT (英语, Apache-2.0)", "backend": "higgs-stt", "languages": ["en"],
+        "models": [_auto("Higgs-STT (Q4, ~2.3GB)", "higgs-stt")],
+    },
+    {
+        "label": "MOSS-Transcribe 2B (英语, Apache-2.0)",
+        "backend": "moss-transcribe", "languages": ["en"],
+        "models": [_auto("MOSS-Transcribe preview 2B (Q4, ~1.6GB)", "moss-transcribe")],
     },
     {
         "label": "Moonshine (轻量, 英语 + 6 语言)",
@@ -308,13 +347,46 @@ CRISP_ASR_TRANSLATION_BACKENDS = [
 ]
 
 
+def model_id(model: dict) -> str:
+    return f"{model['backend']}::{model['value']}"
+
+
+def backend_options():
+    return [(b["backend"], b["label"]) for b in CRISP_ASR_BACKENDS]
+
+
+def model_options(backend):
+    group = get_backend_by_label(backend)
+    return [(model_id(m), m["label"]) for m in group["models"]] if group else []
+
+
+def normalize_selection(backend, model, vad, lid):
+    """Migrate recognized legacy labels only; unknown nonempty values survive."""
+    group = get_backend_by_label(backend)
+    if group:
+        backend = group["backend"]
+        for entry in group["models"]:
+            if model in (entry["label"], model_id(entry)):
+                model = model_id(entry)
+                break
+    for entries, value, name in ((CRISP_ASR_VAD_METHODS, vad, "vad"), (CRISP_ASR_LID_METHODS, lid, "lid")):
+        for entry in entries:
+            if value in (entry["label"], entry["value"]):
+                if name == "vad":
+                    vad = entry["value"]
+                else:
+                    lid = entry["value"]
+                break
+    return backend, model, vad, lid
+
+
 def get_backend_labels() -> list[str]:
     return [b["label"] for b in CRISP_ASR_BACKENDS]
 
 
 def get_backend_by_label(label: str) -> "dict | None":
     for b in CRISP_ASR_BACKENDS:
-        if b["label"] == label:
+        if label in (b["label"], b["backend"]):
             return b
     return None
 
@@ -338,14 +410,14 @@ def get_language_codes(backend_label: str, model_label: "str | None" = None) -> 
         return None
     if model_label is not None:
         for m in b["models"]:
-            if m["label"] == model_label:
+            if model_label in (m["label"], model_id(m)):
                 if "languages" in m:
                     return m["languages"]
                 break
     return b.get("languages")
 
 
-# CrispASR v0.8.25 的 --list-backends-json 运行时 capability matrix 中，只有
+# CrispASR v0.8.34 的 --list-backends-json 运行时 capability matrix 中，只有
 # Whisper 与 SenseVoice 声明 language-detect。其余 ASR 后端的 `-l auto` 都会走
 # 外部 audio-LID 预处理步骤，默认会使用 whisper-tiny；本应用允许用户改选 ECAPA、
 # FireRed 等 LID 模型。不要以 README 的语言覆盖表推断原生 LID。
@@ -360,7 +432,7 @@ def _resolve_effective_backend(backend_label: str, model_label: "str | None" = N
     effective_backend = b["backend"]
     if model_label is not None:
         for m in b["models"]:
-            if m["label"] == model_label:
+            if model_label in (m["label"], model_id(m)):
                 effective_backend = m.get("backend", b["backend"])
                 break
     return effective_backend
@@ -399,8 +471,10 @@ def get_lid_labels() -> list[str]:
 
 def resolve_lid_method(lid_label: str) -> str:
     for m in CRISP_ASR_LID_METHODS:
-        if m["label"] == lid_label:
+        if lid_label in (m["label"], m["value"]):
             return m["value"]
+    if lid_label:
+        raise ValueError(f"未知 LID 选择: {lid_label}")
     return "ecapa"
 
 
@@ -409,12 +483,18 @@ def resolve_model(backend_label: str, model_label: str) -> "tuple[str, str]":
 
     模型项可携带自己的 backend（如 Parakeet 的多个变体对应不同 --backend）。
     """
+    if backend_label.startswith("KugelAudio"):
+        raise ValueError("KugelAudio 仅支持语音合成，不能转录。请在设置中重新选择 ASR 模型。")
     b = get_backend_by_label(backend_label)
     if not b:
+        if backend_label or model_label:
+            raise ValueError(f"未知 ASR 选择: {backend_label}；请重新选择模型")
         return ("whisper", "auto")
     for m in b["models"]:
-        if m["label"] == model_label:
+        if model_label in (m["label"], model_id(m)):
             return (m.get("backend", b["backend"]), m["value"])
+    if model_label:
+        raise ValueError(f"未知模型选择: {model_label}；不会自动改用其他模型")
     if b["models"]:
         first = b["models"][0]
         return (first.get("backend", b["backend"]), first["value"])
@@ -427,6 +507,8 @@ def get_vad_labels() -> list[str]:
 
 def resolve_vad_method(vad_label: str) -> str:
     for v in CRISP_ASR_VAD_METHODS:
-        if v["label"] == vad_label:
+        if vad_label in (v["label"], v["value"]):
             return v["value"]
+    if vad_label:
+        raise ValueError(f"未知 VAD 选择: {vad_label}")
     return "silero"

@@ -3,6 +3,8 @@
 
 #include "mel.h"
 
+#include "parallel_for.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -169,28 +171,17 @@ std::vector<float> compute(const float* samples, int n_samples, const float* win
 #else
             // Portable std::thread path (§305): AppleClang ships no libomp, so the
             // OpenMP path above is compiled out on macOS — without this the STFT
-            // stayed single-threaded there. Each thread owns its FFT scratch and
+            // stayed single-threaded there. Each chunk owns its FFT scratch and
             // frames write disjoint `power` rows → data-race free, bit-identical.
+            // The 8-thread default cap is deliberate and predates the shared
+            // helper, so it is passed in rather than left to hardware_concurrency.
             const unsigned hw = std::thread::hardware_concurrency();
             const int cap = p.n_threads > 0 ? p.n_threads : (int)((hw == 0) ? 1u : std::min(hw, 8u));
-            const int nt = std::min(cap, T);
-            std::vector<std::thread> pool;
-            pool.reserve(nt > 0 ? nt - 1 : 0);
-            const int chunk = (T + nt - 1) / nt;
-            auto run = [&](int t0, int t1) {
+            core_parallel::for_each_chunk(T, cap, [&](int t0, int t1) {
                 std::vector<float> fft_in((size_t)n_fft), fft_out((size_t)n_fft * 2);
                 for (int t = t0; t < t1; t++)
                     compute_frame(t, fft_in.data(), fft_out.data());
-            };
-            for (int i = 1; i < nt; i++) {
-                const int a = i * chunk, b = std::min(T, a + chunk);
-                if (a >= b)
-                    break;
-                pool.emplace_back([&run, a, b]() { run(a, b); });
-            }
-            run(0, std::min(T, chunk));
-            for (auto& th : pool)
-                th.join();
+            });
 #endif
         } else {
             std::vector<float> fft_in((size_t)n_fft);

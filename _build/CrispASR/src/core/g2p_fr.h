@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include "core/num2words_fr.h" // #316: spell digits out before phonemizing
+
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -524,6 +526,15 @@ inline std::string lts_word_to_ipa(const std::string& word) {
 
 struct context {
     dictionary dict;
+
+    // #316 round 2: carry punctuation through into the phoneme string. Kokoro's
+    // 178-symbol vocabulary contains `,.;:!?…—"«»“”` — they are how the model
+    // knows to pause, and dropping them delivers a paragraph in one breath.
+    // English proved it (misaki emits them and we did not); this is the same
+    // defect in the same shape. Off by default: piper's phoneme inventory is
+    // espeak's, and that consumer has never been fed punctuation, so the flag
+    // is the caller's to set. See g2p_en::style.
+    bool emit_punctuation = false;
 };
 
 inline std::vector<std::string> tokenize(const std::string& text) {
@@ -532,7 +543,7 @@ inline std::vector<std::string> tokenize(const std::string& text) {
     for (size_t i = 0; i < text.size(); i++) {
         char c = text[i];
         if (c == ' ' || c == ',' || c == '.' || c == '!' || c == '?' || c == ';' || c == ':' || c == '-' || c == '\n' ||
-            c == '\'') {
+            c == '"' || c == '(' || c == ')' || c == '[' || c == ']' || c == '\'') {
             if (!cur.empty()) {
                 tokens.push_back(cur);
                 cur.clear();
@@ -566,14 +577,37 @@ inline std::string word_to_ipa(const context& ctx, const std::string& word) {
 }
 
 inline std::string text_to_ipa(const context& ctx, const std::string& text) {
-    auto words = tokenize(text);
+    // #316: spell numbers out FIRST. Digits are in no pronunciation dictionary
+    // and no letter-to-sound rule, so a numeric token phonemized to the EMPTY
+    // string and vanished from the audio. Must run before tokenize(), which
+    // splits on ',' and '.' — the decimal mark and thousands separator.
+    auto words = tokenize(core_num2words_fr::expand(text));
+    // A mark that the consumer wants goes flush against the word before it and
+    // is followed by a space, the way misaki emits English. A mark it does not
+    // want still separates its neighbours — with ONE space, not the two the old
+    // loop produced around every comma. `-` is a separator only: it is in no
+    // TTS vocabulary here.
     std::string ipa;
+    bool pending_space = false;
     for (const auto& w : words) {
-        if (w.size() == 1 && strchr(",.!?;:-'", w[0]))
+        const bool punct = w.size() == 1 && strchr(",.!?;:-\"()[]'", w[0]) != nullptr;
+        if (punct && (!ctx.emit_punctuation || w[0] == '-' || w[0] == '\'')) {
+            if (!ipa.empty())
+                pending_space = true;
             continue;
-        if (!ipa.empty())
+        }
+        if (punct) {
+            ipa += w; // attaches to the word before it
+            pending_space = true;
+            continue;
+        }
+        const std::string ph = word_to_ipa(ctx, w);
+        if (ph.empty())
+            continue;
+        if (!ipa.empty() && (pending_space || ipa.back() != ' '))
             ipa += ' ';
-        ipa += word_to_ipa(ctx, w);
+        pending_space = false;
+        ipa += ph;
     }
     return ipa;
 }

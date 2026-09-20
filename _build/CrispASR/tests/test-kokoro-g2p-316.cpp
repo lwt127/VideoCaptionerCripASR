@@ -74,6 +74,15 @@ TEST_CASE("decimals, separators, ordinals, signs and units", "[unit][kokoro][g2p
     REQUIRE(expand("50%") == "fifty percent");
     REQUIRE(expand("$20") == "twenty dollars");
     REQUIRE(expand("$1") == "one dollar");
+    // #316 follow-up: the unit used to survive only for a LEADING '$'. A
+    // currency symbol is in no dictionary and no letter-to-sound rule, so every
+    // other form lost it silently — "€50" was spoken "fifty".
+    REQUIRE(expand("\u20ac50") == "fifty euros");
+    REQUIRE(expand("\u00a350") == "fifty pounds");
+    REQUIRE(expand("\u20ac1") == "one euro");
+    // …and the postfix form every European locale writes.
+    REQUIRE(expand("50\u20ac") == "fifty euros");
+    REQUIRE(expand("50 \u20ac") == "fifty euros");
 }
 
 TEST_CASE("alphanumeric tokens are left for the existing rules", "[unit][kokoro][g2p]") {
@@ -331,4 +340,186 @@ TEST_CASE("capitalisation drives the stress, not part of speech", "[unit][kokoro
     REQUIRE(core_g2p_ctxwords::apply_caps_stress("Box", "bˈɑks") == "bˈɑks");
     // No vowel, nothing to stress.
     REQUIRE(core_g2p_ctxwords::apply_caps_stress("Hmm", "hm") == "hm");
+}
+
+// ── the rules reach the OUTPUT, not just their own header ───────────────────
+//
+// Everything above tests `core_g2p_ctxwords` in isolation, and every one of
+// those assertions passed while the product shipped `ði bɑks` and read the
+// article "a" as the LETTER, `ˈA`: nothing anywhere set `context_words`, so
+// `text_to_ipa` never called any of it. These tests run the pipeline.
+
+#include "core/g2p_en.h"
+
+namespace {
+
+// A stand-in for misaki's lexicon: the same entries, verbatim, for the handful
+// of words below. Keeps the test hermetic — no download, no 178K-entry file.
+g2p_en::context mini_lexicon() {
+    g2p_en::context ctx;
+    ctx.espeak_ipa.entries = {
+        {"a", "A"}, // misaki's citation form IS the letter, "eɪ"
+        {"the", "ði"},      {"to", "tu"},
+        {"i", "ˈI"},        {"box", "bˈɑks"},
+        {"apple", "ˈæpᵊl"}, {"dramatic", "dɹəmˈæɾɪk"},
+        {"high", "hˈI"},    {"contrast", "kˈɑntɹˌæst"},
+        {"dark", "dˈɑɹk"},  {"mr.", "mˈɪstəɹ"},
+    };
+    ctx.espeak_ipa.loaded = true;
+    return ctx;
+}
+
+std::string misaki(const g2p_en::context& ctx, const std::string& text) {
+    return g2p_en::text_to_ipa(ctx, text, g2p_en::misaki_style());
+}
+
+} // namespace
+
+TEST_CASE("configure_for_misaki turns on everything Kokoro needs", "[unit][kokoro][g2p]") {
+    // The wiring contract. The first round of #316 wrote the contextual-word
+    // rules and left them switched off in the product for a whole release.
+    g2p_en::context ctx;
+    REQUIRE_FALSE(ctx.context_words);
+    g2p_en::configure_for_misaki(ctx);
+    REQUIRE(ctx.context_words);
+    REQUIRE(ctx.emit_punctuation);
+    REQUIRE(ctx.join_hyphenated);
+    REQUIRE(ctx.consumer().context_words);
+}
+
+TEST_CASE("the contextual forms come out of text_to_ipa", "[unit][kokoro][g2p]") {
+    const auto ctx = mini_lexicon();
+    // The reported "old English" diction: the citation form in every position.
+    REQUIRE(misaki(ctx, "the box") == "ðə bˈɑks");
+    REQUIRE(misaki(ctx, "the apple") == "ði ˈæpᵊl");
+    // "and a dark background" — the article was read as the LETTER A, with
+    // PRIMARY stress: the "unnecessary emphasis on a" in the #316 follow-up.
+    REQUIRE(misaki(ctx, "a dark box") == "ɐ dˈɑɹk bˈɑks");
+    // ...and the pronoun carries SECONDARY stress, not primary.
+    REQUIRE(misaki(ctx, "I box") == "ˌI bˈɑks");
+    // Without the misaki conventions the same dictionary keeps its citation
+    // forms — that is what piper wants and must not change.
+    REQUIRE(g2p_en::text_to_ipa(ctx, "the box") == "ði bˈɑks");
+}
+
+TEST_CASE("punctuation survives into the phoneme string", "[unit][kokoro][g2p]") {
+    const auto ctx = mini_lexicon();
+    // Kokoro's 178-symbol vocabulary contains `,` and `.`; they are how the
+    // model knows to pause. Dropping them delivered a whole paragraph in one
+    // breath.
+    REQUIRE(misaki(ctx, "the box, the apple.") == "ðə bˈɑks, ði ˈæpᵊl.");
+    // A mark sits flush against the word it follows, exactly as misaki emits it.
+    REQUIRE(misaki(ctx, "box; box: box!") == "bˈɑks; bˈɑks: bˈɑks!");
+    // The piper consumer still gets none of it — and gets ONE space where the
+    // old loop emitted two.
+    REQUIRE(g2p_en::text_to_ipa(ctx, "the box, the apple.") == "ði bˈɑks ði ˈæpᵊl");
+}
+
+TEST_CASE("a quoted word still reaches the lexicon", "[unit][kokoro][g2p]") {
+    const auto ctx = mini_lexicon();
+    // `"dramatic"` used to arrive at every lookup tier WEARING ITS QUOTES,
+    // missed all of them, and came back out of the letter-to-sound rules as
+    // dɹˈæmætɪk — first-syllable stress. That is the "strange pronunciation of
+    // dramatic" in the #316 follow-up report.
+    REQUIRE(misaki(ctx, "\"dramatic\"") == "“dɹəmˈæɾɪk”");
+    REQUIRE(misaki(ctx, "(box)") == "(bˈɑks)");
+    // Straight quotes alternate into the directional pair misaki produces and
+    // Kokoro was trained on.
+    REQUIRE(misaki(ctx, "\"box\" \"apple\"") == "“bˈɑks” “ˈæpᵊl”");
+}
+
+TEST_CASE("a hyphenated compound is one word with one primary stress", "[unit][kokoro][g2p]") {
+    const auto ctx = mini_lexicon();
+    // misaki: high-contrast -> hˌIkˈɑntɹˌæst. Splitting it gave two primary
+    // stresses and a pause through the middle of the word.
+    REQUIRE(misaki(ctx, "high-contrast") == "hˌIkˈɑntɹˌæst");
+    // piper keeps the split (its dictionaries have no compound entries).
+    REQUIRE(g2p_en::text_to_ipa(ctx, "high-contrast") == "hˈI kˈɑntɹˌæst");
+}
+
+TEST_CASE("an abbreviation's period is not a full stop", "[unit][kokoro][g2p]") {
+    const auto ctx = mini_lexicon();
+    // misaki's lexicon lists `Mr.` WITH the dot; splitting it off put a
+    // sentence-length pause after every "Mister".
+    REQUIRE(misaki(ctx, "Mr. Box") == "mˈɪstəɹ bˈɑks");
+    // A real sentence end is still a sentence end.
+    REQUIRE(misaki(ctx, "the box.") == "ðə bˈɑks.");
+}
+
+TEST_CASE("compound de-stressing follows misaki's rule", "[unit][kokoro][g2p]") {
+    using core_g2p_ctxwords::destress;
+    using core_g2p_ctxwords::join_compound;
+    // apply_stress(ps, -0.5): primary becomes secondary, secondaries go.
+    REQUIRE(destress("hˈI") == "hˌI");
+    REQUIRE(destress("kˈɑntɹˌæst") == "kˌɑntɹæst");
+    REQUIRE(destress("ænd") == "ænd"); // no primary — untouched
+    // The lighter half yields: "high" (weight 4) loses to "contrast" (10).
+    REQUIRE(join_compound({"hˈI", "kˈɑntɹˌæst"}) == "hˌIkˈɑntɹˌæst");
+    // Only one primary between them: nothing to resolve, join as-is.
+    REQUIRE(join_compound({"ænd", "bˈɑks"}) == "ændbˈɑks");
+}
+
+TEST_CASE("ALLCAPS promotes an existing secondary stress", "[unit][kokoro][g2p]") {
+    // misaki's apply_stress, the `stress >= 1 and PRIMARY not in ps` branch.
+    REQUIRE(core_g2p_ctxwords::apply_caps_stress("HIGH", "hˌI") == "hˈI");
+    REQUIRE(core_g2p_ctxwords::apply_caps_stress("High", "hˌI") == "hˌI");
+}
+
+// ── acronyms: misaki reads them out, letter by letter ───────────────────────
+
+namespace {
+
+// misaki's own letter readings (us_gold.json, uppercase keys).
+g2p_en::context lexicon_with_letters() {
+    g2p_en::context ctx = mini_lexicon();
+    ctx.letters.entries = {
+        {"a", "ˈA"}, {"b", "bˈi"}, {"c", "sˈi"}, {"d", "dˈi"}, {"e", "ˈi"},  {"f", "ˈɛf"}, {"g", "ʤˈi"},  {"h", "ˈAʧ"},
+        {"i", "ˈI"}, {"n", "ˈɛn"}, {"p", "pˈi"}, {"s", "ˈɛs"}, {"u", "jˈu"}, {"v", "vˈi"}, {"x", "ˈɛks"},
+    };
+    ctx.letters.loaded = true;
+    return ctx;
+}
+
+} // namespace
+
+TEST_CASE("a dotted acronym is spelled, not pronounced", "[unit][kokoro][g2p]") {
+    const auto ctx = lexicon_with_letters();
+    // Verified against misaki 0.9.4 in an identical frame. The old output was
+    // `jˈu.ˈɛs.ɐ.` — full stops INSIDE the word, so the model paused between
+    // the letters, and the trailing "a" was read as the article.
+    REQUIRE(misaki(ctx, "U.S.A.") == "jˌuˌɛsˈA");
+    REQUIRE(misaki(ctx, "e.g.") == "ˌiʤˈi");
+    // Every letter is demoted and the LAST one promoted back — one word, one
+    // stress peak (misaki's get_NNP).
+    REQUIRE(misaki(ctx, "U.S.") == "jˌuˈɛs");
+}
+
+TEST_CASE("an unknown ALLCAPS word is spelled; a known one is not", "[unit][kokoro][g2p]") {
+    const auto ctx = lexicon_with_letters();
+    REQUIRE(misaki(ctx, "PDF") == "pˌidˌiˈɛf");
+    // misaki lowercases an ALLCAPS word and looks THAT up first, so a word in
+    // the dictionary is still a word however it is capitalised.
+    REQUIRE(misaki(ctx, "BOX") == "bˈɑks");
+    // A single letter is not an acronym — a lone "A" stays the article.
+    REQUIRE(misaki(ctx, "A dark box") == "ɐ dˈɑɹk bˈɑks");
+}
+
+TEST_CASE("spelling is inert without a letters table", "[unit][kokoro][g2p]") {
+    // The espeak/piper dicts have no letter entries, which is what keeps this
+    // whole path off for that consumer — no separate flag needed.
+    const auto ctx = mini_lexicon();
+    REQUIRE(ctx.letters.entries.empty());
+    REQUIRE(g2p_en::spell_out(ctx, "PDF").empty());
+    REQUIRE_FALSE(g2p_en::wants_spelling(ctx, "PDF"));
+}
+
+TEST_CASE("is_dotted_acronym matches misaki's shape test", "[unit][kokoro][g2p]") {
+    using core_g2p_ctxwords::is_dotted_acronym;
+    REQUIRE(is_dotted_acronym("U.S."));
+    REQUIRE(is_dotted_acronym("e.g."));
+    REQUIRE(is_dotted_acronym("Ph.D."));     // longest run is 2, still under 3
+    REQUIRE_FALSE(is_dotted_acronym("Mr.")); // no dot INSIDE the word
+    REQUIRE_FALSE(is_dotted_acronym("etc.."));
+    REQUIRE_FALSE(is_dotted_acronym("box"));
+    REQUIRE_FALSE(is_dotted_acronym("3.14"));
 }

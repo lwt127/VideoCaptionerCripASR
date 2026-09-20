@@ -1,23 +1,45 @@
 #!/bin/bash
-# tests/test_vad_export_live.sh — live tests for --vad-export fixes (#227).
+# tests/test_vad_export_live.sh — CLI-surface tests for --vad-export (#227).
 #
-# Verifies:
-#   1. --vad-export produces a valid JSON file without needing a model
-#   2. --vad-export implies --vad (real VAD boundaries, not continuous)
-#   3. The exported file can be imported with --vad-import
-#   4. Multi-file export produces per-file outputs
-#   5. --vad-export exits before transcription (fast, no model needed)
+# TWO TIERS IN ONE SCRIPT, selected by $3:
 #
-# Requires: crispasr binary (built), test audio files.
-# Does NOT require any model downloads.
+#   unit        Tests 1-4 only. No model, no network. Four CLI runs with
+#               Silero VAD — a few seconds idle, ~30s on a contended box, so
+#               not a microtest. This is the half that caught #227's actual
+#               bug (--vad-import silently ignored).
+#   live | all  Everything, including the model-gated Tests 6-8 (14 CLI runs,
+#               each loading a whisper model). `all` is the default so running
+#               the script by hand still does what it always did.
+#
+# `live` deliberately re-runs the cheap half rather than skipping it: one extra
+# second buys the guarantee that the two tiers cannot drift into testing
+# different things.
+#
+# The split exists because the two halves belong in different ctest tiers and
+# used to share one. Labelled `unit`, the whole script passed in CI — which has
+# no model, so it SKIPPED everything below Test 4 and reported green for
+# coverage it never ran — while timing out at 120s on any developer machine
+# where a model happened to be findable. Green where it tests nothing, red
+# where it tests everything, which is exactly backwards.
+#
+# Requires: crispasr binary (built), test audio. The live tier additionally
+# needs a whisper model via $CRISPASR_MODEL_WHISPER or a known local path.
 #
 # Usage:
-#   bash tests/test_vad_export_live.sh
+#   bash tests/test_vad_export_live.sh [crispasr] [src_dir] [unit|live|all]
 
 set -e
 
 CRISPASR="${1:-${CRISPASR_BIN:-build/bin/crispasr}}"
 SRC_DIR="${2:-.}"
+TIER="${3:-all}"
+case "$TIER" in
+    unit | live | all) ;;
+    *)
+        echo "unknown tier '$TIER' (expected unit, live or all)" >&2
+        exit 2
+        ;;
+esac
 JFK_WAV="$SRC_DIR/samples/jfk.wav"
 TMPDIR="$(mktemp -d "${TMPDIR_BASE:-/tmp}/test227.XXXXXX")"
 
@@ -125,9 +147,9 @@ else
     skip "Test 3" "no export file from test 1"
 fi
 
-# ─── Test 4: --vad-export is fast (no model load) ───────────────────
+# ─── Test 4: --vad-export runs without loading the ASR model ─────────
 echo ""
-echo "--- Test 4: --vad-export completes quickly (no model load) ---"
+echo "--- Test 4: --vad-export runs without loading the ASR model ---"
 EXPORT_FILE4="$TMPDIR/vad4.json"
 START_TIME=$(date +%s%N)
 $CRISPASR --backend paraformer -m /nonexistent/model.gguf \
@@ -136,15 +158,37 @@ END_TIME=$(date +%s%N)
 ELAPSED_MS=$(( (END_TIME - START_TIME) / 1000000 ))
 
 if [ -f "$EXPORT_FILE4" ]; then
-    # VAD export should complete in under 10 seconds on any machine
-    # (Silero VAD on 11s audio is <1s). If it takes longer, the model
-    # load was not skipped.
-    check "export completed in <10s (${ELAPSED_MS}ms)" test "$ELAPSED_MS" -lt 10000
+    # THE assertion: the export ran to completion with -m pointing at a file
+    # that does not exist. If the ASR model load were not skipped, the run
+    # would have failed there and this file would not be here. That is the
+    # property under test, stated directly.
+    check "export produced despite a nonexistent ASR model" test -f "$EXPORT_FILE4"
+
+    # Elapsed time is reported, NOT asserted. This used to gate on <10s, on the
+    # reasoning that Silero VAD over 11s of audio is ~1s so anything slower
+    # meant the model had loaded. That is a proxy for the property above, and
+    # it is a proxy that measures the machine rather than the code: measured
+    # here at 1.5s of CPU but 5.8-15.7s of WALL on a contended box, so the
+    # threshold fires on a busy laptop and says "model load was not skipped"
+    # when nothing of the sort happened. A test that fails because something
+    # else was compiling is a test people learn to re-run rather than read.
+    echo "[INFO] export took ${ELAPSED_MS}ms wall (informational; not a gate)"
 else
     echo "[FAIL] export file not created"
     FAIL=$((FAIL + 1))
 fi
 
+
+if [ "$TIER" = "unit" ]; then
+    echo ""
+    echo "=== Results (unit tier): $PASS passed, $FAIL failed, $SKIP skipped ==="
+    rm -rf "$TMPDIR"
+    [ "$FAIL" -eq 0 ] || exit 1
+    exit 0
+fi
+
+# ─── Everything below needs a whisper model and transcribes real audio ──
+# 14 CLI runs, each loading the model. This is the `live` tier.
 
 # ─── Test 6: --vad-import is HONOURED on the default path (issue #227) ─
 # The bug: --vad-import was silently ignored unless --backend was passed,
@@ -155,7 +199,7 @@ echo ""
 echo "--- Test 6: --vad-import not silently ignored ---"
 MODEL="${CRISPASR_MODEL_WHISPER:-}"
 if [ -z "$MODEL" ]; then
-    for m in ggml-base.bin models/ggml-base.en.bin /Volumes/backups/ai/CrispASR/ggml-base.bin; do
+    for m in ggml-base.bin models/ggml-base.en.bin "${CRISPASR_MODELS_DIR:-$HOME/.cache/crispasr}/ggml-base.bin"; do
         [ -f "$m" ] && MODEL="$m" && break
     done
 fi

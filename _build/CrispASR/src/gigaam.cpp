@@ -92,6 +92,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 // ===========================================================================
 // Env gates
@@ -1076,7 +1077,7 @@ extern "C" struct gigaam_context* gigaam_init_from_file(const char* path_model, 
     ctx->params = params;
     ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
-    ctx->backend_cpu = ggml_backend_cpu_init();
+    ctx->backend_cpu = core_cpu_backend::init();
     ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : nullptr;
     if (!ctx->backend)
         ctx->backend = ctx->backend_cpu;
@@ -1114,7 +1115,7 @@ extern "C" void gigaam_free(struct gigaam_context* ctx) {
         ggml_backend_sched_free(ctx->sched);
     ctx->model.pw_q8.free();
     if (ctx->model.buf)
-        ggml_backend_buffer_free(ctx->model.buf);
+        core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->model.ctx)
         ggml_free(ctx->model.ctx);
     if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)

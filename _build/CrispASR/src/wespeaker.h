@@ -78,6 +78,25 @@ int wespeaker_embed(struct wespeaker_context* ctx, const float* samples, int n_s
 int wespeaker_embed_windows(struct wespeaker_context* ctx, const float* samples, int n_samples, const int* win_start,
                             const int* win_end, int n_win, float* out_embeddings);
 
+// Embed `n_win` independent windows of `samples`, batching same-length groups
+// through the trunk along the ggml batch dimension (ne[3]). ARITHMETIC-
+// IDENTICAL to looping wespeaker_embed(): every window keeps its own fbank and
+// its own per-window CMN, and windows never see each other's audio — only the
+// forward passes are fused, which turns the seg1 GEMV into a GEMM and lets one
+// graph amortise the per-dispatch cost that dominates 1.2 s windows. (Contrast
+// wespeaker_embed_windows above, which shares fbank/CMN/conv context across a
+// span and therefore moves DER.)
+//
+// offsets/lengths are sample ranges into `samples`; out_embeddings receives
+// n_win * embed_dim floats in caller order. Windows of unequal length are
+// grouped by exact fbank frame count — never padded, padding would change CMN
+// and conv content — and singleton groups fall back to the per-window graph.
+// Batch size per graph is capped by CRISPASR_WESPEAKER_BATCH (default 16,
+// max 32). Returns 0 only if EVERY window succeeded; on non-zero the caller
+// should fall back to per-window wespeaker_embed() to isolate the failure.
+int wespeaker_embed_batch(struct wespeaker_context* ctx, const float* samples, int64_t n_samples,
+                          const int64_t* offsets, const int* lengths, int n_win, float* out_embeddings);
+
 // ---- Stage-level entry points (for crispasr-diff) ----
 
 // Kaldi fbank (80 mel, 25/10 ms, hamming) AFTER per-utterance CMN — i.e. the

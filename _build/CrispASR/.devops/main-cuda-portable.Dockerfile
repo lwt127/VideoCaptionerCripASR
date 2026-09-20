@@ -44,18 +44,19 @@ ARG CRISPASR_BUILD_JOBS
 # CPUs — the RTX GPU still carries the ASR; CPU VAD/diarization run on the
 # generic (slower but correct) kernels.
 #
-# ⚠ Why every flag must be spelled OFF: GGML_NATIVE=OFF does NOT mean baseline.
+# ⚠ Why one CrispASR option owns the full flag set: GGML_NATIVE=OFF does
+# NOT mean baseline.
 # ggml's CMake:
 #     if (GGML_NATIVE OR NOT GGML_NATIVE_DEFAULT)  set(INS_ENB OFF)
 #     else()                                       set(INS_ENB ON)
 #     option(GGML_BMI2 "..." ${INS_ENB})   # and GGML_SSE42 / GGML_AVX
 # GGML_NATIVE_DEFAULT is ON for a normal build, so GGML_NATIVE=OFF lands in the
 # else branch → INS_ENB=ON → BMI2/SSE42/AVX default ON and ggml-cpu gets
-# `-mbmi2`. Forcing each to OFF is the only way to get a true SSE2 baseline.
+# `-mbmi2`. CRISPASR_PORTABLE_CPU forces every current optional x86 ISA OFF in
+# root CMake, including new ggml knobs added after this Dockerfile (#302).
 RUN jobs="${CRISPASR_BUILD_JOBS:-$(nproc)}" && \
     cmake -S . -B build -G Ninja -DCRISPASR_BUILD_TESTS=OFF -DGGML_CUDA=1 \
-        -DGGML_NATIVE=OFF -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF \
-        -DGGML_BMI2=OFF -DGGML_SSE42=OFF -DGGML_AVX=OFF -DGGML_AVX512=OFF \
+        -DCRISPASR_PORTABLE_CPU=ON \
         -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-real;120-real;120-virtual" \
         -DCMAKE_EXE_LINKER_FLAGS="-Wl,--allow-shlib-undefined" && \
     cmake --build build -j"${jobs}" --target crispasr-cli

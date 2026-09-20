@@ -1,21 +1,170 @@
 # Install & build
 
 This page covers the full build matrix. For a quick sanity build, see
-the **Quick install** section in the [README](../README.md).
+the **Quick install** section in the [README](../README.md). If you only want a
+working binary and a first transcription, start at
+[getting-started.md](getting-started.md) instead — it picks the release asset
+for you and stops there.
+
+## Prebuilt Linux tarballs — which one to download (#355)
+
+The GitHub releases carry several Linux x86-64 tarballs.
+
+| tarball | GPU acceleration | falls back to CPU? |
+|---|---|---|
+| `crispasr-linux-x86_64.tar.gz` | none (CPU only) | n/a — it *is* the CPU build |
+| `crispasr-linux-x86_64-cpu-legacy.tar.gz` | none (generic x86-64/SSE2 CPU) | n/a |
+| `crispasr-linux-x86_64-avx512.tar.gz` | none (AVX-512 CPU) | n/a |
+| `crispasr-linux-x86_64-cuda.tar.gz` | NVIDIA GPU (CUDA 12) | **yes** — runs on CPU if CUDA libs are absent |
+| `crispasr-linux-x86_64-cuda13.tar.gz` | NVIDIA GPU (CUDA 13) | **yes** — runs on CPU if CUDA libs are absent |
+| `crispasr-linux-x86_64-hip.tar.gz` | AMD GPU (ROCm) | **no** |
+| `crispasr-linux-x86_64-vulkan.tar.gz` | Vulkan GPU | **no** |
+
+Since v0.8.30 the CUDA tarballs use dynamic backend loading
+(`GGML_BACKEND_DL`): the CUDA backend is a separate shared library
+(`ggml-cuda.so`) that the main binary loads via `dlopen` at runtime. If the
+NVIDIA driver (`libcuda.so.1`) or CUDA runtime (`libcudart.so.12` / `.13`) are absent,
+the CUDA backend simply does not load and the CPU backend is used instead —
+the "auto-select the best backend, fall back to CPU" behavior works as
+advertised. No wrapper script is needed.
+
+Since #405 the CUDA tarballs also ship the CPU backend as a **set of
+ISA-variant modules** (`libggml-cpu-x64.so` … `libggml-cpu-icelake.so`); at
+startup ggml scores each against the host CPU and loads the best supported
+one. A pre-AVX2 host (e.g. a Sandy/Ivy Bridge Xeon next to a Tesla P40) gets
+the `x64`/`sse42`/`sandybridge` module instead of *no CPU backend at all* —
+v0.8.30's single AVX2 `libggml-cpu.so` was refused there, which aborted every
+model load with `GGML_ASSERT(backend)` / `GGML_ASSERT(device)`. If no CPU
+module can load, crispasr now exits with a clear "no CPU ggml backend" error
+pointing at the `-cpu-legacy` artifact instead of aborting.
+
+For GPU acceleration, the NVIDIA driver and CUDA toolkit must be installed on
+the host (or injected into the container via `--gpus` / `runtime: nvidia`).
+
+> **Installing via `mise` (or another GitHub-release installer)?** Those tools
+> pick ONE asset per OS/arch — for Linux that is the plain
+> `crispasr-linux-x86_64.tar.gz`, which is an AVX2 CPU build (2013+ Intel /
+> 2015+ AMD; it fails fast with an explanatory error on older CPUs since
+> #380/#405 instead of dying on an illegal instruction). The CUDA / Vulkan /
+> HIP / legacy-CPU flavors are separate assets the installer does not know
+> about — download the tarball you need from the releases page directly, or
+> configure your installer's asset selection if it supports one.
+
+The HIP and Vulkan tarballs still require their respective runtimes at
+link time (no CPU fallback). Use the plain CPU tarball if you need a
+GPU-less fallback for those.
+
+Verify what a given tarball actually requires before deploying it:
+
+```bash
+readelf -d crispasr | grep NEEDED
+```
+
+> **Can the GPU build degrade gracefully instead?** Yes, if you build it
+> yourself: `-DGGML_BACKEND_DL=ON -DBUILD_SHARED_LIBS=ON` makes each backend a
+> `dlopen`-ed module, so a missing CUDA driver leaves the CUDA backend
+> unregistered instead of killing the process. This works and is verified on
+> Metal and CPU — see [the #355 section](#graceful-degradation-via-ggml_backend_dl-355)
+> for the measured transcripts and the two throughput caveats. The two CUDA
+> tarballs above are already built this way; the HIP and Vulkan tarballs are
+> still statically linked, because flipping those release legs needs an A/B on
+> real AMD and Vulkan hardware first.
+
+## Windows CPU: which zip? (#380)
+
+`crispasr-windows-x86_64-cpu.zip` targets an **AVX2 + FMA** baseline (Intel
+Haswell 2013+ / AMD Excavator 2015+). On an older CPU — e.g. Sandy/Ivy Bridge,
+which have AVX but not AVX2 — the first compute instruction raises an
+illegal-instruction fault that the Windows console swallows: the program
+prints its banner and exits with no output and no error (issue #380). Since
+that report the CLI checks at startup and prints an explicit error instead
+(`CRISPASR_IGNORE_CPU_ISA=1` overrides).
+
+> Hitting that "banner, then nothing" symptom on a machine that *does* have
+> AVX2? It is still a crash, and the exit code says which kind — see
+> [troubleshooting.md](troubleshooting.md#it-printed-the-banner-then-nothing-happened).
+
+For pre-AVX2 CPUs use **`crispasr-windows-x86_64-cpu-legacy.zip`** — a generic
+x86-64/SSE2-floor build (`CRISPASR_PORTABLE_CPU=ON`) that runs on anything
+from Westmere up, just slower per core. Check with `wmic cpu get name` and
+look the model up, or run the AVX2 build once: the new error message tells
+you which features are missing.
+
+## Windows CUDA: split downloads (#342)
+
+The Windows CUDA packages bundle three NVIDIA runtime DLLs — `cudart64_*.dll`,
+`cublas64_*.dll` and `cublasLt64_*.dll` — so they work on a host that never
+added the CUDA `bin` directory to `PATH`. They also dominate the download, and
+they change far less often than we cut releases. Re-fetching them for every
+version is wasted bandwidth, which is painful if github.com is slow for you.
+
+So each release ships both forms:
+
+| asset | contains |
+|---|---|
+| `crispasr-windows-x86_64-cuda.zip` | CLI (CUDA 12), self-contained |
+| `crispasr-windows-x86_64-cuda-non-cuda.zip` | CLI (CUDA 12), **without** the three DLLs |
+| `crispasr-windows-x86_64-cuda13.zip` | CLI (CUDA 13, sm_75+, #400), self-contained |
+| `crispasr-windows-x86_64-cuda13-non-cuda.zip` | CLI (CUDA 13), **without** the three DLLs |
+| `libcrispasr-windows-x86_64-cuda.tar.gz` | shared libs + headers (CUDA 12), self-contained |
+| `libcrispasr-windows-x86_64-cuda-non-cuda.tar.gz` | shared libs + headers (CUDA 12), **without** the three DLLs |
+| `cudart64_*.dll`, `cublas64_*.dll`, `cublasLt64_*.dll` | the three DLLs of each CUDA major, on their own |
+| `crispasr-windows-x86_64-cuda*-runtime-sha256.txt` | SHA-256 of each trio (one manifest per major) |
+
+To upgrade without re-downloading the runtime: take the `-non-cuda` archive,
+unpack it, and copy the three DLLs you already have next to `crispasr.exe`
+(for the libs package, into `bin\`). The DLL file names carry the CUDA major
+(`cudart64_12.dll` vs `cudart64_13.dll`), so a CUDA 12 trio cannot be
+mistakenly installed into a CUDA 13 package or vice versa.
+
+The executable reports the toolkit it was built and linked against and the
+required runtime ABI major on both diagnostic surfaces:
+
+```powershell
+.\crispasr.exe --version | Select-String 'cuda'
+.\crispasr.exe --diagnostics 2>&1 | Select-String 'cuda toolkit|cuda runtime ABI'
+```
+
+A CUDA 12 package prints `cuda toolkit : 12.8...` and `cuda runtime ABI: 12`;
+the CUDA 13 package prints `13.0...` and ABI `13`. This identifies the binary,
+not a separately installed toolkit. The self-contained zip loads its matching
+major-version DLLs from beside `crispasr.exe`.
+
+The Windows CUDA 12 build delay-loads the NVIDIA driver DLL used by ggml's VMM
+allocator. It therefore reaches these diagnostic commands and can fall back to
+CPU on a driverless host, while retaining VMM when an NVIDIA GPU is available.
+
+Each trio is published **once** per release and shared by that major's
+packages — sound only because every CUDA-bundling job of the same major pins
+the same toolkit (12.8.0 for the CUDA 12 packages, 13.0.0 for CUDA 13).
+`tools/check-cuda-split-packaging.py` enforces that, along with the rule that
+any job bundling them must also ship a split archive and attach it to the
+release. Check the SHA-256 manifest before reusing DLLs from an older download;
+a CUDA version bump changes the filenames, which is your signal to re-fetch.
+
+The Windows CUDA 13 recipe is proven in CI by
+`.github/workflows/win-cuda13-verify.yml`: it rebuilds the exact release
+package on a GPU-less `windows-2022` runner, asserts the `*64_13.dll` wiring
+(`dumpbin /dependents` on `ggml-cuda.dll`), and runs the packaged
+`crispasr.exe` end-to-end on `samples/jfk.wav` — which also proves the zip's
+CPU fallback on a machine with no NVIDIA driver.
 
 ## Prerequisites
 
-- C++17 compiler (GCC 10+, Clang 12+, MSVC 19.30+)
+- C++17 compiler with C++20 support (GCC 10+, Clang 12+, MSVC 19.30+; the
+  global standard is C++17, but the `cohere` backend target compiles as
+  C++20 via `target_compile_features(cohere PUBLIC cxx_std_20)`)
 - CMake 3.14+
 - `curl` or `wget` on `$PATH` if you want to use `-m auto` auto-download
 
 Optional:
 - `libavformat` / `libavcodec` / `libavutil` / `libswresample` for
   Opus / M4A / WebM ingestion (`-DCRISPASR_FFMPEG=ON`).
-- `libopenblas` / MKL / Accelerate — speeds up CPU-side matmuls for
-  Conformer-based encoders (parakeet, canary, cohere, granite,
-  fastconformer-ctc). The ggml CPU backend picks BLAS up automatically
-  when present at build time; no CrispASR flag is needed.
+- `libopenblas` / MKL / Accelerate — speeds up the CPU-side mel-filterbank
+  SGEMM used by Conformer-based encoders (parakeet, canary, cohere, granite,
+  fastconformer-ctc). CrispASR's own targets pick BLAS up automatically when it
+  is present at build time; no CrispASR flag is needed. (ggml's separate BLAS
+  backend, `-DGGML_BLAS=ON`, still defaults OFF outside Apple.)
 - CUDA / Metal / Vulkan / MUSA / SYCL toolchains for GPU acceleration —
   enabled via ggml's standard flags (`-DGGML_CUDA=ON`,
   `-DGGML_METAL=ON`, `-DGGML_VULKAN=ON`, `-DGGML_MUSA=ON`,
@@ -112,7 +261,7 @@ What it does:
 2. Finds the latest VS 2022 installation that includes the VC++ toolchain.
 3. Calls `vcvars64.bat` to initialize the 64-bit MSVC environment.
 4. Runs `cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release [extra flags]`.
-5. Builds the `crispasr` target → `build\bin\crispasr.exe`.
+5. Builds the `crispasr-cli` target → `build\bin\crispasr.exe`.
 
 ### `build-vulkan.bat` — Vulkan GPU build
 
@@ -186,8 +335,9 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_SYCL=ON     # Intel oneAPI
 ```
 
 You can compile multiple backends into one binary; ggml will pick the
-highest-priority compiled backend at runtime
-(CUDA > Metal > Vulkan > MUSA > SYCL > CPU). Force a specific backend
+highest-priority compiled backend at runtime, in ggml's registration order
+(CUDA > Metal > SYCL > Vulkan > CPU — MUSA registers through the CUDA
+slot, so it shares CUDA's position). Force a specific backend
 with `--gpu-backend <name>`, and pin a device with `-dev N`:
 
 ```bash
@@ -350,3 +500,70 @@ Output lands in `build-android/<ABI>/src/libcrispasr.so`.
 cross-compiler produces binaries linked against Android's bionic libc,
 suitable for embedding in Android apps via JNI. Termux uses its own
 linker and packages — use the native Termux build above instead.
+
+### Graceful degradation via `GGML_BACKEND_DL` (#355)
+
+`-DGGML_BACKEND_DL=ON -DBUILD_SHARED_LIBS=ON` now **configures, links and runs**.
+It is opt-in: the default build is unchanged. The two Linux CUDA release tarballs
+now ship with it enabled; the rest are still statically linked (see "flipping the
+release leg" below).
+
+Three things blocked it, all now resolved:
+
+1. **CMake** — every per-model library linked `ggml-cuda` / `ggml-metal`
+   explicitly (125 sites), and under DL those are `MODULE` targets that cannot
+   be linked. They now route through `crispasr_link_ggml_*` interface targets
+   that are empty in a DL build and the real backend otherwise. ✅
+2. **CPU-backend symbols** — under DL even the CPU backend is a module, so
+   `ggml_backend_cpu_init`, `ggml_backend_is_cpu`, `ggml_backend_cpu_set_n_threads`,
+   `ggml_backend_cpu_buffer_type`, `ggml_backend_cpu_reg`, `ggml_backend_is_metal`
+   and `ggml_backend_cpu_set_threadpool` are not linkable. All 426 call sites go
+   through `src/core/ggml_cpu_backend.h`, whose non-DL branch is the identical
+   direct call. ✅
+3. **Direct CPU graph execution** — `ggml_graph_compute`,
+   `ggml_graph_compute_with_ctx`, `ggml_graph_plan`, `ggml_threadpool_new` /
+   `_free` and `ggml_get_type_traits_cpu`, across ~23 sites. These now go
+   through the same header, which under DL routes them to a `thread_local` CPU
+   backend obtained from the registry (`thread_local` because a ggml backend is
+   not safe for concurrent use and several of these sites run on worker
+   threads). ✅
+
+`tests/test-cpu-backend-shim.cpp` is the equivalence gate: the same 7 cases
+compile unchanged in both modes and assert arithmetic, not just return codes.
+Both report *27 assertions in 7 test cases*.
+
+Measured on an M1 with `parakeet-tdt-0.6b-v3-q4_k` + Silero VAD over a 300 s
+FLEURS clip, all four runs producing 608 words:
+
+| build | device | transcript |
+| --- | --- | --- |
+| default | Metal | **X** |
+| DL, `libggml-metal.so` present | Metal | **X** — byte-identical |
+| default, `-ng` | CPU | **Y** |
+| DL, `libggml-metal.so` removed | CPU | **Y** — byte-identical |
+
+X and Y differ in two tokens. That is the ordinary CPU-vs-Metal reduction-order
+divergence — it is present in the default build too, which is exactly what the
+`-ng` row is there to show. DL itself changes nothing.
+
+Removing the module is the #355 scenario in miniature: the process does not die,
+it logs `load_backend: loaded CPU backend` and transcribes.
+
+**Two limitations keep this opt-in rather than default.** ggml's CPU registry
+does not expose the threadpool setter through `get_proc_address` (only
+`set_n_threads` — see `ggml_backend_cpu_get_proc_address`), so a DL build cannot
+install the shared worker pool and falls back to ggml's own per-call threading.
+For the same reason `ggml_graph_plan` has no DL equivalent, so the hot paths
+that size a work buffer once and reuse it across frames re-plan per call
+instead. Neither is a correctness issue and neither has been measured; both are
+throughput risks on the per-frame VAD and wav2vec2 paths.
+
+`tests/test_ggml_audio_ops_*` are not built under DL. They call
+`ggml_backend_metal_init()` by symbol on purpose — naming one exact backend with
+no scheduler fallback is the point of those tests — and routing them through the
+registry would pick "best available" instead.
+
+The `-cuda` and `-cuda13` release legs now build with
+`-DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON`. Flipping `-hip` and `-vulkan` too
+still needs an A/B on real AMD and Vulkan hardware; only Metal and CPU are
+verified above.

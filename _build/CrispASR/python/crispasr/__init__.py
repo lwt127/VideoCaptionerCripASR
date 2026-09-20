@@ -2,9 +2,13 @@
 
 from ._binding import (
     AlignedWord,
+    ChatAborted,
+    ChatMessage,
+    ChatSession,
     CrispASR,
     DiarizeMethod,
     DiarizeSegment,
+    DiarizeTurn,
     KokoroResolved,
     LidMethod,
     LidResult,
@@ -25,6 +29,7 @@ from ._binding import (
     cache_ensure_file,
     detect_language_pcm,
     diarize_segments,
+    diarize_segments_with_turns,
     kokoro_resolve_for_lang,
     list_known_models,
     mic_default_device_name,
@@ -38,9 +43,13 @@ from ._binding import (
 
 __all__ = [
     "AlignedWord",
+    "ChatAborted",
+    "ChatMessage",
+    "ChatSession",
     "CrispASR",
     "DiarizeMethod",
     "DiarizeSegment",
+    "DiarizeTurn",
     "KokoroResolved",
     "LidMethod",
     "LidResult",
@@ -61,6 +70,7 @@ __all__ = [
     "cache_ensure_file",
     "detect_language_pcm",
     "diarize_segments",
+    "diarize_segments_with_turns",
     "kokoro_resolve_for_lang",
     "list_known_models",
     "mic_default_device_name",
@@ -71,4 +81,4 @@ __all__ = [
     "watermark_embed",
     "watermark_load_model",
 ]
-__version__ = "0.8.25"
+__version__ = "0.8.34"

@@ -2,6 +2,7 @@
 
 #include "crispasr_backend.h"
 #include "whisper_params.h"
+#include "core/arch_backend_map.h" // #335: general.architecture → backend table, SHARED with the C ABI
 
 // Forward declarations of per-backend constructors. Each is implemented in
 // its own crispasr_backend_X.cpp file and compiled only if the backend's
@@ -25,6 +26,7 @@ std::unique_ptr<CrispasrBackend> crispasr_make_qwen3_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_fastconformer_ctc_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_wav2vec2_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_vibevoice_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_vibevoice_streaming_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_vibevoice_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_vibevoice_1p5b_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_kugelaudio_backend();
@@ -41,6 +43,7 @@ std::unique_ptr<CrispasrBackend> crispasr_make_glm_asr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_kyutai_stt_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_firered_asr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_backend_lang(const char* sole_lang);
 std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_streaming_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_gemma4_e2b_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_omniasr_backend();
@@ -63,7 +66,10 @@ std::unique_ptr<CrispasrBackend> crispasr_make_paraformer_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_sensevoice_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_sidon_backend();
 std::unique_ptr<CrispasrBackend> crispasr_create_miotts_backend();
+std::unique_ptr<CrispasrBackend> crispasr_create_bt2_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_create_piano_transcription_backend();
+std::unique_ptr<CrispasrBackend> crispasr_create_basic_pitch_backend();
+std::unique_ptr<CrispasrBackend> crispasr_create_mt3_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_voxcpm2_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_voxcpm2_vae_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_cosyvoice3_tts_backend();
@@ -75,11 +81,14 @@ std::unique_ptr<CrispasrBackend> crispasr_make_outetts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_zonos_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_f5_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_irodori_tts_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_supertonic_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_bark_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_pocket_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_speecht5_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_dia_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_dots_tts_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_fireredtts3_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_confucius4_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_parler_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_fastpitch_backend();
 // csm-tts (§135): sesame/csm-1b — Llama backbone + depth decoder + Mimi codec.
@@ -114,7 +123,7 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
     if (name == "nemotron" || name == "nemotron-streaming" || name == "nemotron-3.5" || name == "nemotron-asr" ||
         name == "nemotron-speech-streaming")
         return crispasr_make_nemotron_backend();
-    if (name == "parakeet" || name == "reazonspeech")
+    if (name == "parakeet" || name == "reazonspeech" || name == "quds" || name == "quds-fa")
         return crispasr_make_parakeet_backend();
     if (name == "canary")
         return crispasr_make_canary_backend();
@@ -148,6 +157,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_wav2vec2_backend();
     if (name == "vibevoice" || name == "vibevoice-bitnet" || name == "vibevoice-asr-bitnet")
         return crispasr_make_vibevoice_backend();
+    if (name == "vibevoice-streaming")
+        return crispasr_make_vibevoice_streaming_backend();
     if (name == "vibevoice-tts")
         return crispasr_make_vibevoice_tts_backend();
     if (name == "kugelaudio" || name == "kugelaudio-tts" || name == "kugelaudio-0-open")
@@ -163,8 +174,19 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_qwen3_tts_backend();
     if (name == "miotts" || name == "mio-tts" || name == "mio_tts" || name == "miotts-0.6b")
         return crispasr_create_miotts_backend();
+    // Breeze TTS 2 (#412). The primary key does NOT lead with the licensor's
+    // mark (LICENSE §4); the descriptive aliases are attribution, which §4
+    // permits, and keep the model discoverable by the name it is published
+    // under.
+    if (name == "bt2-tts" || name == "bt2" || name == "bt2tts" || name == "breeze-tts-2" || name == "breeze_tts_2" ||
+        name == "breeze-tts2")
+        return crispasr_create_bt2_tts_backend();
     if (name == "piano-transcription" || name == "piano_transcription" || name == "piano-trans")
         return crispasr_create_piano_transcription_backend();
+    if (name == "basic-pitch" || name == "basic_pitch" || name == "basicpitch")
+        return crispasr_create_basic_pitch_backend();
+    if (name == "mt3" || name == "music-transcription" || name == "music_transcription")
+        return crispasr_create_mt3_backend();
     if (name == "moss-tts-local" || name == "moss_tts_local" || name == "moss-tts-local-v1.5" ||
         name == "mosstts-local" || name == "moss-tts-local-transformer")
         return crispasr_make_moss_tts_local_backend();
@@ -177,9 +199,10 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         name == "kartoffel-orpheus-synthetic" || name == "lex-au-orpheus-de" || name == "lex-au-orpheus")
         return crispasr_make_orpheus_backend();
     if (name == "chatterbox" || name == "chatterbox-tts" || name == "chatterbox-base" || name == "chatterbox-turbo" ||
-        name == "chatterbox_turbo" || name == "kartoffelbox" || name == "kartoffelbox-turbo" ||
-        name == "kartoffelbox_turbo" || name == "lahgtna" || name == "lahgtna-chatterbox" ||
-        name == "lahgtna-chatterbox-v1")
+        name == "chatterbox_turbo" || name == "chatterbox-nano" || name == "chatterbox_nano" ||
+        name == "chatterbox-finnish-nano" || name == "chatterbox_finnish_nano" || name == "kartoffelbox" ||
+        name == "kartoffelbox-turbo" || name == "kartoffelbox_turbo" || name == "lahgtna" ||
+        name == "lahgtna-chatterbox" || name == "lahgtna-chatterbox-v1")
         return crispasr_make_chatterbox_backend();
     if (name == "tada" || name == "tada-tts" || name == "tada-1b" || name == "tada-tts-1b" || name == "tada-3b" ||
         name == "tada-3b-ml")
@@ -196,11 +219,18 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
     if (name == "outetts" || name == "outetts-tts" || name == "oute-tts" || name == "outetts-0.3-1b")
         return crispasr_make_outetts_backend();
 #endif
-    if (name == "f5-tts" || name == "f5_tts" || name == "f5tts" || name == "f5")
+    if (name == "f5-tts" || name == "f5_tts" || name == "f5tts" || name == "f5" || name == "raon" || name == "raon-1b")
         return crispasr_make_f5_tts_backend();
     if (name == "irodori-tts" || name == "irodori_tts" || name == "irodori")
         return crispasr_make_irodori_tts_backend();
-    if (name == "pocket-tts" || name == "pocket_tts" || name == "pockettts" || name == "pocket")
+    if (name == "supertonic" || name == "supertonic-tts" || name == "supertonic_tts" || name == "supertonic3" ||
+        name == "supertonic-3")
+        return crispasr_make_supertonic_backend();
+    if (name == "pocket-tts" || name == "pocket_tts" || name == "pockettts" || name == "pocket" ||
+        name == "pocket-tts-de" || name == "pocket-tts-german" || name == "pocket-tts-es" ||
+        name == "pocket-tts-spanish" || name == "pocket-tts-it" || name == "pocket-tts-italian" ||
+        name == "pocket-tts-pt" || name == "pocket-tts-portuguese" || name == "pocket-tts-fr" ||
+        name == "pocket-tts-french")
         return crispasr_make_pocket_tts_backend();
     if (name == "fastpitch" || name == "fastpitch-tts" || name == "fastpitch_tts")
         return crispasr_make_fastpitch_backend();
@@ -208,8 +238,13 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_voxcpm2_tts_backend();
     if (name == "voxcpm2-vae" || name == "voxcpm2_vae" || name == "voxcpm2-upscaler")
         return crispasr_make_voxcpm2_vae_backend();
+    // `cosyvoice3-tts-rl` is the same engine pointed at upstream's OTHER talker
+    // checkpoint (llm.rl.pt — reinforcement-learning tuned for stability and
+    // pronunciation accuracy). Flow, HiFT, CAMPPlus, the speech tokenizer and
+    // the voice bank are shared, so the alias exists only so `-m auto` fetches
+    // the RL LLM GGUF instead of the base one (#334).
     if (name == "cosyvoice3" || name == "cosyvoice3-tts" || name == "cosyvoice3_tts" || name == "cv3" ||
-        name == "cv3-tts")
+        name == "cv3-tts" || name == "cosyvoice3-rl" || name == "cosyvoice3-tts-rl" || name == "cv3-rl")
         return crispasr_make_cosyvoice3_tts_backend();
     if (name == "m2m100" || name == "m2m-100" || name == "translate" || name == "m2m100-wmt21" || name == "wmt21" ||
         name == "m2m100-1.2b")
@@ -241,7 +276,12 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_moonshine_streaming_backend();
     if (name == "gemma4-e2b" || name == "gemma4e2b" || name == "gemma4")
         return crispasr_make_gemma4_e2b_backend();
-    if (name == "moonshine" || name == "moonshine-de" || name == "moonshine-tiny-de")
+    // The de fine-tunes share the runtime but are NOT en-only — the variant's
+    // language must ride along or the sole-language guard rejects `-l de` and
+    // the #227 auto shortcut mislabels output (found 2026-09-02).
+    if (name == "moonshine-de" || name == "moonshine-tiny-de")
+        return crispasr_make_moonshine_backend_lang("de");
+    if (name == "moonshine")
         return crispasr_make_moonshine_backend();
     if (name.rfind("omniasr", 0) == 0)
         return crispasr_make_omniasr_backend();
@@ -272,6 +312,10 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_dia_backend();
     if (name == "dots-tts" || name == "dots_tts" || name == "dots" || name == "dots.tts")
         return crispasr_make_dots_tts_backend();
+    if (name == "fireredtts3" || name == "fireredtts3-tts" || name == "firered-tts3" || name == "fireredtts-3")
+        return crispasr_make_fireredtts3_backend();
+    if (name == "confucius4-tts" || name == "confucius4_tts" || name == "confucius4")
+        return crispasr_make_confucius4_tts_backend();
     if (name == "parler-tts" || name == "parler_tts" || name == "parler" || name == "parlertts")
         return crispasr_make_parler_tts_backend();
     if (name == "zonos" || name == "zonos-tts" || name == "zonos_tts")
@@ -294,6 +338,7 @@ std::vector<std::string> crispasr_list_backends() {
         "gigaam",
         "parakeet",
         "reazonspeech",
+        "quds-fa",
         "canary",
         "canary-qwen",
         "lfm2-audio",
@@ -315,11 +360,15 @@ std::vector<std::string> crispasr_list_backends() {
         "hubert",
         "data2vec",
         "vibevoice",
+        "vibevoice-streaming",
         "vibevoice-bitnet",
         "kugelaudio",
         "qwen3-tts",
         "miotts",
+        "bt2-tts",
         "piano-transcription",
+        "basic-pitch",
+        "mt3",
         "moss-tts",
         "moss-tts-local",
         "vibevoice-1.5b",
@@ -333,6 +382,8 @@ std::vector<std::string> crispasr_list_backends() {
         "kartoffel-orpheus-de-synthetic",
         "chatterbox",
         "chatterbox-turbo",
+        "chatterbox-nano",
+        "chatterbox-finnish-nano",
         "kartoffelbox-turbo",
         "lahgtna-chatterbox",
         "tada",
@@ -341,7 +392,13 @@ std::vector<std::string> crispasr_list_backends() {
         "tada-3b-ml",
         "indextts",
         "f5-tts",
+        "raon",
         "pocket-tts",
+        "pocket-tts-de",
+        "pocket-tts-es",
+        "pocket-tts-it",
+        "pocket-tts-pt",
+        "pocket-tts-fr",
         "fastpitch",
         "kokoro",
         "melotts",
@@ -350,6 +407,7 @@ std::vector<std::string> crispasr_list_backends() {
         "voxcpm2-tts",
         "voxcpm2-vae",
         "cosyvoice3-tts",
+        "cosyvoice3-tts-rl",
         "m2m100",
         "m2m100-wmt21",
         "madlad",
@@ -379,6 +437,11 @@ std::vector<std::string> crispasr_list_backends() {
         "dia",
         "dia-tts",
         "dots-tts",
+        "fireredtts3",
+        "confucius4-tts",
+        "irodori-tts",
+        "supertonic",
+        "supertonic-tts",
         "parler-tts",
         "zonos",
         "zonos-tts",
@@ -433,6 +496,7 @@ static constexpr feature_col kFeatures[] = {
     {"beats", CAP_BEATS},
     {"tab", CAP_TAB},
     {"piano", CAP_PIANO},
+    {"tts-speed", CAP_TTS_SPEED},
 };
 
 void crispasr_print_backend_matrix() {
@@ -515,6 +579,7 @@ static constexpr cap_slug kCapSlugs[] = {
     {"beats", CAP_BEATS},
     {"tab", CAP_TAB},
     {"piano", CAP_PIANO},
+    {"tts-speed", CAP_TTS_SPEED},
 };
 
 void crispasr_print_backend_matrix_json() {
@@ -620,6 +685,9 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "parakeet";
     if (contains_ci("reazonspeech"))
         return "parakeet";
+    if (contains_ci("quds"))
+        return "parakeet"; // #387: Persian FastConformer-RNNT rides the parakeet runtime
+
     // Check "fastconformer-ctc" / "stt_en_fc_ctc" style filenames before
     // the broader "canary" match so users who drop a NeMo standalone
     // model next to a canary aligner pick the right backend.
@@ -668,8 +736,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "outetts";
     if (contains_ci("indextts"))
         return "indextts";
-    if (contains_ci("f5-tts") || contains_ci("f5tts") || contains_ci("F5TTS"))
-        return "f5-tts";
+    if (contains_ci("f5-tts") || contains_ci("f5tts") || contains_ci("F5TTS") || contains_ci("raon"))
+        return "f5-tts"; // #387 Raon-OpenTTS rides the f5-tts runtime
     if (contains_ci("pocket-tts") || contains_ci("pocket_tts") || contains_ci("pockettts"))
         return "pocket-tts";
     if (contains_ci("fastpitch"))
@@ -714,6 +782,11 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "gemma4-e2b";
     if (contains_ci("moonshine") && contains_ci("streaming"))
         return "moonshine-streaming";
+    // The de fine-tune must resolve to its variant name so the factory hands
+    // it the right sole language (a plain "moonshine" would be treated as
+    // en-only by the pre-dispatch guard).
+    if (contains_ci("moonshine") && contains_ci("-de"))
+        return "moonshine-de";
     if (contains_ci("moonshine"))
         return "moonshine";
     if (contains_ci("fun-asr") || contains_ci("funasr") || contains_ci("fun_asr"))
@@ -730,8 +803,12 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "dia";
     if (contains_ci("dia-tts") || contains_ci("dia_tts"))
         return "dia";
+    if (contains_ci("confucius4") || contains_ci("confucius4-tts") || contains_ci("confucius4_tts"))
+        return "confucius4-tts";
     if (contains_ci("dots-tts") || contains_ci("dots_tts") || contains_ci("dots.tts"))
         return "dots-tts";
+    if (contains_ci("fireredtts3"))
+        return "fireredtts3";
     if (contains_ci("csm") || contains_ci("sesame"))
         return "csm";
     if (contains_ci("parler") && contains_ci("tts"))
@@ -752,6 +829,10 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "miotts";
     if (contains_ci("piano") && contains_ci("transcription"))
         return "piano-transcription";
+    if (contains_ci("basic") && contains_ci("pitch"))
+        return "basic-pitch";
+    if (contains_ci("mt3"))
+        return "mt3";
     if (contains_ci("gigaam"))
         return "gigaam";
     if (contains_ci("ggml-") && contains_ci(".bin"))
@@ -761,6 +842,12 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
     //
     // Only reached when the filename didn't clearly identify a backend.
     // Reads just the "general.architecture" key; no weight tensors.
+    //
+    // The architecture -> backend table is SHARED with the C ABI's
+    // `crispasr_detect_backend_from_gguf` (src/core/arch_backend_map.h). Issue
+    // #335: the two used to be independent copies and had drifted by 113
+    // architecture strings. The filename pass above hid that from CLI users
+    // while every binding got a NULL session for the very same GGUF.
     struct gguf_init_params gip = {/*.no_alloc=*/true, /*.ctx=*/nullptr};
     gguf_context* gctx = gguf_init_from_file(model_path.c_str(), gip);
     if (!gctx)
@@ -770,178 +857,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
     const int key = gguf_find_key(gctx, "general.architecture");
     if (key >= 0) {
         const char* arch = gguf_get_val_str(gctx, key);
-        if (arch) {
-            const std::string a = arch;
-            if (a == "whisper")
-                result = "whisper";
-            else if (a == "sidon")
-                result = "sidon";
-            else if (a == "nemotron" || a == "nemotron-asr" || a == "nemotron-streaming")
-                result = "nemotron";
-            else if (a == "gigaam")
-                result = "gigaam";
-            else if (a == "parakeet")
-                result = "parakeet";
-            else if (a == "parakeet-tdt" || a == "parakeet-ja" || a == "parakeet_ja")
-                result = "parakeet";
-            else if (a == "canary")
-                result = "canary";
-            else if (a == "canary_qwen" || a == "canary-qwen")
-                result = "canary-qwen";
-            else if (a == "lfm2-audio")
-                result = "lfm2-audio";
-            else if (a == "mini-omni2")
-                result = "mini-omni2";
-            else if (a == "canary-ctc")
-                // FastConformer-CTC standalones + canary CTC aligners run on the
-                // canary_ctc runtime (CTC greedy decode), NOT the AED "canary"
-                // encoder-decoder backend, which has no CTC head.
-                result = "fastconformer-ctc";
-            else if (a == "cohere")
-                // Also covers the "cohere-ar" alias: the GGUF's general.architecture
-                // is always "cohere" (the Arabic model shares the runtime); the
-                // alias only affects the model-registry lookup and CLI dispatch
-                // (crispasr_create_backend), not this filename/GGUF-metadata pass.
-                result = "cohere";
-            else if (a == "cohere-transcribe")
-                result = "cohere";
-            else if (a == "qwen3-asr" || a == "qwen3_asr" || a == "qwen3asr")
-                result = "qwen3";
-            else if (a == "qwen3-tts" || a == "qwen3_tts" || a == "qwen3tts")
-                result = "qwen3-tts";
-            else if (a == "miotts" || a == "mio-tts")
-                result = "miotts";
-            else if (a == "moss-tts-local" || a == "moss_tts_local")
-                result = "moss-tts-local";
-            else if (a == "moss-tts" || a == "moss_tts" || a == "moss-tts-delay")
-                result = "moss-tts";
-            else if (a == "orpheus")
-                result = "orpheus";
-            else if (a == "kokoro" || a == "styletts2" || a == "styletts2-ljspeech")
-                result = "kokoro";
-            else if (a == "voxcpm2-vae" || a == "voxcpm2_vae")
-                result = "voxcpm2-vae";
-            else if (a == "voxcpm2" || a == "voxcpm2_tts" || a == "voxcpm2-tts")
-                result = "voxcpm2-tts";
-            else if (a == "cosyvoice3" || a == "cosyvoice3-tts" || a == "cosyvoice3_tts" || a == "cosyvoice3-llm")
-                result = "cosyvoice3-tts";
-            else if (a == "fastpitch" || a == "fastpitch-tts" || a == "fastpitch_tts")
-                result = "fastpitch";
-            else if (a == "bananamind_tts" || a == "bananamind-tts")
-                result = "bananamind-tts";
-            else if (a == "omnivoice" || a == "omnivoice-tts" || a == "omnivoice_tts")
-                result = "omnivoice";
-            else if (a == "piper" || a == "piper-tts" || a == "piper_tts" || a == "vits")
-                result = "piper";
-            else if (a == "melotts" || a == "melo-tts" || a == "melo_tts" || a == "vits2")
-                result = "melotts";
-            else if (a == "f5-tts" || a == "f5_tts" || a == "f5tts")
-                result = "f5-tts";
-            else if (a == "irodori-tts" || a == "irodori_tts" || a == "irodori")
-                result = "irodori-tts";
-            else if (a == "chatterbox" || a == "chatterbox_turbo" || a == "kartoffelbox")
-                result = "chatterbox";
-            else if (a == "tada" || a == "tada-tts" || a == "tada-1b" || a == "tada-tts-1b" || a == "tada-3b-ml")
-                result = "tada";
-            else if (a == "m2m100" || a == "m2m_100")
-                result = "m2m100";
-            else if (a == "voxtral")
-                result = "voxtral";
-            else if (a == "higgs-stt" || a == "higgs_stt" || a == "higgs-audio-v3-stt")
-                result = "higgs-stt";
-            else if (a == "voxtral_tts" || a == "voxtral-tts")
-                result = "voxtral-tts";
-            else if (a == "voxtral4b" || a == "voxtral-4b" || a == "voxtral_4b")
-                result = "voxtral4b";
-            else if (a == "granite-speech" || a == "granite_speech" || a == "granitespeech")
-                result = "granite";
-            else if (a == "granite-nle" || a == "granite_nle" || a == "granitenle")
-                result = "granite-4.1-nar";
-            else if (a == "wav2vec2" || a == "wav2vec2-ctc")
-                result = "wav2vec2";
-            else if (a == "vibevoice" || a == "vibevoice-asr" || a == "vibevoice_asr" || a == "vibevoice-bitnet" ||
-                     a == "vibevoice-asr-bitnet" || a == "vibevoice_bitnet")
-                result = "vibevoice";
-            else if (a == "kugelaudio" || a == "kugelaudio-tts" || a == "kugelaudio_tts")
-                result = "kugelaudio";
-            else if (a == "fastconformer-ctc" || a == "stt-fastconformer-ctc" || a == "stt_fastconformer_ctc")
-                result = "fastconformer-ctc";
-            else if (a == "glmasr" || a == "glm-asr" || a == "glm_asr")
-                result = "glm-asr";
-            else if (a == "htdemucs" || a == "demucs")
-                result = "htdemucs";
-            else if (a == "mel-band-roformer" || a == "mel_band_roformer")
-                result = "mel-band-roformer";
-            else if (a == "crepe")
-                result = "crepe";
-            else if (a == "btc")
-                result = "btc-chords";
-            else if (a == "tabcnn")
-                result = "tabcnn";
-            else if (a == "rvc")
-                result = "rvc-svc";
-            else if (a == "beat-this")
-                result = "beat-this";
-            else if (a == "kyutai-stt" || a == "kyutai_stt" || a == "kyutaistt")
-                result = "kyutai-stt";
-            else if (a == "firered-asr" || a == "firered_asr" || a == "firereadasr" || a == "firered-lid" ||
-                     a == "firered_lid")
-                result = "firered-asr";
-            else if (a == "moonshine_streaming")
-                return "moonshine-streaming";
-            else if (a == "gemma4e2b" || a == "gemma4_e2b")
-                return "gemma4-e2b";
-            else if (a == "moonshine" || a == "moonshine-tiny" || a == "moonshine-base")
-                result = "moonshine";
-            else if (a == "omniasr-ctc" || a == "omniasr_ctc" || a == "omniasr" || a == "omniasr-300m" ||
-                     a == "omniasr-llm" || a == "omniasr_llm")
-                result = "omniasr";
-            else if (a == "hubert" || a == "hubert-ctc")
-                result = "wav2vec2";
-            else if (a == "data2vec" || a == "data2vec-audio" || a == "data2vec_audio")
-                result = "wav2vec2";
-            else if (a == "fireredpunc")
-                result = "fireredpunc";
-            else if (a == "mimo_asr" || a == "mimo-asr")
-                result = "mimo-asr";
-            else if (a == "arkasr" || a == "ark-asr" || a == "ark_asr")
-                result = "ark-asr";
-            else if (a == "moss_audio" || a == "moss-audio")
-                result = "moss-audio";
-            else if (a == "moss_transcribe" || a == "moss-transcribe")
-                result = "moss-transcribe";
-            else if (a == "moss_transcribe_diarize" || a == "moss-transcribe-diarize" || a == "moss_diarize" ||
-                     a == "moss-diarize")
-                result = "moss-diarize";
-            else if (a == "funasr" || a == "fun_asr" || a == "fun-asr")
-                result = "funasr";
-            else if (a == "paraformer")
-                result = "paraformer";
-            else if (a == "sensevoice" || a == "sense_voice" || a == "sense-voice" || a == "sensevoicesmall")
-                result = "sensevoice";
-            else if (a == "indextts" || a == "indextts-1.5" || a == "indextts_1_5")
-                result = "indextts";
-            else if (a == "outetts" || a == "oute-tts" || a == "oute_tts")
-                result = "outetts";
-            else if (a == "pocket-tts" || a == "pocket_tts" || a == "pockettts")
-                result = "pocket-tts";
-            else if (a == "speecht5-tts" || a == "speecht5_tts" || a == "speecht5")
-                result = "speecht5";
-            else if (a == "bark" || a == "bark-tts" || a == "bark_tts")
-                result = "bark";
-            else if (a == "dia" || a == "dia-tts" || a == "dia_tts")
-                result = "dia";
-            else if (a == "dots-tts" || a == "dots_tts" || a == "dots.tts")
-                result = "dots-tts";
-            else if (a == "csm" || a == "csm-tts" || a == "csm_tts")
-                result = "csm";
-            else if (a == "parler-tts" || a == "parler_tts" || a == "parlertts")
-                result = "parler-tts";
-            else if (a == "zonos" || a == "zonos-tts" || a == "zonos_tts")
-                result = "zonos";
-            else if (a == "piano-transcription" || a == "piano_transcription")
-                result = "piano-transcription";
-        }
+        if (arch)
+            result = core_arch::backend_for_arch(arch);
     }
     gguf_free(gctx);
     return result;

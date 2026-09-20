@@ -126,3 +126,49 @@ TEST_CASE("split_at_energy_minima: slices are non-overlapping and contiguous", "
         REQUIRE(slices[i].second > slices[i].first); // non-empty
     }
 }
+
+// ── is_digitally_silent ───────────────────────────────────────────────────────
+//
+// Guards the gate that stops an ASR model inventing speech from an empty span.
+// The risk runs BOTH ways: too loose and it silences real quiet audio; too
+// tight and the fabricated-sentence bug returns. The levels below are measured
+// from real fixtures, not invented.
+
+TEST_CASE("audio_chunking::is_digitally_silent flags true zero", "[unit][audio]") {
+    const std::vector<float> zeros(16000, 0.0f);
+    REQUIRE(audio_chunking::is_digitally_silent(zeros.data(), zeros.size()));
+    REQUIRE(audio_chunking::peak_abs(zeros.data(), zeros.size()) == 0.0f);
+
+    // An empty span has nothing to transcribe either.
+    REQUIRE(audio_chunking::is_digitally_silent(nullptr, 0));
+}
+
+TEST_CASE("audio_chunking::is_digitally_silent never fires on real audio", "[unit][audio]") {
+    // ONE non-zero int16 sample must disable the gate: 1 LSB = 1/32768 =
+    // 3.05e-5, above the 1e-5 default epsilon.
+    std::vector<float> almost(16000, 0.0f);
+    almost[9999] = 1.0f / 32768.0f;
+    REQUIRE_FALSE(audio_chunking::is_digitally_silent(almost.data(), almost.size()));
+
+    // Measured peaks: quietest real speech to hand (FLEURS) 0.038, ordinary
+    // speech (jfk.wav) 0.783, low-level noise that does NOT provoke the model
+    // 0.0018. None may be gated.
+    for (float peak : {0.037964f, 0.782715f, 0.662231f, 0.0018f}) {
+        std::vector<float> buf(1000, 0.0f);
+        buf[500] = peak;
+        REQUIRE_FALSE(audio_chunking::is_digitally_silent(buf.data(), buf.size()));
+    }
+
+    // Negative-going samples count too (peak is absolute).
+    std::vector<float> neg(1000, 0.0f);
+    neg[10] = -0.5f;
+    REQUIRE_FALSE(audio_chunking::is_digitally_silent(neg.data(), neg.size()));
+    REQUIRE(audio_chunking::peak_abs(neg.data(), neg.size()) == 0.5f);
+}
+
+TEST_CASE("audio_chunking::is_digitally_silent honours an explicit epsilon", "[unit][audio]") {
+    std::vector<float> tiny(1000, 0.0f);
+    tiny[3] = 1e-4f;
+    REQUIRE_FALSE(audio_chunking::is_digitally_silent(tiny.data(), tiny.size()));  // default 1e-5
+    REQUIRE(audio_chunking::is_digitally_silent(tiny.data(), tiny.size(), 1e-3f)); // looser
+}

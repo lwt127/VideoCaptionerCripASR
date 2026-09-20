@@ -37,11 +37,10 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release ^
             -DGGML_CUDA=ON ^
             -DCMAKE_CUDA_ARCHITECTURES="${{ inputs.arch }}" ^
-            -DGGML_NATIVE=OFF ^
-            -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
             -DCRISPASR_OPUS_FETCH=ON || exit /b 1
-          echo === compiling acc.cu + add-id.cu (verbose shows the nvcc command) ===
+          echo === compiling ggml-cpu + 2 CUDA kernels (verbose shows compiler commands) ===
           cmake --build build --verbose -- ^
+            ggml-cpu ^
             ggml/src/ggml-cuda/CMakeFiles/ggml-cuda.dir/acc.cu.obj ^
             ggml/src/ggml-cuda/CMakeFiles/ggml-cuda.dir/add-id.cu.obj || exit /b 1
           echo === WIN_CUDA_SMOKE_OK arch='${{ inputs.arch }}' ===

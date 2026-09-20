@@ -781,7 +781,8 @@ struct ipa_dict {
 // A targeted scanner rather than a JSON library: the file is machine-generated
 // and this avoids pulling a parser into the phonemizer for one call site.
 // Returns the number of DEFAULT entries loaded.
-inline int load_misaki_json(ipa_dict& out, ipa_dict& final_out, const std::string& path) {
+inline int load_misaki_json(ipa_dict& out, ipa_dict& final_out, const std::string& path,
+                            ipa_dict* letters_out = nullptr) {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f)
         return 0;
@@ -839,10 +840,17 @@ inline int load_misaki_json(ipa_dict& out, ipa_dict& final_out, const std::strin
         std::string lower = key;
         for (auto& c : lower)
             c = (char)tolower((unsigned char)c);
+        // A single UPPERCASE key is the LETTER's reading ("A" -> ˈA), which is
+        // a different word from the lowercase entry ("a" -> the article). They
+        // collide once the key is lowercased, so the letter goes in its own
+        // table — spelling out an acronym needs it and nothing else does.
+        const bool is_letter_key = key.size() == 1 && key[0] >= 'A' && key[0] <= 'Z';
         if (i < buf.size() && buf[i] == '"') {
             std::string val;
             if (!read_string(i, val))
                 break;
+            if (letters_out && is_letter_key && !val.empty())
+                letters_out->entries[lower] = val;
             if (!val.empty() && !out.entries.count(lower)) {
                 out.entries[lower] = val;
                 count++;
@@ -970,6 +978,29 @@ inline int load_ipa_dict_file(ipa_dict& dict, const std::string& path) {
 
 // ── Context ─────────────────────────────────────────────────────────
 
+// ── Output conventions of the CONSUMER (not of the dictionary) ──────────────
+//
+// #316: which lexicon is loaded and what the model downstream expects are two
+// independent questions, and conflating them is how Kokoro's no-lexicon
+// fallback came to inherit piper's conventions. `text_to_ipa` takes one of
+// these so a single loaded dictionary can serve both.
+struct style {
+    // Apply the contextual function-word rules (the/to/a/an/in) plus the
+    // capitalisation-stress rule. They need to see the NEXT word's phonemes.
+    // Off for piper: its dict is espeak-derived and already encodes its own
+    // reductions.
+    bool context_words = false;
+    // Carry punctuation through into the phoneme string.
+    bool emit_punctuation = false;
+    // Keep a hyphenated compound as one word.
+    bool join_hyphenated = false;
+};
+
+// What Kokoro needs: misaki's own conventions, whichever dictionary fed it.
+inline style misaki_style() {
+    return style{true, true, true};
+}
+
 struct context {
     ipa_dict espeak_ipa; // Pre-generated espeak IPA (highest priority)
     cmudict dict;        // CMUdict ARPAbet (converted to IPA)
@@ -992,7 +1023,47 @@ struct context {
     // when NOTHING follows the word ("…is she?" -> ʃˌi). 32 entries; empty
     // unless the companion dict is loaded.
     ipa_dict phrase_final;
+
+    // #316 follow-up: the 26 LETTER readings ("a" -> ˈA, "x" -> ˈɛks), used to
+    // spell out an acronym the way misaki's `get_NNP` does. Separate from
+    // `espeak_ipa` because the letter and the word collide once the lexicon key
+    // is lowercased ("A" the letter vs "a" the article). Empty for the espeak
+    // dicts, and everything below is a no-op when it is empty — so this stays
+    // Kokoro-only without needing its own flag.
+    ipa_dict letters;
+
+    // #316 follow-up: carry punctuation through into the phoneme string.
+    // Kokoro's vocabulary contains `,.;:!?…—"«»“”` and misaki emits them, so
+    // dropping them takes every pause out of a paragraph and delivers it in one
+    // breath. Off by default: piper's phoneme inventory is espeak's, and that
+    // consumer has never been fed punctuation.
+    bool emit_punctuation = false;
+
+    // #316 follow-up: treat a hyphenated compound as one word (see
+    // tokenize_ex). Off by default for the same reason.
+    bool join_hyphenated = false;
+
+    // The three above are the CONSUMER's conventions, not the dictionary's, and
+    // one context is shared by two consumers (the CMUdict context serves both
+    // piper and Kokoro's no-lexicon fallback). `text_to_ipa` therefore takes an
+    // override; these fields are only the default for callers that don't pass
+    // one.
+    style consumer() const { return {context_words, emit_punctuation, join_hyphenated}; }
 };
+
+// #316: the one place that says what the misaki/Kokoro consumer needs.
+//
+// It exists because every one of these flags defaults to OFF and the first
+// round of #316 shipped the contextual-word rules with nothing anywhere setting
+// `context_words` — the feature was written, tested in isolation, and inert in
+// the product. A single configure function is testable on its own, so "is it
+// wired up?" is a question a unit test can answer.
+inline void configure_for_misaki(context& ctx) {
+    const style s = misaki_style();
+    ctx.context_words = s.context_words;
+    ctx.emit_punctuation = s.emit_punctuation;
+    ctx.join_hyphenated = s.join_hyphenated;
+}
 
 // ── Text normalization (technical tokens) ──────────────────────────
 // Expand common technical terms containing symbols that the tokenizer
@@ -1127,13 +1198,14 @@ inline std::string normalize_unicode_punct(const std::string& text) {
         const char* from;
         const char* to;
     } kMap[] = {
-        {"\xe2\x80\x94", "-"}, // — em dash
-        {"\xe2\x80\x93", "-"}, // – en dash
-        {"\xe2\x80\x99", "'"}, // ’ right single quote (apostrophe)
-        {"\xe2\x80\x98", " "}, // ‘ left single quote
-        {"\xe2\x80\x9c", " "}, // " left double quote
-        {"\xe2\x80\x9d", " "}, // " right double quote
-        {"\xe2\x80\xa6", " "}, // … ellipsis
+        {"\xe2\x80\x93", "\xe2\x80\x94"}, // – en dash → — em dash (the vocab has only the em dash)
+        {"\xe2\x80\x99", "'"},            // ’ right single quote (apostrophe)
+        {"\xe2\x80\x98", " "},            // ‘ left single quote
+        // — “ ” … are NOT folded away: they are punctuation the tokenizer
+        // splits on, and Kokoro's vocab contains every one of them. Folding
+        // them to a space (as this table used to) meant a quoted word arrived
+        // at the lexicon still wearing its quotes on the ASCII path and lost
+        // its pause on the Unicode one.
     };
     std::string out;
     out.reserve(text.size());
@@ -1154,25 +1226,116 @@ inline std::string normalize_unicode_punct(const std::string& text) {
     return out;
 }
 
-inline std::vector<std::string> tokenize(const std::string& text_raw) {
-    const std::string text = normalize_unicode_punct(text_raw);
-    std::vector<std::string> tokens;
-    std::string cur;
-    for (char c : text) {
-        if (c == ' ' || c == ',' || c == '.' || c == '!' || c == '?' || c == ';' || c == ':' || c == '-' || c == '\n') {
-            if (!cur.empty()) {
-                tokens.push_back(cur);
-                cur.clear();
-            }
-            if (c != ' ')
-                tokens.push_back(std::string(1, c));
-        } else {
-            cur += c;
-        }
+// Punctuation the English tokenizer splits on. Every mark here is also in
+// Kokoro's 178-symbol vocabulary, so `text_to_ipa` can pass it straight through
+// when the consumer wants it (see `context::emit_punctuation`).
+//
+// The ASCII double quote and the bracket family used to be missing, which is
+// why `"dramatic"` reached the lexicon as the literal string `"dramatic"`,
+// missed every tier, and came out of the letter-to-sound rules as `dɹˈæmætɪk`
+// — first-syllable stress, the "strange pronunciation" reported in #316.
+inline size_t punct_len_at(const std::string& t, size_t i) {
+    static const char* kMarks[] = {
+        ",",
+        ".",
+        "!",
+        "?",
+        ";",
+        ":",
+        "-",
+        "_",
+        "/",
+        "\"",
+        "(",
+        ")",
+        "[",
+        "]",
+        "{",
+        "}",
+        "\xe2\x80\x94", // — em dash
+        "\xe2\x80\x9c",
+        "\xe2\x80\x9d", // “ ”
+        "\xc2\xab",
+        "\xc2\xbb",     // « »
+        "\xe2\x80\xa6", // … ellipsis
+    };
+    for (const char* m : kMarks) {
+        const size_t n = std::char_traits<char>::length(m);
+        if (t.compare(i, n, m) == 0)
+            return n;
     }
-    if (!cur.empty())
-        tokens.push_back(cur);
+    return 0;
+}
+
+// Separators that are never spoken and never emitted — misaki's
+// SUBTOKEN_JUNKS. `said--yes` must phonemize with no trace of the dashes (we
+// used to emit `sˈɛd,--`), Project-Gutenberg-style `_italics_` must reach the
+// lexicon as "italics" and not fall through to the letter-to-sound rules
+// (`_you_` came out `jˈW`), and Kokoro's vocabulary has no slot for any of
+// them anyway.
+inline bool is_silent_mark(const std::string& t) {
+    return t == "-" || t == "_" || t == "/";
+}
+
+// A tokenizer token: a word, or a single punctuation mark.
+struct token {
+    std::string text;
+    bool punct = false;
+    bool space_before = false; // there was whitespace before it in the source
+};
+
+// `join_hyphen` keeps a hyphenated compound ("high-contrast") as ONE token, the
+// way misaki does — it phonemizes as a single word with a single primary
+// stress. Off by default: the espeak/piper dicts have no compound entries, so
+// splitting is the better answer there.
+inline std::vector<token> tokenize_ex(const std::string& text_raw, bool join_hyphen = false) {
+    const std::string text = normalize_unicode_punct(text_raw);
+    std::vector<token> tokens;
+    std::string cur;
+    bool pending_space = false;
+    auto flush = [&]() {
+        if (cur.empty())
+            return;
+        tokens.push_back({cur, false, pending_space});
+        cur.clear();
+        pending_space = false;
+    };
+    for (size_t i = 0; i < text.size();) {
+        const char c = text[i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            flush();
+            pending_space = true;
+            i++;
+            continue;
+        }
+        // A hyphen flanked by word characters joins a compound rather than
+        // splitting it — but only for a consumer that can pronounce one.
+        if (c == '-' && join_hyphen && !cur.empty() && i + 1 < text.size() &&
+            (isalnum((unsigned char)text[i + 1]) || (unsigned char)text[i + 1] >= 0x80)) {
+            cur += c;
+            i++;
+            continue;
+        }
+        if (const size_t n = punct_len_at(text, i)) {
+            flush();
+            tokens.push_back({text.substr(i, n), true, pending_space});
+            pending_space = false;
+            i += n;
+            continue;
+        }
+        cur += c;
+        i++;
+    }
+    flush();
     return tokens;
+}
+
+// Back-compat shape: text only, punctuation included as its own tokens.
+inline std::vector<std::string> tokenize(const std::string& text_raw) {
+    std::vector<std::string> out;
+    for (const auto& t : tokenize_ex(text_raw))
+        out.push_back(t.text);
+    return out;
 }
 
 // ── Main API: text → IPA ────────────────────────────────────────────
@@ -1321,23 +1484,145 @@ inline std::string word_to_ipa(const context& ctx, const std::string& word) {
     return ipa;
 }
 
+// Phonemize one word token. A hyphenated compound is phonemized part by part
+// and joined the way misaki joins it (one primary stress, no gap).
+// misaki's `get_NNP` over this context's letters table, or "" when it cannot
+// answer (no table, or a letter missing from it) — in which case the caller
+// keeps its normal lookup chain.
+inline std::string spell_out(const context& ctx, const std::string& word) {
+    if (ctx.letters.entries.empty())
+        return std::string();
+    return core_g2p_ctxwords::spell_out(word, [&ctx](const std::string& c) -> std::string {
+        auto it = ctx.letters.entries.find(c);
+        return it == ctx.letters.entries.end() ? std::string() : it->second;
+    });
+}
+
+// Should this token be READ OUT as letters? Two shapes, both misaki's:
+//   - a dotted acronym: U.S.A., e.g., Ph.D.
+//   - an ALLCAPS word that is in no dictionary. misaki lowercases an ALLCAPS
+//     word and looks THAT up first, so "HELLO" is still "hello"; only a
+//     genuinely unknown one is spelled. We mirror that by checking the same
+//     tiers `word_to_ipa` consults before its rule-based fallback.
+inline bool wants_spelling(const context& ctx, const std::string& w) {
+    if (ctx.letters.entries.empty())
+        return false;
+    if (core_g2p_ctxwords::is_dotted_acronym(w))
+        return true;
+    if (w.size() < 2 || core_g2p_ctxwords::classify_caps(w) != core_g2p_ctxwords::Caps::Upper)
+        return false;
+    std::string lower;
+    for (char c : w) {
+        if (!isalpha((unsigned char)c))
+            return false;
+        lower += (char)tolower((unsigned char)c);
+    }
+    if (ctx.espeak_ipa.entries.count(lower))
+        return false;
+    if (ctx.inflect_fallback && !ctx.inflect_fallback(lower).empty())
+        return false;
+    std::string upper = lower;
+    for (auto& c : upper)
+        c = (char)toupper((unsigned char)c);
+    return !ctx.dict.entries.count(upper);
+}
+
+inline std::string token_to_ipa(const context& ctx, const style& st, const std::string& w) {
+    if (st.context_words && wants_spelling(ctx, w)) {
+        const std::string spelled = spell_out(ctx, w);
+        if (!spelled.empty())
+            return spelled;
+    }
+    if (!st.join_hyphenated || w.find('-') == std::string::npos)
+        return word_to_ipa(ctx, w);
+    std::vector<std::string> parts;
+    size_t start = 0;
+    for (size_t i = 0; i <= w.size(); i++) {
+        if (i == w.size() || w[i] == '-') {
+            const std::string p = w.substr(start, i - start);
+            if (!p.empty())
+                parts.push_back(st.context_words ? core_g2p_ctxwords::apply_caps_stress(p, word_to_ipa(ctx, p))
+                                                 : word_to_ipa(ctx, p));
+            start = i + 1;
+        }
+    }
+    if (parts.empty())
+        return std::string();
+    if (parts.size() == 1)
+        return parts[0];
+    return core_g2p_ctxwords::join_compound(parts);
+}
+
 // Convert full text to IPA string.
-inline std::string text_to_ipa(const context& ctx, const std::string& text) {
-    auto words = tokenize(normalize_technical_tokens(text));
+inline std::string text_to_ipa(const context& ctx, const std::string& text, const style& st) {
+    auto toks = tokenize_ex(normalize_technical_tokens(text), st.join_hyphenated);
+    // An abbreviation's period is part of the word, not a full stop. misaki's
+    // lexicon lists exactly seven of them (`Mr. Mrs. Ms. Dr. Esq. No. etc.`)
+    // and spaCy hands them over with the dot attached; splitting it off gave
+    // every "Mr. Darcy" a sentence-length pause after "Mister".
+    //
+    // Lexicon-driven, so a dict without those entries (piper's espeak one) is
+    // untouched. `no.` is left out on purpose: "she said no." is a sentence, not
+    // a number, and no tagger here can tell them apart.
+    for (size_t i = 0; i + 1 < toks.size(); i++) {
+        if (toks[i].punct || !toks[i + 1].punct || toks[i + 1].text != "." || toks[i + 1].space_before)
+            continue;
+        std::string lower;
+        for (char c : toks[i].text)
+            lower += (char)tolower((unsigned char)c);
+        // A title never ends a sentence, so `Mr.` always merges. The ambiguous
+        // two do not: "she said no." is a sentence, and "apples, oranges, etc."
+        // ends one — `etc.` merges only with a word still to come, and `no.`
+        // never (no tagger here can tell "No. 5" from a refusal).
+        if (lower == "no")
+            continue;
+        if (lower == "etc" && i + 2 >= toks.size())
+            continue;
+        if (!ctx.espeak_ipa.entries.count(lower + "."))
+            continue;
+        toks[i].text += ".";
+        toks.erase(toks.begin() + (long)i + 1);
+    }
+    // An acronym's dots belong to it, too. `U.S.A.` arrives as six tokens and
+    // used to phonemize as `jˈu.ˈɛs.ɐ.` — full stops INSIDE the word, so the
+    // model pauses between the letters, and the trailing "a" read as the
+    // article. Merge a run of at least two `<1-2 letters> .` pairs back into
+    // one token; `token_to_ipa` then spells it out. Gated on the letters table,
+    // so the espeak/piper dicts (which have none) never take this path.
+    if (!ctx.letters.entries.empty()) {
+        for (size_t i = 0; i + 3 < toks.size(); i++) {
+            size_t j = i, pairs = 0;
+            while (j + 1 < toks.size() && !toks[j].punct && toks[j].text.size() <= 2 &&
+                   toks[j].text.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") ==
+                       std::string::npos &&
+                   toks[j + 1].punct && toks[j + 1].text == "." && !toks[j + 1].space_before &&
+                   (j == i || !toks[j].space_before)) {
+                pairs++;
+                j += 2;
+            }
+            if (pairs < 2)
+                continue;
+            for (size_t k = i + 1; k < j; k++)
+                toks[i].text += toks[k].text;
+            toks.erase(toks.begin() + (long)i + 1, toks.begin() + (long)j);
+        }
+    }
+    std::vector<std::string> words;
+    std::vector<bool> is_punct;
+    words.reserve(toks.size());
+    is_punct.reserve(toks.size());
+    for (const auto& t : toks) {
+        words.push_back(t.text);
+        is_punct.push_back(t.punct);
+    }
     // Two passes: a contextual function word ("the", "to") needs to know
     // whether the FOLLOWING word starts with a vowel, so every word is
     // phonemized first and the rules are applied afterwards (#316).
     std::vector<std::string> parts;
-    std::vector<bool> is_punct;
-    parts.reserve(words.size());
-    is_punct.reserve(words.size());
-    for (const auto& w : words) {
-        const bool punct = w.size() == 1 && (w[0] == ',' || w[0] == '.' || w[0] == '!' || w[0] == '?' || w[0] == ';' ||
-                                             w[0] == ':' || w[0] == '-');
-        is_punct.push_back(punct);
-        parts.push_back(punct ? std::string() : word_to_ipa(ctx, w));
-    }
-    if (ctx.context_words) {
+    parts.reserve(toks.size());
+    for (size_t i = 0; i < toks.size(); i++)
+        parts.push_back(is_punct[i] ? std::string() : token_to_ipa(ctx, st, words[i]));
+    if (st.context_words) {
         for (size_t i = 0; i < words.size(); i++) {
             if (is_punct[i])
                 continue;
@@ -1376,18 +1661,56 @@ inline std::string text_to_ipa(const context& ctx, const std::string& text) {
             }
         }
     }
+    // Reassemble. misaki emits `''.join(phonemes + whitespace)`, so a mark sits
+    // flush against the word it follows and the space that separated the words
+    // in the source is the space between them here: `hˌIkˈɑntɹˌæst, sˌɪnə…`.
+    // A dropped token (punctuation the consumer does not want, or a word that
+    // phonemized to nothing) still separates its neighbours — but with ONE
+    // space, not the two the old loop emitted around every comma.
     std::string ipa;
+    bool pending_space = false;
+    bool open_quote = true;
     for (size_t i = 0; i < parts.size(); i++) {
-        if (is_punct[i]) {
-            if (!ipa.empty() && ipa.back() != ' ')
-                ipa += ' ';
+        const bool keep = is_punct[i] ? (st.emit_punctuation && !is_silent_mark(words[i])) : !parts[i].empty();
+        if (!keep) {
+            if (!ipa.empty())
+                pending_space = true;
             continue;
         }
-        if (!ipa.empty())
+        // A mark attaches to the word before it. Without this a dropped silent
+        // separator put a space in front of the comma — Gutenberg's italic
+        // markers turned "_you_, Lizzy" into `ju , lˈɪzzj`, and in Kokoro's
+        // vocabulary that space is a real token, i.e. an audible gap before the
+        // comma's pause.
+        const bool sep = is_punct[i] ? toks[i].space_before : (toks[i].space_before || pending_space);
+        if (sep && !ipa.empty())
             ipa += ' ';
-        ipa += parts[i];
+        pending_space = false;
+        if (!is_punct[i]) {
+            ipa += parts[i];
+            continue;
+        }
+        // misaki's tokenizer resolves the straight `"` to a DIRECTIONAL quote,
+        // and Kokoro has only ever seen `“` and `”`. Both spellings are in the
+        // vocabulary, so the straight one costs no error and buys no training
+        // match either — alternate, the way the text was written.
+        if (words[i] == "\"") {
+            ipa += open_quote ? "\xe2\x80\x9c" : "\xe2\x80\x9d";
+            open_quote = !open_quote;
+            continue;
+        }
+        if (words[i] == "\xe2\x80\x9c")
+            open_quote = false;
+        else if (words[i] == "\xe2\x80\x9d")
+            open_quote = true;
+        ipa += words[i];
     }
     return ipa;
+}
+
+// Default: the conventions the context itself was configured for.
+inline std::string text_to_ipa(const context& ctx, const std::string& text) {
+    return text_to_ipa(ctx, text, ctx.consumer());
 }
 
 } // namespace g2p_en

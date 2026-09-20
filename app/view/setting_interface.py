@@ -113,7 +113,7 @@ class SettingInterface(ScrollArea):
             FIF.LANGUAGE,
             self.tr("目标语言"),
             self.tr("选择翻译字幕的目标语言"),
-            texts=[lang.value for lang in cfg.target_language.validator.options],
+            texts=[self.tr(lang.value) for lang in cfg.target_language.validator.options],
             parent=self.translateGroup,
         )
 
@@ -385,7 +385,7 @@ class SettingInterface(ScrollArea):
                 config["api_key_cfg"],
                 FIF.FINGERPRINT,
                 self.tr("API Key"),
-                self.tr(f"输入您的 {service.value} API Key"),
+                self.tr("输入您的 {service.value} API Key").replace("{service.value}", service.value),
                 "sk-" if service != LLMServiceEnum.OLLAMA else "",
                 self.llmGroup,
             )
@@ -396,7 +396,7 @@ class SettingInterface(ScrollArea):
                 config["api_base_cfg"],
                 FIF.LINK,
                 self.tr("Base URL"),
-                self.tr(f"输入 {service.value} Base URL, 需要包含 /v1"),
+                self.tr("输入 {service.value} Base URL, 需要包含 /v1").replace("{service.value}", service.value),
                 config["default_base"],
                 self.llmGroup,
             )
@@ -407,7 +407,7 @@ class SettingInterface(ScrollArea):
                 config["model_cfg"],
                 FIF.ROBOT,
                 self.tr("模型"),
-                self.tr(f"选择 {service.value} 模型"),
+                self.tr("选择 {service.value} 模型").replace("{service.value}", service.value),
                 config["default_models"],
                 self.llmGroup,
             )

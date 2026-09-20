@@ -51,6 +51,26 @@ struct crispasr_disp_segment {
 std::vector<crispasr_disp_segment> crispasr_make_disp_segments(const std::vector<crispasr_segment>& segments,
                                                                int max_len, bool split_on_punct = false);
 
+// Issue #356: the cue stream the writers emit must be non-decreasing in start
+// time. Note WHICH start time — crispasr_make_disp_segments reads the WORD
+// timestamps of any segment that carries words and only falls back to
+// seg.t0/seg.t1 for a text-only one, so a list whose segment spans look
+// monotone can still write backward-jumping cues. This walks the same values
+// the writers will and returns the index of the first segment that starts
+// before the previous emitted position, or -1 when the list is in order.
+// `prev_cs` / `cur_cs` (optional) receive the two offending timestamps.
+//
+// Diagnostic only: it reports, it never reorders.
+int crispasr_first_backward_segment(const std::vector<crispasr_segment>& segments, int64_t* prev_cs = nullptr,
+                                    int64_t* cur_cs = nullptr);
+
+// Print one warning per process if `segments` is out of order. #356 reached a
+// user as a subtitle-rendering complaint because nothing between the producer
+// (the #89 gap-fill second pass) and the writers ever checked this — every
+// stage that could have was either opt-in or documented as "never reorders".
+// `where` names the producing stage. CRISPASR_ORDER_WARN=0 silences it.
+void crispasr_warn_if_segments_backward(const std::vector<crispasr_segment>& segments, const char* where);
+
 // ---------------------------------------------------------------------------
 // Writers. All take a full file path; callers are expected to choose the
 // path via crispasr_make_out_path().

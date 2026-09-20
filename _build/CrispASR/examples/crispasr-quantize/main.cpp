@@ -265,6 +265,14 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
     // run on it but do not expect much.
     const bool is_btc = (arch == "btc");
 
+    // Supertonic-3 (#434): quantize ONLY the big vector-field / vocoder 2-D
+    // matmul weights (vf.* / voc.*). Everything else — the CPU-side duration
+    // predictor + text encoder (dp.* / te.*, tiny), the char embedders, the
+    // baked style prototypes / uncond tokens, all voice.* presets and the
+    // text.* index tables — stays at source precision. The dwconv kernels are
+    // 3-D and already fall out via ok_dims.
+    const bool is_supertonic = (arch == "supertonic-tts");
+
     const bool is_chatterbox =
         (arch.find("chatterbox") != std::string::npos || arch.find("kartoffelbox") != std::string::npos);
     // CosyVoice3: the three sub-models live in separate GGUFs but share the
@@ -432,6 +440,55 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
     const bool is_vibevoice = (arch.find("vibevoice") != std::string::npos);
     const char* env_vv_all = std::getenv("CRISPASR_VIBEVOICE_QUANT_ALL");
     const bool vibevoice_quant_all = is_vibevoice && env_vv_all && *env_vv_all && *env_vv_all != '0';
+    bool vibevoice_asr_streaming = false;
+    if (const int key = gguf_find_key(ctx_in, "vibevoice.asr_streaming"); key >= 0)
+        vibevoice_asr_streaming = gguf_get_val_u32(ctx_in, key) != 0;
+    const char* env_vv_frontend = std::getenv("CRISPASR_VIBEVOICE_ASR_FRONTEND_F16");
+    const bool vibevoice_asr_frontend_f16 =
+        vibevoice_asr_streaming && env_vv_frontend && *env_vv_frontend && *env_vv_frontend != '0';
+
+    // Breeze TTS 2 (#412): T5Gemma2 text encoder -> Qwen3 backbone -> 12L depth
+    // decoder over 16 codebooks. Four families stay at source precision, all of
+    // them small and all of them decision-making rather than bulk compute:
+    //   backbone.audio_embd.weight  the TIED summed-codebook embedding. One
+    //       physical tensor is bound to BOTH the backbone's audio input embed
+    //       and the depth decoder's token embed (config.tie_codebooks_embeddings,
+    //       breeze.py:1102-1108), so quantization error here is paid twice per
+    //       codebook per frame, on a pure lookup that has no matmul to average
+    //       it out. 134 MB at F16.
+    //   backbone.codebook0_head.weight  2052 rows, where row 2051 IS the
+    //       backbone EOS class (breeze.py:922-923). An EOS logit nudged by
+    //       quantization noise changes the UTTERANCE LENGTH, which is the
+    //       zonos failure mode above, one file down. 8 MB.
+    //   depth.cb_head.{0..14}.weight  the 15 per-codebook output heads. Their
+    //       argmax IS the emitted code; there is no downstream layer to absorb
+    //       a wrong pick, and a head-15 error is inaudible as "a bug" and
+    //       audible as codec grit. 63 MB for all fifteen.
+    //   te_proj.weight / depth.projection.weight  the two single-tensor bridges
+    //       between components (1152->2048 text encoder -> backbone; 2048->1024
+    //       backbone hidden -> depth frame 0). Every text token and every frame
+    //       passes through one of them. 9 MB together.
+    // Total carve-out ~214 MB, against a ~2.85 B live-parameter model.
+    //
+    // te.token_embd.weight (262158 x 1152, 302 M params / 604 MB at F16) is the
+    // one genuinely expensive call. It is kept at source precision BY DEFAULT,
+    // following every other TTS backend here (bark token_embd, chatterbox
+    // t3.text_emb, zonos embeddings, dia embedding): in TTS a text-embedding row
+    // is a pronunciation, and a mangled row is a mispronounced word rather than
+    // a slightly worse average. Set CRISPASR_BREEZE_QUANT_TEXT_EMBD=1 to include
+    // it and save ~450 MB, which is the difference between a ~2.2 GB and a
+    // ~1.75 GB q4_k. That is a real trade and it should be measured, not assumed
+    // — hence a switch rather than a silent choice in either direction.
+    //
+    // ⚠ SHAPE NOTE, not a rule: the text encoder is d=1152 and 1152 % 256 == 128,
+    // so NO tensor whose ne0 is 1152 (te.token_embd, te.blk.*.attn_{q,k,v},
+    // te.blk.*.ffn_{gate,up}) can be a k-quant — those fall back to a legacy
+    // quant even when --q4_k is asked for. te.blk.*.attn_output (ne0 1024) and
+    // te.blk.*.ffn_down (ne0 6912) k-quantize normally. Expect a mixed text
+    // encoder and do not read the fallback as a bug.
+    const bool is_breeze = (arch == "breeze-tts-2");
+    const char* env_bz_te = std::getenv("CRISPASR_BREEZE_QUANT_TEXT_EMBD");
+    const bool breeze_quant_text_embd = is_breeze && env_bz_te && *env_bz_te && *env_bz_te != '0';
 
     // Zonos TTS: 26-layer GQA transformer + 9-codebook DAC heads.
     // Uniformly quantizing all tensors inflates the EOS logit at prefill
@@ -582,6 +639,13 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
     //   - penc.in_proj/out_proj/ds_conv — PatchEncoder I/O
     // Vocoder and speaker encoder are in separate GGUFs — quantize normally.
     const bool is_dots_tts = (arch.find("dots-tts") != std::string::npos || arch.find("dots_tts") != std::string::npos);
+    // FireRedTTS3 (#377): mirror the dots.tts lesson — a flow-matching head
+    // audibly degrades under weight quantization, so keep the WHOLE DiT and
+    // the PatchEncoder at F16; quantize only the Qwen3-1.7B backbone matmuls.
+    // The redae companion (arch fireredtts3-redae) is an autoencoder over
+    // 24 kHz audio — also quality-critical: quantize nothing but the Qwen3
+    // stack projections there, keep in/out/istft I/O at F16.
+    const bool is_fireredtts3 = (arch.find("fireredtts3") != std::string::npos);
     // ARK-ASR-3B: keep the tied embedding/lm_head (dec.embed.weight) and the
     // whole Whisper encoder + adapter (mel-sensitive, small vs the 36L decoder)
     // at F16; quantize only the decoder attn/ffn projections.
@@ -626,6 +690,36 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
                __func__);
     }
 
+    // t5 / MADLAD-400 (#333). Keeping `shared.embed.weight` and
+    // `lm_head.weight` at source precision is OPT-IN, because it was measured
+    // and it LOSES.
+    //
+    // The reasoning that motivated it was: those two carry the whole 256K
+    // vocabulary, Q4_K's worst stages were enc_embed 0.9974 and enc_out 0.9937,
+    // therefore the loss is embedding-driven. Wrong. Re-quantizing with them
+    // held wide and diffing against the reference archive:
+    //
+    //     q8_0   3.38 -> 3.62 GB   worst cos 0.999922 -> 0.999920
+    //     q4_k   2.04 -> 2.41 GB   worst cos 0.992929 -> 0.992606
+    //
+    // Bigger and no better. The new worst stages say why — cross_v_blk0,
+    // enc_out, cross_k_blk0 — i.e. the error is what ACCUMULATES through 32
+    // encoder blocks, not what the embedding lookup rounds off. A wide
+    // embedding cannot fix a stack that has already drifted.
+    //
+    // Kept and inverted rather than deleted: a different T5 checkpoint (tied
+    // embeddings, a smaller vocabulary, an imatrix run) could land differently,
+    // and the lever costs nothing switched off.
+    const bool is_t5 = (arch == "t5");
+    const char* env_t5_keep = std::getenv("CRISPASR_T5_KEEP_EMBED");
+    const bool t5_keep_embed = is_t5 && env_t5_keep && *env_t5_keep && *env_t5_keep != '0';
+    if (t5_keep_embed) {
+        printf("%s: t5 — keeping shared.embed.* and lm_head.* at source precision "
+               "(CRISPASR_T5_KEEP_EMBED=1; measured BIGGER and no better on madlad400 — "
+               "see the note in this file)\n",
+               __func__);
+    }
+
     const bool is_parakeet = (arch == "parakeet");
     bool parakeet_is_rnnt = false;
     if (is_parakeet) {
@@ -638,6 +732,33 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
     if (is_parakeet && parakeet_is_rnnt && !parakeet_quant_all) {
         printf("%s: parakeet RNNT — keeping joint.* and decoder.embed.* at source precision "
                "(override with CRISPASR_PARAKEET_QUANT_ALL=1)\n",
+               __func__);
+    }
+
+    // Sidon speech restoration (arch "sidon"): w2v-BERT predictor + continuous
+    // DAC. The 64 attention/FFN matrices (1024x1024, 1024x4096) are the bulk and
+    // quantize normally; the DAC decoder is 3-D conv and is skipped by ok_dims.
+    // Two 2-D tensors slip through the generic rule and should not:
+    //
+    //   * `...self_attn.distance_embedding.weight` (64 x 73) is the relative-
+    //     position LOOKUP TABLE — one row per distance bucket, the same class as
+    //     every other embedding this file already protects (tok_emb, lang_emb,
+    //     whisper-vad encoder.embed_positions, voxtral codec.semantic_cb). Its
+    //     73 rows bias EVERY attention score in all 8 layers, so rounding them
+    //     perturbs the whole attention map rather than one projection.
+    //   * `predictor.feature_projection.projection.weight` (160 x 1024) is the
+    //     single 160-d feature -> 1024-d hidden input projection. Everything the
+    //     predictor computes is downstream of it.
+    //
+    // Neither row is 256-aligned (73-bucket table rows are 64 wide; the
+    // projection rows are 160), so under `--q4_k` BOTH silently take the row-fit
+    // fallback to legacy Q4_0 — the crudest 4-bit type, not a k-quant — which is
+    // the worst place in this model to spend precision. Keeping both at source
+    // precision costs ~235 KB on a 251 MB q4_k file (0.09 %).
+    const bool is_sidon = (arch == "sidon");
+    if (is_sidon) {
+        printf("%s: sidon — keeping the relative-position distance_embedding and the feature "
+               "projection at source precision (they are not 256-aligned and would fall back to Q4_0)\n",
                __func__);
     }
 
@@ -735,6 +856,8 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
             // `--q4_k` silently falls back to Q4_0. That fallback is why the q4
             // row costs so much -- it is Q4_0, not a k-quant.
             !(is_tabcnn && sname == "head.weight") &&
+            // Supertonic-3: allow-list vf.*/voc.* (see is_supertonic note).
+            !(is_supertonic && !(sname.rfind("vf.", 0) == 0 || sname.rfind("voc.", 0) == 0)) &&
             !(is_granite_family && !granite_quant_all && sname.find("enc.") == 0) &&
             // MOSS-Audio: keep encoder + adapter + deepstack at F16
             !(arch == "moss_audio" &&
@@ -755,6 +878,13 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
             // embeddings, and the tiny FM input projection at F16/F32.
             !(arch == "voxtral_tts" &&
               (sname == "codec.semantic_cb.weight" || sname.find("voice.") == 0 || sname.find("fm.input_proj") == 0)) &&
+            // Confucius4-TTS: keep the baked speaker encoders at source precision.
+            // T2S ECAPA (speaker_encoder.*) makes the single condition_emb prefix
+            // slot; S2A CAMPPlus (campplus.*) makes the 192-d style vector — both
+            // are tiny and load-bearing (a wrong style vector shifts the whole
+            // CFG-conditioned ODE).
+            !(arch.find("confucius4") != std::string::npos &&
+              (sname.find("speaker_encoder.") == 0 || sname.find("campplus.") == 0)) &&
             !(sname.find("cls.") == 0 && ggml_nelements(t) < 65536) && (sname.find("enc_proj.") != 0) &&
             (allow_lmhead || (sname.find("lm_head.") != 0)) && (sname.find("tok_emb.") != 0) &&
             (sname.find("lang_emb.") != 0) &&
@@ -767,6 +897,12 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
                sname == "cosyvoice3.flow.input_embd.w" || sname == "cosyvoice3.flow.spk_affine.w" ||
                sname == "cosyvoice3.s3tok.fsq.proj.w")) &&
             !is_f5tts &&
+            !(is_fireredtts3 &&
+              (sname.find("frt.dit") == 0 || sname.find("frt.penc.") == 0 || sname.find("frt.spk_proj_") == 0 ||
+               sname.find("frt.stop_head.") == 0 || sname.find("frt.llm.tok_emb.") == 0 ||
+               sname.find("frt.dprompt.") == 0 || sname.find("frt.enc.in_proj") == 0 ||
+               sname.find("frt.enc.out_proj.") == 0 || sname.find("frt.dec.in_proj.") == 0 ||
+               sname.find("frt.dec.istft_") == 0 || sname.find("campp.") == 0)) &&
             !(is_dots_tts && (sname.find("dots.dit.") == 0 || sname.find(".adaln.") != std::string::npos ||
                               sname.find("dots.hidden_proj.") == 0 || sname.find("dots.latent_proj.") == 0 ||
                               sname.find("dots.coordinate_proj.") == 0 || sname.find("dots.xvec_proj.") == 0 ||
@@ -794,6 +930,15 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
             !(is_vibevoice && !vibevoice_quant_all &&
               (sname.find("pred.") == 0 || sname.find("at_conn.") == 0 || sname.find("se_conn.") == 0 ||
                sname.find("tts_eos.") == 0 || sname.find("tts_types.") == 0)) &&
+            // A/B gate for #426. The streaming checkpoint recomputes this
+            // frontend for every 3.47 s window, so frontend drift compounds
+            // across persistent decoder state. Kaggle parity decides whether
+            // the published Q4 needs these encoder tensors retained at F16.
+            !(vibevoice_asr_frontend_f16 && (sname.find("at_enc.") == 0 || sname.find("st_enc.") == 0)) &&
+            !(is_breeze && (sname == "backbone.audio_embd.weight" || sname == "backbone.codebook0_head.weight" ||
+                            sname.rfind("depth.cb_head.", 0) == 0 || sname == "te_proj.weight" ||
+                            sname == "depth.projection.weight" ||
+                            (!breeze_quant_text_embd && sname == "te.token_embd.weight"))) &&
             !(is_zonos && (sname.find("heads.") == 0 || sname.find("embeddings.") == 0 ||
                            sname.find("prefix_conditioner.") == 0)) &&
             !(is_bark &&
@@ -819,6 +964,10 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
             // can't cast k-quant → the pos_emb get_rows workaround, #305). Keep it
             // at F16 like every other positional embedding.
             !(is_whisper_vad && sname == "encoder.embed_positions.weight") &&
+            // Sidon: relative-position lookup table + the input feature
+            // projection stay at source precision (see the is_sidon note above).
+            !(is_sidon && (sname.find("self_attn.distance_embedding.") != std::string::npos ||
+                           sname.find("feature_projection.projection.") != std::string::npos)) &&
             !(is_higgs && (sname == "token_embd.weight" || sname == "output.weight")) &&
             !(is_miotts && sname.find("codec.") == 0) &&
             !(is_parakeet && parakeet_is_rnnt && !parakeet_quant_all &&
@@ -829,6 +978,7 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
             !(is_gigaam && !gigaam_quant_all &&
               (sname.find("joint.") == 0 || sname.find("decoder.") == 0 || sname.find("head.ctc.") == 0 ||
                sname.find("encoder.pre.") == 0 || sname.find("preprocessor.") == 0)) &&
+            !(t5_keep_embed && (sname.find("shared.embed") == 0 || sname.find("lm_head") == 0)) &&
             !(is_tada && !tada_quant_all && (sname.find("talker.token_embd") == 0 || sname.find("tada.") == 0)) &&
             ([&]() {
                 if (!is_tada || tada_quant_all || (tada_keep_head == 0 && tada_keep_tail == 0))
@@ -921,6 +1071,22 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
         // unquantized targets pass through. Rows not 32-aligned keep source.
         if (is_qwen3_asr && !qwen3asr_quant_audio && sname.find("audio.") == 0 && should_quantize &&
             ggml_is_quantized(target_types[i]) && target_types[i] != GGML_TYPE_Q8_0) {
+            target_types[i] = (ncols % ggml_blck_size(GGML_TYPE_Q8_0) == 0) ? GGML_TYPE_Q8_0 : t->type;
+        }
+
+        // Chatterbox Multilingual V3 Q4 quality floor. The S3Tokenizer output
+        // is reused twice by native voice cloning (T3 speech prompt and S3Gen
+        // prompt tokens), so its error affects both speaker conditioning and
+        // the generated mel. Against the pinned official V3 Python path, a Q8
+        // tokenizer floor improves proj-down cosine 0.999477 -> 0.999929 and
+        // downstream T3 conditioning 0.9855 -> 0.9951. Keep the T3 sampling
+        // head at Q8 too: it directly ranks 8194 speech tokens and costs only
+        // ~4 MB. Q8/F16 targets are unchanged; unsupported row widths retain
+        // their source precision.
+        const bool chatterbox_q8_floor =
+            is_chatterbox && (sname.find("s3.tok.") == 0 || sname == "t3.speech_head.weight");
+        if (chatterbox_q8_floor && should_quantize && ggml_is_quantized(target_types[i]) &&
+            target_types[i] != GGML_TYPE_Q8_0) {
             target_types[i] = (ncols % ggml_blck_size(GGML_TYPE_Q8_0) == 0) ? GGML_TYPE_Q8_0 : t->type;
         }
 

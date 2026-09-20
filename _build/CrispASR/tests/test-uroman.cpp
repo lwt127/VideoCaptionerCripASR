@@ -54,3 +54,25 @@ TEST_CASE("uroman: empty string", "[unit][uroman]") {
     REQUIRE(romanize("") == "");
     REQUIRE_FALSE(needs_romanization(""));
 }
+
+TEST_CASE("uroman: per-word romanization is label-safe (#419)", "[unit][uroman]") {
+    // The aligner romanizes PER WORD to build CTC labels while returning the
+    // original-script words to callers (crispasr_align_words::restore_text).
+    // That 1:1 mapping requires romanize(word) to stay a single, non-empty,
+    // whitespace-free token for the scripts we align — a romanization that
+    // split or emptied a word would desync labels from originals and the
+    // restore would bail to the aligner's own labels (the #419 translit).
+    const char* words[] = {
+        "\xd0\xb2\xd0\xb8\xd0\xba\xd0\xb8\xd0\xbd\xd0\xb3\xd0\xb8",         // викинги
+        "\xd0\xbe\xd1\x82\xd0\xb2\xd0\xb0\xd0\xb6\xd0\xbd\xd1\x8b\xd0\xb5", // отважные
+        "\xd0\xb2\xd0\xbe\xd0\xb8\xd0\xbd\xd1\x8b,",                        // воины, (with punct)
+        "\xd0\x95\xd0\xb2\xd1\x80\xd0\xbe\xd0\xbf\xd1\x8b.",                // Европы.
+    };
+    for (const char* w : words) {
+        REQUIRE(needs_romanization(w));
+        const std::string r = romanize(w);
+        REQUIRE_FALSE(r.empty());
+        REQUIRE(r.find(' ') == std::string::npos);
+        REQUIRE(r.find('\t') == std::string::npos);
+    }
+}

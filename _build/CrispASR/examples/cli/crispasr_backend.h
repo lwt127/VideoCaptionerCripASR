@@ -13,6 +13,8 @@
 
 #pragma once
 
+#include "crispasr_speaker_identity_models.h" // declared_speaker_identity() — the researched verdicts
+
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -67,9 +69,11 @@ struct crispasr_segment {
     std::vector<crispasr_word> words;   // may be empty
     std::vector<crispasr_token> tokens; // may be empty
     // Multi-task ASR metadata (SenseVoice and similar). Empty when the
-    // backend doesn't emit them.
+    // backend doesn't emit them. There is deliberately no `emotion` field:
+    // inferring emotions from voice is an emotion recognition system under
+    // EU AI Act Art. 3(39) — prohibited in workplace/education (Art. 5(1)(f))
+    // and high-risk otherwise (Annex III(1)(c)). See docs/eu-ai-act.md.
     std::string lang_id;     // e.g. "en", "zh", "ja"
-    std::string emotion;     // e.g. "HAPPY", "NEUTRAL"
     std::string audio_event; // e.g. "Speech", "Music"
     std::string itn_flag;    // "withitn" or "woitn"
 };
@@ -134,11 +138,20 @@ enum crispasr_capability : uint32_t {
                                         // dispatcher. Note this backend emits scores, not a
                                         // decided tablature: the constrained Viterbi/DP that
                                         // picks a playable fingering belongs to the caller.
+    CAP_TTS_SPEED = 1u << 29,           // backend handles tts_speed / duration scaling natively without pitch shift
 };
 
 // ---------------------------------------------------------------------------
 // Backend interface
 // ---------------------------------------------------------------------------
+
+class CrispasrRealtimeSession {
+public:
+    using callback = std::function<void(const std::string& partial_text, bool is_final)>;
+    virtual ~CrispasrRealtimeSession() = default;
+    virtual bool append(const float* samples, int n_samples, bool flush, callback on_text) = 0;
+    virtual void reset() = 0;
+};
 
 class CrispasrBackend {
 public:
@@ -149,6 +162,11 @@ public:
 
     // Bitmask of crispasr_capability flags.
     virtual uint32_t capabilities() const = 0;
+
+    // True if this backend handles speaking-rate / speed scaling natively
+    // (via duration predictor, pace, ODE speed, etc.) without pitch shift.
+    // When true, server-side post-synthesis resampling is bypassed.
+    virtual bool handles_tts_speed() const { return (capabilities() & CAP_TTS_SPEED) != 0; }
 
     // Load the model and prepare internal state. Returns false on failure.
     // Params are passed by const-ref — backends should only read the fields
@@ -173,6 +191,57 @@ public:
     // CTC grid return nullptr. The pointer is owned by the backend and valid
     // until the next transcribe() / shutdown().
     virtual const crispasr_ctc_logits* last_ctc_logits() const { return nullptr; }
+
+    // ---- Optional split transcribe (encode ∥ decode pipelining) ----
+    //
+    // Encoder-decoder backends typically run the encoder on the GPU and the
+    // decoder on the CPU. Processing N slices with transcribe() serialises the
+    // two, leaving one processor idle at all times. A backend that can hand out
+    // its intermediate encoder state lets the caller overlap the encode of
+    // slice N+1 with the decode of slice N — the same throughput win as a
+    // worker pool, without the N-times model memory.
+    //
+    // Contract: encode_slice() may be called on a WORKER thread while
+    // decode_slice() runs on another, so a backend may only advertise this when
+    // its encode and decode paths touch disjoint state. Calls are issued in
+    // slice order and decodes happen in the same order. The handle is opaque
+    // and must be consumed by exactly one decode_slice(), which frees it;
+    // release_encoded() frees an unconsumed handle on an error path.
+    struct encoded_slice {
+        void* h = nullptr; // backend-owned; null = encode failed
+    };
+    virtual bool supports_split_transcribe() const { return false; }
+    // Whether THIS slice length can go through encode_slice/decode_slice. A
+    // backend may route long inputs through a multi-window path that the split
+    // pair does not reproduce. The caller must check every slice up front and
+    // fall back to the fully sequential path if any slice says no — mixing
+    // transcribe() into a running pipeline would encode on two threads at once.
+    virtual bool can_split_slice(int /*n_samples*/, const whisper_params& /*params*/) const { return false; }
+    virtual encoded_slice encode_slice(const float* /*samples*/, int /*n_samples*/, const whisper_params& /*params*/) {
+        return {};
+    }
+    virtual std::vector<crispasr_segment> decode_slice(encoded_slice /*enc*/, int64_t /*t_offset_cs*/,
+                                                       const whisper_params& /*params*/) {
+        return {};
+    }
+    virtual void release_encoded(encoded_slice /*enc*/) {}
+    // Called on the CALLER's thread once before a run of encode_slice/
+    // decode_slice pairs, never concurrently with them.
+    //
+    // transcribe() typically applies per-call settings (sampling, beam,
+    // hotwords, attention context) to backend state on every call; the split
+    // pair cannot, because encode_slice runs on a worker thread and mutating
+    // decode state there would race the decoder. Without this hook those flags
+    // are silently dropped whenever the pipeline engages — measured on
+    // parakeet: `--vad --beam-size 4` decoded greedily.
+    virtual void begin_split_run(const whisper_params& /*params*/) {}
+    // Post-decode repair that needs the model AND the raw audio, so it cannot
+    // run inside decode_slice: it re-encodes, and the producer is still
+    // encoding at that point. The caller invokes it after the pipeline has
+    // joined, before the segments are trimmed and stored, which is where
+    // transcribe() applies it. Default is no-op.
+    virtual void repair_slice(const float* /*samples*/, int /*n_samples*/, int64_t /*t_offset_cs*/,
+                              std::vector<crispasr_segment>& /*segs*/, const whisper_params& /*params*/) {}
 
     // Optional stereo-aware overload for backends that can split stereo
     // channels for diarization (currently: whisper). Default
@@ -214,6 +283,44 @@ public:
         if (!v.empty())
             cb(v.data(), (int)v.size(), true);
     }
+
+    // Whose voice this backend's BUILT-IN preset voices belong to.
+    //
+    // The default is a lookup in crispasr_speaker_identity_models.h, keyed on
+    // (backend name, checkpoint) — because one backend serves many checkpoints
+    // with different answers (`orpheus` runs both Canopy's base model and
+    // Kartoffel's German fine-tune), and because these are research results
+    // that belong in one reviewable table rather than scattered across 50
+    // adapters. A backend only overrides this if it can do better from its own
+    // loaded metadata.
+    //
+    // Unresearched models resolve to Unknown, and that claims nothing: it means
+    // nobody has read the provider's card yet, not that the voice is synthetic.
+    // Guessing Synthetic is the costly direction — it silently removes an
+    // Art. 50(4) disclosure.
+    //
+    // A RealPerson preset is disclosed but NOT consent-gated; see
+    // crispasr_speaker_identity.h for why those are different duties.
+    //
+    // A pack or bank entry that declares its own crispasr.voice.speaker_identity
+    // outranks this, and --speaker-identity outranks both.
+    virtual crispasr_voice::SpeakerIdentity declared_speaker_identity(const std::string& model_path) const {
+        return crispasr_voice::identity_for_model(name(), model_path);
+    }
+
+    // Path to the multi-voice BANK this backend selects `--voice` entries from,
+    // or empty when `--voice` names a file directly (the usual case).
+    //
+    // This exists for the voice-clone gate, not for synthesis. cosyvoice3 keeps
+    // every voice inside one bundle discovered as a sibling of the model, so
+    // `--voice fleurs-en` names no file on disk; the gate read no metadata and
+    // classified a zero-shot voice clone as a preset, on every surface. The
+    // backend is the only thing that knows which bundle it resolved, so it has
+    // to hand the path over. See crispasr_voice_provenance.h.
+    //
+    // Any future backend that selects voices by name from a container MUST
+    // override this, or its clones ship unattested and undisclosed.
+    virtual std::string voice_bank_path() const { return {}; }
 
     // Sample rate of `synthesize()` output PCM. Defaults to 24 kHz since most
     // TTS backends (kokoro, qwen3-tts, vibevoice, chatterbox, orpheus, indextts)
@@ -267,6 +374,24 @@ public:
     // multilingual backend — that would wrongly force its output language.
     virtual const char* sole_language() const { return nullptr; }
 
+    // Detect the spoken language using the ALREADY-LOADED model, when the
+    // backend can do so without a second one. Returns false (the default) when
+    // it cannot, and the caller falls back to external LID (whisper-tiny etc.).
+    //
+    // This is NOT the same as CAP_LANGUAGE_DETECT. That cap means "detection
+    // happens inside transcribe(), the CLI need not resolve a language at all";
+    // declaring it on a backend that in fact needs a language in its prompt
+    // leaves `-l auto` unresolved. This hook is for the opposite case: the
+    // backend REQUIRES a language but can work one out from its own weights.
+    //
+    // A backend whose language set is smaller than the external detector's also
+    // has a correctness reason to prefer this: external LID can return a
+    // language the model does not support, which is unfixable after the fact.
+    virtual bool detect_language(const float* /*samples*/, int /*n_samples*/, const whisper_params& /*params*/,
+                                 std::string& /*out_lang*/, float& /*out_confidence*/) {
+        return false;
+    }
+
     // Streaming transcription callback type.
     // Called with partial text (empty string counts as keep-alive)
     // and is_final flag. When is_final is true, partial_text is the
@@ -295,6 +420,10 @@ public:
         }
         on_text(full, true); // final
     }
+
+    // Stateful cross-append streaming. Backends return nullptr until they can
+    // preserve their native frontend/encoder/decoder state per connection.
+    virtual std::unique_ptr<CrispasrRealtimeSession> create_realtime_session(const whisper_params&) { return nullptr; }
 
     // Warmup: run a short dummy transcribe to amortize first-call
     // overhead (graph allocation, GPU kernel compilation, gallocr shape

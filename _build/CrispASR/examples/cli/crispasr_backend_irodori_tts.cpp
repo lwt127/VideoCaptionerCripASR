@@ -9,6 +9,7 @@
 #include "crispasr_backend.h"
 #include "crispasr_model_mgr_cli.h"
 #include "crispasr_model_registry.h"
+#include "crispasr_voice_provenance.h"
 #include "whisper_params.h"
 
 #include "core/wav_reader.h"
@@ -172,20 +173,33 @@ private:
     // (irodori_tts_set_reference, content-addressed), so it's skipped across
     // runs and shared with every other consumer (C ABI, server, wrappers).
     void apply_reference(const whisper_params& p) {
-        if (p.tts_voice == ref_path_)
+        // Resolve a BARE voice name against --voice-dir before anything else.
+        // The server passes `voice` through verbatim by design and documents
+        // that the adapter owns the interpretation, so an unresolved adapter
+        // gets the literal name as a path: /v1/audio/speech with
+        // {"voice": "reference"} listed fine under /v1/voices but failed to
+        // load, while the CLI worked because it was handed a full path (#384).
+        // Same shared resolver the server's provenance gate uses, so the two
+        // surfaces agree on WHICH file a name means.
+        const std::string voice = p.tts_voice.empty() || p.tts_voice_dir.empty()
+                                      ? p.tts_voice
+                                      : crispasr_voice::resolve_voice_path(p.tts_voice, p.tts_voice_dir);
+        // Cache on the RESOLVED path: a name and its path are the same
+        // reference, and re-encoding per chunk is the expensive part.
+        if (voice == ref_path_)
             return; // already in the desired state (including both empty)
-        ref_path_ = p.tts_voice;
+        ref_path_ = voice;
 
-        if (p.tts_voice.empty()) {
+        if (voice.empty()) {
             irodori_tts_clear_reference(ctx_);
             return;
         }
 
         std::vector<float> pcm;
         int sr = 0;
-        if (!crispasr::core::read_wav_mono_pcm16(p.tts_voice, pcm, sr) || pcm.empty() || sr <= 0) {
+        if (!crispasr::core::read_wav_mono_pcm16(voice, pcm, sr) || pcm.empty() || sr <= 0) {
             std::fprintf(stderr, "crispasr[irodori-tts]: failed to load reference audio '%s' (cloning disabled)\n",
-                         p.tts_voice.c_str());
+                         voice.c_str());
             irodori_tts_clear_reference(ctx_);
             // Keep ref_path_ set so we don't re-warn for every chunk of the
             // same request; a fixed voice path won't become readable mid-run.
@@ -202,8 +216,8 @@ private:
             return;
         }
         if (!p.no_prints) {
-            std::fprintf(stderr, "crispasr[irodori-tts]: reference voice '%s' (%d samples, %d Hz)\n",
-                         p.tts_voice.c_str(), (int)pcm.size(), sr);
+            std::fprintf(stderr, "crispasr[irodori-tts]: reference voice '%s' (%d samples, %d Hz)\n", voice.c_str(),
+                         (int)pcm.size(), sr);
         }
     }
 

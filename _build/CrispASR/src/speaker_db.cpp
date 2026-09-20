@@ -36,6 +36,11 @@ struct speaker_profile {
 struct speaker_db {
     std::string dir_path;
     std::vector<speaker_profile> speakers;
+    // Set by speaker_db_retain(): the claimed closed roster. enroll_into()
+    // consults it so same-handle enrollment can never widen the roster the
+    // caller attested to (#266).
+    std::vector<std::string> retained_roster;
+    bool roster_applied = false;
 };
 
 // Read a .spkr file (v1 or v2). Returns false if the file is invalid.
@@ -141,6 +146,8 @@ extern "C" int speaker_db_retain(struct speaker_db* db, const char* csv_names) {
         // No roster claimed — retain nothing. An unclaimed db must never
         // silently fall back to an open 1:N search.
         db->speakers.clear();
+        db->retained_roster.clear();
+        db->roster_applied = true;
         return 0;
     }
 
@@ -159,6 +166,9 @@ extern "C" int speaker_db_retain(struct speaker_db* db, const char* csv_names) {
             cur += *p;
         }
     }
+
+    db->retained_roster = claimed;
+    db->roster_applied = true;
 
     std::vector<speaker_profile> kept;
     for (const auto& name : claimed) {
@@ -246,4 +256,44 @@ extern "C" bool speaker_db_enroll(const char* dir_path, const char* name, const 
     if (ok)
         fprintf(stderr, "speaker_db: enrolled '%s' → %s (%d-d, consent recorded)\n", name, path.c_str(), dim);
     return ok;
+}
+
+extern "C" bool speaker_db_enroll_into(struct speaker_db* db, const char* name, const float* embedding, int dim,
+                                       bool consent_attested) {
+    if (!db || !name || !embedding || dim <= 0)
+        return false;
+    if (!speaker_db_enroll(db->dir_path.c_str(), name, embedding, dim, consent_attested))
+        return false;
+
+    // The disk write is done; decide whether THIS handle may match the name.
+    if (db->roster_applied) {
+        bool on_roster = false;
+        for (const auto& r : db->retained_roster) {
+            if (r == name) {
+                on_roster = true;
+                break;
+            }
+        }
+        if (!on_roster) {
+            fprintf(stderr,
+                    "speaker_db: '%s' enrolled on disk but NOT added to this handle — it is outside the\n"
+                    "  retained roster; reopen with the name claimed to match against it (#266)\n",
+                    name);
+            return true;
+        }
+    }
+
+    speaker_profile sp;
+    sp.name = name;
+    sp.embedding.assign(embedding, embedding + dim);
+    sp.consent_attested = true;
+    sp.enroll_time = (uint64_t)time(nullptr);
+    for (auto& existing : db->speakers) {
+        if (existing.name == sp.name) {
+            existing = std::move(sp);
+            return true;
+        }
+    }
+    db->speakers.push_back(std::move(sp));
+    return true;
 }

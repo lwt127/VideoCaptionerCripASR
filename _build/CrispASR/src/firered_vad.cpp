@@ -7,6 +7,7 @@
 #include "core/gguf_loader.h"
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "core/crispasr_env.h"
+#include "core/parallel_for.h"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "gguf.h"
@@ -66,27 +67,6 @@ static int firered_vad_nthreads() {
     return v;
 }
 
-// Run fn(begin, end) over a partition of [0, n) across threads. fn must be safe
-// to call concurrently on disjoint sub-ranges (all callers write disjoint cells).
-template <class F> static void firered_parallel_for(int n, F&& fn) {
-    const int nt = std::min(firered_vad_nthreads(), n);
-    if (nt <= 1) {
-        fn(0, n);
-        return;
-    }
-    std::vector<std::thread> pool;
-    pool.reserve(nt - 1);
-    const int chunk = (n + nt - 1) / nt;
-    for (int t = 1; t < nt; t++) {
-        const int a = t * chunk, b = std::min(n, a + chunk);
-        if (a >= b)
-            break;
-        pool.emplace_back([&fn, a, b]() { fn(a, b); });
-    }
-    fn(0, std::min(n, chunk)); // this thread takes the first chunk
-    for (auto& th : pool)
-        th.join();
-}
 
 struct firered_vad_bench_stage {
     const char* name;
@@ -203,7 +183,7 @@ static void cpu_fsmn(const float* x, float* out, const float* lb_w, const float*
     int lb_pad = (N1 - 1) * S1;
     int lb_out_len = T + lb_pad; // T + (N1-1)*S1
     std::vector<float> lb_conv(P * lb_out_len, 0.0f);
-    firered_parallel_for(P, [&](int p0, int p1) {
+    core_parallel::for_each_chunk(P, firered_vad_nthreads(), [&](int p0, int p1) {
         for (int p = p0; p < p1; p++) {
             for (int t_out = 0; t_out < lb_out_len; t_out++) {
                 float s = 0;
@@ -232,7 +212,7 @@ static void cpu_fsmn(const float* x, float* out, const float* lb_w, const float*
         int la_pad = (N2 - 1) * S2;
         int la_out_len = T + la_pad;
         std::vector<float> la_conv(P * la_out_len, 0.0f);
-        firered_parallel_for(P, [&](int p0, int p1) {
+        core_parallel::for_each_chunk(P, firered_vad_nthreads(), [&](int p0, int p1) {
             for (int p = p0; p < p1; p++) {
                 for (int t_out = 0; t_out < la_out_len; t_out++) {
                     float s = 0;
@@ -330,7 +310,7 @@ static void compute_fbank_vad(const float* pcm, int n_samples, std::vector<float
 
     // Frames are independent (disjoint features[] writes); give each thread its
     // own FFT scratch. Bit-identical to the serial loop (#305).
-    firered_parallel_for(n_frames, [&](int t0, int t1) {
+    core_parallel::for_each_chunk(n_frames, firered_vad_nthreads(), [&](int t0, int t1) {
         std::vector<float> fre(n_fft), fim(n_fft);
         for (int t = t0; t < t1; t++) {
             int off = t * hop;

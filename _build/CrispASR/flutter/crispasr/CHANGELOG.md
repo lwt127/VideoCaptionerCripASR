@@ -1,5 +1,208 @@
 # Changelog
 
+## 0.8.34
+
+* **Breeze-TTS-2 (`bt2-tts`)** adds plain synthesis, voice cloning, and voice
+  design. Its GGUFs retain the upstream non-commercial licence.
+* **Linux CUDA 12 and CUDA 13 CLI packages return** after v0.8.33's release
+  jobs failed to link their dynamically loaded ggml backends (#442).
+* **Parakeet long audio is bounded at the encoder allocation itself** and uses
+  cgroup-aware available memory, preventing the intermittent 123.6 GB request
+  and NULL dereference reported on a 47.5-minute input (#441).
+* **Sidon splits oversized recordings by default** instead of asking users to
+  do it manually, while inputs that fit keep the same single-pass path (#431).
+* M2M100/WMT21 translation now uses each checkpoint's beam-5, 200-token decode
+  defaults in both CLI and library sessions, avoiding repetition collapse
+  (#439). Zonos rejects unsupported voice cloning and switches per-request
+  languages reliably (#435).
+
+## 0.8.33
+
+* **Two new TTS backends**: Supertonic-3 (`--backend supertonic`, 44.1 kHz
+  non-autoregressive flow matching, 10 voices, OpenRAIL-M) and FireRedTTS3
+  (`--backend fireredtts3`, zero-shot voice cloning, Apache-2.0) — closing the
+  last model in #377.
+* **Sidon accepts long audio** (#431). The input cap now derives from a memory
+  budget instead of a hardcoded frame count, and `CRISPASR_SIDON_SPLIT=1`
+  restores very long files as N exact passes cut at energy minima.
+* **Zonos no longer emits noise for non-Latin scripts** (#435). A missing
+  phonemizer now refuses loudly instead of synthesising a near-empty prompt,
+  and the per-request language is honoured.
+* **New API**: `set_voice_samples()` (#432), `backend_caps()` /
+  `list_backends_with_caps()` and `detect_backends()` (#433) — the last names
+  every backend that can open a given file, not just one.
+* **Built-in G2P replaces espeak-ng for en/de/fr** in zonos, removing that
+  GPL-3.0 dependency for those languages.
+* Fixes: supertonic q4_k was unloadable; a shared CAM++ pooling defect affecting
+  five backends; `voxcpm2-vae` reachable by `-m auto`.
+
+## 0.8.32
+
+* **Four new backends**: Raon-OpenTTS speech synthesis, Quds Persian
+  recognition, and MT3 / Basic Pitch on the music surface, with Standard MIDI
+  output (#250, #387). mel-band-roformer, already present on CPU, gains a
+  fused GPU graph (#422).
+* **Source separation runs on the GPU by default** where one is present —
+  HTDemucs and the new fused mel-band-roformer graph (#413, #414, #422).
+* **Nemotron `-l auto` no longer conditions on English regardless of the
+  detected language**, and reads its 121-entry language table from the model,
+  reaching 51 languages that were previously unnameable (#425).
+* Subtitle output returns the original script instead of transliterated text,
+  and Canary reports wrong-language conditioning instead of failing silently
+  (#419).
+* Live/streaming WebM decodes past the first 100 ms timeslice (#417), and a
+  malformed sample rate can no longer amplify a small file into a
+  multi-gigabyte allocation.
+* Kokoro honours `--tts-speed` (#423); FunASR, piano transcription, the
+  Bananamind vocoder and Sidon all get bit-identical speedups (#305, #416).
+
+## 0.8.31
+
+* **Pocket-TTS** now supports German, Spanish, Italian, Portuguese, and French
+  through managed GGUF variants, language-aware `-m auto` routing, and the C
+  session ABI (#411).
+* **Chatterbox Nano** gains a Finnish checkpoint (#382), while direct T3
+  KV-cache views remove redundant per-layer copies (#410).
+* Streaming partials avoid repeated audio slicing and can opt into bounded
+  tail decoding; CosyVoice3 enables packed Conv1d by default (#404, #406).
+* GPU portability improves across Windows CUDA 13, old-CPU CUDA packages,
+  Vulkan Chatterbox, Qwen3-TTS HIP fallbacks, and HTDemucs separation
+  (#337, #398, #400, #402, #405).
+* Silero language identification, server-side transcription progress, safer
+  TTS padding, and Go speaker-turn access round out the release (#395, #408,
+  #409).
+
+## 0.8.30
+
+* **Audio input**: files whose sample rate differs from the backend's are no
+  longer resampled by linear interpolation. A 10 kHz tone decoded to 16 kHz,
+  where it must vanish, previously survived at -10.3 dB and folded down into
+  the speech band; every 44.1/48 kHz recording carried that alias. Decoding now
+  happens at the file's own rate and resamples with the Kaiser-windowed
+  polyphase sinc (-89 dB on the same test). `CRISPASR_HQ_RESAMPLE=0` restores
+  the old path.
+* **GPU binaries**: the v0.8.29 GPU artifacts were built with `-march=native`
+  against a runner that has AVX-512, so the official Windows CUDA build died
+  with SIGILL on any CPU without it (#374). Nine of eleven GPU jobs were
+  affected. Replace any v0.8.29 GPU build.
+* A build/host CPU ISA mismatch now fails fast with a message naming the right
+  download, instead of an illegal-instruction fault the Windows console
+  swallows (#380).
+* **Windows**: cached GGUFs larger than 2 GiB were reported missing and
+  re-downloaded on every run, because MSVC's `stat` uses a 32-bit size field
+  and fails outright above 2 GiB (#393).
+* Punctuation restoration returned an empty string — not degraded output,
+  nothing — for every SentencePiece `fireredpunc` model (`fullstop-punc`,
+  `punctuate-all`).
+* VibeVoice-ASR answered in the wrong language: the input was never normalised
+  to -25 dBFS before the VAE encoders, and the 1.5B model was sent the 7B's
+  prompt format (#369). The model's own `[Silence]` marker no longer leaks into
+  transcripts and SRT files.
+* Canary long-form seam artifacts are gone — the real dynamic chunking from
+  canary-1b-v2 replaces the parakeet-shaped machinery (#375), with opt-in seam
+  dedup at chunk boundaries (#365).
+* New backend: **Confucius4-TTS** (#377), with native voice cloning via
+  `--voice`.
+* `/v1/realtime` Nemotron sessions are genuinely incremental — the stream now
+  owns frontend, encoder and predictor state across appends instead of
+  recomputing the whole buffer every 500 ms (#383).
+* New endpoint: `POST /v1/audio/separation` (#381).
+* Bare voice names resolve against `--voice-dir` in five TTS adapters, over
+  HTTP as well as the CLI (#384).
+* Long-form progress is reported on the chunk-encoded, JA-sliced and unified
+  dispatch routes, not only the common one (#385).
+* Diarization forwards FoxNose speaker turns across the C ABI (#395), and the
+  minimum speaker count is clamped to the distinct pyannote tracks (#368).
+* f5-tts counts UTF-8 characters, not bytes, in its duration estimate (#372);
+  kyutai `stt-1b-en_fr` no longer claims to be English-only (#366); omnivoice
+  matches upstream's target-token arithmetic exactly (#363).
+* `--align-only` accepts JSON input, for a JSON-to-JSON pipeline (#317).
+
+## 0.8.29
+
+* **Dart binding**: `inputSampleRate` and `outputSampleRate` are now bound
+  (#321). They had been added to the five bindings that lacked
+  `speechToSpeech`, which skipped the three that already had it — so Dart kept
+  s2s while never gaining the getter that says what rate to feed it. Both
+  return 0 on a dylib that predates the symbol, matching `separateSampleRate`.
+* **Chat**: cancellation and prompt-token counting are bound, plus four defects
+  fixed in the Dart chat surface (#361, #362). A session now waits for its
+  in-flight calls before freeing, so tearing one down mid-generation is safe.
+* `--diarize-method pyannote` never worked out of the box: the managed download
+  for its segmentation model was tagged with the licence string `"other"`, which
+  the registry treats as restricted, so it refused to fetch and produced no
+  speaker turns. It is MIT and ungated.
+* Diarization now returns speaker labels through `verbose_json`, which
+  previously dropped them entirely, and embeds segments across workers
+  (1.6–2.0x on the embed stage).
+* Parakeet long-form dropped whole spans of 30–300 s audio (#350) and could
+  emit segments out of time order (#356); both fixed, and long-form throughput
+  is 2.1x (#353).
+* Every GGUF load leaked its weight mapping — `MAP_PRIVATE` with write
+  permission, so merely reading the weights privatized the pages.
+* CosyVoice3 cloning works through the session API when the reference clip has
+  been prepared once through the CLI (#334).
+* Windows CUDA packages now ship in split form, without the three NVIDIA
+  runtime DLLs (#342) — 296 MB instead of 873 MB for the dev-lib package.
+* There is a Dart binding CI job, so this package is compiled on every push.
+
+## 0.8.28
+
+* **HIP/ROCm on Linux**: first release since 0.8.25 with a
+  `crispasr-linux-x86_64-hip` tarball. The packaging step rewrote `RUNPATH`
+  before asking `ldd` what the binaries needed, so ROCm's OpenMP runtime
+  (`libomp.so`, reachable only through that `RUNPATH`) was silently dropped and
+  the archive never built (#339).
+* The same defect in two more artifact kinds, neither reported (#341):
+  `libcrispasr-linux-x86_64-hip` shipped needing an unbundled `libomp.so`, and
+  the Python binding tarballs needed `libgomp.so.1` and `libblas.so.3` — so
+  `import crispasr` failed in the loader on any host without OpenBLAS and gcc's
+  OpenMP. Both are now bundled and gated.
+* GPU archives no longer copy the build machine's CUDA/ROCm install into the
+  tarball, and carry those toolkit directories in their own `RUNPATH` instead —
+  so they resolve without the `/etc/ld.so.conf.d` post-install step.
+* CLI tarballs now ship `LICENSE` and `THIRD_PARTY_NOTICES.txt`, which now also
+  declare the bundled OpenMP runtimes (`libgomp`, `libomp`).
+
+## 0.8.27
+
+* **Linux users on 0.8.26 should upgrade**: that release published only one of
+  its seven Linux binary tarballs (plain x86_64, arm64, CUDA, CUDA 13, Vulkan
+  and HIP all failed to build). Two shell bugs in the release workflow, fixed
+  (#339).
+* Fixed a null-pointer crash in the audio loader on a malformed Ogg file: a
+  Vorbis comment header declares its entry count before the array is
+  allocated, so an attacker-sized count left a non-zero length with a null
+  pointer that the teardown path then indexed. Reachable from
+  `crispasr_audio_load` on untrusted input.
+* qwen3-tts: `--temperature` now reaches the talker (it had only ever reached
+  the code predictor), plus greedy/replay/logit-dump levers for cross-backend
+  diagnosis (#337).
+
+## 0.8.26
+
+* CosyVoice3 voice cloning was conditioned on the wrong speaker embedding
+  (cosine 0.737 against upstream's CAMPPlus ONNX): the export folds
+  `out_nonlinear`'s BatchNorm into the preceding convolution and the fused bias
+  was dropped. Now 0.999997. Baked bank voices were never affected (#334).
+* CosyVoice3 `--ref-text` is now optional — the reference is auto-transcribed
+  and cached — and the decode has upstream's minimum-length floor, so it can no
+  longer end at step 0 with no audio (#334).
+* New CosyVoice3 RL talker: `--backend cosyvoice3-tts-rl` (#334).
+* Voxtral TTS could index its embedding table out of bounds on some inputs: a
+  Tekken vocabulary blob may serialize more pieces than the checkpoint
+  activates. Bounded, in both `voxtral-tts` and `voxtral4b` (#338).
+* qwen3-tts could emit 300 s of audio for one sentence — the frame budget was
+  the KV cache ceiling rather than anything derived from the input text (#337).
+* madlad400 F16 and Q8_0 artifacts published; F16 verified at cosine 1.000000
+  on all 14 stages against the PyTorch reference (#333).
+* Kokoro punctuation was being discarded, in German, French and Spanish too,
+  and the contextual G2P rules had shipped switched off (#316).
+* `-tl` / `--target-lang` was silently discarded by cosyvoice3 and omnivoice
+  (#329).
+* Rust and Dart diarize ABI mirrors were 24 bytes short; FoxNose exposed, plus
+  `session_output_sample_rate` and channel getters (#332).
+
 ## 0.8.25
 
 * New ASR backend: GigaAM-v3 (Russian, CTC + RNN-T, punctuation-native `e2e` heads).

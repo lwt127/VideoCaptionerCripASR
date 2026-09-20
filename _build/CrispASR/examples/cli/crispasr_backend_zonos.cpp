@@ -63,7 +63,15 @@ public:
     const char* name() const override { return "zonos"; }
 
     uint32_t capabilities() const override {
-        return CAP_TTS | CAP_AUTO_DOWNLOAD | CAP_TEMPERATURE | CAP_FLASH_ATTN | CAP_VOICE_CLONING;
+        // NOT CAP_VOICE_CLONING (#435). zonos_tts_set_voice() is a hard stub
+        // returning -1 ("not yet implemented") — cloning needs a ResNet293
+        // speaker encoder that is not ported. The only other route,
+        // zonos_tts_set_speaker_embedding(), is called from NOWHERE in the CLI
+        // or the C API and has no flag, so there is no path to a cloned voice
+        // at all. Declaring the cap made `--voice` accepted, warned about, and
+        // then silently answered with a RANDOM speaker. Re-declare it with a
+        // working encoder, not before.
+        return CAP_TTS | CAP_AUTO_DOWNLOAD | CAP_TEMPERATURE | CAP_FLASH_ATTN;
     }
 
     int tts_sample_rate() const override { return 44100; }
@@ -122,7 +130,11 @@ public:
 
         // Set language if specified
         if (!p.language.empty()) {
-            zonos_tts_set_language(ctx_, p.language.c_str());
+            // Only record it as applied if it WAS applied (see synthesize()).
+            if (zonos_tts_set_language(ctx_, p.language.c_str()) == 0)
+                cur_language_ = p.language; // #435: baseline for the per-request check
+            else
+                fprintf(stderr, "crispasr[zonos]: warning: could not set language '%s'\n", p.language.c_str());
         }
 
         // Load reference voice for speaker cloning
@@ -132,7 +144,14 @@ public:
             if (v.size() > 4 && (v.substr(v.size() - 4) == ".wav" || v.substr(v.size() - 4) == ".mp3" ||
                                  v.substr(v.size() - 5) == ".flac")) {
                 if (zonos_tts_set_voice(ctx_, v.c_str()) != 0) {
-                    fprintf(stderr, "crispasr[zonos]: warning: failed to load voice from '%s'\n", v.c_str());
+                    // Not a file problem: the speaker encoder is not implemented.
+                    // Saying "failed to load" sent #435's reporter looking at
+                    // their wav. Name the real cause and the real consequence.
+                    fprintf(stderr,
+                            "crispasr[zonos]: --voice is NOT supported by this backend: the speaker "
+                            "encoder (ResNet293) is not implemented, so '%s' was ignored and a RANDOM "
+                            "speaker will be used. This is not a problem with your file.\n",
+                            v.c_str());
                 }
             }
         }
@@ -143,6 +162,31 @@ public:
     std::vector<float> synthesize(const std::string& text, const whisper_params& params) override {
         if (!ctx_ || text.empty()) {
             return {};
+        }
+
+        // #435: honour the PER-REQUEST language. init() froze whatever the CLI
+        // was started with (default en-us), and synthesize() applied only
+        // temperature and seed — so `POST /v1/audio/speech {"language":"ru"}`
+        // reached a throwaway params struct and never the model. A server
+        // started without -l phonemised every language as en-us, which for
+        // Cyrillic meant no usable phonemes at all.
+        //
+        // Tracked so the call is skipped when nothing changed: zonos resolves
+        // the string to a language_id and espeak re-selects its voice, neither
+        // of which is worth redoing per request.
+        if (!params.language.empty() && params.language != "auto" && params.language != cur_language_) {
+            // #435: latch ONLY on success. Recording the request unconditionally
+            // made a FAILED switch sticky: the next request for the same
+            // language compared equal to cur_language_, skipped the call, and
+            // the model kept the language it was actually still set to. A
+            // failure has to stay retryable, and it has to be audible.
+            if (zonos_tts_set_language(ctx_, params.language.c_str()) == 0)
+                cur_language_ = params.language;
+            else
+                fprintf(stderr,
+                        "crispasr[zonos]: warning: request language '%s' not applied; "
+                        "still speaking '%s'\n",
+                        params.language.c_str(), cur_language_.c_str());
         }
 
         if (params.temperature > 0.0f) {
@@ -169,6 +213,9 @@ public:
 
 private:
     zonos_tts_context* ctx_ = nullptr;
+    // #435: language currently applied to ctx_, so a per-request change is
+    // detected and an unchanged one costs nothing.
+    std::string cur_language_;
 };
 
 } // namespace

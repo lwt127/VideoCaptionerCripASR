@@ -19,6 +19,7 @@ extern "C" {
 #endif
 
 struct nemotron_context;
+struct nemotron_stream;
 
 struct nemotron_context_params {
     int n_threads;
@@ -76,7 +77,8 @@ struct nemotron_result* nemotron_transcribe_ex(struct nemotron_context* ctx, con
 // Default is preset 0.
 void nemotron_set_context_preset(struct nemotron_context* ctx, int preset);
 
-// Set the language for prompt features. Pass ISO-639-1 code (e.g. "en", "de").
+// Set the language for prompt features. Pass ISO-639-1 code (e.g. "en", "de"),
+// or "auto" to use the model-native automatic language prompt (prompt_id=101).
 // Default is "en" (prompt_id=0).
 void nemotron_set_language(struct nemotron_context* ctx, const char* lang_code);
 
@@ -93,6 +95,14 @@ int nemotron_n_vocab(struct nemotron_context* ctx);
 int nemotron_blank_id(struct nemotron_context* ctx);
 const char* nemotron_token_to_str(struct nemotron_context* ctx, int token_id);
 
+// ---- Diagnostics / diff API ----
+
+float* nemotron_compute_mel(struct nemotron_context* ctx, const float* samples, int n_samples, int* out_n_mels,
+                            int* out_T_mel);
+
+float* nemotron_run_encoder_ext(struct nemotron_context* ctx, const float* mel, int n_mels, int T_mel, int* out_T_enc,
+                                int* out_d_model);
+
 // Hyper-parameters
 int nemotron_frame_dur_cs(struct nemotron_context* ctx);
 int nemotron_n_mels(struct nemotron_context* ctx);
@@ -105,6 +115,17 @@ typedef void (*nemotron_token_cb)(int tok_id, float prob, void* userdata);
 // Uses greedy RNN-T decode regardless of beam_size setting.
 void nemotron_transcribe_cb(struct nemotron_context* ctx, const float* samples, int n_samples, nemotron_token_cb cb,
                             void* userdata);
+
+// Persistent cache-aware streaming session. append() consumes new 16 kHz PCM
+// and emits tokens for encoder chunks that have become stable. flush=true
+// pads/processes the final short chunk. reset() starts a new utterance while
+// retaining the loaded model.
+struct nemotron_stream* nemotron_stream_create(struct nemotron_context* ctx);
+void nemotron_stream_free(struct nemotron_stream* stream);
+bool nemotron_stream_append(struct nemotron_stream* stream, const float* samples, int n_samples, bool flush,
+                            nemotron_token_cb cb, void* userdata);
+void nemotron_stream_reset(struct nemotron_stream* stream);
+int nemotron_stream_processed_frames(const struct nemotron_stream* stream);
 
 #ifdef __cplusplus
 }

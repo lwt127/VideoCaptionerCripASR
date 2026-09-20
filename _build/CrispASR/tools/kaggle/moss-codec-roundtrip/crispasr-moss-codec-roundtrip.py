@@ -55,8 +55,12 @@ if token:
 # CPU-only: the round-trip is tiny (a couple of dozen frames) and this needs no
 # GPU, so it stays off the GPU quota entirely.
 kh.step("cmake")
+# EXAMPLES=ON is required: crispasr-cli lives there, and the ASR leg of the
+# acceptance test needs it. With it OFF the build fails late with
+# "ninja: error: unknown target 'crispasr-cli'" — after the round-trip has
+# already succeeded, which reads as a failed test when it is a failed harness.
 flags = ["-DCMAKE_BUILD_TYPE=Release", "-DCRISPASR_BUILD_TESTS=OFF",
-         "-DCRISPASR_BUILD_EXAMPLES=OFF", "-DCRISPASR_BUILD_SERVER=OFF"] + kh.cache_and_link_flags()
+         "-DCRISPASR_BUILD_EXAMPLES=ON", "-DCRISPASR_BUILD_SERVER=OFF"] + kh.cache_and_link_flags()
 with kh.build_heartbeat("cmake.configure"):
     rc, out = sh(f"cmake -S {REPO} -B {BUILD} -G Ninja " + " ".join(flags))
 if rc != 0:

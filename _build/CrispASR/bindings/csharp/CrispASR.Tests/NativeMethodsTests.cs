@@ -141,6 +141,7 @@ namespace CrispASR.Tests
         [InlineData("crispasr_session_set_g2p_dict")]
         [InlineData("crispasr_session_set_source_language")]
         [InlineData("crispasr_session_set_target_language")]
+        [InlineData("crispasr_session_set_tts_reference_language")]
         [InlineData("crispasr_session_set_punctuation")]
         [InlineData("crispasr_session_set_translate")]
         [InlineData("crispasr_session_set_temperature")]

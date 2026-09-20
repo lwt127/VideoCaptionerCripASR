@@ -37,6 +37,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -677,13 +678,13 @@ static tada_codec_context* tada_codec_init_from_file_impl(const char* path, int 
         c->backend_cpu = shared_backend_cpu;
         c->owns_backend = false;
     } else {
-        c->backend_cpu = ggml_backend_cpu_init();
+        c->backend_cpu = core_cpu_backend::init();
         if (!c->backend_cpu) {
             fprintf(stderr, "tada-codec: failed to init CPU backend\n");
             delete c;
             return nullptr;
         }
-        ggml_backend_cpu_set_n_threads(c->backend_cpu, n_threads);
+        core_cpu_backend::set_n_threads(c->backend_cpu, n_threads);
         c->backend = use_gpu ? crispasr_init_gpu_backend() : c->backend_cpu;
         if (!c->backend)
             c->backend = c->backend_cpu;
@@ -1052,7 +1053,7 @@ void tada_codec_free(struct tada_codec_context* ctx) {
     if (ctx->ctx_perm)
         ggml_free(ctx->ctx_perm);
     if (ctx->buf_w)
-        ggml_backend_buffer_free(ctx->buf_w);
+        core_gguf::release_weight_buffer(ctx->buf_w);
     if (ctx->ctx_w)
         ggml_free(ctx->ctx_w);
     if (ctx->owns_backend) {

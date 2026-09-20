@@ -31,6 +31,8 @@ from qfluentwidgets import (
 import os
 
 from app.common.config import cfg
+from app.components.crisp_asr_license_dialog import ensure_crispasr_license
+from app.core.task_factory import TaskFactory
 
 from app.thread.batch_process_thread import (
     BatchProcessThread,
@@ -437,22 +439,11 @@ class BatchProcessInterface(QWidget):
             )
             return
 
-        # 顯示開始處理的提示
-        InfoBar.success(
-            title="開始處理",
-            content=f"開始處理 {waiting_tasks} 個任務",
-            duration=2000,
-            position=InfoBarPosition.TOP,
-            parent=self,
-        )
-        # 开始处理任务
-        for row in range(self.task_table.rowCount()):
-            file_path = self.task_table.item(row, 0).toolTip()
-            status = self.task_table.item(row, 2).text()
-            if status == str(BatchTaskStatus.WAITING):
-                task_type = BatchTaskType(self.task_type_combo.currentText())
-                batch_task = BatchTask(file_path, task_type)
-                self.batch_thread.add_task(batch_task)
+        self._submit_tasks([
+            self.task_table.item(row, 0).toolTip()
+            for row in range(self.task_table.rowCount())
+            if self.task_table.item(row, 2).text() == str(BatchTaskStatus.WAITING)
+        ])
 
     def get_selected_rows(self):
         selected_indexes = self.task_table.selectionModel().selectedRows()
@@ -492,17 +483,7 @@ class BatchProcessInterface(QWidget):
             )
             return
 
-        InfoBar.success(
-            title="開始處理",
-            content=f"開始處理 {len(selected_file_paths)} 個選中任務",
-            duration=2000,
-            position=InfoBarPosition.TOP,
-            parent=self,
-        )
-
-        task_type = BatchTaskType(self.task_type_combo.currentText())
-        for file_path in selected_file_paths:
-            self.batch_thread.add_task(BatchTask(file_path, task_type))
+        self._submit_tasks(selected_file_paths)
 
     def restart_selected_tasks(self):
         selected_file_paths = self.get_selected_restartable_file_paths()
@@ -516,8 +497,7 @@ class BatchProcessInterface(QWidget):
             )
             return
 
-        for file_path in selected_file_paths:
-            self.restart_task(file_path)
+        self._submit_tasks(selected_file_paths, restart=True)
 
     def cancel_selected_tasks(self):
         selected_file_paths = self.get_selected_file_paths()
@@ -541,34 +521,46 @@ class BatchProcessInterface(QWidget):
             QDesktopServices.openUrl(QUrl.fromLocalFile(output_dir))
 
     def start_task(self, file_path: str):
-        # 顯示開始處理的提示
-        file_name = os.path.basename(file_path)
-        InfoBar.success(
-            title="開始處理",
-            content=f"開始處理檔案：{file_name}",
-            duration=2000,
-            position=InfoBarPosition.TOP,
-            parent=self,
-        )
-
-        # 创建并添加单个任务
-        task_type = BatchTaskType(self.task_type_combo.currentText())
-        batch_task = BatchTask(file_path, task_type)
-        self.batch_thread.add_task(batch_task)
+        self._submit_tasks([file_path])
 
     def restart_task(self, file_path: str):
-        for row in range(self.task_table.rowCount()):
-            if self.task_table.item(row, 0).toolTip() == file_path:
-                progress_bar = self.task_table.cellWidget(row, 1)
-                progress_bar.setValue(0)
+        self._submit_tasks([file_path], restart=True)
 
-                status_item = self.task_table.item(row, 2)
-                status_item.setText(str(BatchTaskStatus.WAITING))
-                status_item.setToolTip("")
-                status_item.setForeground(Qt.gray)
-                break
+    def _submit_tasks(self, file_paths, restart=False):
+        """Confirm on the GUI thread before changing rows or enqueueing work."""
+        task_type = BatchTaskType(self.task_type_combo.currentText())
+        tasks = []
+        # Build all snapshots before a modal dialog can allow settings to change.
+        for file_path in file_paths:
+            transcribe_task = None
+            if task_type != BatchTaskType.SUBTITLE:
+                transcribe_task = TaskFactory.create_transcribe_task(
+                    file_path, need_next_task=task_type != BatchTaskType.TRANSCRIBE
+                )
+            tasks.append(BatchTask(file_path, task_type, transcribe_task))
+        for task in tasks:
+            if task.transcribe_task and not ensure_crispasr_license(
+                self, task.transcribe_task.transcribe_config
+            ):
+                return False
 
-        self.start_task(file_path)
+        for task in tasks:
+            if restart:
+                for row in range(self.task_table.rowCount()):
+                    if self.task_table.item(row, 0).toolTip() == task.file_path:
+                        self.task_table.cellWidget(row, 1).setValue(0)
+                        item = self.task_table.item(row, 2)
+                        item.setText(str(BatchTaskStatus.WAITING))
+                        item.setToolTip("")
+                        item.setForeground(Qt.gray)
+                        break
+            self.batch_thread.add_task(task)
+        if tasks:
+            InfoBar.success(
+                title="開始處理", content=f"開始處理 {len(tasks)} 個任務",
+                duration=2000, position=InfoBarPosition.TOP, parent=self,
+            )
+        return True
 
     def cancel_task(self, file_path: str):
         self.batch_thread.stop_task(file_path)

@@ -216,3 +216,84 @@ TEST_CASE("speaker_db: legacy v1 profiles (no consent trailer) still load", "[un
     REQUIRE(std::string(name) == "alice");
     speaker_db_free(db);
 }
+
+// ---------------------------------------------------------------------------
+// enroll_into — same-handle enrollment (found via CrisperWeaver #35 round 2).
+//
+// The path-based speaker_db_enroll() writes the profile to disk but an
+// already-open handle never learns of it: enroll → match on the SAME handle
+// scored -1.0 against an empty roster, and every caller had to know the
+// undocumented "close and reopen after enrolling" contract. enroll_into()
+// keeps the on-disk write AND updates the handle — without ever widening a
+// retained roster (the #266 closed-roster guarantee).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("speaker_db: enroll_into makes the name matchable on the same handle", "[unit]") {
+    const std::string dir = make_temp_dir();
+    struct speaker_db* db = speaker_db_load(dir.c_str());
+    REQUIRE(db != nullptr);
+    speaker_db_retain(db, "jfk"); // empty dir: roster claimed, none enrolled yet
+
+    std::vector<float> jfk = norm({1, 0, 1, 0, 1, 0, 1, 0});
+    REQUIRE(speaker_db_enroll_into(db, "jfk", jfk.data(), D, /*consent=*/true));
+    REQUIRE(speaker_db_count(db) == 1);
+
+    float score = -2.0f;
+    const char* name = speaker_db_match(db, jfk.data(), D, 0.7f, &score);
+    REQUIRE(name != nullptr);
+    REQUIRE(std::string(name) == "jfk");
+    REQUIRE(score >= 0.99f);
+    speaker_db_free(db);
+
+    // The disk write happened too: a fresh handle sees the profile.
+    struct speaker_db* db2 = speaker_db_load(dir.c_str());
+    REQUIRE(speaker_db_count(db2) == 1);
+    speaker_db_free(db2);
+}
+
+TEST_CASE("speaker_db: enroll_into never widens a retained roster", "[unit]") {
+    const std::string dir = make_temp_dir();
+    struct speaker_db* db = speaker_db_load(dir.c_str());
+    speaker_db_retain(db, "alice");
+
+    std::vector<float> bob = norm({0, 1, 0, 1, 0, 1, 0, 1});
+    // Disk write succeeds — bob is enrolled for FUTURE handles that claim
+    // him — but this handle's closed roster must not grow.
+    REQUIRE(speaker_db_enroll_into(db, "bob", bob.data(), D, /*consent=*/true));
+    REQUIRE(speaker_db_count(db) == 0);
+    float score = -2.0f;
+    REQUIRE(speaker_db_match(db, bob.data(), D, 0.7f, &score) == nullptr);
+    speaker_db_free(db);
+
+    struct speaker_db* db2 = speaker_db_load(dir.c_str());
+    REQUIRE(speaker_db_count(db2) == 1); // bob's .spkr is on disk
+    speaker_db_free(db2);
+}
+
+TEST_CASE("speaker_db: enroll_into replaces an existing profile in place", "[unit]") {
+    const std::string dir = make_temp_dir();
+    std::vector<float> v1 = norm({1, 0, 0, 0, 0, 0, 0, 0});
+    std::vector<float> v2 = norm({0, 0, 0, 0, 0, 0, 0, 1});
+    REQUIRE(speaker_db_enroll(dir.c_str(), "alice", v1.data(), D, true));
+
+    struct speaker_db* db = speaker_db_load(dir.c_str());
+    speaker_db_retain(db, "alice");
+    REQUIRE(speaker_db_enroll_into(db, "alice", v2.data(), D, true));
+    REQUIRE(speaker_db_count(db) == 1); // replaced, not duplicated
+
+    float score = -2.0f;
+    const char* name = speaker_db_match(db, v2.data(), D, 0.7f, &score);
+    REQUIRE(name != nullptr);
+    REQUIRE(score >= 0.99f); // matches the NEW embedding
+    speaker_db_free(db);
+}
+
+TEST_CASE("speaker_db: enroll_into refuses without consent", "[unit]") {
+    const std::string dir = make_temp_dir();
+    struct speaker_db* db = speaker_db_load(dir.c_str());
+    speaker_db_retain(db, "alice");
+    std::vector<float> a = norm({1, 1, 0, 0, 0, 0, 0, 0});
+    REQUIRE_FALSE(speaker_db_enroll_into(db, "alice", a.data(), D, /*consent=*/false));
+    REQUIRE(speaker_db_count(db) == 0);
+    speaker_db_free(db);
+}

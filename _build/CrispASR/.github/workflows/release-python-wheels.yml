@@ -56,9 +56,32 @@ jobs:
   # and expose the tag to every downstream job.
   setup:
     runs-on: ubuntu-latest
+    # Run whenever the Release workflow FINISHED, not only when it was green.
+    #
+    # The old gate was `workflow_run.conclusion == 'success'`, and it cost
+    # v0.8.26 every GPU wheel: six Linux TARBALL legs failed, the Release run
+    # went red, and this whole pipeline skipped — even though the
+    # `libcrispasr-*` assets these wheels actually repackage had all built
+    # fine. Release legs attach independently, so a red run does not mean the
+    # inputs are missing; it means SOME leg failed. Coupling wheels to the
+    # aggregate conclusion turns any unrelated failure into a silent wheel
+    # outage, and "silent" is the problem — nothing reported it for four days.
+    #
+    # The real precondition is "the libcrispasr asset I repackage exists",
+    # which each matrix leg already checks when it downloads. So proceed on any
+    # completed run and let the legs fail loudly on a genuinely missing asset.
+    #
+    # ⚠ But a DRY RUN of Release is not a release. `head_branch` is the ref the
+    # run was on, so a dry run dispatched from main arrives here as the tag
+    # "main", and every leg then fails downloading assets from a release that
+    # does not exist. Dry runs are the recommended way to inspect packaging
+    # before tagging, so that red run appears on main every time anyone follows
+    # the documented process. Require a tag-shaped ref.
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
+      ((github.event.workflow_run.conclusion == 'success' ||
+        github.event.workflow_run.conclusion == 'failure') &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
     steps:
@@ -103,6 +126,15 @@ jobs:
             smoke: true
     steps:
       - uses: actions/checkout@v6
+        # Check out the TAG being packaged, not the default branch. The wheel
+        # version comes from the checked-out pyproject/VERSION, so building
+        # from main while packaging an older tag produces wheels labelled with
+        # main's version and attaches them to that older release — a wrong
+        # artifact under a version number, which is worse than a missing one.
+        # Hit for real: a workflow_dispatch with tag=v0.8.26 while main was
+        # 0.8.27 put three 0.8.27-labelled wheels on the v0.8.26 release.
+        with:
+          ref: ${{ needs.setup.outputs.tag }}
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
@@ -183,6 +215,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        # Check out the TAG being packaged, not the default branch. The wheel
+        # version comes from the checked-out pyproject/VERSION, so building
+        # from main while packaging an older tag produces wheels labelled with
+        # main's version and attaches them to that older release — a wrong
+        # artifact under a version number, which is worse than a missing one.
+        # Hit for real: a workflow_dispatch with tag=v0.8.26 while main was
+        # 0.8.27 put three 0.8.27-labelled wheels on the v0.8.26 release.
+        with:
+          ref: ${{ needs.setup.outputs.tag }}
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
@@ -247,6 +288,15 @@ jobs:
             local: vulkan
     steps:
       - uses: actions/checkout@v6
+        # Check out the TAG being packaged, not the default branch. The wheel
+        # version comes from the checked-out pyproject/VERSION, so building
+        # from main while packaging an older tag produces wheels labelled with
+        # main's version and attaches them to that older release — a wrong
+        # artifact under a version number, which is worse than a missing one.
+        # Hit for real: a workflow_dispatch with tag=v0.8.26 while main was
+        # 0.8.27 put three 0.8.27-labelled wheels on the v0.8.26 release.
+        with:
+          ref: ${{ needs.setup.outputs.tag }}
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
