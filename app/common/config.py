@@ -89,6 +89,10 @@ class Config(QConfig):
         "LLM", "GitHubCopilot_Model", "gemini-3.7-flash"
     )
 
+    antigravity_model = ConfigItem(
+        "LLM", "Antigravity_Model", "auto"
+    )
+
     silicon_cloud_model = ConfigItem("LLM", "SiliconCloud_Model", "gpt-4o-mini")
     silicon_cloud_api_key = ConfigItem("LLM", "SiliconCloud_API_Key", "")
     silicon_cloud_api_base = ConfigItem(

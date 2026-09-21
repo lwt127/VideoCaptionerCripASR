@@ -287,6 +287,24 @@ class SettingInterface(ScrollArea):
                 "default_base": "",
                 "default_models": ["gemini-3.7-flash", "auto"],
             },
+            LLMServiceEnum.ANTIGRAVITY: {
+                "prefix": "antigravity",
+                "api_key_cfg": None,
+                "api_base_cfg": None,
+                "model_cfg": cfg.antigravity_model,
+                "default_base": "",
+                "default_models": [
+                    "auto",
+                    "gemini-3.8-flash-high",
+                    "gemini-3.8-flash-medium",
+                    "gemini-3.8-flash-low",
+                    "gemini-3.7-flash-high",
+                    "gemini-3.1-pro-high",
+                    "claude-sonnet-4-6",
+                    "claude-opus-4-6-thinking",
+                    "gpt-oss-120b-medium",
+                ],
+            },
             LLMServiceEnum.SILICON_CLOUD: {
                 "prefix": "silicon_cloud",
                 "api_key_cfg": cfg.silicon_cloud_api_key,
@@ -362,12 +380,17 @@ class SettingInterface(ScrollArea):
                 }
                 continue
 
-            if service == LLMServiceEnum.GITHUB_COPILOT:
+            if service in (LLMServiceEnum.GITHUB_COPILOT, LLMServiceEnum.ANTIGRAVITY):
+                desc = (
+                    self.tr("使用已登录的 Antigravity CLI (agy)，无需 API Key")
+                    if service == LLMServiceEnum.ANTIGRAVITY
+                    else self.tr("使用已登录的 GitHub Copilot 订阅，无需 API Key")
+                )
                 model_card = EditComboBoxSettingCard(
                     config["model_cfg"],
                     FIF.ROBOT,
                     self.tr("模型"),
-                    self.tr("使用已登录的 GitHub Copilot 订阅，无需 API Key"),
+                    desc,
                     config["default_models"],
                     self.llmGroup,
                 )
@@ -649,7 +672,21 @@ class SettingInterface(ScrollArea):
             model = service_config["model"].comboBox.currentText()
             self.checkLLMConnectionCard.button.setEnabled(False)
             self.checkLLMConnectionCard.button.setText(self.tr("正在检查..."))
-            self.connection_thread = LLMConnectionThread("", "", model, True)
+            self.connection_thread = LLMConnectionThread(
+                "", "", model, is_copilot=True
+            )
+            self.connection_thread.finished.connect(self.onConnectionCheckFinished)
+            self.connection_thread.error.connect(self.onConnectionCheckError)
+            self.connection_thread.start()
+            return
+
+        if current_service == LLMServiceEnum.ANTIGRAVITY:
+            model = service_config["model"].comboBox.currentText()
+            self.checkLLMConnectionCard.button.setEnabled(False)
+            self.checkLLMConnectionCard.button.setText(self.tr("正在检查..."))
+            self.connection_thread = LLMConnectionThread(
+                "", "", model, is_antigravity=True
+            )
             self.connection_thread.finished.connect(self.onConnectionCheckFinished)
             self.connection_thread.error.connect(self.onConnectionCheckError)
             self.connection_thread.start()
@@ -804,12 +841,15 @@ class LLMConnectionThread(QThread):
     finished = pyqtSignal(bool, str, list)
     error = pyqtSignal(str)
 
-    def __init__(self, api_base, api_key, model, is_copilot=False):
+    def __init__(
+        self, api_base, api_key, model, is_copilot=False, is_antigravity=False
+    ):
         super().__init__()
         self.api_base = api_base
         self.api_key = api_key
         self.model = model
         self.is_copilot = is_copilot
+        self.is_antigravity = is_antigravity
 
     def run(self):
         """检查 LLM 连接并获取模型列表"""
@@ -818,6 +858,12 @@ class LLMConnectionThread(QThread):
                 from app.core.subtitle_processor.llm_client import test_copilot
 
                 is_success, message, models = test_copilot(self.model)
+                self.finished.emit(is_success, message, models)
+                return
+            if self.is_antigravity:
+                from app.core.subtitle_processor.llm_client import test_antigravity
+
+                is_success, message, models = test_antigravity(self.model)
                 self.finished.emit(is_success, message, models)
                 return
             is_success, message = test_openai(self.api_base, self.api_key, self.model)

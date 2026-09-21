@@ -63,6 +63,17 @@ class SubtitleThread(QThread):
                 raise Exception(message)
             return self.task.subtitle_config
 
+        if self.task.subtitle_config.llm_service == LLMServiceEnum.ANTIGRAVITY:
+            model = self.task.subtitle_config.llm_model
+            if not model or model.endswith(":batch"):
+                raise Exception(self.tr("Antigravity CLI 不支持 :batch 模型"))
+            from app.core.subtitle_processor.llm_client import test_antigravity
+
+            is_success, message, _ = test_antigravity(model)
+            if not is_success:
+                raise Exception(message)
+            return self.task.subtitle_config
+
         public_base_url = "https://ddg.bkfeng.top/v1"
         if self.task.subtitle_config.base_url == public_base_url:
             # 检查是否可以使用服务
@@ -155,7 +166,10 @@ class SubtitleThread(QThread):
             ):
                 self.progress.emit(2, self.tr("开始验证API配置..."))
                 subtitle_config = self._setup_api_config()
-                if subtitle_config.llm_service != LLMServiceEnum.GITHUB_COPILOT:
+                if subtitle_config.llm_service not in (
+                    LLMServiceEnum.GITHUB_COPILOT,
+                    LLMServiceEnum.ANTIGRAVITY,
+                ):
                     os.environ["OPENAI_BASE_URL"] = subtitle_config.base_url
                     os.environ["OPENAI_API_KEY"] = subtitle_config.api_key
 

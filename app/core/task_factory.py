@@ -155,6 +155,10 @@ class TaskFactory:
             base_url = None
             api_key = None
             llm_model = cfg.github_copilot_model.value
+        elif current_service == LLMServiceEnum.ANTIGRAVITY:
+            base_url = None
+            api_key = None
+            llm_model = cfg.antigravity_model.value
         elif current_service == LLMServiceEnum.SILICON_CLOUD:
             base_url = cfg.silicon_cloud_api_base.value
             api_key = cfg.silicon_cloud_api_key.value

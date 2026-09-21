@@ -78,6 +78,7 @@ class LLMServiceEnum(Enum):
 
     OPENAI = "OpenAI"
     GITHUB_COPILOT = "GitHub Copilot"
+    ANTIGRAVITY = "Antigravity CLI"
     SILICON_CLOUD = "SiliconCloud"
     DEEPSEEK = "DeepSeek"
     OLLAMA = "Ollama"
