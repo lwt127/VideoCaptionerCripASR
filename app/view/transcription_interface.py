@@ -335,18 +335,14 @@ class TranscriptionInterface(QWidget):
 
         self.model_menu = RoundMenu(parent=self)
         for model in TranscribeModelEnum:
-            if "接口" in model.value or "api" in model.value.lower():
-                self.model_menu.addActions(
-                    [
-                        Action(FluentIcon.GLOBE, model.value),
-                    ]
-                )
-            else:
-                self.model_menu.addActions(
-                    [
-                        Action(FluentIcon.ROBOT, model.value),
-                    ]
-                )
+            icon = (
+                FluentIcon.GLOBE
+                if ("接口" in model.value or "api" in model.value.lower())
+                else FluentIcon.ROBOT
+            )
+            action = Action(icon, self.tr(model.value))
+            action.setData(model.value)
+            self.model_menu.addActions([action])
         self.model_button.setMenu(self.model_menu)
         self.command_bar.addWidget(self.model_button)
 
@@ -359,8 +355,8 @@ class TranscriptionInterface(QWidget):
         # 设置模型选择菜单的信号连接
         for action in self.model_menu.actions():
             action.triggered.connect(
-                lambda checked, text=action.text(): self.on_transcription_model_changed(
-                    text
+                lambda checked, value=action.data() or action.text(): self.on_transcription_model_changed(
+                    value
                 )
             )
 

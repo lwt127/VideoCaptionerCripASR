@@ -487,7 +487,7 @@ class MyVideoWidget(QWidget):
         self.videoWidget.setStyleSheet("background-color: rgb(24, 24, 24);")
 
         # 添加提示标签
-        self.tipLabel = CaptionLabel("请拖入视频文件", self.videoWidget)
+        self.tipLabel = CaptionLabel(self.tr("请拖入视频文件"), self.videoWidget)
         self.tipLabel.setStyleSheet(
             """
             color: rgba(255, 255, 255, 0.5);

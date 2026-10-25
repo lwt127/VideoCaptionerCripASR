@@ -13,7 +13,7 @@ from app.config import LOG_PATH, RESOURCE_PATH
 class LogWindow(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("日志查看器")
+        self.setWindowTitle(self.tr("日志查看器"))
         self.resize(800, 600)
 
         FluentStyleSheet.FLUENT_WINDOW.apply(self)
@@ -37,7 +37,7 @@ class LogWindow(QWidget):
 
         # 创建顶部按钮布局
         top_layout = QHBoxLayout()
-        self.open_folder_btn = PushButton("打开日志文件夹", self)
+        self.open_folder_btn = PushButton(self.tr("打开日志文件夹"), self)
         self.open_folder_btn.clicked.connect(self.open_log_folder)
         top_layout.addWidget(self.open_folder_btn)
         top_layout.addStretch()

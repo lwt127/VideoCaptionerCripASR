@@ -30,7 +30,9 @@ class SubtitleSettingDialog(MessageBoxBase):
             FIF.TILES,
             self.tr("字幕分割类型"),
             self.tr("根据句子或者根据语义对字幕进行断句"),
-            texts=[model.value for model in cfg.split_type.validator.options],
+            texts=[
+                self.tr(model.value) for model in cfg.split_type.validator.options
+            ],
             parent=self,
         )
 

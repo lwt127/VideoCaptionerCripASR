@@ -83,7 +83,10 @@ class SettingInterface(ScrollArea):
             FIF.MICROPHONE,
             self.tr("转录模型"),
             self.tr("语音转换文字要使用的语音识别模型"),
-            texts=[model.value for model in cfg.transcribe_model.validator.options],
+            texts=[
+                self.tr(model.value)
+                for model in cfg.transcribe_model.validator.options
+            ],
             parent=self.transcribeGroup,
         )
 
@@ -247,9 +250,12 @@ class SettingInterface(ScrollArea):
         self.llmServiceCard = ComboBoxSettingCard(
             cfg.llm_service,
             FIF.ROBOT,
-            self.tr("LLM服务)"),
-            self.tr("选择大服务，用于字幕断句、字幕优化、字幕翻译（如果选择"),
-            texts=[service.value for service in cfg.llm_service.validator.options],
+            self.tr("LLM服务"),
+            self.tr("选择LLM服务"),
+            texts=[
+                self.tr(service.value)
+                for service in cfg.llm_service.validator.options
+            ],
             parent=self.llmGroup,
         )
 
@@ -467,7 +473,8 @@ class SettingInterface(ScrollArea):
             self.tr("翻译服务"),
             self.tr("选择翻译服务"),
             texts=[
-                service.value for service in cfg.translator_service.validator.options
+                self.tr(service.value)
+                for service in cfg.translator_service.validator.options
             ],
             parent=self.translate_serviceGroup,
         )
@@ -626,8 +633,10 @@ class SettingInterface(ScrollArea):
         self.aboutCard.clicked.connect(self.checkUpdate)
 
         # 全局 signalBus
-        self.transcribeModelCard.comboBox.currentTextChanged.connect(
-            signalBus.transcription_model_changed
+        self.transcribeModelCard.comboBox.currentIndexChanged.connect(
+            lambda idx: signalBus.transcription_model_changed.emit(
+                self.transcribeModelCard.comboBox.itemData(idx).value
+            )
         )
         self.subtitleCorrectCard.checkedChanged.connect(
             signalBus.subtitle_optimization_changed
@@ -635,8 +644,10 @@ class SettingInterface(ScrollArea):
         self.subtitleTranslateCard.checkedChanged.connect(
             signalBus.subtitle_translation_changed
         )
-        self.targetLanguageCard.comboBox.currentTextChanged.connect(
-            signalBus.target_language_changed
+        self.targetLanguageCard.comboBox.currentIndexChanged.connect(
+            lambda idx: signalBus.target_language_changed.emit(
+                self.targetLanguageCard.comboBox.itemData(idx).value
+            )
         )
         self.softSubtitleCard.checkedChanged.connect(signalBus.soft_subtitle_changed)
         self.needVideoCard.checkedChanged.connect(signalBus.need_video_changed)
@@ -661,7 +672,9 @@ class SettingInterface(ScrollArea):
     def checkLLMConnection(self):
         """检查 LLM 连接"""
         # 获取当前选中的服务
-        current_service = LLMServiceEnum(self.llmServiceCard.comboBox.currentText())
+        current_service = self.llmServiceCard.comboBox.currentData() or LLMServiceEnum(
+            self.llmServiceCard.comboBox.currentText()
+        )
 
         # 获取服务配置
         service_config = self.llm_service_configs.get(current_service)
@@ -746,7 +759,9 @@ class SettingInterface(ScrollArea):
         self.checkLLMConnectionCard.button.setText(self.tr("检查连接"))
 
         # 获取当前服务
-        current_service = LLMServiceEnum(self.llmServiceCard.comboBox.currentText())
+        current_service = self.llmServiceCard.comboBox.currentData() or LLMServiceEnum(
+            self.llmServiceCard.comboBox.currentText()
+        )
 
         if models:
             # 更新当前服务的模型列表
@@ -774,9 +789,11 @@ class SettingInterface(ScrollArea):
     def checkUpdate(self):
         webbrowser.open(RELEASE_URL)
 
-    def __onLLMServiceChanged(self, service):
+    def __onLLMServiceChanged(self, service=None):
         """处理LLM服务切换事件"""
-        current_service = LLMServiceEnum(service)
+        current_service = self.llmServiceCard.comboBox.currentData()
+        if not isinstance(current_service, LLMServiceEnum):
+            current_service = LLMServiceEnum(service)
 
         # 隐藏所有卡片
         for config in self.llm_service_configs.values():
@@ -813,7 +830,7 @@ class SettingInterface(ScrollArea):
         self.llmGroup.adjustSize()
         self.expandLayout.update()
 
-    def __onTranslatorServiceChanged(self, service):
+    def __onTranslatorServiceChanged(self, service=None):
         openai_cards = [
             self.needReflectTranslateCard,
             self.batchSizeCard,
@@ -824,11 +841,18 @@ class SettingInterface(ScrollArea):
         for card in all_cards:
             card.setVisible(False)
 
+        current_translator = self.translatorServiceCard.comboBox.currentData()
+        service_value = (
+            current_translator.value
+            if isinstance(current_translator, TranslatorServiceEnum)
+            else service
+        )
+
         # 根据选择的服务显示相应的配置卡片
-        if service in [TranslatorServiceEnum.DEEPLX.value]:
+        if service_value in [TranslatorServiceEnum.DEEPLX.value]:
             for card in deeplx_cards:
                 card.setVisible(True)
-        elif service in [TranslatorServiceEnum.OPENAI.value]:
+        elif service_value in [TranslatorServiceEnum.OPENAI.value]:
             for card in openai_cards:
                 card.setVisible(True)
 
@@ -863,7 +887,7 @@ class LLMConnectionThread(QThread):
             if self.is_antigravity:
                 from app.core.subtitle_processor.llm_client import test_antigravity
 
-                is_success, message, models = test_antigravity(self.model)
+                is_success, message, models = test_antigravity(self.model, use_cache=False)
                 self.finished.emit(is_success, message, models)
                 return
             is_success, message = test_openai(self.api_base, self.api_key, self.model)

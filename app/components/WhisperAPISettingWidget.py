@@ -78,7 +78,7 @@ class WhisperAPISettingWidget(QWidget):
             FIF.LANGUAGE,
             self.tr("原语言"),
             self.tr("音频的原语言"),
-            [lang.value for lang in TranscribeLanguageEnum],
+            [self.tr(lang.value) for lang in TranscribeLanguageEnum],
             self.setting_group,
         )
 

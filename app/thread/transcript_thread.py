@@ -123,7 +123,6 @@ class TranscriptThread(QThread):
         except Exception as e:
             logger.exception("转录过程中发生错误: %s", str(e))
             self.error.emit(str(e))
-            self.progress.emit(100, self.tr("转录失败"))
         finally:
             # 清理临时文件
             if temp_file and os.path.exists(temp_file.name):

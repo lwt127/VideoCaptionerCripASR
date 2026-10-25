@@ -957,6 +957,9 @@ class SubtitleSplitter:
                 start_seg_index = best_pos
                 end_seg_index = best_pos + best_window_size - 1
 
+                # LLM output is only a boundary suggestion, not permission to
+                # delete speech it omitted. Preserve skipped source tokens.
+                new_segments.extend(segments[asr_index:start_seg_index])
                 segs_to_merge = segments[start_seg_index : end_seg_index + 1]
 
                 # 按照时间切分避免合并跨度大的
@@ -985,8 +988,10 @@ class SubtitleSplitter:
                         f"未匹配句子数量超过阈值 {max_unmatched}，处理终止"
                     )
                 max_shift = 100
-                asr_index = min(asr_index + 1, asr_len - 1)
+                # A hallucinated/unmatched suggestion consumes no source text.
 
+        # Includes the full input when the model returned no usable sentences.
+        new_segments.extend(segments[asr_index:])
         return new_segments
 
     def stop(self):

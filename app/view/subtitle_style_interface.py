@@ -298,17 +298,21 @@ class SubtitleStyleInterface(QWidget):
             FIF.MESSAGE,
             self.tr("预览文字"),
             self.tr("设置预览显示的文字内容"),
-            texts=PERVIEW_TEXTS.keys(),
+            texts=[self.tr(k) for k in PERVIEW_TEXTS.keys()],
             parent=self.previewGroup,
         )
+        for index, key in enumerate(PERVIEW_TEXTS.keys()):
+            self.previewTextCard.comboBox.setItemData(index, key)
 
         self.orientationCard = ComboBoxSettingCard(
             FIF.LAYOUT,
             self.tr("预览方向"),
             self.tr("设置预览图片的显示方向"),
-            texts=["横屏", "竖屏"],
+            texts=[self.tr("横屏"), self.tr("竖屏")],
             parent=self.previewGroup,
         )
+        for index, key in enumerate(("横屏", "竖屏")):
+            self.orientationCard.comboBox.setItemData(index, key)
 
         self.previewImageCard = PushSettingCard(
             self.tr("选择图片"),
@@ -459,7 +463,10 @@ class SubtitleStyleInterface(QWidget):
 
     def onOrientationChanged(self):
         """当预览方向改变时调用"""
-        orientation = self.orientationCard.comboBox.currentText()
+        orientation = (
+            self.orientationCard.comboBox.currentData()
+            or self.orientationCard.comboBox.currentText()
+        )
         preview_image = (
             DEFAULT_BG_LANDSCAPE if orientation == "横屏" else DEFAULT_BG_PORTRAIT
         )
@@ -544,7 +551,11 @@ class SubtitleStyleInterface(QWidget):
         style_str = self.generateAssStyles()
 
         # 获取预览文本
-        main_text, sub_text = PERVIEW_TEXTS[self.previewTextCard.comboBox.currentText()]
+        preview_key = (
+            self.previewTextCard.comboBox.currentData()
+            or self.previewTextCard.comboBox.currentText()
+        )
+        main_text, sub_text = PERVIEW_TEXTS[preview_key]
 
         # 字幕布局
         layout = self.layoutCard.comboBox.currentData()
@@ -558,7 +569,10 @@ class SubtitleStyleInterface(QWidget):
             main_text, sub_text = main_text, None
 
         # 获取预览方向
-        orientation = self.orientationCard.comboBox.currentText()
+        orientation = (
+            self.orientationCard.comboBox.currentData()
+            or self.orientationCard.comboBox.currentText()
+        )
         default_preview = DEFAULT_BG_LANDSCAPE if orientation == "横屏" else DEFAULT_BG_PORTRAIT
         
         # 检查是否存在用户自定义背景图片

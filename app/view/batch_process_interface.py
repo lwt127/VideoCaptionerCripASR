@@ -70,21 +70,24 @@ class BatchProcessInterface(QWidget):
 
         # 任务类型选择
         self.task_type_combo = ComboBox()
-        self.task_type_combo.addItems([str(task_type) for task_type in BatchTaskType])
-        self.task_type_combo.setCurrentText(str(BatchTaskType.FULL_PROCESS))
+        for task_type in BatchTaskType:
+            self.task_type_combo.addItem(self.tr(str(task_type)), userData=task_type)
+        self.task_type_combo.setCurrentIndex(
+            list(BatchTaskType).index(BatchTaskType.FULL_PROCESS)
+        )
 
         # 控制按钮
-        self.add_file_btn = PushButton("添加檔案", icon=FIF.ADD)
-        self.start_all_btn = PushButton("開始處理", icon=FIF.PLAY)
-        self.clear_btn = PushButton("清空列表", icon=FIF.DELETE)
+        self.add_file_btn = PushButton(self.tr("添加文件"), icon=FIF.ADD)
+        self.start_all_btn = PushButton(self.tr("开始处理"), icon=FIF.PLAY)
+        self.clear_btn = PushButton(self.tr("清空列表"), icon=FIF.DELETE)
 
         # 并行任务数量
-        self.concurrent_label = BodyLabel("并行数")
+        self.concurrent_label = BodyLabel(self.tr("并行数"))
         self.concurrent_spin = SpinBox()
         self.concurrent_spin.setRange(1, 8)
         self.concurrent_spin.setValue(int(cfg.batch_concurrent_tasks.value))
         self.concurrent_spin.setToolTip(
-            "同时处理的任务数。GPU 显存充足时可调高以提升吞吐。"
+            self.tr("同时处理的任务数。GPU 显存充足时可调高以提升吞吐。")
         )
         self.concurrent_spin.setMinimumWidth(120)
 
@@ -101,7 +104,7 @@ class BatchProcessInterface(QWidget):
         # 创建任务表格
         self.task_table = TableWidget()
         self.task_table.setColumnCount(3)
-        self.task_table.setHorizontalHeaderLabels(["檔案名稱", "進度", "狀態"])
+        self.task_table.setHorizontalHeaderLabels([self.tr("文件名称"), self.tr("进度"), self.tr("状态")])
 
         # 设置表格样式
         self.task_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
@@ -152,8 +155,32 @@ class BatchProcessInterface(QWidget):
         self.task_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.task_table.customContextMenuRequested.connect(self.show_context_menu)
 
+    def _current_task_type(self) -> BatchTaskType:
+        data = self.task_type_combo.currentData()
+        if isinstance(data, BatchTaskType):
+            return data
+        text = self.task_type_combo.currentText()
+        for task_type in BatchTaskType:
+            if text in (task_type.value, self.tr(task_type.value)):
+                return task_type
+        return BatchTaskType(text)
+
+    def _set_task_status_item(self, item: QTableWidgetItem, status: BatchTaskStatus):
+        item.setData(Qt.UserRole, status)
+        item.setText(self.tr(str(status)))
+
+    def _is_row_status(self, row: int, *statuses: BatchTaskStatus) -> bool:
+        item = self.task_table.item(row, 2)
+        if not item:
+            return False
+        role_data = item.data(Qt.UserRole)
+        if isinstance(role_data, BatchTaskStatus):
+            return role_data in statuses
+        text = item.text()
+        return any(text in (str(s), self.tr(str(s))) for s in statuses)
+
     def on_add_file_clicked(self):
-        task_type = self.task_type_combo.currentText()
+        task_type = self._current_task_type()
         file_filter = ""
         if task_type in [
             BatchTaskType.TRANSCRIBE,
@@ -164,13 +191,13 @@ class BatchProcessInterface(QWidget):
             audio_formats = [f"*.{fmt.value}" for fmt in SupportedAudioFormats]
             video_formats = [f"*.{fmt.value}" for fmt in SupportedVideoFormats]
             formats = audio_formats + video_formats
-            file_filter = f"音视频文件 ({' '.join(formats)})"
+            file_filter = f"{self.tr('音视频文件')} ({' '.join(formats)})"
         elif task_type == BatchTaskType.SUBTITLE:
             # 获取所有支持的字幕格式
             subtitle_formats = [f"*.{fmt.value}" for fmt in SupportedSubtitleFormats]
-            file_filter = f"字幕文件 ({' '.join(subtitle_formats)})"
+            file_filter = f"{self.tr('字幕文件')} ({' '.join(subtitle_formats)})"
 
-        files, _ = QFileDialog.getOpenFileNames(self, "选择文件", "", file_filter)
+        files, _ = QFileDialog.getOpenFileNames(self, self.tr("选择文件"), "", file_filter)
         if files:
             self.add_files(files)
 
@@ -185,7 +212,7 @@ class BatchProcessInterface(QWidget):
         self.add_files(files)
 
     def add_files(self, file_paths):
-        task_type = BatchTaskType(self.task_type_combo.currentText())
+        task_type = self._current_task_type()
 
         # 检查文件是否存在并收集不存在的文件
         non_existent_files = []
@@ -199,8 +226,8 @@ class BatchProcessInterface(QWidget):
         # 如果有不存在的文件，显示警告
         if non_existent_files:
             InfoBar.warning(
-                title="文件不存在",
-                content=f"以下文件不存在：\n{', '.join(non_existent_files)}",
+                title=self.tr("文件不存在"),
+                content=self.tr("以下文件不存在：") + f"\n{', '.join(non_existent_files)}",
                 duration=3000,
                 position=InfoBarPosition.TOP,
                 parent=self,
@@ -225,7 +252,9 @@ class BatchProcessInterface(QWidget):
                 first_file.endswith(f".{fmt.value}") for fmt in SupportedVideoFormats
             )
             if is_subtitle:
-                self.task_type_combo.setCurrentText(str(BatchTaskType.SUBTITLE))
+                self.task_type_combo.setCurrentIndex(
+                    list(BatchTaskType).index(BatchTaskType.SUBTITLE)
+                )
                 task_type = BatchTaskType.SUBTITLE
             # elif is_media:
             #     self.task_type_combo.setCurrentText(str(BatchTaskType.FULL_PROCESS))
@@ -236,8 +265,8 @@ class BatchProcessInterface(QWidget):
 
         if not valid_files:
             InfoBar.warning(
-                title="无效文件",
-                content=f"请选择正确的文件类型",
+                title=self.tr("无效文件"),
+                content=self.tr("请选择正确的文件类型"),
                 duration=3000,
                 position=InfoBarPosition.TOP,
                 parent=self,
@@ -251,8 +280,8 @@ class BatchProcessInterface(QWidget):
                 if self.task_table.item(row, 0).toolTip() == file_path:
                     exists = True
                     InfoBar.warning(
-                        title="任务已存在",
-                        content=f"任务已存在",
+                        title=self.tr("任务已存在"),
+                        content=self.tr("任务已存在"),
                         duration=2000,
                         position=InfoBarPosition.TOP_RIGHT,
                         parent=self,
@@ -300,7 +329,8 @@ class BatchProcessInterface(QWidget):
         self.task_table.setCellWidget(row, 1, progress_bar)
 
         # 状态
-        status = QTableWidgetItem(str(BatchTaskStatus.WAITING))
+        status = QTableWidgetItem()
+        self._set_task_status_item(status, BatchTaskStatus.WAITING)
         status.setTextAlignment(Qt.AlignCenter)
         status.setForeground(Qt.gray)  # 设置字体颜色为灰色
         font = QFont()
@@ -315,26 +345,25 @@ class BatchProcessInterface(QWidget):
 
         menu = RoundMenu(parent=self)
         file_path = self.task_table.item(row, 0).toolTip()
-        status = self.task_table.item(row, 2).text()
         selected_rows = self.get_selected_rows()
         use_selected_rows = len(selected_rows) > 1 and row in selected_rows
         selected_waiting_file_paths = self.get_selected_waiting_file_paths()
 
-        start_action = Action(FIF.PLAY, "開始")
+        start_action = Action(FIF.PLAY, self.tr("开始"))
         if use_selected_rows:
             start_action.triggered.connect(self.start_selected_tasks)
         else:
             start_action.triggered.connect(lambda: self.start_task(file_path))
         menu.addAction(start_action)
 
-        restart_action = Action(FIF.SYNC, "重啟")
+        restart_action = Action(FIF.SYNC, self.tr("重启"))
         if use_selected_rows:
             restart_action.triggered.connect(self.restart_selected_tasks)
         else:
             restart_action.triggered.connect(lambda: self.restart_task(file_path))
         menu.addAction(restart_action)
 
-        cancel_action = Action(FIF.CLOSE, "取消")
+        cancel_action = Action(FIF.CLOSE, self.tr("取消"))
         if use_selected_rows:
             cancel_action.triggered.connect(self.cancel_selected_tasks)
         else:
@@ -342,7 +371,7 @@ class BatchProcessInterface(QWidget):
         menu.addAction(cancel_action)
 
         menu.addSeparator()
-        open_folder_action = Action(FIF.FOLDER, "開啟輸出資料夾")
+        open_folder_action = Action(FIF.FOLDER, self.tr("打开输出文件夹"))
         if use_selected_rows:
             open_folder_action.triggered.connect(self.open_selected_output_folders)
         else:
@@ -354,20 +383,19 @@ class BatchProcessInterface(QWidget):
             restart_action.setEnabled(
                 len(self.get_selected_restartable_file_paths()) > 0
             )
-        elif status != str(BatchTaskStatus.WAITING):
+        elif not self._is_row_status(row, BatchTaskStatus.WAITING):
             start_action.setEnabled(False)
 
-            if status not in [
-                str(BatchTaskStatus.COMPLETED),
-                str(BatchTaskStatus.FAILED),
-            ]:
+            if not self._is_row_status(
+                row, BatchTaskStatus.COMPLETED, BatchTaskStatus.FAILED
+            ):
                 restart_action.setEnabled(False)
 
         menu.exec_(self.task_table.viewport().mapToGlobal(pos))
 
     def open_output_folder(self, file_path: str):
         # 根据任务类型和文件路径确定输出文件夹
-        task_type = BatchTaskType(self.task_type_combo.currentText())
+        task_type = self._current_task_type()
         file_dir = os.path.dirname(file_path)
 
         if task_type == BatchTaskType.FULL_PROCESS:
@@ -387,30 +415,33 @@ class BatchProcessInterface(QWidget):
                 progress_bar = self.task_table.cellWidget(row, 1)
                 progress_bar.setValue(progress)
                 # 更新状态
-                self.task_table.item(row, 2).setText(status)
+                status_item = self.task_table.item(row, 2)
+                status_item.setData(Qt.UserRole, BatchTaskStatus.RUNNING)
+                status_item.setText(self.tr(status))
                 break
 
     def on_task_error(self, file_path: str, error: str):
         for row in range(self.task_table.rowCount()):
             if self.task_table.item(row, 0).toolTip() == file_path:
                 status_item = self.task_table.item(row, 2)
-                status_item.setText(str(BatchTaskStatus.FAILED))
+                self._set_task_status_item(status_item, BatchTaskStatus.FAILED)
                 status_item.setToolTip(error)
                 break
 
     def on_task_completed(self, file_path: str):
         for row in range(self.task_table.rowCount()):
             if self.task_table.item(row, 0).toolTip() == file_path:
-                self.task_table.item(row, 2).setText(str(BatchTaskStatus.COMPLETED))
-                self.task_table.item(row, 2).setForeground(QColor("#13A10E"))
+                status_item = self.task_table.item(row, 2)
+                self._set_task_status_item(status_item, BatchTaskStatus.COMPLETED)
+                status_item.setForeground(QColor("#13A10E"))
                 break
 
     def start_all_tasks(self):
         # 检查是否有任务
         if self.task_table.rowCount() == 0:
             InfoBar.warning(
-                title="无任务",
-                content="请先添加需要处理的文件",
+                title=self.tr("无任务"),
+                content=self.tr("请先添加需要处理的文件"),
                 duration=2000,
                 position=InfoBarPosition.TOP,
                 parent=self,
@@ -426,13 +457,13 @@ class BatchProcessInterface(QWidget):
         # 检查是否有等待处理的任务
         waiting_tasks = 0
         for row in range(self.task_table.rowCount()):
-            if self.task_table.item(row, 2).text() == str(BatchTaskStatus.WAITING):
+            if self._is_row_status(row, BatchTaskStatus.WAITING):
                 waiting_tasks += 1
 
         if waiting_tasks == 0:
             InfoBar.warning(
-                title="无待处理任务",
-                content="所有任务已经在处理或已完成",
+                title=self.tr("无待处理任务"),
+                content=self.tr("所有任务已经在处理或已完成"),
                 duration=2000,
                 position=InfoBarPosition.TOP,
                 parent=self,
@@ -442,7 +473,7 @@ class BatchProcessInterface(QWidget):
         self._submit_tasks([
             self.task_table.item(row, 0).toolTip()
             for row in range(self.task_table.rowCount())
-            if self.task_table.item(row, 2).text() == str(BatchTaskStatus.WAITING)
+            if self._is_row_status(row, BatchTaskStatus.WAITING)
         ])
 
     def get_selected_rows(self):
@@ -455,19 +486,16 @@ class BatchProcessInterface(QWidget):
     def get_selected_waiting_file_paths(self):
         selected_file_paths = []
         for row in self.get_selected_rows():
-            status = self.task_table.item(row, 2).text()
-            if status == str(BatchTaskStatus.WAITING):
+            if self._is_row_status(row, BatchTaskStatus.WAITING):
                 selected_file_paths.append(self.task_table.item(row, 0).toolTip())
         return selected_file_paths
 
     def get_selected_restartable_file_paths(self):
         selected_file_paths = []
         for row in self.get_selected_rows():
-            status = self.task_table.item(row, 2).text()
-            if status in [
-                str(BatchTaskStatus.COMPLETED),
-                str(BatchTaskStatus.FAILED),
-            ]:
+            if self._is_row_status(
+                row, BatchTaskStatus.COMPLETED, BatchTaskStatus.FAILED
+            ):
                 selected_file_paths.append(self.task_table.item(row, 0).toolTip())
         return selected_file_paths
 
@@ -475,8 +503,8 @@ class BatchProcessInterface(QWidget):
         selected_file_paths = self.get_selected_waiting_file_paths()
         if not selected_file_paths:
             InfoBar.warning(
-                title="无待处理任务",
-                content="选中的任务都已在处理或已完成",
+                title=self.tr("无待处理任务"),
+                content=self.tr("选中的任务都已在处理或已完成"),
                 duration=2000,
                 position=InfoBarPosition.TOP,
                 parent=self,
@@ -489,8 +517,8 @@ class BatchProcessInterface(QWidget):
         selected_file_paths = self.get_selected_restartable_file_paths()
         if not selected_file_paths:
             InfoBar.warning(
-                title="无可重啟任務",
-                content="选中的任务中没有已完成或失败的任务",
+                title=self.tr("无可重启任务"),
+                content=self.tr("选中的任务中没有已完成或失败的任务"),
                 duration=2000,
                 position=InfoBarPosition.TOP,
                 parent=self,
@@ -528,7 +556,19 @@ class BatchProcessInterface(QWidget):
 
     def _submit_tasks(self, file_paths, restart=False):
         """Confirm on the GUI thread before changing rows or enqueueing work."""
-        task_type = BatchTaskType(self.task_type_combo.currentText())
+        combo_data = getattr(self.task_type_combo, "currentData", lambda: None)()
+        if isinstance(combo_data, BatchTaskType):
+            task_type = combo_data
+        else:
+            text = self.task_type_combo.currentText()
+            task_type = next(
+                (
+                    t
+                    for t in BatchTaskType
+                    if text in (t.value, getattr(self, "tr", lambda s: s)(t.value))
+                ),
+                None,
+            ) or BatchTaskType(text)
         tasks = []
         # Build all snapshots before a modal dialog can allow settings to change.
         for file_path in file_paths:
@@ -550,15 +590,19 @@ class BatchProcessInterface(QWidget):
                     if self.task_table.item(row, 0).toolTip() == task.file_path:
                         self.task_table.cellWidget(row, 1).setValue(0)
                         item = self.task_table.item(row, 2)
-                        item.setText(str(BatchTaskStatus.WAITING))
+                        item.setData(Qt.UserRole, BatchTaskStatus.WAITING)
+                        item.setText(self.tr(str(BatchTaskStatus.WAITING)))
                         item.setToolTip("")
                         item.setForeground(Qt.gray)
                         break
             self.batch_thread.add_task(task)
         if tasks:
             InfoBar.success(
-                title="開始處理", content=f"開始處理 {len(tasks)} 個任務",
-                duration=2000, position=InfoBarPosition.TOP, parent=self,
+                title=self.tr("开始处理"),
+                content=self.tr("开始处理 {0} 个任务").format(len(tasks)),
+                duration=2000,
+                position=InfoBarPosition.TOP,
+                parent=self,
             )
         return True
 

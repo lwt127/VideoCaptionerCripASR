@@ -8,6 +8,46 @@
         <source>批量处理</source>
         <translation>批量處理</translation>
     </message>
+    <message>
+        <location filename="../../app/view/batch_process_interface.py" line="77"/>
+        <source>添加文件</source>
+        <translation>添加檔案</translation>
+    </message>
+    <message>
+        <location filename="../../app/view/batch_process_interface.py" line="78"/>
+        <source>开始处理</source>
+        <translation>開始處理</translation>
+    </message>
+    <message>
+        <location filename="../../app/view/batch_process_interface.py" line="79"/>
+        <source>清空列表</source>
+        <translation>清空列表</translation>
+    </message>
+    <message>
+        <location filename="../../app/view/batch_process_interface.py" line="82"/>
+        <source>并行数</source>
+        <translation>並行數</translation>
+    </message>
+    <message>
+        <location filename="../../app/view/batch_process_interface.py" line="87"/>
+        <source>同时处理的任务数。GPU 显存充足时可调高以提升吞吐。</source>
+        <translation>同時處理的工作數量。GPU 顯存充裕時可調高以提升處理效率。</translation>
+    </message>
+    <message>
+        <location filename="../../app/view/batch_process_interface.py" line="104"/>
+        <source>文件名称</source>
+        <translation>檔案名稱</translation>
+    </message>
+    <message>
+        <location filename="../../app/view/batch_process_interface.py" line="104"/>
+        <source>进度</source>
+        <translation>進度</translation>
+    </message>
+    <message>
+        <location filename="../../app/view/batch_process_interface.py" line="104"/>
+        <source>状态</source>
+        <translation>狀態</translation>
+    </message>
 </context>
 <context>
     <name>DonateDialog</name>
@@ -1409,6 +1449,21 @@
         <location filename="../../app/view/subtitle_style_interface.py" line="722"/>
         <source>已创建新样式 </source>
         <translation>已創建新樣式 </translation>
+    </message>
+    <message>
+        <location filename="../../app/view/subtitle_style_interface.py" line="301"/>
+        <source>长文本</source>
+        <translation>長文本</translation>
+    </message>
+    <message>
+        <location filename="../../app/view/subtitle_style_interface.py" line="301"/>
+        <source>中文本</source>
+        <translation>中等文本</translation>
+    </message>
+    <message>
+        <location filename="../../app/view/subtitle_style_interface.py" line="301"/>
+        <source>短文本</source>
+        <translation>短文本</translation>
     </message>
 </context>
 <context>

@@ -183,6 +183,46 @@
         <source>任务出错:</source>
         <translation type="obsolete">Task Error:</translation>
     </message>
+    <message>
+        <location filename="../../app/view/batch_process_interface.py" line="77"/>
+        <source>添加文件</source>
+        <translation>Add Files</translation>
+    </message>
+    <message>
+        <location filename="../../app/view/batch_process_interface.py" line="78"/>
+        <source>开始处理</source>
+        <translation>Start Processing</translation>
+    </message>
+    <message>
+        <location filename="../../app/view/batch_process_interface.py" line="79"/>
+        <source>清空列表</source>
+        <translation>Clear List</translation>
+    </message>
+    <message>
+        <location filename="../../app/view/batch_process_interface.py" line="82"/>
+        <source>并行数</source>
+        <translation>Parallel Tasks</translation>
+    </message>
+    <message>
+        <location filename="../../app/view/batch_process_interface.py" line="87"/>
+        <source>同时处理的任务数。GPU 显存充足时可调高以提升吞吐。</source>
+        <translation>Number of tasks processed simultaneously. Increase when GPU VRAM is sufficient to improve throughput.</translation>
+    </message>
+    <message>
+        <location filename="../../app/view/batch_process_interface.py" line="104"/>
+        <source>文件名称</source>
+        <translation>File Name</translation>
+    </message>
+    <message>
+        <location filename="../../app/view/batch_process_interface.py" line="104"/>
+        <source>进度</source>
+        <translation>Progress</translation>
+    </message>
+    <message>
+        <location filename="../../app/view/batch_process_interface.py" line="104"/>
+        <source>状态</source>
+        <translation>Status</translation>
+    </message>
 </context>
 <context>
     <name>DonateDialog</name>
@@ -1757,6 +1797,21 @@ Note: When using a small LLM model, it is recommended to keep the script within 
         <source>设置预览图片的显示方向</source>
         <translation>Set the display orientation of the preview image</translation>
     </message>
+    <message>
+        <location filename="../../app/view/subtitle_style_interface.py" line="301"/>
+        <source>长文本</source>
+        <translation>Long Text</translation>
+    </message>
+    <message>
+        <location filename="../../app/view/subtitle_style_interface.py" line="301"/>
+        <source>中文本</source>
+        <translation>Medium Text</translation>
+    </message>
+    <message>
+        <location filename="../../app/view/subtitle_style_interface.py" line="301"/>
+        <source>短文本</source>
+        <translation>Short Text</translation>
+    </message>
 </context>
 <context>
     <name>SubtitleTableModel</name>
@@ -2619,7 +2674,7 @@ Note: When using a small LLM model, it is recommended to keep the script within 
     <message>
         <location filename="../../app/components/WhisperCppSettingWidget.py" line="472"/>
         <source>下载失败</source>
-        <translation type="unfinished"></translation>
+        <translation>Download Failed</translation>
     </message>
 </context>
 <context>

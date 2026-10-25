@@ -1050,7 +1050,7 @@ class FasterWhisperSettingWidget(QWidget):
             FIF.LANGUAGE,
             self.tr("源语言"),
             self.tr("音频的源语言"),
-            [lang.value for lang in TranscribeLanguageEnum],
+            [self.tr(lang.value) for lang in TranscribeLanguageEnum],
             self.setting_group,
         )
         self.language_card.comboBox.setMaxVisibleItems(6)

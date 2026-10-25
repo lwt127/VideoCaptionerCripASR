@@ -8,6 +8,46 @@
         <source>批量处理</source>
         <translation></translation>
     </message>
+    <message>
+        <location filename="../../app/view/batch_process_interface.py" line="77"/>
+        <source>添加文件</source>
+        <translation></translation>
+    </message>
+    <message>
+        <location filename="../../app/view/batch_process_interface.py" line="78"/>
+        <source>开始处理</source>
+        <translation></translation>
+    </message>
+    <message>
+        <location filename="../../app/view/batch_process_interface.py" line="79"/>
+        <source>清空列表</source>
+        <translation></translation>
+    </message>
+    <message>
+        <location filename="../../app/view/batch_process_interface.py" line="82"/>
+        <source>并行数</source>
+        <translation></translation>
+    </message>
+    <message>
+        <location filename="../../app/view/batch_process_interface.py" line="87"/>
+        <source>同时处理的任务数。GPU 显存充足时可调高以提升吞吐。</source>
+        <translation></translation>
+    </message>
+    <message>
+        <location filename="../../app/view/batch_process_interface.py" line="104"/>
+        <source>文件名称</source>
+        <translation></translation>
+    </message>
+    <message>
+        <location filename="../../app/view/batch_process_interface.py" line="104"/>
+        <source>进度</source>
+        <translation></translation>
+    </message>
+    <message>
+        <location filename="../../app/view/batch_process_interface.py" line="104"/>
+        <source>状态</source>
+        <translation></translation>
+    </message>
 </context>
 <context>
     <name>DonateDialog</name>
