@@ -411,6 +411,10 @@ class BatchProcessInterface(QWidget):
     def update_task_progress(self, file_path: str, progress: int, status: str):
         for row in range(self.task_table.rowCount()):
             if self.task_table.item(row, 0).toolTip() == file_path:
+                if self._is_row_status(
+                    row, BatchTaskStatus.COMPLETED, BatchTaskStatus.FAILED
+                ):
+                    break
                 # 更新进度条
                 progress_bar = self.task_table.cellWidget(row, 1)
                 progress_bar.setValue(progress)

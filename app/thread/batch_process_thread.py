@@ -107,13 +107,16 @@ class BatchProcessThread(QThread):
 
     def _on_progress_wrapper(self, batch_task: BatchTask, progress: int, message: str):
         """进度信号包装器"""
-        self.task_progress.emit(batch_task.file_path, progress, message)
+        if batch_task.status == BatchTaskStatus.RUNNING:
+            self.task_progress.emit(batch_task.file_path, progress, message)
 
     def _on_error_wrapper(self, batch_task: BatchTask, error: str):
         """错误信号包装器"""
         batch_task.status = BatchTaskStatus.FAILED
         batch_task.error_message = error
         self.task_error.emit(batch_task.file_path, error)
+        if batch_task.current_thread in self.threads:
+            self.threads.remove(batch_task.current_thread)
 
     def _on_finished_wrapper(self, batch_task: BatchTask, task=None):
         """完成信号包装器"""
@@ -195,8 +198,9 @@ class BatchProcessThread(QThread):
         self, batch_task: BatchTask, progress: int, message: str
     ):
         """转录+字幕任务进度包装器"""
-        progress = progress // 2  # 转录占50%进度
-        self.task_progress.emit(batch_task.file_path, progress, message)
+        if batch_task.status == BatchTaskStatus.RUNNING:
+            progress = progress // 2  # 转录占50%进度
+            self.task_progress.emit(batch_task.file_path, progress, message)
 
     def _on_trans_sub_finished_wrapper(
         self, batch_task: BatchTask, task: TranscribeTask
@@ -235,8 +239,9 @@ class BatchProcessThread(QThread):
         self, batch_task: BatchTask, progress: int, message: str
     ):
         """转录+字幕任务字幕进度包装器"""
-        progress = 50 + progress // 2  # 字幕处理占后50%进度
-        self.task_progress.emit(batch_task.file_path, progress, message)
+        if batch_task.status == BatchTaskStatus.RUNNING:
+            progress = 50 + progress // 2  # 字幕处理占后50%进度
+            self.task_progress.emit(batch_task.file_path, progress, message)
 
     def _handle_full_process_task(self, batch_task: BatchTask):
         # 首先创建转录任务

@@ -175,11 +175,12 @@ class CrispASR(BaseASR):
         # allows CPU execution with a GPU build.
         self.use_gpu = use_gpu and engine_flavor not in ("cpu", "cpu-legacy")
         self.use_vad = use_vad
-        self.need_word_time_stamp = need_word_time_stamp or word_timestamps
+        self.word_timestamps = bool(word_timestamps)
+        self.need_word_time_stamp = need_word_time_stamp or self.word_timestamps
         self.alignment_mode = alignment_mode
         self.aligner = aligner
         self._alignment_args = alignment_args(
-            alignment_mode, aligner, language, self.need_word_time_stamp
+            alignment_mode, aligner, language, self.word_timestamps
         )
         self._custom_engine = crisp_asr_path is not None
         self.process = None
@@ -401,6 +402,16 @@ class CrispASR(BaseASR):
 
                 if self.process.returncode != 0:
                     code = self.process.returncode
+                    if code == 31 and any(
+                        "keeping ASR timestamps" in ln for ln in full_output
+                    ):
+                        recovered = self._recover_srt_from_stdout(full_output)
+                        if recovered:
+                            logger.warning(
+                                "部分片段对齐回退到原始时间戳 (code 31)，已从标准输出恢复字幕"
+                            )
+                            callback(100, "转换完成")
+                            return recovered
                     # 0xFFFFFFFF / -1 等通常为后端崩溃（如长音频 + 实验性后端不稳定）
                     hint = ""
                     if code in (4294967295, -1, 3221225477, -1073741819):
@@ -601,9 +612,33 @@ class CrispASR(BaseASR):
         if result.returncode != 0 or not Path(out_wav).is_file():
             raise RuntimeError(f"分段音频裁剪失败: {result.stderr[-500:]}")
 
+    def _recover_srt_from_stdout(self, lines: list[str]) -> str | None:
+        """当部分切片因对齐异常回退到 ASR 段级时间戳导致严格检查退出 (code 31) 时，从标准输出恢复字幕。"""
+        ts_re = re.compile(
+            r"^\[(\d{2}):(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})\.(\d{3})\]\s*(.+)$"
+        )
+        segments: list[ASRDataSeg] = []
+        for raw in lines:
+            m = ts_re.match(raw.strip())
+            if not m:
+                continue
+            h1, m1, s1, ms1, h2, m2, s2, ms2, text = m.groups()
+            start_ms = ((int(h1) * 3600 + int(m1) * 60 + int(s1)) * 1000) + int(ms1)
+            end_ms = ((int(h2) * 3600 + int(m2) * 60 + int(s2)) * 1000) + int(ms2)
+            seg = ASRDataSeg(text.strip(), start_ms, end_ms)
+            if self.word_timestamps and len(seg.text) > 2 and not (
+                len(seg.text.split()) == 1 and seg.text.isascii()
+            ):
+                segments.extend(ASRData([seg]).split_to_word_segments().segments)
+            else:
+                segments.append(seg)
+        if not segments:
+            return None
+        return ASRData(segments).to_srt()
+
     def _get_key(self):
         return (
-            f"crispasr-{self.crc32_hex}-{self.need_word_time_stamp}"
+            f"crispasr-{self.crc32_hex}-{self.word_timestamps}"
             f"-{self.backend}-{Path(str(self.model_arg)).name}-{self.language}"
             f"-{self.alignment_mode}-{self.aligner}-{self.engine_flavor}-{self.use_gpu}"
         )
